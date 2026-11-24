@@ -68,6 +68,9 @@ Independent host-copy refreshes are the exception: they use parallel workers
 automatically on systems with at least four logical CPUs. Each switch is
 described in a comment where it is read.
 
+To compare CPU load, GPU engines and memory pressure during a run, see
+[Recording resource usage on Windows](docs/resource-logging.md).
+
 ### Known problems
 
 - Everything in shadow is black (see above).
