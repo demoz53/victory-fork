@@ -101,14 +101,19 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 asked = src_args.Load3(src_at);
+        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         bool huge = g.z != 0 && g.x * g.y > GROUPS / g.z;
-        // Diagnostics, in the budget buffer's words 3 and 4: the largest
-        // group count a compute record asked for (all ones past the most a
-        // dispatch runs), and the groups run in all.
+        // Diagnostics, in the budget buffer's words 3 to 5: the largest
+        // first dimension a compute record asked for (as the title wrote it),
+        // the groups run in all, and the records cut down (a dimension over
+        // 65,535, or more groups than a dispatch runs).
         uint was;
-        budget.InterlockedMax(12, huge ? 0xffffffffu : g.x * g.y * g.z, was);
+        budget.InterlockedMax(12, asked.x, was);
+        if (huge || any(asked > g)) {
+            budget.InterlockedAdd(20, 1u, was);
+        }
         if (huge) {
             g = uint3(0, 0, 0);
         }

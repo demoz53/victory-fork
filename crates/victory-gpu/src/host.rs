@@ -1335,9 +1335,9 @@ fn card_budget() -> bool {
 }
 
 /// Indirect compute dispatches since the last frame line, the same way: the
-/// largest group count a record asked for (`u32::MAX` for one past the most
-/// a dispatch runs), and the groups run in all (before the list's budget).
-static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// largest first dimension a record asked for (as the title wrote it), the
+/// groups run in all (before the list's budget), and the records cut down.
+static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -5925,17 +5925,19 @@ impl HostList {
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
             // asked for, the groups asked in all; compute dispatches: the
-            // largest asked for, the groups run; with the card's copy, as the
-            // list's end copied them here): taken, then zeroed.
+            // largest asked for, the groups run, the records cut down; with the
+            // card's copy, as the list's end copied them here): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                let (largest, run) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                let (largest, run, cut) =
+                    (words.add(3).read_volatile(), words.add(4).read_volatile(), words.add(5).read_volatile());
                 COMPUTE_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 COMPUTE_GROUPS[1].fetch_add(u64::from(run), Ordering::Relaxed);
-                for k in 0..5 {
+                COMPUTE_GROUPS[2].fetch_add(u64::from(cut), Ordering::Relaxed);
+                for k in 0..6 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6878,9 +6880,9 @@ impl Meter {
         );
         let compute_largest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
         let compute_groups = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let compute_cut = COMPUTE_GROUPS[2].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "indirect compute dispatches: the largest group count asked for {compute_largest} ({} = past the most a dispatch runs, 1048576), {compute_groups:.0} groups run per frame",
-            u32::MAX
+            "indirect compute dispatches: the largest first dimension asked for {compute_largest} (run: at most 65535), {compute_groups:.0} groups run per frame, {compute_cut:.1} records a frame cut down"
         );
         late_line(frames);
         crate::draw::window_line(frames);
