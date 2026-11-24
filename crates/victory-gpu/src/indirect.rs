@@ -321,9 +321,24 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    bound_at(list, src, count, spec, (0, 0))
+}
+
+/// [`bound`] into the scratch buffer from byte `at` on (a multiple of 4),
+/// in a scratch buffer of at least `room` bytes (`crate::draw`'s windows
+/// keep several runs of clamped records at once, each in a part of its
+/// own: `VICTORY_INDIRECT_WINDOW=2`).
+pub(crate) fn bound_at(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    (at, room): (u64, u64),
+) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    let size = at.checked_add(bytes)?.max(room);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(size)?);
+    clamp_into(list, c, (&dst, at), budget, src, count, spec, false).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -341,9 +356,21 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    bound_ahead_at(list, src, spec, (0, 0))
+}
+
+/// [`bound_ahead`] into the scratch buffer from byte `at` on, in one of at
+/// least `room` bytes ([`bound_at`]).
+pub(crate) fn bound_ahead_at(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    (at, room): (u64, u64),
+) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    let size = at.checked_add(bytes)?.max(room);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(size)?);
+    clamp_into(list, c, (&dst, at), budget, src, None, spec, true).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -353,7 +380,7 @@ pub(crate) fn bound_ahead(
 fn clamp_into(
     list: &HostList,
     c: &Clamp,
-    dst: &ID3D12Resource,
+    (dst, at): (&ID3D12Resource, u64),
     budget: u64,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -361,7 +388,7 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded = record_clamp_at(c, &list.list, (dst, before, at), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -379,6 +406,22 @@ fn record_clamp_as(
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_at(c, l, (dst, before, 0), budget, src, count, spec, ahead)
+}
+
+/// [`record_clamp_as`] into `dst` from byte `at` on: record `i` lands at
+/// `at + i * stride`, and nothing else of `dst` is written.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_at(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before, at): (&ID3D12Resource, D3D12_RESOURCE_STATES, u64),
+    budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -392,7 +435,10 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_base) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let Some(dst_gpu) = dst_base.checked_add(at) else {
+        return false;
+    };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }

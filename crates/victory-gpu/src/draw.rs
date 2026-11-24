@@ -96,10 +96,110 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Where in the scratch buffer record 0 is ([`wide_windows`]: each
+    /// window its own part; else 0).
+    at: u64,
 }
 
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
+
+/// With [`wide_windows`]: the windows a list keeps at once, and the bytes
+/// of the scratch buffer each has (the longest step a window takes, 256,
+/// times [`WINDOW_MOST`]). The part after them is for the clamps of
+/// executions that are not windows.
+const WINDOW_SLOTS: u64 = 8;
+const WINDOW_SLOT: u64 = 256 * WINDOW_MOST;
+const WINDOWS_END: u64 = WINDOW_SLOTS * WINDOW_SLOT;
+
+/// `VICTORY_INDIRECT_WINDOW`: 0 (off), 1 ([`windows`]) or 2 (and
+/// [`wide_windows`]).
+fn window_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_WINDOW").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Windows that last longer (`VICTORY_INDIRECT_WINDOW=2`, on top of
+/// [`windows`]). With windows alone the records clamped a frame went from
+/// 2,900-6,300 to 2,000-2,600 (runs dc-off and ind-window) for some 4,800
+/// indirect executions: most clamps are still of one record, each a
+/// compute pass of ours between two waits in the middle of the title's
+/// drawing (the card goes from drawing to compute and back for each; a
+/// shadow draw of next to nothing cost 12-16 microseconds a record in the
+/// timing runs). What ended windows that need not:
+///
+/// - a direct draw or mesh dispatch, or a dispatch, whose shaders store to
+///   no buffer: it cannot change the arguments a window holds clamped, so
+///   the window stays (one whose shaders store still ends every window);
+/// - an indirect execution that is not a window (a count buffer, more than
+///   one record) and stores nothing: its clamp now goes to a part of the
+///   scratch buffer after the windows', so they stay;
+/// - a draw from another argument buffer, or another walk of the same one:
+///   a list keeps up to [`WINDOW_SLOTS`] windows, each in a part of the
+///   scratch buffer of its own, and a draw reads whichever holds its
+///   record. A walk that goes on past its window clamps the next window
+///   into the same part.
+///
+/// The clamp, the bounds and the budget are as with [`windows`]; only
+/// where the clamped records lie, and how long they are read, change. The
+/// frame line's "indirect windows" line counts what happened, for both.
+fn wide_windows() -> bool {
+    window_mode() > 1
+}
+
+/// Since the last frame-rate line, by the `W_` names: what indirect
+/// executions did with windows ([`windows`]).
+static WINDOW_STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+const W_HIT: usize = 0;
+const W_CLAMPED: usize = 1;
+const W_ONE: usize = 2;
+const W_COUNTED: usize = 3;
+const W_MANY: usize = 4;
+const W_STORES: usize = 5;
+const W_DISPATCH: usize = 6;
+const W_END_DRAW: usize = 7;
+const W_KEPT_DRAW: usize = 8;
+const W_END_STORE: usize = 9;
+const W_GROWN: usize = 10;
+const W_ASIDE: usize = 11;
+
+fn window_count(what: usize) {
+    WINDOW_STATS[what].fetch_add(1, Ordering::Relaxed);
+}
+
+/// For the frame-rate line, with [`windows`]: what indirect executions did
+/// with windows per frame since the last one.
+pub(crate) fn window_line(frames: f64) {
+    if !windows() {
+        return;
+    }
+    let w: Vec<f64> = WINDOW_STATS.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "indirect windows per frame (VICTORY_INDIRECT_WINDOW={}): {:.0} executions read a window clamped before, \
+         {:.0} windows clamped (more than one record), {:.0} windowable executions clamped alone; not windows: \
+         {:.0} with a count buffer, {:.0} of more than one record, {:.0} whose shaders store, {:.0} dispatches; \
+         windows ended by {:.0} direct draws or dispatches, kept over {:.0} that store nothing, ended by {:.0} \
+         indirect executions whose shaders store, {:.0} times by a bigger scratch buffer; {:.0} windowable \
+         executions found a window of their buffer that neither held their record nor walked on to it",
+        window_mode(),
+        w[W_HIT],
+        w[W_CLAMPED],
+        w[W_ONE],
+        w[W_COUNTED],
+        w[W_MANY],
+        w[W_STORES],
+        w[W_DISPATCH],
+        w[W_END_DRAW],
+        w[W_KEPT_DRAW],
+        w[W_END_STORE],
+        w[W_GROWN],
+        w[W_ASIDE],
+    );
+}
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -148,6 +248,13 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether the shaders of title pipeline `pipeline` may store to buffers
+/// (no host pipeline: nothing runs, nothing is stored).
+fn pipeline_stores(pipeline: usize) -> bool {
+    crate::pipeline::host_pipeline(pipeline as This)
+        .is_some_and(|p| p.stages.iter().any(|stage| stage.translated().stores))
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -177,9 +284,10 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
-    /// The indirect records clamped last, if later draws may still read
-    /// them ([`windows`]).
-    window: Option<Window>,
+    /// The runs of indirect records clamped, oldest first, that later draws
+    /// may still read ([`windows`]: the last one; [`wide_windows`]: up to
+    /// [`WINDOW_SLOTS`]).
+    windows: Vec<Window>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1668,10 +1776,25 @@ impl State {
         });
     }
 
+    /// A direct draw, mesh dispatch or dispatch is recorded: it ends the
+    /// windows of clamped records ([`windows`]), unless its shaders store
+    /// to no buffer and windows last longer ([`wide_windows`]).
+    fn draw_ends_windows(&mut self) {
+        if self.windows.is_empty() {
+            return;
+        }
+        if wide_windows() && !pipeline_stores(self.pipeline) {
+            window_count(W_KEPT_DRAW);
+            return;
+        }
+        window_count(W_END_DRAW);
+        self.windows.clear();
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.draw_ends_windows();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1804,7 +1927,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.draw_ends_windows();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2127,7 +2250,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.draw_ends_windows();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2232,7 +2355,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.draw_ends_windows();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2358,82 +2481,155 @@ impl State {
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
-        // or may write the arguments.
+        // or may write the arguments (`wide_windows`: only what may write).
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
-            && kind != DISPATCH
-            && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
+        let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        let windowed = windows() && kind != DISPATCH && max == 1 && count.is_none() && !stores;
+        let wide = wide_windows();
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
-            self.window = None;
+        if windows() && list.first_use(WINDOW_USE) {
+            self.windows.clear();
+        }
+        if windows() && !windowed {
+            window_count(if count.is_some() {
+                W_COUNTED
+            } else if max != 1 {
+                W_MANY
+            } else if stores {
+                W_STORES
+            } else {
+                W_DISPATCH
+            });
+            if !wide || stores {
+                if stores && !self.windows.is_empty() {
+                    window_count(W_END_STORE);
+                }
+                self.windows.clear();
+            }
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+        let hit = if windowed {
+            self.windows
+                .iter()
+                .rev()
+                .filter(|w| same(w) && offset >= w.base)
+                .find(|w| {
+                    (offset - w.base) % u64::from(w.step) == 0
+                        && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+                })
+                .map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
+        } else {
+            None
+        };
         let (bounded, at) = match hit {
-            Some(hit) => hit,
+            Some(hit) => {
+                window_count(W_HIT);
+                hit
+            }
             None => {
-                // A record a short step after the last window's last one
-                // (the same step as that window's, if it had one): the
-                // title walks the buffer, so the ones that step apart
-                // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
-                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                        } else {
-                            (stride, max)
-                        }
+                // A record a short step after a window's last one (the same
+                // step as that window's, if it had one): the title walks
+                // the buffer, so the ones that step apart after it are
+                // clamped with it.
+                let walks = |w: &Window| {
+                    let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
+                    let step = offset.saturating_sub(last);
+                    (step >= u64::from(stride)
+                        && step <= 256
+                        && step % 4 == 0
+                        && (w.records == 1 || step == u64::from(w.step)))
+                    .then_some(step)
+                };
+                let walked = if windowed {
+                    self.windows.iter().rposition(|w| same(w) && walks(w).is_some())
+                } else {
+                    None
+                };
+                if windowed && walked.is_none() && self.windows.iter().any(same) {
+                    window_count(W_ASIDE);
+                }
+                let (step, records) = match walked.map(|i| &self.windows[i]) {
+                    Some(w) => {
+                        let step = walks(w).unwrap_or(u64::from(stride));
+                        let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                        (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
                     }
-                    _ => (stride, max),
+                    None => (stride, max),
+                };
+                // Where the records go. With wide windows: a window in the
+                // part of the walk it goes on (else a free part, else the
+                // oldest window's), anything else after the windows' parts.
+                // Otherwise everything at 0, and a window replaces the one
+                // before.
+                let wide_window = wide && windowed && u64::from(step) * u64::from(records) <= WINDOW_SLOT;
+                let place = if wide_window {
+                    let slot = match walked {
+                        Some(i) => self.windows.remove(i).at,
+                        None => {
+                            let free = (0..WINDOW_SLOTS)
+                                .map(|k| k * WINDOW_SLOT)
+                                .find(|at| !self.windows.iter().any(|w| w.at == *at));
+                            match free {
+                                Some(at) => at,
+                                None => self.windows.remove(0).at,
+                            }
+                        }
+                    };
+                    (slot, WINDOWS_END + (64 << 10))
+                } else if wide {
+                    (WINDOWS_END, WINDOWS_END + (64 << 10))
+                } else {
+                    if windowed {
+                        self.windows.clear();
+                    }
+                    (0, 0)
                 };
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
                 }
                 // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a scratch
-                // buffer at offset 0.
+                // own and copies clamped active records into the scratch
+                // buffer from `place.0` on.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead_at(list, (&args.buffer, offset), (kind, step, records), place)
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound_at(list, (&args.buffer, offset), count_arg, (kind, step, records), place)
                 };
                 let Some(bounded) = bounded else {
-                    self.window = None;
+                    self.windows.clear();
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                if windowed {
+                    window_count(if records > 1 { W_CLAMPED } else { W_ONE });
+                }
+                // A bigger scratch buffer replaced the one the windows lie in.
+                let before = self.windows.len();
+                self.windows.retain(|w| w.scratch == bounded);
+                if self.windows.len() < before {
+                    window_count(W_GROWN);
+                }
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
-                (bounded, 0)
+                if windowed && (wide_window || !wide) {
+                    self.windows.push(Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                        at: place.0,
+                    });
+                }
+                (bounded, place.0)
             }
         };
         let ran = match kind {
