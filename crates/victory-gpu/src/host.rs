@@ -1730,6 +1730,8 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Work that writes host memory only, reading title memory `(address, bytes)`.
+    HostRead(usize, usize, Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -1774,6 +1776,11 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Numbered title-memory copies (`crate::memory`) already refreshed /
+    /// marked for shader write-back on this list since the last reset (or,
+    /// for reads, since the last step that wrote title memory).
+    memory_read_seen: usize,
+    memory_write_seen: usize,
 }
 
 impl Deferred {
@@ -1801,6 +1808,26 @@ impl Deferred {
         self.writes.clear();
         self.backs.clear();
         self.budget_zeroed = false;
+        // As a new list's (fxceless #205: the watermarks start again at
+        // every reset).
+        self.memory_read_seen = 0;
+        self.memory_write_seen = 0;
+    }
+
+    /// Advances the list's title-memory copy watermarks to `total` (`writes`:
+    /// whether this dispatch may write title memory) and returns
+    /// `(read_from, write_from)`.
+    fn memory_sync_range(&mut self, total: usize, writes: bool) -> (usize, usize) {
+        let read_from = self.memory_read_seen.min(total);
+        self.memory_read_seen = total;
+        let write_from = if writes {
+            let prev = self.memory_write_seen.min(total);
+            self.memory_write_seen = total;
+            prev
+        } else {
+            total
+        };
+        (read_from, write_from)
     }
 }
 
@@ -2016,7 +2043,10 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, join_copy_ranges, join_ranges, landable, touches_other};
+    use super::{
+        Step, WHY_READ, WHY_RUN, blocked_by_steps, flagged_pieces, join_copy_ranges, join_ranges, landable,
+        touches_other,
+    };
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2084,6 +2114,52 @@ mod relay_tests {
         // Read-back (`owner == 0`): blocks every copy.
         assert!(touches_other(&written, &by_copy, copy_a, 0x4000, 0x4080));
         assert!(touches_other(&written, &by_copy, copy_b, 0x4080, 0x4200));
+    }
+
+    /// Two command lists interleaved with newly numbered title-memory copies:
+    /// a list that ran earlier still refreshes and declares write-back for
+    /// copies another list numbered meanwhile, and re-refreshes all copies
+    /// after a title-memory copy or callback on the same list.
+    #[test]
+    fn memory_sync_range_covers_copies_numbered_by_other_lists() {
+        let mut list_a = super::Deferred::default();
+        let mut list_b = super::Deferred::default();
+
+        // List A sees copies 0..10 (read + write).
+        assert_eq!(list_a.memory_sync_range(10, true), (0, 0));
+        // List B numbers 5 more copies (total 15) and only reads them.
+        assert_eq!(list_b.memory_sync_range(15, false), (0, 15));
+        // List A's next dispatch must still refresh & write-back copies 10..15.
+        assert_eq!(list_a.memory_sync_range(15, true), (10, 10));
+        // List B then dispatches a writer at total 17: reads 15..17, writes 0..17.
+        assert_eq!(list_b.memory_sync_range(17, true), (15, 0));
+        // A title-memory copy clears the read watermark (refresh again) without
+        // re-declaring write-back for copies already covered.
+        list_a.memory_read_seen = 0;
+        assert_eq!(list_a.memory_sync_range(17, true), (0, 15));
+        // Resetting the list clears both watermarks.
+        list_a = super::Deferred::default();
+        assert_eq!(list_a.memory_sync_range(17, true), (0, 0));
+    }
+
+    /// `Step::HostRead` (used by `expand_rects`) is checked against pending
+    /// shader writes, and a later `Step::Run` takes precedence over an earlier
+    /// `WHY_READ` so `VICTORY_RELAY=2` settles rather than waiting only on read
+    /// ranges.
+    #[test]
+    fn blocked_by_steps_checks_host_read_and_prioritizes_run() {
+        let written = [(0x2000usize, 0x3000usize)];
+        let unrelated = [Step::HostRead(0x4000, 0x100, Box::new(|| {}))];
+        assert_eq!(blocked_by_steps(&written, &[], &[], &unrelated), None);
+
+        let host_read = [Step::HostRead(0x2800, 0x200, Box::new(|| {}))];
+        assert_eq!(blocked_by_steps(&written, &[], &[], &host_read), Some((WHY_READ, Some(16))));
+
+        let read_then_run = [
+            Step::Fill(0x1000, 0x2400, 0x100),
+            Step::Run(Box::new(|| {})),
+        ];
+        assert_eq!(blocked_by_steps(&written, &[], &[], &read_then_run), Some((WHY_RUN, None)));
     }
 }
 
@@ -2322,6 +2398,45 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, &by_copy, &immed, runs, true)
 }
 
+/// [`blocked_by`] over one slice of steps, returning `(reason, read_stat)`
+/// (`read_stat`: the place in `LATE_STATS` of the first read found) with
+/// `WHY_RUN` taking precedence over an earlier `WHY_READ` (fxceless #207).
+fn blocked_by_steps<'a>(
+    written: &[(usize, usize)],
+    by_copy: &[(usize, usize, usize)],
+    immed: &[(usize, usize)],
+    steps: impl IntoIterator<Item = &'a Step>,
+) -> Option<(usize, Option<usize>)> {
+    if written.is_empty() && immed.is_empty() {
+        return None;
+    }
+    let any_written = |from: usize, to: usize| touches(written, from, to) || touches(immed, from, to);
+    let mut read_stat: Option<Option<usize>> = None;
+    for step in steps {
+        let stat = match step {
+            &Step::Copy(dst, src, len) => (any_written(src, src + len) || any_written(dst, dst + len)).then_some(15),
+            &Step::Fill(_, src, len) => any_written(src, src + len).then_some(16),
+            Step::Texture { staging, .. } => {
+                let (at, len) = staging.memory();
+                any_written(at, at + len).then_some(17)
+            }
+            // A read of title memory by a step of ours (`expand_rects`).
+            &Step::HostRead(src, len, _) => any_written(src, src + len).then_some(16),
+            Step::Refresh(shadow, address, len) => {
+                let (from, to) = (*address, *address + *len);
+                let copy = std::sync::Arc::as_ptr(shadow) as usize;
+                (touches_other(written, by_copy, copy, from, to) || touches(immed, from, to)).then_some(18)
+            }
+            Step::Run(_) => return Some((WHY_RUN, None)),
+            Step::GpuWrite(..) | Step::Host(_) => None,
+        };
+        if read_stat.is_none() && stat.is_some() {
+            read_stat = Some(stat);
+        }
+    }
+    read_stat.map(|stat| (WHY_READ, stat))
+}
+
 /// [`late_blocked`] against `written` (joined), `by_copy` (per owner), and
 /// `immed` (bottom-of-pipe writes); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2335,49 +2450,25 @@ fn blocked_by(
     if written.is_empty() && immed.is_empty() {
         return None;
     }
-    let any_written = |from: usize, to: usize| touches(written, from, to) || touches(immed, from, to);
+    let mut read_stat: Option<Option<usize>> = None;
     for list in runs {
-        for step in &list.deferred().copies {
-            match step {
-                &Step::Copy(dst, src, len) => {
-                    if any_written(src, src + len) || any_written(dst, dst + len) {
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                &Step::Fill(_, src, len) => {
-                    if any_written(src, src + len) {
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Texture { staging, .. } => {
-                    let (at, len) = staging.memory();
-                    if any_written(at, at + len) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Refresh(shadow, address, len) => {
-                    let (from, to) = (*address, *address + *len);
-                    let copy = std::sync::Arc::as_ptr(shadow) as usize;
-                    if touches_other(written, by_copy, copy, from, to) || touches(immed, from, to) {
-                        if count {
-                            LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Run(_) => return Some(WHY_RUN),
-                Step::GpuWrite(..) | Step::Host(_) => {}
+        let deferred = list.deferred();
+        if let Some((why, stat)) = blocked_by_steps(written, by_copy, immed, &deferred.copies) {
+            if why == WHY_RUN {
+                return Some(WHY_RUN);
+            }
+            if read_stat.is_none() {
+                read_stat = Some(stat);
             }
         }
+    }
+    if let Some(stat) = read_stat {
+        if count
+            && let Some(slot) = stat
+        {
+            LATE_STATS[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        return Some(WHY_READ);
     }
     None
 }
@@ -5437,6 +5528,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.memory_read_seen = 0;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -5662,16 +5754,39 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Advances the list's title-memory copy watermarks to `total` (`writes`:
+    /// whether this dispatch may write title memory by address) and returns
+    /// `(read_from, write_from)`: the first copy index still needing a
+    /// refresh and, when `writes`, the first still needing a write-back
+    /// declaration.
+    pub(crate) fn memory_sync_range(&self, total: usize, writes: bool) -> (usize, usize) {
+        self.deferred().memory_sync_range(total, writes)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.memory_read_seen = 0;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
+    /// (No caller here since fxceless #272 and #207 took its last two; kept
+    /// for the open PRs that use it.)
+    #[allow(dead_code)]
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    /// As [`HostList::defer_host`], recording the title-memory range
+    /// `[src, src + len)` read by `work` so late-wait / relay waits for
+    /// in-flight writes to that range.
+    pub(crate) fn defer_host_read(&self, src: *const u8, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::HostRead(src as usize, len, Box::new(work)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -5719,7 +5834,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work) | Step::HostRead(_, _, work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
