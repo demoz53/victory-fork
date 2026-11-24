@@ -6855,7 +6855,20 @@ impl<'a> Lower<'a> {
                     return Err("an M0-relative move");
                 };
                 let indexed_src = name != "v_movreld_b32";
-                let value = if indexed_src {
+                let value = if !indexed_src {
+                    s(self, 0)?
+                } else if let Some(offset) = self.s.m.int_value(m0) {
+                    // A fixed relative read only needs its selected VGPR.
+                    // Other registers in the range can hold scalar spills.
+                    let selected = u8::try_from(offset)
+                        .ok()
+                        .and_then(|offset| sreg.checked_add(offset))
+                        .and_then(|reg| inst.read(Reg::V(reg)));
+                    match selected {
+                        Some(x) => self.i32_of(x)?,
+                        None => self.s.m.i32(0),
+                    }
+                } else {
                     let mut r = self.s.m.i32(0);
                     for k in 0..=255u8.saturating_sub(sreg) {
                         let Some(x) = inst.read(Reg::V(sreg + k)) else {
@@ -6867,8 +6880,6 @@ impl<'a> Lower<'a> {
                         r = self.s.m.select(c, is, x, r);
                     }
                     r
-                } else {
-                    s(self, 0)?
                 };
                 if name == "v_movrels_b32" {
                     return int(self, value);
