@@ -598,3 +598,34 @@ fn threaded_wave64_compute_still_runs_wave32_retries() {
             .expect("DXIL validation failed");
     }
 }
+
+/// A 32-lane console wave. A loop counts s6 up from 1 and leaves on `s_cbranch_vccz` of
+/// `v_cmp_eq_u32 vcc, s6, v0`: on the console VCC is tested for the whole wave, so the wave
+/// leaves at the first count some lane meets (lane 1, at s6 = 1) and every lane stores 1.
+/// Taken as each lane's own bit, lane 0 (whose index s6 never reaches) would keep looping up
+/// to the iteration limit and store that count instead (the clustered-light pixel shaders,
+/// fxceless #196). Every lane stores s6 at its own dword; lane 0's is checked.
+#[test]
+fn a_loop_on_a_vcc_test_of_a_lane_compare_leaves_with_the_wave() {
+    let words = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x8006_8106, // loop: s_add_u32 s6, s6, 1
+        0x7D84_0006, // v_cmp_eq_u32 vcc, s6, v0
+        0xBF86_FFFD, // s_cbranch_vccz loop (no lane met it: once more)
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 3, // buffer_store_dword v2, v3, s[8:11], 0 offen
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = on_the_card(&shader, [0, 0]) else { return };
+    assert_eq!(got, 1, "lane 0 left the loop at count {got}, not with the wave at 1");
+    eprintln!("ran on the hardware device: the wave left the loop together");
+}
