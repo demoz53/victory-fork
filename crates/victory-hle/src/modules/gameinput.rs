@@ -1259,7 +1259,7 @@ mod host {
             read: Option<u64>,
             partial: String,
             polled: Option<Instant>,
-            queue: VecDeque<u8>,
+            queue: VecDeque<(u8, Duration)>,
             held: Option<(u8, Instant)>,
             free_at: Instant,
         }
@@ -1303,12 +1303,24 @@ mod host {
                             if line.is_empty() {
                                 continue;
                             }
-                            match key_code(line) {
-                                Some(vk) => {
+                            // `<key>` or `<key> <ms>`: held 200 ms, or as long as the line says (at most a
+                            // minute). A frame can take longer than 200 ms, so a stick turn needs more.
+                            let mut words = line.split_whitespace();
+                            let key = words.next().unwrap_or_default();
+                            let hold = match words.next() {
+                                None => Some(HOLD),
+                                Some(ms) => ms
+                                    .parse::<u64>()
+                                    .ok()
+                                    .filter(|&ms| ms <= 60_000)
+                                    .map(Duration::from_millis),
+                            };
+                            match (key_code(key), hold) {
+                                (Some(vk), Some(hold)) if words.next().is_none() => {
                                     tracing::info!(key = line, "scripted key from VICTORY_KEYS_FILE");
-                                    f.queue.push_back(vk);
+                                    f.queue.push_back((vk, hold));
                                 }
-                                None => tracing::warn!(line, "VICTORY_KEYS_FILE: unknown key, skipped"),
+                                _ => tracing::warn!(line, "VICTORY_KEYS_FILE: unknown key, skipped"),
                             }
                         }
                     }
@@ -1326,9 +1338,9 @@ mod host {
         }
         if f.held.is_none()
             && now >= f.free_at
-            && let Some(vk) = f.queue.pop_front()
+            && let Some((vk, hold)) = f.queue.pop_front()
         {
-            f.held = Some((vk, now + HOLD));
+            f.held = Some((vk, now + hold));
         }
         f.held.map(|(vk, _)| vk).into_iter().collect()
     }
