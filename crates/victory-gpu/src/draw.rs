@@ -485,6 +485,22 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// Whether constant buffer views in descriptor tables are bound straight
+/// from their host copy where it is 256-byte aligned, as root ones are
+/// ([`root_view`]), not filled into upload memory at submission
+/// (`VICTORY_TABLE_CBV_DIRECT=1`; off by default; fxceless #144). A fill
+/// reads title memory on the CPU, so a fill of memory that a flight's
+/// shaders may write settles the flights ("a fill of upload memory", 1-1.8
+/// settles a frame in rr-new, each a drain of the card); the host copy is
+/// written by the card in queue order and needs no wait. What changes for
+/// the picture: a draw reads the constants as the copy holds them when it
+/// runs, not as they were when its submission was prepared, as root
+/// constant views and every other buffer view already do.
+fn table_cbv_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CBV_DIRECT").is_some_and(|v| v == "1"))
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -2134,12 +2150,31 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
+                        // Mirror `root_view`: when the constant buffer lives in
+                        // an existing shadow copy at a 256-byte-aligned host GPU
+                        // address and fits within D3D12's 64 KiB CBV limit, bind
+                        // the shadow directly instead of allocating upload
+                        // scratch and emitting a `Step::Fill` that stalls on
+                        // in-flight shader writes.
+                        let aligned_size = size.next_multiple_of(256);
+                        if table_cbv_direct()
+                            && aligned_size > 0
+                            && aligned_size <= 65536
+                            && let Some(shadow) =
+                                crate::shadow::find(address, u64::from(aligned_size))
+                            && shadow.gpu(address) % 256 == 0
+                            && shadow.left(address) >= u64::from(aligned_size)
+                        {
+                            shadow.refresh(list, address, u64::from(aligned_size));
+                            host.constant_at(index, shadow.gpu(address), size);
+                        } else {
+                            let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                                host.make_null(index);
+                                continue;
+                            };
+                            list.defer_fill(to, address as *const u8, size as usize);
+                            host.constant_at(index, gpu, size);
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
