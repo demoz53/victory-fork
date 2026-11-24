@@ -18,7 +18,13 @@
 //!   `SamplerDescriptorHeap[]`, at the index the console address gives, so
 //!   the host heaps keep the title's descriptor order. The root signature
 //!   needs `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` and
-//!   `SAMPLER_HEAP_DIRECTLY_INDEXED`.
+//!   `SAMPLER_HEAP_DIRECTLY_INDEXED`. A host view heap capped below the
+//!   title's slots may keep only an identity window of them in place
+//!   ([`set_view_heap_map`]): a view taken from the resource heap itself
+//!   (a root parameter of type `ResourceHeap`, not a table) at a title
+//!   index past the window is then read at the host slot the heap map (a
+//!   raw buffer view at a fixed view heap slot) gives, as its bitwise not
+//!   at dword `index - window` (0 there: the null slot past the limit).
 //! * **Immediate samplers** as static samplers `s<n>, space 0`, `n` the
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
@@ -117,7 +123,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    set_view_heap_limit, set_view_heap_map, view_heap_limit, view_heap_map,
 };
 
 /// The loop limit without an override: 2^20.
