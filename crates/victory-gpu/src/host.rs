@@ -6322,6 +6322,7 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        crate::draw::window_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

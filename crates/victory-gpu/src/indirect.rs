@@ -314,7 +314,8 @@ fn validate_layout(
 /// until the next clamp into it: executions read it with no barrier of
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
-/// available.
+/// available. (Tests; the draws use [`bound_at`].)
+#[cfg(test)]
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -350,7 +351,9 @@ pub(crate) fn bound_at(
 /// draw of the list after them (run 93: "the largest group count asked for
 /// 4294967295", 43 to 153 such records a frame). Here a record that asks
 /// for more than can run is left empty and charges nothing; a record
-/// clamped alone is clamped and charged as before.
+/// clamped alone is clamped and charged as before. (Tests; the draws use
+/// [`bound_ahead_at`].)
+#[cfg(test)]
 pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -400,6 +403,7 @@ fn clamp_into(
 /// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
 /// their draws ([`bound_ahead`]). False, with nothing recorded, if the
 /// layout or the addresses do not fit the clamp.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
@@ -1642,6 +1646,102 @@ void main() {
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
         }
+    }
+
+    /// Two windows clamped into parts of their own of the scratch buffer
+    /// (`bound_ahead_at`, as `crate::draw`'s wide windows do), then a clamp
+    /// of an execution that is not a window after both: the first window's
+    /// records are read after the later clamps and still run, each once.
+    #[test]
+    fn windows_in_parts_of_their_own_outlive_later_clamps() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        const STEP: u32 = 32;
+        // As `crate::draw`'s parts: 16 KiB a window, the rest after 128 KiB.
+        const PART: u64 = 16 << 10;
+        const REST: u64 = 8 * PART;
+        const ROOM: u64 = REST + (64 << 10);
+        let signature = {
+            let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(KIND_DISPATCH as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: STRIDE,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &arg,
+                NodeMask: 0,
+            };
+            let mut sig: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a valid single-argument command signature description.
+            unsafe {
+                host.device
+                    .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig)
+                    .unwrap();
+            }
+            sig.unwrap()
+        };
+        let windows: [&[u32]; 3] = [&[1, 2, 3, 4], &[10, 11, 12, 13], &[100]];
+        let mut sources = Vec::new();
+        for groups in windows {
+            let total = groups.len() * STEP as usize;
+            let Some((buffer, ptr)) = host.shared_buffer(total as u64) else {
+                return;
+            };
+            let mut bytes = vec![0xffu8; total];
+            for (i, &g) in groups.iter().enumerate() {
+                for (w, word) in [g, 1, 1].into_iter().enumerate() {
+                    let at = i * STEP as usize + w * 4;
+                    bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            // SAFETY: the mapping holds `total` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, total) };
+            sources.push(buffer);
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        let expected: u32 = windows.iter().flat_map(|g| g.iter()).sum();
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // SAFETY: the mapping holds 256 bytes; nothing runs.
+        unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+        // Window 0 in part 0, window 1 in part 1, then the third, not a
+        // window, after the parts.
+        let spec = |g: &[u32]| (KIND_DISPATCH, STEP, g.len() as u32);
+        let first = bound_ahead_at(&list, (&sources[0], 0), spec(windows[0]), (0, ROOM)).unwrap();
+        let second = bound_ahead_at(&list, (&sources[1], 0), spec(windows[1]), (PART, ROOM)).unwrap();
+        let third = bound_at(&list, (&sources[2], 0), None, spec(windows[2]), (REST, ROOM)).unwrap();
+        assert!(first == second && second == third, "one scratch buffer for all parts");
+        assert_eq!(list.indirect_state(&first), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        // SAFETY: an open list; the worker's root signature and pipeline;
+        // buffers the test holds until the list has run.
+        unsafe {
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            for (part, groups) in [0, PART, REST].into_iter().zip(windows) {
+                for i in 0..groups.len() as u64 {
+                    list.list.ExecuteIndirect(&signature, 1, &first, part + i * u64::from(STEP), None, 0);
+                }
+            }
+        }
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: the list has run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, expected, "every record of every part runs once, the first after both later clamps");
     }
 }
 
