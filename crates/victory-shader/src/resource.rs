@@ -1244,6 +1244,30 @@ impl<'a> Tracer<'a> {
         only
     }
 
+    /// The one edge into the join `block` that is not an `s_cbranch_execz` skipping to it,
+    /// where every other edge is one: the edge out of the skipped region. The console takes
+    /// a skip only when no lane is left for the region, and a descriptor the region makes
+    /// (`CS_AlphTransmissionPrefilterMip` builds a sampler there and samples with it after
+    /// the join) then holds whatever the registers held before, which no lane that reads it
+    /// can rely on. Where the lanes' paths cannot rule the skip out ([`Self::only_edge`]: in
+    /// a form of the program without its early-outs, lanes with EXEC clear walk on), the
+    /// region's descriptor is the one read.
+    fn past_skip(&self, block: usize) -> Option<usize> {
+        let preds = &self.p.blocks[block].preds;
+        if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let skip = |q: usize| {
+            matches!(self.p.blocks[q].exit, Exit::Branch { taken, .. } if taken == block)
+                && self.p.blocks[q].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+        };
+        let mut rest = (0..preds.len()).filter(|&j| !skip(preds[j]));
+        match (rest.next(), rest.next()) {
+            (Some(j), None) => Some(j),
+            _ => None,
+        }
+    }
+
     /// Whether lowering can make a handle for `source` in any block: its
     /// heap index comes from root parameters and constants alone (a table
     /// offset the code computes exists only where the load is).
@@ -1340,7 +1364,13 @@ impl<'a> Tracer<'a> {
                     Ok(source) if self.anywhere(&source) => Ok(source),
                     _ => Err(e),
                 },
-                None => Err(e),
+                None => match self.past_skip(block) {
+                    Some(j) => match self.classify(&edge(j), joins, known) {
+                        Ok(source) if self.anywhere(&source) => Ok(source),
+                        _ => Err(e),
+                    },
+                    None => Err(e),
+                },
             },
         };
         joins.pop();
@@ -3803,6 +3833,39 @@ pub(crate) mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    /// A descriptor made inside a region its `s_cbranch_execz` skips when no lane is left and
+    /// used after the join (`CS_AlphTransmissionPrefilterMip` builds a sampler so): every lane
+    /// can come by either edge, but the skip's leaves no lane that needs the descriptor.
+    #[test]
+    fn a_descriptor_made_in_a_skipped_region_is_the_regions_after_the_join() {
+        let r = track_words(
+            &[
+                0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+                0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+                0xBF88_0005, // s_cbranch_execz -> the join
+                0xB008_0092, // s_movk_i32 s8, 0x92
+                0xBE89_03FF,
+                0x00C0_0000, // s_mov_b32 s9, 0xc00000
+                0xBE8A_0BA8, // s_brev_b32 s10, 40
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0xBEFE_0314, // the join: s_mov_b32 exec_lo, s20
+                0xE030_0000,
+                0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert!(
+            r.descriptors.iter().any(|d| matches!(
+                &d.source,
+                Source::Constant(w) if w[..] == [0x92, 0x00C0_0000, 40u32.reverse_bits(), 0]
+            )),
+            "{:?}",
+            r.descriptors.iter().map(|d| &d.source).collect::<Vec<_>>()
         );
     }
 
