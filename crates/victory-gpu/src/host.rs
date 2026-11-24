@@ -4313,6 +4313,13 @@ impl Host {
         working(was_working);
     }
 
+    /// Whether the card has run the submission behind fence value `target`
+    /// (or the device is gone, which [`Host::wait_for_staging`] reports).
+    pub(crate) fn staging_done(&self, target: u64) -> bool {
+        // SAFETY: a plain query of our fence.
+        (unsafe { self.fence.GetCompletedValue() }) >= target
+    }
+
     /// A CPU detile must wait for the last GPU read of its staging buffer.
     /// Called with the submission lock held, so no newer upload can race it.
     pub(crate) fn wait_for_staging(&self, target: u64) {

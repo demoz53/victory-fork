@@ -624,6 +624,13 @@ impl Staging {
         self.last_upload.store(fence, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Whether a detile now would wait for a submission sent ahead that
+    /// still copies from the staging buffer ([`Staging::detile`]).
+    fn busy(&self) -> bool {
+        let fence = self.last_upload.load(std::sync::atomic::Ordering::Relaxed);
+        fence != 0 && host().is_some_and(|h| !h.staging_done(fence))
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)
@@ -728,8 +735,10 @@ impl Staging {
         // only with this taken alone, so what `committed` finds mapped
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
-        // 74).
-        let _mapped = if no_wait() {
+        // 74). Let go before a wait for a flight that still copies from the
+        // staging buffer (`Staging::busy`): the runtime's remapping would
+        // wait for the card with it, and every read behind the remapping.
+        let mut mapped = Some(if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -739,7 +748,7 @@ impl Staging {
             mapped
         } else {
             waited(2, crate::watch::title_memory_reading)
-        };
+        });
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -765,6 +774,10 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
+                // The bytes are in the read buffer now.
+                if self.busy() {
+                    drop(mapped.take());
+                }
                 self.detile(read);
                 true
             });
@@ -787,6 +800,9 @@ impl Staging {
                 }
                 last.hash = Some(hash);
                 found_blind(last);
+                if self.busy() {
+                    drop(mapped.take());
+                }
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -794,7 +810,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -804,7 +820,17 @@ impl Staging {
         }
         last.hash = Some(hash);
         found_blind(last);
-        self.detile(tiled);
+        if self.busy() {
+            // Taken out of title memory first, then the wait without the
+            // runtime's lock.
+            with_read(size, |read| {
+                read.copy_from_slice(tiled);
+                drop(mapped.take());
+                self.detile(read);
+            });
+        } else {
+            self.detile(tiled);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
