@@ -347,6 +347,31 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Time waiting to reuse texture staging read by a late submission, since
+/// the last frame-rate line.
+static STAGING_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The same, since the start (never reset): [`Host::submit`] takes what a
+/// preparing waited from it, so that the wait counts as waiting for the
+/// card on the frame line, not as preparing.
+static STAGING_WAITED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// fxceless #141's wait as well (`VICTORY_STAGING_WAIT=submission`; off by
+/// default, for comparing): a submission sent ahead waits, before it is
+/// prepared, until every flight that used one of its textures has landed,
+/// whether or not a texture changed or that flight copied from its staging
+/// buffer. In the relay reference run (dc-off) that was nearly all of the
+/// 11-13 settles a frame for "title memory read" (only about 1 a frame
+/// named a buffer copy, a fill or another copy) and 90-120 ms a frame of the
+/// submitting thread waiting for the card, with the card idle 108-148 ms a
+/// frame behind our preparing. By default only a detile into a staging
+/// buffer that a flight still copies from waits, for that flight's fence
+/// ([`Host::wait_for_staging`], fxceless #272).
+fn staging_wait_whole() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STAGING_WAIT").is_ok_and(|v| v == "submission"))
+}
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -1709,7 +1734,10 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture {
+        staging: std::sync::Arc<crate::texture::Staging>,
+        uploads: bool,
+    },
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2322,7 +2350,7 @@ fn blocked_by(
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture { staging, .. } => {
                     let (at, len) = staging.memory();
                     if any_written(at, at + len) {
                         if count {
@@ -2355,7 +2383,7 @@ fn blocked_by(
 fn staging_in_flight_at(runs: &[&HostList], finished: u64) -> bool {
     runs.iter().any(|list| {
         list.deferred().copies.iter().any(|step| {
-            matches!(step, Step::Texture(staging) if staging.in_flight() > finished)
+            matches!(step, Step::Texture { staging, .. } if staging.in_flight() > finished)
         })
     })
 }
@@ -2890,11 +2918,17 @@ mod late_tests {
         let list = host.new_list().expect("host list");
         crate::texture::upload(&list, resource, tex);
         assert!(!super::staging_in_flight_at(&[&list], 0));
+        // The first use records the copy from the staging buffer: that
+        // list's submission is what a later detile waits for.
+        let mut uploading = 0;
         for step in &list.deferred().copies {
-            if let super::Step::Texture(staging) = step {
+            if let super::Step::Texture { staging, uploads } = step {
+                assert!(*uploads, "the first use of a texture copies from its staging buffer");
+                uploading += 1;
                 staging.mark_in_flight(10);
             }
         }
+        assert_eq!(uploading, 1);
         assert!(super::staging_in_flight_at(&[&list], 9));
         assert!(!super::staging_in_flight_at(&[&list], 10));
         assert!(!super::staging_in_flight_at(&[&list], 11));
@@ -4279,6 +4313,36 @@ impl Host {
         working(was_working);
     }
 
+    /// A CPU detile must wait for the last GPU read of its staging buffer.
+    /// Called with the submission lock held, so no newer upload can race it.
+    pub(crate) fn wait_for_staging(&self, target: u64) {
+        // SAFETY: the fence belongs to this host. A null event waits inline.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            fail(format_args!("device removed while waiting to reuse texture staging"));
+        }
+        if completed < target {
+            let started = std::time::Instant::now();
+            let was_working = working(false);
+            // SAFETY: target was signalled on the host queue before preparation began.
+            let waited = unsafe { self.fence.SetEventOnCompletion(target, HANDLE::default()) };
+            working(was_working);
+            if let Err(error) = waited {
+                fail(format_args!("could not wait to reuse texture staging ({error})"));
+            }
+            // SAFETY: a plain query. Device removal can also wake the wait.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed == u64::MAX || completed < target {
+                fail(format_args!("texture staging upload did not reach fence {target}"));
+            }
+            stood(started);
+            let us = started.elapsed().as_micros() as u64;
+            STAGING_WAIT_US.fetch_add(us, Ordering::Relaxed);
+            STAGING_WAITED_US.fetch_add(us, Ordering::Relaxed);
+            SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -4311,7 +4375,7 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
-        if late && staging_in_flight(runs) {
+        if late && staging_wait_whole() && staging_in_flight(runs) {
             if relay_exact() {
                 relay_wait(WHY_READ, |_| !staging_in_flight(runs));
             } else {
@@ -4354,6 +4418,7 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        let staging_before = STAGING_WAITED_US.load(Ordering::Relaxed);
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -4421,11 +4486,18 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        // Waits for staging buffers a flight still copies from, inside this
+        // preparing: counted as waiting for the card, as `settled` is.
+        settled += std::time::Duration::from_micros(
+            STAGING_WAITED_US.load(Ordering::Relaxed).saturating_sub(staging_before),
+        );
         if late {
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Texture(staging) = step {
-                        staging.mark_in_flight(this_submission);
+            if staging_wait_whole() {
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Texture { staging, .. } = step {
+                            staging.mark_in_flight(this_submission);
+                        }
                     }
                 }
             }
@@ -4438,6 +4510,13 @@ impl Host {
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+            }
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::Texture { staging, uploads: true } = step {
+                        staging.note_upload_fence(*submitted);
+                    }
+                }
             }
             let back = declared_writes(runs);
             let backs: Vec<(usize, usize)> = runs
@@ -5535,8 +5614,8 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, uploads: bool) {
+        self.deferred().copies.push(Step::Texture { staging, uploads });
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -5612,7 +5691,10 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture { staging, uploads } => {
+                    if *uploads {
+                        staging.note_upload();
+                    }
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
@@ -6193,11 +6275,13 @@ impl Meter {
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let staging = STAGING_WAIT_US.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames;
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                     hold still (the runtime remapping it), {staging:.1} ms waiting for the staging upload; \
+                     the rest is reading, hashing and detiling"
                 );
             }
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
