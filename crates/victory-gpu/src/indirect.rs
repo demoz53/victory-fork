@@ -103,9 +103,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else if (active && kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        bool huge = g.z != 0 && g.x * g.y > GROUPS / g.z;
+        // Diagnostics, in the budget buffer's words 3 and 4: the largest
+        // group count a compute record asked for (all ones past the most a
+        // dispatch runs), and the groups run in all.
+        uint was;
+        budget.InterlockedMax(12, huge ? 0xffffffffu : g.x * g.y * g.z, was);
+        if (huge) {
             g = uint3(0, 0, 0);
         }
+        budget.InterlockedAdd(16, g.x * g.y * g.z, was);
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else if (active) {
