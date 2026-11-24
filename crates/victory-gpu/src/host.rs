@@ -2163,6 +2163,21 @@ mod relay_tests {
     /// `WHY_READ` so `VICTORY_RELAY=2` settles rather than waiting only on read
     /// ranges.
     #[test]
+    fn a_blocked_refresh_says_what_it_waits_for() {
+        let (a, b) = (0xaaaa_0000usize, 0xbbbb_0000usize);
+        let written = [(0x1000usize, 0x2000usize), (0x4000, 0x4100)];
+        let by_copy = [(0usize, 0x4000usize, 0x4100usize), (a, 0x1000, 0x2000)];
+        let immed = [(0x8000usize, 0x8004usize)];
+        // Its own copy's writes: no wait; another copy's: 19.
+        assert_eq!(super::refresh_blocked(&written, &by_copy, &immed, a, 0x1800, 0x1900), None);
+        assert_eq!(super::refresh_blocked(&written, &by_copy, &immed, b, 0x1800, 0x1900), Some(19));
+        // A read-back's range alone: 20; a bottom-of-pipe write alone: 21.
+        assert_eq!(super::refresh_blocked(&written, &by_copy, &immed, a, 0x4000, 0x4010), Some(20));
+        assert_eq!(super::refresh_blocked(&written, &by_copy, &immed, a, 0x7000, 0x9000), Some(21));
+        assert_eq!(super::refresh_blocked(&written, &by_copy, &immed, b, 0x9000, 0xa000), None);
+    }
+
+    #[test]
     fn blocked_by_steps_checks_host_read_and_prioritizes_run() {
         let written = [(0x2000usize, 0x3000usize)];
         let unrelated = [Step::HostRead(0x4000, 0x100, Box::new(|| {}))];
@@ -2326,7 +2341,9 @@ const WHY_FENCE: usize = 10;
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
 /// copy, a fill of upload memory, a texture, another host copy).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
+/// Then, of the last (another host copy): over the writes of another copy's
+/// shaders, over a range a read-back writes, over a bottom-of-pipe write.
+static LATE_STATS: [std::sync::atomic::AtomicU64; 22] = [const { std::sync::atomic::AtomicU64::new(0) }; 22];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
@@ -2414,6 +2431,26 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, &by_copy, &immed, runs, true)
 }
 
+/// For [`blocked_by_steps`]: whether a refresh of `[from, to)` of host copy
+/// `copy` waits for flights, and for what ([`LATE_STATS`]' places 19-21,
+/// all counted under 18 too): the writes of another copy's shaders, a
+/// range a read-back writes (owner 0), a bottom-of-pipe write.
+fn refresh_blocked(
+    written: &[(usize, usize)],
+    by_copy: &[(usize, usize, usize)],
+    immed: &[(usize, usize)],
+    copy: usize,
+    from: usize,
+    to: usize,
+) -> Option<usize> {
+    let meets = |owner: usize| by_copy.iter().any(|&(o, a, b)| o == owner && a < to && b > from);
+    if touches_other(written, by_copy, copy, from, to) {
+        let other_copy = by_copy.iter().any(|&(o, a, b)| o != copy && o != 0 && a < to && b > from);
+        return Some(if !other_copy && meets(0) { 20 } else { 19 });
+    }
+    touches(immed, from, to).then_some(21)
+}
+
 /// [`blocked_by`] over one slice of steps, returning `(reason, read_stat)`
 /// (`read_stat`: the place in `LATE_STATS` of the first read found) with
 /// `WHY_RUN` taking precedence over an earlier `WHY_READ` (fxceless #207).
@@ -2441,7 +2478,7 @@ fn blocked_by_steps<'a>(
             Step::Refresh(shadow, address, len) => {
                 let (from, to) = (*address, *address + *len);
                 let copy = std::sync::Arc::as_ptr(shadow) as usize;
-                (touches_other(written, by_copy, copy, from, to) || touches(immed, from, to)).then_some(18)
+                refresh_blocked(written, by_copy, immed, copy, from, to)
             }
             Step::Run(_) => return Some((WHY_RUN, None)),
             Step::GpuWrite(..) | Step::Host(_) => None,
@@ -2483,10 +2520,70 @@ fn blocked_by(
             && let Some(slot) = stat
         {
             LATE_STATS[slot].fetch_add(1, Ordering::Relaxed);
+            if slot >= 19 {
+                LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                blocked_example(written, by_copy, immed, runs);
+            }
         }
         return Some(WHY_READ);
     }
     None
+}
+
+/// Diagnostics, at most every two seconds: a refresh that waits for
+/// flights because another host copy's shaders, a read-back or a
+/// bottom-of-pipe write may write its bytes ([`refresh_blocked`]), with the
+/// copy refreshed and what in the air meets it, for telling which copies
+/// alias.
+#[cfg(feature = "diagnostics")]
+fn blocked_example(
+    written: &[(usize, usize)],
+    by_copy: &[(usize, usize, usize)],
+    immed: &[(usize, usize)],
+    runs: &[&HostList],
+) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 2000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    for list in runs {
+        for step in &list.deferred().copies {
+            let Step::Refresh(shadow, address, len) = step else {
+                continue;
+            };
+            let (from, to) = (*address, *address + *len);
+            let copy = std::sync::Arc::as_ptr(shadow) as usize;
+            let Some(slot) = refresh_blocked(written, by_copy, immed, copy, from, to) else {
+                continue;
+            };
+            let (start, size) = shadow.span();
+            let met: Vec<String> = by_copy
+                .iter()
+                .filter(|&&(o, a, b)| o != copy && a < to && b > from)
+                .take(4)
+                .map(|&(o, a, b)| format!("{} {a:#x}+{:#x}", if o == 0 { "read-back" } else { "copy" }, b - a))
+                .chain(
+                    immed
+                        .iter()
+                        .filter(|&&(a, b)| a < to && b > from)
+                        .take(2)
+                        .map(|&(a, b)| format!("bottom-of-pipe write {a:#x}+{:#x}", b - a)),
+                )
+                .collect();
+            tracing::info!(
+                why = ["another copy's shaders", "a read-back", "a bottom-of-pipe write"][slot - 19],
+                "a refresh waits for flights: {from:#x}+{:#x} of copy {:#x}+{size:#x} (number {}{}), meeting {met:?}",
+                to - from,
+                start,
+                shadow.id(),
+                if shadow.unwatched() { ", not write-watched" } else { "" }
+            );
+            return;
+        }
+    }
 }
 
 /// Whether any texture staging buffer refreshed by `runs` is still being
@@ -2876,7 +2973,8 @@ fn late_line(frames: f64) {
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
          settled for: a synchronous submission or present {:.1}, the card had run them {:.1}, a wait for a memory value {:.1}, \
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
-         a texture {:.1}, another copy {:.1}), a step of ours {:.1}, {} lists in the air {:.1}, \
+         a texture {:.1}, another copy {:.1} (over another copy's shader writes {:.1}, a read-back {:.1}, a bottom-of-pipe \
+         write {:.1})), a step of ours {:.1}, {} lists in the air {:.1}, \
          bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
          {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
         s[0],
@@ -2892,6 +2990,9 @@ fn late_line(frames: f64) {
         s[16],
         s[17],
         s[18],
+        s[19],
+        s[20],
+        s[21],
         s[WHY_RUN],
         late_most(),
         s[WHY_MOST],
