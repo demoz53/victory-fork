@@ -490,6 +490,27 @@ fn emit_once(
                 }
             }
         }
+        // `VICTORY_WAVE_WIDE=last`: the wave-wide form only for a program that no other form
+        // takes, which would otherwise keep 64 lanes (`WaveSize(64)`, refused by a 32-lane
+        // host) or stay untranslated, so its dispatches are dropped either way. The programs
+        // that hung the card under `=1` (runs 121-124) have an earlier form and keep it.
+        // shortcut: opt-in until a run shows the programs it takes leave the card alone.
+        if wide_last() {
+            let deep = form(ir::without_skips(p, true));
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches, last of all", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -509,6 +530,22 @@ fn emit_once(
         other => other,
     };
     original.map(|(shader, _)| shader)
+}
+
+/// `VICTORY_WAVE_WIDE=last` ([`emit_once`]): the wave-wide form for 64-lane programs that
+/// no other form takes.
+fn wide_last() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WIDE_LAST.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_WAVE_WIDE=last`, for its thread only.
+    static TEST_WIDE_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

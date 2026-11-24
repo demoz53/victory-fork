@@ -629,3 +629,61 @@ fn a_loop_on_a_vcc_test_of_a_lane_compare_leaves_with_the_wave() {
     assert_eq!(got, 1, "lane 0 left the loop at count {got}, not with the wave at 1");
     eprintln!("ran on the hardware device: the wave left the loop together");
 }
+
+/// The wave size a translation asks of the host (PSV0's minimum and maximum lane counts).
+fn psv0_wave(shader: &HostShader) -> (u32, u32) {
+    let c = crate::Container::parse(&shader.dxil).expect("container");
+    let d = c.part(crate::FourCC::PSV0).expect("PSV0").data;
+    let at = |k: usize| u32::from_le_bytes(d[k..k + 4].try_into().unwrap());
+    (at(20), at(24))
+}
+
+/// `VICTORY_WAVE_WIDE=last` keeps every form an earlier retry takes: a console wave64
+/// program with a wave OR inside a per-lane branch ([`program`]) and one with an LDS write
+/// and read inside a per-lane branch (lane t reads lane t ^ 32's word), on a 32-lane host,
+/// under the whole `emit`, translate the same with and without it. (The programs that hung
+/// the card under `VICTORY_WAVE_WIDE=1` had such an earlier form; only a program that would
+/// keep 64 lanes reaches the wave-wide form last of all: 4 of the 6 a 32-lane card refuses
+/// in the title.)
+#[test]
+fn the_wave_wide_form_last_of_all_keeps_the_forms_taken_before() {
+    let mut lds = native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0 (this lane's byte)
+        0x3A04_02FF,
+        0x0000_0080, // v_xor_b32 v2, 128, v1 (lane t ^ 32's byte)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0008, // s_cbranch_execz to the restore of EXEC
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0300_0002, // ds_read_b32 v3, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 3 << 8 | 1, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    if let StageIo::Cs(cs) = &mut lds.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    for native in [program(0xBF88_0000), lds] {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let io = io::raise(&p, &native).expect("io");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+        let empty_bytes = crate::dxbc::build(&[]);
+        let empty = crate::Container::parse(&empty_bytes).unwrap();
+        let run = |last: bool| {
+            let was = lower::TEST_HOST_WAVE.replace(Some(32));
+            let was_last = super::TEST_WIDE_LAST.replace(Some(last));
+            let r = super::emit(&empty, &native, &p, &st, &io, &res);
+            super::TEST_WIDE_LAST.set(was_last);
+            lower::TEST_HOST_WAVE.set(was);
+            r.expect("translates")
+        };
+        let (before, after) = (run(false), run(true));
+        assert_ne!(psv0_wave(&before), (64, 64), "an earlier form takes it");
+        assert_eq!(before.dxil, after.dxil, "and the switch keeps that form");
+    }
+}
