@@ -1208,33 +1208,129 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
+                    key_code(key)?,
                 ))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(filed());
+        down
+    }
+
+    /// A key name of `VICTORY_KEYS` / `VICTORY_KEYS_FILE` as a virtual key.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// Debugging aid: `VICTORY_KEYS_FILE=<file>`: every line appended to the
+    /// file while the title runs is a key (the names of `VICTORY_KEYS`),
+    /// held 0.2 s with 0.2 s between keys, with or without focus. Lines that
+    /// are already there when input starts are skipped, so one file serves
+    /// several runs. The file is read at most every 100 ms; an unknown line is
+    /// logged and skipped.
+    #[cfg(feature = "diagnostics")]
+    fn filed() -> Vec<u8> {
+        const HOLD: Duration = Duration::from_millis(200);
+        struct Filed {
+            path: Option<std::path::PathBuf>,
+            read: Option<u64>,
+            partial: String,
+            polled: Option<Instant>,
+            queue: VecDeque<u8>,
+            held: Option<(u8, Instant)>,
+            free_at: Instant,
+        }
+        static FILED: LazyLock<Mutex<Filed>> = LazyLock::new(|| {
+            Mutex::new(Filed {
+                path: std::env::var_os("VICTORY_KEYS_FILE").map(std::path::PathBuf::from),
+                read: None,
+                partial: String::new(),
+                polled: None,
+                queue: VecDeque::new(),
+                held: None,
+                free_at: Instant::now(),
+            })
+        });
+        let mut f = FILED.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(path) = f.path.clone() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        if f.polled.is_none_or(|at| now.duration_since(at) >= Duration::from_millis(100)) {
+            f.polled = Some(now);
+            let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+            match f.read {
+                // The first look: what is there already is not for this run.
+                None => f.read = Some(len),
+                Some(read) if len > read => {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut text = String::new();
+                    let got = std::fs::File::open(&path)
+                        .and_then(|mut file| {
+                            file.seek(SeekFrom::Start(read))?;
+                            file.take(len - read).read_to_string(&mut text)
+                        })
+                        .is_ok();
+                    if got {
+                        f.read = Some(len);
+                        f.partial.push_str(&text);
+                        while let Some(end) = f.partial.find('\n') {
+                            let line: String = f.partial.drain(..=end).collect();
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            match key_code(line) {
+                                Some(vk) => {
+                                    tracing::info!(key = line, "scripted key from VICTORY_KEYS_FILE");
+                                    f.queue.push_back(vk);
+                                }
+                                None => tracing::warn!(line, "VICTORY_KEYS_FILE: unknown key, skipped"),
+                            }
+                        }
+                    }
+                }
+                // A file that shrank was replaced: read it from the start next time.
+                Some(read) if len < read => f.read = Some(0),
+                Some(_) => {}
+            }
+        }
+        if let Some((_, until)) = f.held
+            && now >= until
+        {
+            f.held = None;
+            f.free_at = until + HOLD;
+        }
+        if f.held.is_none()
+            && now >= f.free_at
+            && let Some(vk) = f.queue.pop_front()
+        {
+            f.held = Some((vk, now + HOLD));
+        }
+        f.held.map(|(vk, _)| vk).into_iter().collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
