@@ -81,6 +81,19 @@ fn build() -> &'static [u8; 32] {
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::run_shader_opt().to_le_bytes());
+                // And whether ray-tracing node tests all miss
+                // (`VICTORY_RT_MISS`): it changes what they translate to.
+                let rt_miss = victory_shader::emit::rt_miss();
+                if rt_miss {
+                    tracing::warn!(
+                        "VICTORY_RT_MISS=1: every ray-tracing node test misses, so every traced ray sees the sky"
+                    );
+                } else if std::env::var_os("VICTORY_RT_MISS").is_some_and(|v| v == "1") {
+                    tracing::warn!(
+                        "VICTORY_RT_MISS=1 is ignored: VICTORY_BVH_BUILDER=1 asks for the structure builder"
+                    );
+                }
+                bytes.push(u8::from(rt_miss));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

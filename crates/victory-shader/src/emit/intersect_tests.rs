@@ -486,11 +486,42 @@ impl Drop for Memory {
     }
 }
 
+/// Sets [`super::rt_miss`] for this thread until dropped.
+struct RtMiss;
+
+impl RtMiss {
+    fn on() -> Self {
+        super::TEST_RT_MISS.set(Some(true));
+        Self
+    }
+}
+
+impl Drop for RtMiss {
+    fn drop(&mut self) {
+        super::TEST_RT_MISS.set(None);
+    }
+}
+
 /// Runs every batch on the hardware adapter and WARP and compares with
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
 fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
-    let (shader, res) = build(wide, descriptor).expect("the program lowers");
+    run_as(wide, descriptor, pointers, sort, false);
+}
+
+/// [`run`]; with `miss`, the program is translated with `VICTORY_RT_MISS`
+/// and every thread that runs must get "no node hit" instead.
+fn run_as(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool, miss: bool) {
+    let built = {
+        let _miss = miss.then(RtMiss::on);
+        build(wide, descriptor)
+    };
+    let (shader, res) = built.expect("the program lowers");
+    // What a thread that runs must get.
+    let wanted = |scene: &Scene, case: &Case| match case {
+        Some(_) if miss => [bvh::NONE; 4],
+        _ => expected(scene, case, sort),
+    };
     assert_eq!(res.bvh.len(), 1);
     let (scene, batches) = scene();
     // The reference must see a bit of everything, or the comparison
@@ -563,7 +594,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) => wanted(&scene, c),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -630,6 +661,36 @@ fn the_32_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
 }
 
 #[test]
+fn every_node_test_misses_on_the_card_with_rt_miss() {
+    // `VICTORY_RT_MISS`: the same rays over the same nodes (boxes that are
+    // hit, triangles that are hit) all get "no node hit", in both forms of
+    // the instruction and both places a node can be; masked threads keep
+    // their registers.
+    run_as(true, Descriptor::Table, u64::from(NODES), true, true);
+    run_as(false, Descriptor::Table, u64::from(NODES), true, true);
+    let _memory = Memory::at(BASE);
+    run_as(true, WHOLE, BASE + u64::from(NODES), true, true);
+}
+
+#[test]
+fn with_rt_miss_no_node_is_read() {
+    // Without the switch a node over title memory is read through the
+    // host's directory (the test below); with it the instruction reads
+    // nothing, so the program asks for neither the directory nor the list
+    // of missing pages.
+    for wide in [true, false] {
+        let (shader, _) = {
+            let _miss = RtMiss::on();
+            build(wide, WHOLE).expect("lowers with VICTORY_RT_MISS")
+        };
+        assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
+        let (normal, _) = build(wide, WHOLE).expect("lowers");
+        assert_ne!(normal.dxil, shader.dxil);
+    }
+}
+
+#[test]
 fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
     for wide in [true, false] {
         let native = native(&program(wide, WHOLE));
@@ -670,6 +731,9 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
     let io = io::raise(&p, &native).expect("io::raise");
+    // Refused the same with `VICTORY_RT_MISS`: the switch changes only
+    // what a node test returns, not which programs translate.
+    let _miss = RtMiss::on();
     let r = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
