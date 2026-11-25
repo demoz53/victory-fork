@@ -153,7 +153,7 @@ fn wide_windows() -> bool {
 
 /// Since the last frame-rate line, by the `W_` names: what indirect
 /// executions did with windows ([`windows`]).
-static WINDOW_STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static WINDOW_STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 const W_HIT: usize = 0;
 const W_CLAMPED: usize = 1;
 const W_ONE: usize = 2;
@@ -167,6 +167,22 @@ const W_END_STORE: usize = 9;
 const W_GROWN: usize = 10;
 const W_ASIDE: usize = 11;
 const W_AROUND: usize = 12;
+const W_STORE_HIT: usize = 13;
+
+/// Whether an indirect execution of one record whose shaders store reads
+/// its record from a window that holds it clamped (`VICTORY_WINDOW_STORES=1`;
+/// off by default), instead of a clamp of its own.
+///
+/// Such an execution ends the windows (its shaders may write the arguments
+/// of the records after it), and was clamped alone: 667 a frame in
+/// all8-base, each a compute pass of ours between two waits in the middle
+/// of the title's drawing, beside 1,020 windowable ones clamped alone. Its
+/// own record is as the window clamped it: what ran since, by the windows'
+/// rules, wrote no arguments. It still ends the windows after it.
+fn window_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_STORES").is_some_and(|v| v == "1"))
+}
 
 fn window_count(what: usize) {
     WINDOW_STATS[what].fetch_add(1, Ordering::Relaxed);
@@ -185,7 +201,7 @@ pub(crate) fn window_line(frames: f64) {
          {:.0} with a count buffer, {:.0} of more than one record, {:.0} whose shaders store, {:.0} dispatches; \
          windows ended by {:.0} direct draws or dispatches, kept over {:.0} that store nothing, ended by {:.0} \
          indirect executions whose shaders store, {:.0} times by a bigger scratch buffer; {:.0} windowable \
-         executions found a window of their buffer that neither held their record nor walked on to it, {:.0}          windows clamped around such a record (=2)",
+         executions found a window of their buffer that neither held their record nor walked on to it, {:.0}          windows clamped around such a record (=2); {:.0} executions whose shaders store read a window (VICTORY_WINDOW_STORES=1)",
         window_mode(),
         w[W_HIT],
         w[W_CLAMPED],
@@ -200,6 +216,7 @@ pub(crate) fn window_line(frames: f64) {
         w[W_GROWN],
         w[W_ASIDE],
         w[W_AROUND],
+        w[W_STORE_HIT],
     );
 }
 
@@ -2715,6 +2732,24 @@ impl State {
         if windows() && list.first_use(WINDOW_USE) {
             self.windows.clear();
         }
+        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
+        let holds = |w: &Window| {
+            same(w)
+                && offset >= w.base
+                && (offset - w.base).is_multiple_of(u64::from(w.step))
+                && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+        };
+        // A record of one whose shaders store, that a window holds clamped
+        // (`window_stores`): read from there; the window ends after it, as
+        // it does now, since its shaders may write the arguments.
+        let store_hit = if window_stores() && windows() && kind != DISPATCH && max == 1 && count.is_none() && stores {
+            self.windows.iter().rev().find(|w| holds(w)).map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
+        } else {
+            None
+        };
+        if store_hit.is_some() {
+            window_count(W_STORE_HIT);
+        }
         if windows() && !windowed {
             window_count(if count.is_some() {
                 W_COUNTED
@@ -2732,19 +2767,10 @@ impl State {
                 self.windows.clear();
             }
         }
-        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = if windowed {
-            self.windows
-                .iter()
-                .rev()
-                .filter(|w| same(w) && offset >= w.base)
-                .find(|w| {
-                    (offset - w.base) % u64::from(w.step) == 0
-                        && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
-                })
-                .map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
+            self.windows.iter().rev().find(|w| holds(w)).map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
         } else {
-            None
+            store_hit
         };
         let (bounded, at) = match hit {
             Some(hit) => {
