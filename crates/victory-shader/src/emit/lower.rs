@@ -1412,6 +1412,20 @@ pub fn lds_fit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_FIT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a wave64 program run as 32-lane waves that each act as a wave of their own, with
+/// every mask taken per host wave (`with_local_waves_any`, the last resort for programs no
+/// other form takes), selects by a lane mask it does not follow (`v_cndmask_b32` on a mask
+/// built from scalars or loaded): each lane takes its bit of that mask, as the console's
+/// does. `VICTORY_LOCAL_ANY_MASKS=0`: refused ("a constant lane mask in a half-wave"), as
+/// before. The tile program `f133e35efed2a48a` (8x16 groups, among the material passes)
+/// translated in no form and was dropped every frame; it now translates in that one, the
+/// approximate form with each half-wave's wave operations its own. Part of the translation:
+/// the shader cache keys on it (`victory-gpu`'s does).
+pub fn local_any_masks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_ANY_MASKS").is_none_or(|v| v != "0"))
+}
+
 /// Whether pixel shaders read their quads' other lanes with quad reads, helper
 /// lanes included, and a helper lane's `v_readfirstlane_b32` gives its own value
 /// (`Lower::helpers_read`, `Lower::helper_reads_own`; `VICTORY_PIXEL_HELPERS=0`:
@@ -8264,7 +8278,10 @@ impl<'a> Lower<'a> {
                         // A literal mask is available to both host waves.
                         // Their relabelled console lanes select their own
                         // bits without exchanging any wave's values.
+                        // Every mask per host wave (the last resort) gives the lane its
+                        // bit of whatever mask this is ([`local_any_masks`]).
                         if self.local
+                            && !(self.local_any && local_any_masks())
                             && !(self.exchange.is_some()
                                 && self.s.m.int_value(lo).is_some()
                                 && hi.is_some_and(|h| self.s.m.int_value(h).is_some()))
