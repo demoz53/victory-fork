@@ -206,6 +206,13 @@ pub(super) fn effect(f: &Func) -> Effect {
         // block-local (`Lanes`) keeps same-block load reuse and dead-code
         // removal while letting each block keep its own handle annotation.
         Some(Attr::ReadNone) if name == "annotateHandle" => Effect::Lanes,
+        // The same for the handle itself, with `VICTORY_HEAP_HANDLE_LOCAL=1`
+        // (DexNom/VIctory PR #7).
+        Some(Attr::ReadNone)
+            if name == "createHandleFromHeap" && crate::emit::heap_handles_local() =>
+        {
+            Effect::Lanes
+        }
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)
@@ -1662,6 +1669,37 @@ mod tests {
         assert_eq!(stores(&m, then)[0], [below, below]);
         assert_ne!(below, first);
         m.write();
+    }
+
+    /// With `VICTORY_HEAP_HANDLE_LOCAL=1` a heap handle is not reused by the
+    /// blocks below its own, as `annotateHandle` is not; in its own block it
+    /// still is, and an unused one is dropped. Without, it is reused.
+    /// (DexNom/VIctory PR #7.)
+    #[test]
+    fn a_heap_handle_is_reused_across_blocks_only_without_the_switch() {
+        for local in [true, false] {
+            let Diamond {
+                k: Kit { mut m, b, writes, .. },
+                then,
+                ..
+            } = diamond();
+            let i32t = m.int(32);
+            let hty = m.func_ty(i32t, vec![i32t, i32t]);
+            let heap = m.function("dx.op.createHandleFromHeap", hty, Some(Attr::ReadNone), false);
+            let (one, two) = (m.i32(1), m.i32(2));
+            let first = m.call(b, heap, vec![one, two]);
+            let same_block = m.call(b, heap, vec![one, two]);
+            m.call(b, writes, vec![first, same_block]);
+            let below = m.call(then, heap, vec![one, two]);
+            m.call(then, writes, vec![below, below]);
+            let unused = m.call(then, heap, vec![two, two]);
+            crate::emit::with_heap_handles_local(local, || m.optimise(DEAD | REUSE | LOADS));
+            assert_eq!(stores(&m, b)[0], [first, first]);
+            let want = if local { below } else { first };
+            assert_eq!(stores(&m, then)[0], [want, want], "local {local}");
+            assert!(m.blocks[then].body.iter().all(|&i| V::Inst(i) != unused));
+            m.write();
+        }
     }
 
     #[test]

@@ -8,6 +8,8 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+#[cfg(windows)]
+mod warm;
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -85,6 +87,64 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
+    },
+    /// Make the host pipelines of recorded title pipelines with this
+    /// process's translation switches (`VICTORY_*`) into a pipeline
+    /// library, ahead of a run with those switches. Only while no game
+    /// runs; the library's file is backed up first.
+    #[cfg(windows)]
+    WarmPipelines {
+        /// The library's folder (holding host-pipelines.bin): a run's is
+        /// `<cache>/pipelines`.
+        #[arg(long)]
+        library_dir: PathBuf,
+        /// Pipeline record files (default: the folder's
+        /// recorded-pipelines.txt, which every run writes).
+        #[arg(long)]
+        records: Vec<PathBuf>,
+        /// Folders of saved shaders (`VICTORY_SHADER_SAVE`): each compute
+        /// container there is a compute pipeline to make (they need no
+        /// recorded state); also searched for containers.
+        #[arg(long)]
+        compute_from: Vec<PathBuf>,
+        /// More folders with shader containers (`<hash>.<stage>.cdxil`);
+        /// the folder's recorded-shaders is always searched.
+        #[arg(long)]
+        shaders: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<NonZeroUsize>,
+        /// Pipelines made per child process.
+        #[arg(long, default_value_t = 400)]
+        batch: usize,
+        /// Seconds one pipeline may take before its batch is ended (it is
+        /// then made alone, and skipped if it hangs or crashes again).
+        #[arg(long, default_value_t = 300)]
+        stall: u64,
+        /// Child processes started at most.
+        #[arg(long, default_value_t = 200)]
+        rounds: usize,
+        /// Do not back the library up first.
+        #[arg(long)]
+        no_backup: bool,
+        /// Where the backup goes (default: a new folder beside the library's).
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
+        /// A shader cache folder to translate through (a run's is
+        /// `<cache>/shaders`; the same executable then shares its entries).
+        #[arg(long)]
+        shader_cache: Option<PathBuf>,
+        /// Go on when the host refuses the library's file (the warm then
+        /// replaces it with a new library).
+        #[arg(long)]
+        allow_fresh: bool,
+        /// Go on while a victory.exe runs: only for a copy of a library
+        /// (a file another process holds open is still refused).
+        #[arg(long)]
+        allow_running_game: bool,
+        /// One batch in this process (the supervisor starts these).
+        #[arg(long, hide = true)]
+        child: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -169,6 +229,46 @@ fn main() -> Result<()> {
                 list,
                 jobs.map(NonZeroUsize::get),
             )
+        }
+        #[cfg(windows)]
+        Command::WarmPipelines {
+            library_dir,
+            records,
+            compute_from,
+            shaders,
+            jobs,
+            batch,
+            stall,
+            rounds,
+            no_backup,
+            backup_dir,
+            shader_cache,
+            allow_fresh,
+            allow_running_game,
+            child,
+        } => {
+            let args = warm::Args {
+                library_dir,
+                records,
+                compute_from,
+                shaders,
+                jobs: jobs.map(NonZeroUsize::get),
+                batch,
+                stall,
+                no_backup,
+                backup_dir,
+                shader_cache,
+                allow_fresh,
+                rounds,
+                allow_running_game,
+            };
+            if child {
+                use std::io::Write;
+                let code = warm::child(args)?;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+            warm::run(args)
         }
         Command::Run {
             exe,

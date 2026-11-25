@@ -63,6 +63,32 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder of the library and the early list, once set.
+pub(crate) fn dir() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
+/// Opens the library now (it opens on the first pipeline otherwise): the
+/// bytes of the file it was made from, 0 for an empty library (no file, or
+/// one the host refused), `None` without a library.
+pub(crate) fn open_now() -> Option<u64> {
+    library().map(|_| BLOB.load(Ordering::Relaxed))
+}
+
+/// What the last [`pipeline`] call on this thread did: 0 nothing (no call,
+/// or the creation failed), [`LOADED_ONE`] or [`MADE_ONE`].
+pub(crate) const LOADED_ONE: u8 = 1;
+pub(crate) const MADE_ONE: u8 = 2;
+
+thread_local! {
+    static OUTCOME: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// [`pipeline`]'s last outcome on this thread, cleared.
+pub(crate) fn take_outcome() -> u8 {
+    OUTCOME.with(|o| o.replace(0))
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -548,6 +574,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            OUTCOME.with(|o| o.set(LOADED_ONE));
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -562,6 +589,7 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    OUTCOME.with(|o| o.set(MADE_ONE));
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -586,22 +614,23 @@ pub(crate) fn pipeline(
 static SAVE_IO: Mutex<()> = Mutex::new(());
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
-pub(crate) fn save(now: bool) {
+/// last save and `SAVE_EVERY` has passed (or `now`). False when a write
+/// failed (true when there was nothing to write).
+pub(crate) fn save(now: bool) -> bool {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return true };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+            return true;
         }
         *last = Some(std::time::Instant::now());
     }
     let _io = SAVE_IO.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
-        return;
+        return false;
     }
     let tmp = unique_tmp(&dir.join(LIBRARY_FILE));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
@@ -614,7 +643,7 @@ pub(crate) fn save(now: bool) {
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
-            return;
+            return true;
         }
         if added == 0 {
             0
@@ -625,7 +654,7 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
-                return;
+                return false;
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
@@ -651,15 +680,21 @@ pub(crate) fn save(now: bool) {
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
     match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Ok(()) => {
+            tracing::info!(
+                bytes,
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "host pipeline library not saved");
+            false
+        }
     }
 }
 

@@ -82,9 +82,24 @@ impl Pending {
         names.join(", ")
     }
 
+    /// Its shaders.
+    pub(crate) fn shaders(&self) -> &[Arc<Shader>] {
+        &self.shaders
+    }
+
+    /// What identifies it across runs: its shader containers and state
+    /// (the key of the early list and of the pipeline records).
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            // Before the driver sees it, for an offline warm of the library
+            // (`super::warm`): a record for each pipeline a run makes.
+            super::warm::record(&self.key, &self.shaders, self.graphics.as_deref());
+            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
         let (lock, done) = &self.completion;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
