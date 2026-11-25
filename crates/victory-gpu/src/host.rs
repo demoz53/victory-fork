@@ -6860,6 +6860,17 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        {
+            let [events, us, longest] = [0, 1, 2].map(|i| crate::fence::EVENT_WAITS[i].swap(0, Ordering::Relaxed));
+            if events > 0 {
+                tracing::info!(
+                    "fence events the title asked for before their value, per frame: {:.1}, {:.1} ms from asking to setting in all,                      the longest {:.1} ms since the last line",
+                    events as f64 / frames,
+                    us as f64 / 1e3 / frames,
+                    longest as f64 / 1e3
+                );
+            }
+        }
         crate::draw::window_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
