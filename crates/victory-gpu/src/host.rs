@@ -3090,6 +3090,10 @@ fn relay_hand_back(back: &[Declared]) {
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
+        // The frame account's "pieces that differ" (counted only by the
+        // synchronous copy-back before: always 0 with the relay).
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, found.len() as u64);
         for (at, n) in found {
             written += shadow.relay_merge(at, n, &mut now, &mut title);
         }
