@@ -62,6 +62,9 @@ pub(crate) struct Staging {
     /// Highest late-submission number (`crate::host::STARTED`) that may
     /// still be reading this staging buffer on the GPU (`0` if none).
     in_flight: std::sync::atomic::AtomicU64,
+    /// Whether its memory is write-watched, as its first check found: 0 not
+    /// known yet, 1 yes, 2 no (view memory, guarded).
+    watched: std::sync::atomic::AtomicU8,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -642,6 +645,13 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Its memory `[start, end)`, if an earlier check found it write-watched
+    /// (`crate::host`'s one asking of a submission takes it then).
+    pub(crate) fn watched_memory(&self) -> Option<(usize, usize)> {
+        let (at, len) = self.memory();
+        (self.watched.load(std::sync::atomic::Ordering::Relaxed) == 1 && len > 0).then(|| (at, at + len))
+    }
+
     /// Notes that late submission `submission` may still be reading this
     /// staging buffer on the GPU.
     pub(crate) fn mark_in_flight(&self, submission: u64) {
@@ -681,7 +691,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let watched = waited(1, || crate::watch::writes(start, start + size, false));
+        self.watched.store(if watched.is_some() { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+        if let Some((now, written)) = watched {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1446,6 +1458,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last_upload: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         in_flight: std::sync::atomic::AtomicU64::new(0),
+        watched: std::sync::atomic::AtomicU8::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

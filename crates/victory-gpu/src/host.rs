@@ -5116,6 +5116,7 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let textures = ask_textures();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
@@ -5125,6 +5126,14 @@ impl Host {
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
                         *span = (span.0.min(*address), span.1.max(*address + *len));
+                    }
+                    // The textures checked at their steps too, those whose
+                    // memory is write-watched (`ask_textures`).
+                    if textures
+                        && let Step::Texture { staging, .. } = step
+                        && let Some(range) = staging.watched_memory()
+                    {
+                        spans.entry(std::sync::Arc::as_ptr(staging) as *const () as usize).or_insert(range);
                     }
                 }
             }
@@ -6909,6 +6918,22 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Whether a submission's one write-watch asking (`crate::watch::ask_once`)
+/// covers the memory of the textures its steps check too, where that is
+/// write-watched (`VICTORY_ASK_TEXTURES=1`; off by default).
+///
+/// The askings stayed at 2,500-2,700 a frame (28-33 ms of preparing in
+/// all7) when the title's buffer copies no longer split the refreshes
+/// (186f383): most are not the copies' refreshes. Each texture a step
+/// checks (`Staging::refresh`) asked the kernel on its own, outside the
+/// submission's one asking, which holds only the copies' ranges. With the
+/// switch the textures' ranges join it, and their checks are answered from
+/// the journal while it stands, as the copies' are.
+fn ask_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_TEXTURES").is_some_and(|v| v == "1"))
 }
 
 /// Whether a title buffer copy done at submission flushes every pending
