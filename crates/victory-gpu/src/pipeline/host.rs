@@ -1158,6 +1158,10 @@ mod tests {
             eprintln!("no host mesh shader support; skipped");
             return;
         }
+        if !host.mesh_shaders() {
+            eprintln!("no mesh shader support on this host; skipped");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;
@@ -1171,6 +1175,9 @@ mod tests {
         g.depth.DepthEnable = false.into();
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // The test's target has no depth plane, so the state must not ask
+        // for one: a depth test against an absent depth format is refused.
+        g.depth.DepthEnable = false.into();
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
         mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, false, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
