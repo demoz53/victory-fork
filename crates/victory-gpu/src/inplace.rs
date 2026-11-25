@@ -428,12 +428,14 @@ struct Views {
     /// (A set: a filler page is shown at thousands of addresses, and
     /// views come and go a thousand times a frame while the world streams.)
     pages: BTreeMap<(usize, u64), std::collections::BTreeSet<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, and whether made committed. Thousands
+    /// with the runtime's `VICTORY_SECTION_MB` (sections of a few MiB;
+    /// after ka1qux 193d414c30).
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -442,9 +444,7 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    views().sections.insert(section, (bytes, committed));
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -1166,11 +1166,18 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    // Sections of one size and kind on one line: with the runtime's
+    // `VICTORY_SECTION_MB` there are thousands.
+    let mut kinds: BTreeMap<(u64, bool), u64> = BTreeMap::new();
+    for &(bytes, committed) in v.sections.values() {
+        *kinds.entry((bytes, committed)).or_default() += 1;
+    }
+    for (&(bytes, committed), &n) in kinds.iter().rev() {
         lines.push(format!(
-            "census, a section of {} MB, {}",
-            bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
+            "census, {n} section{} of {} KB, {}",
+            if n == 1 { "" } else { "s" },
+            bytes >> 10,
+            if committed { "committed: each can be opened as one heap" } else { "reserved: refused as a heap until made with SEC_COMMIT" }
         ));
     }
     lines
