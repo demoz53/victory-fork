@@ -950,7 +950,8 @@ impl HostHeap {
         // slot: the guard).
         let map = layout.and_then(|l| {
             let bytes = u64::from((title_count - l.window).max(1)) * 4;
-            let Some((buffer, at)) = host.upload_buffer(bytes) else {
+            // Written, never read, on the CPU: on the card where it can be.
+            let Some((buffer, at)) = host.table_buffer(bytes, "heap map").or_else(|| host.upload_buffer(bytes)) else {
                 tracing::warn!(bytes, "no heap map: title slots past the window read the null slot");
                 return None;
             };
@@ -962,7 +963,10 @@ impl HostHeap {
         let strides = (!sampler)
             .then(|| {
                 let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
-                let (buffer, data) = host.upload_buffer(bytes)?;
+                // Written, never read, on the CPU: on the card where it can be.
+                let (buffer, data) = host
+                    .table_buffer(bytes, "element strides by view heap slot")
+                    .or_else(|| host.upload_buffer(bytes))?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);

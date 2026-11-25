@@ -7,6 +7,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+/// A frame has run 500 draws or more: the title's world has begun (menus
+/// and movies draw a few each). In every build (it was kept by the
+/// diagnostics' frame captures, and a build without them did not build).
+#[cfg(windows)]
+static BEGAN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the title's world has begun (a frame of 500 draws or more), for
+/// skipping only the movies before it (`VICTORY_SKIP_BINK=intro`).
+#[cfg(windows)]
+pub fn world_began() -> bool {
+    BEGAN.load(Ordering::Relaxed)
+}
+
+/// At a present: `drawn` draws run on the host so far.
+#[cfg(windows)]
+fn note_world(drawn: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let before = LAST.swap(drawn, Ordering::Relaxed);
+    if drawn.saturating_sub(before) >= 500 {
+        BEGAN.store(true, Ordering::Relaxed);
+    }
+}
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -814,6 +837,8 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    note_world(crate::draw::drawn());
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());

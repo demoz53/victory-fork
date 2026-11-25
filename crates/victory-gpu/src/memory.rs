@@ -65,6 +65,10 @@ const PAGE: u64 = 1 << 16;
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
+    /// Which pages of the directory have a copy's number ([`Numbered`]):
+    /// what the CPU asks of it, never read from the mapping (which may be
+    /// write-combined memory of the card's, `Host::table_buffer`).
+    numbered: Numbered,
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
@@ -83,6 +87,27 @@ unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
+
+/// A bit per directory page: whether it has a copy's number. Entries are
+/// only ever given, never taken back.
+struct Numbered(Vec<u64>);
+
+impl Numbered {
+    fn new(pages: u32) -> Self {
+        Numbered(vec![0; (pages as usize).div_ceil(64)])
+    }
+
+    fn has(&self, page: u64) -> bool {
+        self.0.get((page / 64) as usize).is_some_and(|w| w >> (page % 64) & 1 != 0)
+    }
+
+    fn set(&mut self, page: u64) {
+        if let Some(w) = self.0.get_mut((page / 64) as usize) {
+            *w |= 1 << (page % 64);
+        }
+    }
+}
+
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
@@ -94,8 +119,12 @@ pub(crate) struct Ready {
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
-        let make = |dwords: u64, what: &str| {
-            let (buffer, data) = host.shared_buffer(dwords * 4)?;
+        let make = |dwords: u64, what: &str, table: bool| {
+            // The directory is written, never read, on the CPU (`numbered`
+            // answers for it): on the card where it can be. The faults
+            // are written by shaders and read on the CPU.
+            let made = if table { host.table_buffer(dwords * 4, "directory of title memory by address") } else { None };
+            let (buffer, data) = made.or_else(|| host.shared_buffer(dwords * 4))?;
             crate::host::name(&buffer, || format!("title memory by address: {what}"));
             // SAFETY: a fresh mapping of at least that many bytes.
             unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };
@@ -105,8 +134,9 @@ impl Memory {
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
-            directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+            directory: make(u64::from(MEMORY_PAGES) * 2, "directory", true)?,
+            numbered: Numbered::new(MEMORY_PAGES),
+            faults: make(u64::from(MEMORY_FAULTS), "faults", false)?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
@@ -124,8 +154,7 @@ impl Memory {
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
-        // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
+        if self.numbered.has(page) {
             return;
         }
         let start = page * PAGE;
@@ -166,12 +195,13 @@ impl Memory {
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     // SAFETY: inside the directory's mapping.
                     let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
-                    unsafe {
-                        if other.read() == 0 {
+                    if !self.numbered.has(at / PAGE) {
+                        // SAFETY: as above; the offset first, as below.
+                        unsafe {
                             other.add(1).write_volatile((at - first) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
+                        self.numbered.set(at / PAGE);
                     }
                     at += PAGE;
                 }
@@ -192,6 +222,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        self.numbered.set(page);
     }
 
     /// The pages shaders found empty since the last frame.
@@ -313,4 +344,22 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod numbered_tests {
+    use super::Numbered;
+
+    /// Pages are numbered one by one, at both ends; past the end nothing is.
+    #[test]
+    fn pages_are_numbered_one_by_one() {
+        let mut n = Numbered::new(1 << 21);
+        assert!(!n.has(0) && !n.has(63) && !n.has(64));
+        n.set(63);
+        n.set((1 << 21) - 1);
+        assert!(n.has(63) && !n.has(62) && !n.has(64));
+        assert!(n.has((1 << 21) - 1));
+        n.set(1 << 21);
+        assert!(!n.has(1 << 21));
+    }
 }

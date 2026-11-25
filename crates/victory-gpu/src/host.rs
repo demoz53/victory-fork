@@ -756,6 +756,25 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Where the card has memory the CPU writes (`Host::gpu_upload`, said
+    /// on the test's output), a table there is made, mapped and written.
+    #[test]
+    fn a_table_in_the_cards_memory_is_written_through_its_mapping() {
+        let Some(host) = super::host() else {
+            return; // no host GPU
+        };
+        let supported = host.gpu_upload();
+        println!("GPU upload heaps (resizable BAR) on this card: {supported}");
+        if !supported {
+            return;
+        }
+        let (buffer, data) = host.card_written_buffer(4096, "test table").expect("a GPU upload heap buffer");
+        // SAFETY: the buffer's whole mapping, written, not read.
+        unsafe { std::ptr::write_bytes(data, 7, 4096) };
+        // SAFETY: a live buffer.
+        assert_ne!(unsafe { buffer.GetGPUVirtualAddress() }, 0);
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -7778,6 +7797,109 @@ impl Host {
             }
         }
     }
+
+    /// Whether the card holds buffers the CPU writes in its own memory
+    /// (`D3D12_HEAP_TYPE_GPU_UPLOAD`, resizable BAR), as the device says
+    /// (`D3D12_OPTIONS16`): asked once, and the answer logged.
+    pub(crate) fn gpu_upload(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a plain query into a struct of its own size.
+            let asked = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            let supported = asked.is_ok() && options.GPUUploadHeapSupported.as_bool();
+            tracing::info!(
+                supported,
+                asked = asked.is_ok(),
+                on = tables_on_card(),
+                "buffers the CPU writes in the card's own memory (GPU upload heaps, resizable BAR); \
+                 VICTORY_TABLES_ON_CARD=1 puts the tables shaders read on every draw there"
+            );
+            supported
+        })
+    }
+
+    /// A buffer of `size` bytes in the card's own memory that the CPU writes
+    /// (mapped write-combined: written, never read, on the CPU), for a table
+    /// translated shaders read on every draw (`what`), with
+    /// `VICTORY_TABLES_ON_CARD=1` on a card that has such memory
+    /// ([`Host::gpu_upload`]); `None` otherwise, and the caller makes it as
+    /// before. In the buffer state that reads promote from.
+    ///
+    /// A shader reading a 4 MiB table by computed index took 12.8 ms from
+    /// the PC's memory and 0.46 ms from such memory in another tree; ours
+    /// (the element strides by view heap slot, the heap map, the directory
+    /// of title memory by address) were all in the PC's memory.
+    pub(crate) fn table_buffer(&self, size: u64, what: &str) -> Option<(ID3D12Resource, *mut u8)> {
+        if !tables_on_card() || !self.gpu_upload() {
+            return None;
+        }
+        self.card_written_buffer(size, what)
+    }
+
+    /// [`Host::table_buffer`] whatever the switch says (on a card with
+    /// [`Host::gpu_upload`]).
+    fn card_written_buffer(&self, size: u64, what: &str) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a buffer the CPU writes.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => {
+                tracing::info!(what, size, "a table shaders read on every draw is in the card's own memory");
+                Some((buffer?, data.cast()))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, what, size, "no buffer in the card's own memory for a table: in the PC's, as before");
+                None
+            }
+        }
+    }
+}
+
+/// Whether the tables translated shaders read on every draw go to the
+/// card's own memory where it has memory the CPU writes
+/// (`VICTORY_TABLES_ON_CARD=1`; off by default): [`Host::table_buffer`].
+pub(crate) fn tables_on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_ON_CARD").is_some_and(|v| v == "1"))
 }
 
 /// The swap chain formats a presented texture can be copied into: its own

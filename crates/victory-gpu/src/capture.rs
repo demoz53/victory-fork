@@ -124,24 +124,11 @@ fn world_on() -> bool {
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// A frame has run 500 draws or more, captures or not: the title's world
-/// has begun (menus and movies draw a few each).
-static BEGAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether the title's world has begun (a frame of 500 draws or more), for
-/// skipping only the movies before it (`VICTORY_SKIP_BINK=intro`).
-pub fn world_began() -> bool {
-    BEGAN.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
-    if drawn.saturating_sub(before) >= 500 {
-        BEGAN.store(true, Relaxed);
-    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
