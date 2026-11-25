@@ -514,23 +514,53 @@ fn is_view(start: usize, end: usize) -> bool {
 /// at every other view of them are made read-only too: a write through
 /// one of those is this memory written, and only a fault can say so.
 fn protect(g: &mut Guards, from: usize, to: usize) {
-    protect_here(g, from, to);
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            for alias in crate::inplace::pages_of(block * BLOCK) {
-                let alias = alias / BLOCK;
-                if alias != block {
-                    protect_here(g, alias, alias + 1);
-                }
-            }
+    protect_here(g, from, to, true);
+    let most = guard_aliases();
+    if most == 0 {
+        return;
+    }
+    let (aliases, many) = crate::inplace::aliases_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK), most);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardAliasMany, many as u64);
+    let _ = many;
+    for alias in aliases {
+        let alias = alias / BLOCK;
+        // Read-only already (its own guard's, or another fan-out's): no
+        // call. Made read-only here, it is not clean: its own guard, if
+        // any, has not taken its bytes, and its next check copies them
+        // (as for a block written through the runtime: read-only, not
+        // clean).
+        if !g.protected.contains(&alias) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardAliasProtects, 1);
+            protect_here(g, alias, alias + 1, false);
         }
     }
 }
 
-/// [`protect`] for one range, without the other views of its pages.
-fn protect_here(g: &mut Guards, from: usize, to: usize) {
+/// How many addresses a guarded page may be shown at for its other views
+/// to be guarded with it ([`protect`], [`open`], [`views_mapped`];
+/// `VICTORY_GUARD_ALIASES`, 8; 0: none, as before fxceless #115).
+///
+/// fxceless #115 guards every view of the guarded pages. Its run had
+/// preparing at about 1.7 s a frame: every protect, open and new view went
+/// to every view of the page, a filler page among them that the runtime
+/// maps at thousands of addresses; and each of those views was made clean
+/// when protected, though nothing had taken its bytes (the stale pages
+/// that remained). Here a page shown at more addresses than this is left
+/// to the guards of its own views and to the texture hash, as before; the
+/// pages behind the walls' stale copies were shown at six.
+fn guard_aliases() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_ALIASES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
+    })
+}
+
+/// [`protect`] for one range, without the other views of its pages;
+/// `clean`: the blocks' bytes were just taken (else they are only made
+/// read-only, for a write through them to fault).
+fn protect_here(g: &mut Guards, from: usize, to: usize, clean: bool) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -546,7 +576,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        if clean {
+            g.clean.extend(from..to);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -584,15 +616,12 @@ fn uncommitted_end(block: usize) -> usize {
 /// guard over the pages must copy them again.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     let mut any = open_here(g, start, end);
-    if start < end {
-        for (base, bytes) in crate::inplace::views_between(start, end) {
-            let first = (base / BLOCK).max(start / BLOCK);
-            let last = base.saturating_add(bytes).div_ceil(BLOCK).min(end.div_ceil(BLOCK));
-            for block in first..last {
-                for alias in crate::inplace::pages_of(block * BLOCK) {
-                    any |= open_here(g, alias, alias.saturating_add(BLOCK));
-                }
-            }
+    let most = guard_aliases();
+    if start < end && most > 0 {
+        let first = start / BLOCK * BLOCK;
+        let (aliases, _) = crate::inplace::aliases_between(first, end.div_ceil(BLOCK).saturating_mul(BLOCK), most);
+        for alias in aliases {
+            any |= open_here(g, alias, alias.saturating_add(BLOCK));
         }
     }
     any
@@ -633,7 +662,13 @@ pub fn writing(at: usize, len: usize) {
 /// again — and are, the pages noted written, which also has the next check
 /// guard the new view (`protect`).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
-    let ranges = crate::inplace::views_of_section(section, offset, len);
+    let most = guard_aliases();
+    if most == 0 {
+        return;
+    }
+    // The new view is one of them: a page shown at more than `most`
+    // addresses with it is left to its views' own guards.
+    let ranges = crate::inplace::views_of_section_most(section, offset, len, most);
     if ranges.is_empty() {
         return;
     }
@@ -1333,6 +1368,9 @@ mod tests {
     /// guarded view's next check reports the pages written.
     #[test]
     fn a_write_through_another_view_is_reported_at_the_guarded_one() {
+        if super::guard_aliases() < 2 {
+            return; // VICTORY_GUARD_ALIASES: other views are not guarded
+        }
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -1352,6 +1390,9 @@ mod tests {
     /// guarded view checks its pages again (and guards the new view).
     #[test]
     fn a_view_mapped_beside_a_guarded_one_makes_it_check_again() {
+        if super::guard_aliases() < 2 {
+            return; // VICTORY_GUARD_ALIASES: other views are not guarded
+        }
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -1362,6 +1403,68 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A view made read-only because another view of its pages was guarded
+    /// is not taken for clean: its own first check reports its pages
+    /// written (its bytes were never taken), then they are clean.
+    #[test]
+    fn a_view_guarded_through_another_is_not_clean() {
+        if super::guard_aliases() < 2 {
+            return; // VICTORY_GUARD_ALIASES: other views are not guarded
+        }
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(guarded, 0), pages(guarded, 1)]));
+        // The other view is read-only now, but nothing took its bytes.
+        assert_eq!(guard(other, other + SIZE), Some(vec![pages(other, 0), pages(other, 1)]));
+        assert_eq!(guard(other, other + SIZE), Some(Vec::new()));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// Pages shown at more addresses than `guard_aliases` allows (a filler
+    /// the runtime maps everywhere) keep their other views as they were:
+    /// a write through one of them is not seen at the guarded view.
+    #[test]
+    fn pages_shown_at_many_places_leave_their_other_views_alone() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        let most = super::guard_aliases();
+        if most == 0 || most > 32 {
+            return;
+        }
+        const SIZE: usize = BLOCK;
+        // SAFETY: a fresh pagefile section mapped `most + 2` times.
+        let (section, views) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let views: Vec<usize> = (0..most + 2)
+                .map(|_| {
+                    let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+                    assert_ne!(at, 0);
+                    crate::inplace::title_memory_view(at, SIZE, section as usize, 0);
+                    at
+                })
+                .collect();
+            (section as usize, views)
+        };
+        let guarded = views[0];
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![guarded / PAGE]));
+        // Not made read-only: this write does not fault, and the guarded
+        // view does not learn of it (the texture hash is the net there).
+        // SAFETY: a writable view of the section.
+        unsafe { ((views[most + 1] + 8) as *mut u8).write(1) };
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &views, SIZE);
     }
 
     /// The runtime's own write into physical pages (`xmem`'s

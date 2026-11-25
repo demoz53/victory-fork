@@ -335,36 +335,42 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
-/// The title views that overlap `[start, end)`, as `(address, bytes)`.
-pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
+/// For every 64 KiB page of the title views in `[start, end)` shown at no
+/// more than `most` addresses: the addresses of its other views, all in one
+/// look (one lock, not one per page). Pages shown at more addresses (a page
+/// the runtime maps at thousands of them, such as a filler behind unmapped
+/// tiles) are left out and counted, the second value.
+pub(crate) fn aliases_between(start: usize, end: usize, most: usize) -> (Vec<usize>, usize) {
+    let (mut aliases, mut many) = (Vec::new(), 0);
     if start >= end {
-        return Vec::new();
+        return (aliases, many);
     }
     let v = views();
-    let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
-    {
-        out.push((base, bytes));
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start);
+    for (&base, &(bytes, section, offset)) in first.into_iter().chain(v.views.range(start.saturating_add(1)..end)) {
+        let (lo, hi) = (start.max(base), end.min(base.saturating_add(bytes)));
+        let mut page = base + (lo - base) / K64 * K64;
+        while page < hi {
+            if let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) {
+                if shown.len() > most {
+                    many += 1;
+                } else {
+                    aliases.extend(shown.iter().copied().filter(|&at| at != page));
+                }
+            }
+            match page.checked_add(K64) {
+                Some(next) => page = next,
+                None => break,
+            }
+        }
     }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
-    }
-    out
+    (aliases, many)
 }
 
-/// The address of the 64 KiB page shown at `page` in every title view that
-/// shows it, `page`'s own address included; empty if `page` is not a view.
-pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
-    let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
-        return Vec::new();
-    };
-    let within = page.wrapping_sub(base);
-    if within >= bytes || !within.is_multiple_of(K64) {
-        return Vec::new();
-    }
-    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+/// [`views_of_section`] without the pages shown at more than `most`
+/// addresses ([`aliases_between`]).
+pub(crate) fn views_of_section_most(section: usize, offset: u64, len: usize, most: usize) -> Vec<(usize, usize)> {
+    views_of_section_where(section, offset, len, |shown| shown <= most)
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +
@@ -372,6 +378,11 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
 /// the runtime wrote through a view of its own (`write_physical`,
 /// DirectStorage's page destinations) is no longer what their guards took.
 pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    views_of_section_where(section, offset, len, |_| true)
+}
+
+/// [`views_of_section`] for the pages whose number of views `keep` allows.
+fn views_of_section_where(section: usize, offset: u64, len: usize, keep: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
     if len == 0 {
         return Vec::new();
     }
@@ -380,7 +391,9 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     let mut pages: Vec<usize> = Vec::new();
     let mut at = offset - offset % K64 as u64;
     while at < end {
-        if let Some(shown) = v.pages.get(&(section, at)) {
+        if let Some(shown) = v.pages.get(&(section, at))
+            && keep(shown.len())
+        {
             pages.extend(shown.iter().copied());
         }
         match at.checked_add(K64 as u64) {
