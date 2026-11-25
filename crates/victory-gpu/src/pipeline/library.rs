@@ -15,8 +15,9 @@
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
 //! will internally synchronize as necessary", `CreatePipelineLibrary`,
-//! Thread Safety), with one exception kept here: two loads of the same
-//! pipeline are made one after the other ([`same_name`]). Under one lock of
+//! Thread Safety). Each name is held across load, creation and store
+//! ([`same_name`]), so another request for the same pipeline can load it
+//! after a successful store. Different names can overlap. Under one lock of
 //! ours for every call, the eight workers made pipelines one at a time:
 //! 87 to 96 of 110 looks at each worker found it waiting for that lock
 //! (run 49), and an earlier run's 2,300 pipelines, all in the library, were
@@ -50,7 +51,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -410,14 +411,29 @@ unsafe impl Send for Library {}
 // SAFETY: as above; the other fields are an atomic and a lock.
 unsafe impl Sync for Library {}
 
-/// Held by a load of the pipeline named `name`: loads of the same name
-/// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
-/// locks, so two different names seldom wait.
-fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+static HELD_NAMES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static NAME_RELEASED: Condvar = Condvar::new();
+
+struct HeldName<'a>(&'a str);
+
+/// Holds the exact library name until the load succeeds or creation and
+/// storage finish. The mutex only protects the set of names in flight.
+fn same_name(name: &str) -> HeldName<'_> {
+    let mut held = HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    while held.contains(name) {
+        #[cfg(test)]
+        concurrency_tests::waiting_for_name();
+        held = NAME_RELEASED.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+    held.insert(name.to_owned());
+    HeldName(name)
+}
+
+impl Drop for HeldName<'_> {
+    fn drop(&mut self) {
+        HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        NAME_RELEASED.notify_all();
+    }
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -520,9 +536,9 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
+    let _one = same_name(name);
     let loaded = {
         let _all = one_call();
-        let _one = same_name(name);
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
@@ -540,7 +556,7 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiled outside any lock: compiles take up to seconds.
+    // Compiles take up to seconds. Keep only this name held.
     let pso = {
         let _call = call("make", name);
         create()?
@@ -564,6 +580,11 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// Serialises on-disk pipeline library staging and replacement so concurrent
+/// periodic saves and shutdown saves cannot race on the same staging file or
+/// target rename.
+static SAVE_IO: Mutex<()> = Mutex::new(());
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
@@ -577,11 +598,12 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let _io = SAVE_IO.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = unique_tmp(&dir.join(LIBRARY_FILE));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -660,6 +682,16 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
     std::fs::write(tmp, &bytes)
 }
 
+/// Unique staging path beside `path` so overlapping writes never share a
+/// temporary file name.
+fn unique_tmp(path: &std::path::Path) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    path.with_file_name(name)
+}
+
 /// Renames the written library `tmp` over the library's file in `dir`. This
 /// run may have that file mapped: Windows 11 replaces a mapped file, and
 /// the mapping goes on reading the old one for as long as a handle on it
@@ -667,15 +699,26 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let res = std::fs::rename(tmp, dir.join(LIBRARY_FILE))
+        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)));
+    if res.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    res
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// `path`: a reader never sees a part. Serialised so concurrent callers do
+/// not race on the target rename or leave orphaned temp files behind.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = unique_tmp(path);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -838,4 +881,69 @@ mod tests {
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
     }
+
+    #[test]
+    fn concurrent_write_atomically_never_fails_or_leaves_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(EARLY_FILE);
+        let threads: Vec<_> = (0..4u8)
+            .map(|t| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let payload = vec![b'a' + t; 4096];
+                    for _ in 0..30 {
+                        write_atomically(&target, &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 4096);
+        assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_save_io_and_replace_library_never_collide_or_leak_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(LIBRARY_FILE);
+        let threads: Vec<_> = (0..4u8)
+            .map(|t| {
+                let dir_path = dir.path().to_path_buf();
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let payload = vec![b'A' + t; 4096];
+                    for _ in 0..25 {
+                        let _io = SAVE_IO.lock().unwrap_or_else(|e| e.into_inner());
+                        let tmp = unique_tmp(&target);
+                        std::fs::write(&tmp, &payload).unwrap();
+                        replace_library(&dir_path, &tmp).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 4096);
+        assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
+    }
 }
+
+#[cfg(test)]
+mod concurrency_tests;

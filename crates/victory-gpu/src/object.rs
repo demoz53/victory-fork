@@ -71,6 +71,21 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Increments the reference count only if it is currently non-zero, preventing
+/// resurrection of an object whose last `Release` is already dropping it.
+/// The caller must prevent deallocation (for instance by holding the table lock
+/// that `Drop` acquires before freeing) across this call.
+#[cfg(windows)]
+pub(crate) fn try_add_ref(this: This) -> bool {
+    // SAFETY: caller prevents deallocation of `this` while checking `refs`.
+    unsafe { &*this }
+        .refs
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n > 0).then_some(n + 1)
+        })
+        .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -129,10 +144,17 @@ pub(crate) fn hand_out<T>(
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
+    release_boxed_with::<T>(this, || {})
+}
+
+/// Like [`release_boxed`], running `before_drop` once the last reference is
+/// dropped and before the allocation is freed.
+pub(crate) fn release_boxed_with<T>(this: This, before_drop: impl FnOnce()) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
+            before_drop();
             private_data().retain(|&(object, _), _| object != this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });

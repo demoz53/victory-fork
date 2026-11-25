@@ -9,6 +9,7 @@ mod run;
 mod shader;
 mod translate;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -83,7 +84,7 @@ enum Command {
         list: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<NonZeroUsize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -161,7 +162,13 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(
+                paths,
+                validate,
+                pipelines,
+                list,
+                jobs.map(NonZeroUsize::get),
+            )
         }
         Command::Run {
             exe,
@@ -219,4 +226,22 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_requires_a_positive_worker_count() {
+        let Err(error) = Cli::try_parse_from(["victory", "translate", "--jobs", "0"]) else {
+            panic!("zero workers should be rejected");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+
+        let cli = Cli::try_parse_from(["victory", "translate", "--jobs", "1"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Translate { jobs, .. } if jobs == NonZeroUsize::new(1))
+        );
+    }
 }

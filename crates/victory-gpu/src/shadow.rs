@@ -82,6 +82,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Diagnostics (`VICTORY_CARD_VERIFY`): the ranges shaders were declared
+    /// to write, by the number of frames presented when they were declared
+    /// ([`Shadow::note_declared`]); the last few frames only.
+    #[cfg(feature = "diagnostics")]
+    declared: Mutex<Vec<(u64, usize, usize)>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -89,8 +94,10 @@ pub(crate) struct Shadow {
 struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// the card's side before the next submission. `None` for a lean
+    /// window ([`lean_windows`]): it has no CPU side, `data` is null, and
+    /// what changed goes to the card straight from title memory.
+    staging: Option<ID3D12Resource>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -106,6 +113,49 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// A lean window's buffer when it is reserved (`Host::reserved_buffer`):
+    /// per 64 KiB tile, the pool's tile mapped there (heap, tile), if any.
+    /// Tiles are mapped as bytes are first sent there; one never sent reads
+    /// as zeros, as a fresh buffer did.
+    tiles: Option<Mutex<Vec<Option<(u32, u32)>>>>,
+}
+
+/// The 64 KiB tiles (`crate::host::TILE`) that offsets `ranges` of a copy
+/// touch, in order, each once.
+fn tiles_of(ranges: &[(usize, usize)]) -> Vec<u32> {
+    let tile = crate::host::TILE as usize;
+    let mut tiles: Vec<u32> = ranges
+        .iter()
+        .filter(|&&(a, b)| a < b)
+        .flat_map(|&(a, b)| (a / tile) as u32..=((b - 1) / tile) as u32)
+        .collect();
+    tiles.sort_unstable();
+    tiles.dedup();
+    tiles
+}
+
+#[cfg(test)]
+mod tiles_tests {
+    use super::tiles_of;
+    const T: usize = 64 << 10;
+
+    /// A range inside one tile touches that tile; one across a boundary,
+    /// both; the end is not included.
+    #[test]
+    fn ranges_touch_the_tiles_they_cover() {
+        assert_eq!(tiles_of(&[(10, 20)]), vec![0]);
+        assert_eq!(tiles_of(&[(T - 1, T + 1)]), vec![0, 1]);
+        assert_eq!(tiles_of(&[(T, 2 * T)]), vec![1]);
+        assert_eq!(tiles_of(&[(0, 4 * T)]), vec![0, 1, 2, 3]);
+    }
+
+    /// Several ranges: each tile once, in order; empty ranges touch none.
+    #[test]
+    fn tiles_come_once_and_in_order() {
+        assert_eq!(tiles_of(&[(3 * T, 3 * T + 5), (0, 1), (3 * T + 9, 4 * T + 1), (7, 7)]), vec![0, 3, 4]);
+        assert!(tiles_of(&[]).is_empty());
+        assert!(tiles_of(&[(5, 5)]).is_empty());
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -247,6 +297,259 @@ pub(crate) const CARD_PARTS: u32 = 16;
 /// The bytes of one part of [`CARD_PARTS`].
 const CARD_PART: usize = PIECE / CARD_PARTS as usize;
 
+/// The live copies in the card's memory (diagnostics: `VICTORY_CARD_VERIFY`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()).collect()
+}
+
+/// What `VICTORY_CARD_VERIFY` reads of a copy in the card's memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct CardVerifyView {
+    /// The card's side.
+    pub(crate) buffer: ID3D12Resource,
+    /// The CPU's side: the mapping, `len` bytes of it are the copy.
+    pub(crate) cpu: usize,
+    /// Where the title buffer (or window) starts in title memory.
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    pub(crate) window: bool,
+    /// Shaders of a submission not yet copied back may be writing it.
+    pub(crate) in_flight: bool,
+    /// Offsets of the CPU's side not yet sent to the card's side, sorted.
+    pub(crate) dirty: Vec<(usize, usize)>,
+    /// Title addresses shaders were declared to write in the last frames
+    /// ([`DECLARED_STAMPS`]), joined, in order.
+    pub(crate) declared: Vec<(usize, usize)>,
+}
+
+/// Frames back from the present that declared ranges are kept for
+/// ([`Shadow::note_declared`]).
+#[cfg(feature = "diagnostics")]
+const DECLARED_STAMPS: u64 = 2;
+
+/// The result of comparing stretches of a copy's card side with its CPU
+/// side, by 64 KiB piece ([`verify_compare`]).
+#[cfg(feature = "diagnostics")]
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct VerifyReport {
+    /// Pieces looked at (a piece with every byte left out is not counted).
+    pub(crate) pieces: u64,
+    /// Pieces with at least one differing byte, and the bytes that differ.
+    pub(crate) bad_pieces: u64,
+    pub(crate) bad_bytes: u64,
+    /// Bytes left out of the comparison: the CPU's side holds them not yet
+    /// sent to the card.
+    pub(crate) excluded: u64,
+    /// Of the first mismatching pieces (at most [`VERIFY_FIRST`]): the title
+    /// address of the first differing byte in it and how many bytes of the
+    /// piece differ.
+    pub(crate) first: Vec<(usize, u64)>,
+}
+
+/// How many mismatching pieces a [`VerifyReport`] names.
+#[cfg(feature = "diagnostics")]
+pub(crate) const VERIFY_FIRST: usize = 8;
+
+/// Compares `card` (the card side's bytes at offsets `[at, at + card.len())`
+/// of a copy of title memory from `start` on) with `cpu` (the CPU side's
+/// bytes there), piece by piece (pieces are cut at multiples of 64 KiB of
+/// title memory, as the card compare cuts them). The offsets of `dirty`
+/// (sorted or not) are left out and counted in `excluded`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn verify_compare(start: usize, at: usize, card: &[u8], cpu: &[u8], dirty: &[(usize, usize)], report: &mut VerifyReport) {
+    debug_assert_eq!(card.len(), cpu.len());
+    let end = at + card.len();
+    let mut lo = at;
+    while lo < end {
+        let hi = (((start + lo) / PIECE + 1) * PIECE - start).min(end);
+        let skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+        let parts = outside(lo, hi, skip);
+        let looked: usize = parts.iter().map(|&(a, b)| b - a).sum();
+        report.excluded += (hi - lo - looked) as u64;
+        if looked > 0 {
+            report.pieces += 1;
+            let mut bad = 0u64;
+            let mut first_at = None;
+            for (a, b) in parts {
+                let (x, y) = (&card[a - at..b - at], &cpu[a - at..b - at]);
+                if x != y {
+                    bad += x.iter().zip(y).filter(|(p, q)| p != q).count() as u64;
+                    first_at.get_or_insert(a + first_difference(x, y).unwrap_or(0));
+                }
+            }
+            if let Some(first_at) = first_at {
+                report.bad_pieces += 1;
+                report.bad_bytes += bad;
+                if report.first.len() < VERIFY_FIRST {
+                    report.first.push((start + first_at, bad));
+                }
+            }
+        }
+        lo = hi;
+    }
+}
+
+/// How many pieces of a class a [`ClassReport`] names.
+#[cfg(feature = "diagnostics")]
+pub(crate) const CLASS_FIRST: usize = 4;
+
+/// The pieces [`verify_compare`] found differing, told apart by who holds
+/// the card's bytes: the title's memory, read live, against the card's side
+/// and the CPU's side. By byte that differs between the two sides, the
+/// title's byte equals the CPU's (class 0, "A": the card's is newer: shaders
+/// wrote it and it did not come back), equals the card's (1, "B": the CPU's
+/// side is stale: a merge missed it) or neither (2, "C": the title wrote it
+/// and neither side has it). A piece with bytes of one class is of it;
+/// of several, class 3 ("D", mixed).
+#[cfg(feature = "diagnostics")]
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct ClassReport {
+    /// Pieces by class.
+    pub(crate) pieces: [u64; 4],
+    /// Of them, pieces with a differing byte inside a range declared as
+    /// written in the last frames.
+    pub(crate) declared: [u64; 4],
+    /// Differing bytes by class 0..=2, and those inside declared ranges.
+    pub(crate) bytes: [u64; 3],
+    pub(crate) bytes_declared: u64,
+    /// Pieces whose title memory could not be read.
+    pub(crate) unread: u64,
+    /// Per class, the first pieces' first differing byte: its offset in the
+    /// copy and whether a declared range holds it.
+    pub(crate) first: [Vec<(usize, bool)>; 4],
+}
+
+/// [`verify_compare`]'s pieces, classified ([`ClassReport`]). `title(address,
+/// len)` reads live title memory; it is asked only for pieces that differ.
+/// `declared` is sorted and joined (title addresses).
+#[cfg(feature = "diagnostics")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_classify(
+    start: usize,
+    at: usize,
+    card: &[u8],
+    cpu: &[u8],
+    dirty: &[(usize, usize)],
+    declared: &[(usize, usize)],
+    title: &mut dyn FnMut(usize, usize) -> Option<Vec<u8>>,
+    report: &mut ClassReport,
+) {
+    let end = at + card.len();
+    let mut lo = at;
+    while lo < end {
+        let hi = (((start + lo) / PIECE + 1) * PIECE - start).min(end);
+        let skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+        let parts = outside(lo, hi, skip);
+        if parts.iter().any(|&(a, b)| card[a - at..b - at] != cpu[a - at..b - at]) {
+            match title(start + lo, hi - lo) {
+                None => report.unread += 1,
+                Some(live) => {
+                    let (mut mask, mut inside, mut first) = (0u8, false, None);
+                    for (a, b) in parts {
+                        for i in a..b {
+                            let (c, p) = (card[i - at], cpu[i - at]);
+                            if c == p {
+                                continue;
+                            }
+                            let t = live[i - lo];
+                            let class = if t == p { 0 } else if t == c { 1 } else { 2 };
+                            mask |= 1 << class;
+                            report.bytes[class] += 1;
+                            let held = declared.get(declared.partition_point(|r| r.1 <= start + i)).is_some_and(|r| r.0 <= start + i);
+                            if held {
+                                inside = true;
+                                report.bytes_declared += 1;
+                            }
+                            first.get_or_insert((i, held));
+                        }
+                    }
+                    let class = if mask.count_ones() == 1 { mask.trailing_zeros() as usize } else { 3 };
+                    report.pieces[class] += 1;
+                    report.declared[class] += u64::from(inside);
+                    if let Some(first) = first
+                        && report.first[class].len() < CLASS_FIRST
+                    {
+                        report.first[class].push(first);
+                    }
+                }
+            }
+        }
+        lo = hi;
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod classify_tests {
+    use super::{ClassReport, PIECE, verify_classify};
+
+    /// Each differing byte is classed by the title's byte, a piece by its
+    /// bytes' classes, and declared ranges are told apart.
+    #[test]
+    fn pieces_are_classed_by_who_holds_the_card_bytes() {
+        let cpu: Vec<u8> = (0..4 * PIECE).map(|i| (i % 251) as u8).collect();
+        let (mut card, mut title) = (cpu.clone(), cpu.clone());
+        let mut change = |at: usize, class: u8| {
+            card[at] = cpu[at] ^ 1;
+            match class {
+                0 => {}
+                1 => title[at] = card[at],
+                _ => title[at] = card[at] ^ 2,
+            }
+        };
+        change(5, 0);
+        change(PIECE + 5, 1);
+        change(2 * PIECE + 5, 2);
+        change(3 * PIECE + 7, 0);
+        change(3 * PIECE + 9, 1);
+        let mut report = ClassReport::default();
+        let live = title.clone();
+        verify_classify(0, 0, &card, &cpu, &[], &[(5, 6)], &mut |a, n| Some(live[a..a + n].to_vec()), &mut report);
+        assert_eq!(report.pieces, [1, 1, 1, 1]);
+        assert_eq!(report.declared, [1, 0, 0, 0]);
+        assert_eq!((report.bytes, report.bytes_declared, report.unread), ([2, 2, 1], 1, 0));
+        assert_eq!(report.first[0], vec![(5, true)]);
+        assert_eq!(report.first[3], vec![(3 * PIECE + 7, false)]);
+        // Every difference left out as unsent: nothing to class. Title
+        // memory that cannot be read: the pieces are counted apart.
+        let mut unread = ClassReport::default();
+        verify_classify(0, 0, &card, &cpu, &[(0, 4 * PIECE)], &[], &mut |_, _| None, &mut unread);
+        assert_eq!(unread, ClassReport::default());
+        verify_classify(0, 0, &card, &cpu, &[], &[], &mut |_, _| None, &mut unread);
+        assert_eq!((unread.unread, unread.pieces), (4, [0; 4]));
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod verify_tests {
+    use super::{PIECE, VerifyReport, verify_compare};
+
+    /// Differences are found per piece with the title address of the first
+    /// differing byte, and offsets in `dirty` are left out.
+    #[test]
+    fn differences_are_counted_per_piece_and_dirty_offsets_are_left_out() {
+        let start = PIECE - 100;
+        let len = 2 * PIECE + 500;
+        let cpu: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut card = cpu.clone();
+        // Piece 0 holds offsets [0, 100), piece 1 [100, 100 + PIECE), piece 2
+        // [100 + PIECE, 100 + 2 * PIECE), piece 3 the rest (400 bytes).
+        card[10] ^= 1;
+        card[200] ^= 1;
+        card[201] ^= 1;
+        card[PIECE + 300] ^= 1;
+        let mut report = VerifyReport::default();
+        verify_compare(start, 0, &card, &cpu, &[(PIECE + 250, PIECE + 400), (0, 5)], &mut report);
+        assert_eq!(report.pieces, 4);
+        assert_eq!(report.excluded, 5 + 150);
+        assert_eq!((report.bad_pieces, report.bad_bytes), (2, 3));
+        assert_eq!(report.first, vec![(start + 10, 1), (start + 200, 2)]);
+        let mut clean = VerifyReport::default();
+        verify_compare(start, 0, &cpu, &cpu, &[], &mut clean);
+        assert_eq!((clean.pieces, clean.bad_pieces, clean.bad_bytes, clean.excluded), (4, 0, 0, 0));
+    }
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 4 KiB part of each 64 KiB piece (a copy that does not start on
 /// a piece boundary has one piece more).
@@ -345,16 +648,98 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        // Lean windows only save the PC's memory on the card: they default
+        // to as much of it as the room rule in `window_card_for` leaves.
+        let default = if lean_windows() { LEAN_WINDOWS_MB } else { 0 };
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
     })
+}
+
+/// [`window_card_most`] with [`lean_windows`] and no `VICTORY_CARD_WINDOWS_MB`.
+const LEAN_WINDOWS_MB: u64 = 8192;
+
+/// Whether windows on the card keep no CPU side (`VICTORY_LEAN_WINDOWS=1`;
+/// off by default).
+///
+/// A window on the card ([`window_card_most`]) kept its whole 4 MiB CPU
+/// side in the PC's memory: title memory was copied into it and what changed
+/// went up from there. So a window cost the PC's memory and the card's. The
+/// windows were 2.2-3.0 GB of a 32 GB PC's commit in the world (fork issue
+/// #54: 700 windows, 2,988 MB, at 19.7 GB private), and the commit ran out at
+/// 23.4 GB private with the page file Windows was given.
+///
+/// With the switch a window on the card has no CPU side: a refresh only notes
+/// which bytes changed ([`Shadow::copy`]), and before the submission those
+/// bytes go from title memory through a small upload buffer of the host's to
+/// the card (`Host::card_before`), so the PC holds the upload buffers alone.
+/// Windows that find no room on the card stay as they were.
+///
+/// What it assumes: shaders write no window (run 91 of the fork's notes: "0.0
+/// MB compared in 0 ranges of windows"), since a write back to title memory
+/// needs the CPU side to tell the card's bytes from the title's. A write
+/// declared for a lean window is not compared or copied back; it is counted
+/// in the lean line instead. The ray-tracing structure builder declares
+/// writes for every copy it can reach, so `VICTORY_BVH_BUILDER=1` turns lean
+/// windows off.
+pub(crate) fn lean_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_LEAN_WINDOWS").is_some_and(|v| v == "1");
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if asked && builder {
+            tracing::warn!("VICTORY_LEAN_WINDOWS is off: the ray-tracing structure builder (VICTORY_BVH_BUILDER) writes windows");
+        }
+        asked && !builder
+    })
+}
+
+/// Lean windows ([`lean_windows`]): made, bytes alive, bytes sent from title
+/// memory to the card since the last lean line, writes declared for them and
+/// left out since the start, plans whose upload ran in parts since the last
+/// line (each part waited for).
+static LEAN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Bytes of title memory that `Host::card_before` sent straight to a lean
+/// window's card side.
+pub(crate) fn lean_sent(bytes: u64) {
+    LEAN[2].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `Host::card_before` filled its upload buffer and waited for the card to
+/// take it before filling it again.
+pub(crate) fn lean_part() {
+    LEAN[4].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The lean windows' line, with the frame line's others (`crate::host`).
+pub(crate) fn lean_line() {
+    if !lean_windows() {
+        return;
+    }
+    let mb = |v: u64| v as f64 / (1 << 20) as f64;
+    let (heaps, mapped) = crate::host::tile_bytes();
+    tracing::info!(
+        "lean windows (VICTORY_LEAN_WINDOWS): {} made, {:.0} MB alive on the card with no CPU side, of it {:.0} MB in \
+         tiles mapped ({:.0} MB of heaps for tiles); {:.1} MB sent up from title memory since the last line, {} times \
+         a full upload buffer waited for; {} declared writes left out since the start",
+        LEAN[0].load(Ordering::Relaxed),
+        mb(LEAN[1].load(Ordering::Relaxed)),
+        mb(mapped),
+        mb(heaps),
+        mb(LEAN[2].swap(0, Ordering::Relaxed)),
+        LEAN[4].swap(0, Ordering::Relaxed),
+        LEAN[3].load(Ordering::Relaxed),
+    );
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
-/// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
+/// be there ([`window_card_most`]), and whether it is reserved: with
+/// `reserve` (a lean window) one the host maps tiles into as they are used,
+/// if the card can (`Host::reserved_buffer`), else a whole one.
+fn window_card_for(size: u64, reserve: bool) -> Option<(ID3D12Resource, bool)> {
     let most = window_card_most();
     if most == 0 || !cards() {
         return None;
@@ -372,11 +757,14 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
+    let made = match reserve.then(|| host.reserved_buffer(size)).flatten() {
+        Some(reserved) => Some((reserved, true)),
+        None => host.uav_buffer(size).map(|whole| (whole, false)),
+    };
+    if made.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    made
 }
 
 /// The copies in the card's memory whose CPU side changed since they were
@@ -679,38 +1067,45 @@ pub(crate) fn relay_fetched(number: u64) {
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(BTreeMap<(usize, usize), (u32, u64)>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
-    /// often it declares it.
+    /// often it declares it. Index exact ranges; overlapping ranges remain
+    /// independent, as before.
     fn declare(&mut self, range: (usize, usize), number: u64) {
-        match self.0.iter_mut().find(|f| f.0 == range) {
-            Some(f) => {
-                if f.2 != number {
-                    f.1 += 1;
-                    f.2 = number;
+        use std::collections::btree_map::Entry;
+        match self.0.entry(range) {
+            Entry::Occupied(mut entry) => {
+                let (count, last) = entry.get_mut();
+                if *last != number {
+                    *count += 1;
+                    *last = number;
                 }
             }
-            None => self.0.push((range, 1, number)),
+            Entry::Vacant(entry) => {
+                entry.insert((1, number));
+            }
         }
     }
 
     /// One submission that declared `ranges` (each once) is copied back:
-    /// the ranges no other submission still holds.
+    /// the ranges no other submission still holds, in input order.
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        use std::collections::btree_map::Entry;
         let mut free = Vec::new();
         for range in ranges {
-            match self.0.iter().position(|f| f.0 == *range) {
-                Some(at) => {
-                    self.0[at].1 = self.0[at].1.saturating_sub(1);
-                    if self.0[at].1 == 0 {
-                        self.0.swap_remove(at);
+            match self.0.entry(*range) {
+                Entry::Occupied(mut entry) => {
+                    let count = &mut entry.get_mut().0;
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        entry.remove();
                         free.push(*range);
                     }
                 }
                 // Not counted (declared before anything counted): free.
-                None => free.push(*range),
+                Entry::Vacant(_) => free.push(*range),
             }
         }
         free
@@ -731,16 +1126,10 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
-    }
-    differs != 0
+    relay_merge_simd::merge(now, held, title)
 }
+
+mod relay_merge_simd;
 
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
@@ -822,6 +1211,60 @@ mod relay_tests {
         assert_eq!(flights.done(&[a]), vec![a]);
         // A range never counted is free at once.
         assert_eq!(flights.done(&[b]), vec![b]);
+    }
+
+    /// Compare indexed bookkeeping with the previous vector algorithm,
+    /// including duplicate declarations, overlapping and unknown ranges,
+    /// and completions that arrive in a different order.
+    #[test]
+    fn indexed_flights_match_vector_reference() {
+        let mut seed = 0x6a09_e667u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..32 {
+            let mut indexed = Flights::default();
+            let mut reference: Vec<((usize, usize), u32, u64)> = Vec::new();
+            for _ in 0..2048 {
+                let start = (next() % 128) as usize * 64;
+                let range = (start, start + (next() % 8 + 1) as usize * 64);
+                let number = u64::from(next() % 16);
+                if next() >> 31 == 0 {
+                    indexed.declare(range, number);
+                    match reference.iter_mut().find(|f| f.0 == range) {
+                        Some(f) if f.2 != number => {
+                            f.1 += 1;
+                            f.2 = number;
+                        }
+                        Some(_) => {}
+                        None => reference.push((range, 1, number)),
+                    }
+                } else {
+                    let ranges = [range, (start + 32, range.1 + 32)];
+                    let mut free = Vec::new();
+                    for r in ranges {
+                        match reference.iter().position(|f| f.0 == r) {
+                            Some(at) => {
+                                reference[at].1 = reference[at].1.saturating_sub(1);
+                                if reference[at].1 == 0 {
+                                    reference.swap_remove(at);
+                                    free.push(r);
+                                }
+                            }
+                            None => free.push(r),
+                        }
+                    }
+                    assert_eq!(indexed.done(&ranges), free);
+                }
+                assert_eq!(indexed.0.len(), reference.len());
+                for &(r, count, last) in &reference {
+                    assert_eq!(indexed.0.get(&r), Some(&(count, last)));
+                }
+            }
+        }
     }
 
     /// The merge moves exactly the bytes the card changed, into title
@@ -1048,7 +1491,16 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None if pool.is_empty() => Vec::with_capacity(n),
+        None => {
+            let mut snapshot = Vec::new();
+            if snapshot.try_reserve_exact(n).is_err() {
+                // Release unused snapshot memory before a final attempt.
+                pool.clear();
+                snapshot.reserve_exact(n);
+            }
+            snapshot
+        }
     };
     v.clear();
     v
@@ -1756,7 +2208,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.start, self.len);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -1766,6 +2218,13 @@ impl Drop for Shadow {
         }
         let window = self.window;
         if let Some(card) = &mut self.card {
+            if card.staging.is_none() {
+                LEAN[1].fetch_sub(card.size, Ordering::Relaxed);
+            }
+            if let Some(tiles) = card.tiles.take() {
+                let tiles = tiles.into_inner().unwrap_or_else(|e| e.into_inner());
+                crate::host::give_back_tiles(tiles.into_iter().flatten());
+            }
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -2111,6 +2570,8 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            #[cfg(feature = "diagnostics")]
+            declared: Mutex::default(),
         }
     }
 
@@ -2139,8 +2600,58 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // A lean window has no CPU side to compare with ([`lean_windows`]):
+        // the write is counted, not declared.
+        if self.lean() {
+            LEAN[3].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// A window on the card with no CPU side ([`lean_windows`]).
+    pub(crate) fn lean(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.staging.is_none())
+    }
+
+    /// Before bytes at offsets `ranges` go to a lean window's reserved
+    /// buffer: the tiles they touch that have none mapped get one of the
+    /// pool's (`take`: so many tiles, or `None`), returned as (tile, (heap,
+    /// heap tile)) for the caller to map ahead of the copy. Empty for a
+    /// buffer that is not reserved. Without tiles from the pool the bytes
+    /// sent to those tiles are dropped by the card and read as zeros.
+    pub(crate) fn tiles_to_map(
+        &self,
+        ranges: &[(usize, usize)],
+        take: impl FnOnce(usize) -> Option<Vec<(u32, u32)>>,
+    ) -> Vec<(u32, (u32, u32))> {
+        let Some(tiles) = self.card.as_ref().and_then(|c| c.tiles.as_ref()) else {
+            return Vec::new();
+        };
+        let mut tiles = tiles.lock().unwrap_or_else(|e| e.into_inner());
+        let wanted: Vec<u32> = tiles_of(ranges)
+            .into_iter()
+            .filter(|&t| tiles.get(t as usize).is_some_and(Option::is_none))
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let Some(taken) = take(wanted.len()) else {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                tracing::warn!("lean windows: no tiles for a window's bytes; they read as zeros");
+            }
+            return Vec::new();
+        };
+        wanted
+            .into_iter()
+            .zip(taken)
+            .map(|(t, pooled)| {
+                tiles[t as usize] = Some(pooled);
+                (t, pooled)
+            })
+            .collect()
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -2152,10 +2663,13 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        if self.place.is_some() {
+        // (A lean window's writes are never declared: `gpu_writes`.)
+        if self.place.is_some() || self.lean() {
             return;
         }
         let range = (address, address + len);
+        #[cfg(feature = "diagnostics")]
+        self.note_declared(range);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -2920,6 +3434,12 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        // A lean window has no CPU side: the bytes go from title memory to
+        // the card before the submission (`Host::card_before`).
+        if self.lean() {
+            self.card_changed(from - start, to - start);
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -2951,12 +3471,13 @@ impl Shadow {
         }
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Of a copy in the card's memory: the CPU's side (PC memory; `None` for
+    /// a lean window, whose bytes come from title memory itself), the card
+    /// side's bytes from before if made yet, and their size.
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((card.staging.as_ref(), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -2977,6 +3498,57 @@ impl Shadow {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
         }
         before.is_some()
+    }
+
+    /// Diagnostics: a range shaders may write is declared now. Kept for the
+    /// last [`DECLARED_STAMPS`] frames, once per frame and range, and only
+    /// with `VICTORY_CARD_VERIFY` set.
+    #[cfg(feature = "diagnostics")]
+    fn note_declared(&self, range: (usize, usize)) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VICTORY_CARD_VERIFY").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) > 0) {
+            return;
+        }
+        let now = crate::queue::presented();
+        let mut log = self.declared.lock().unwrap_or_else(|e| e.into_inner());
+        if log.last().is_some_and(|e| e.0 == now && (e.1, e.2) == range) {
+            return;
+        }
+        log.retain(|e| e.0 + DECLARED_STAMPS >= now);
+        if !log.iter().any(|e| e.0 == now && (e.1, e.2) == range) {
+            log.push((now, range.0, range.1));
+        }
+    }
+
+    /// Diagnostics (`VICTORY_CARD_VERIFY`): what the card-vs-CPU check needs
+    /// of a copy in the card's memory, or `None` for any other copy.
+    ///
+    /// `dirty` is taken under the lock that `card_changed` holds: those are
+    /// the offsets whose CPU-side bytes the card's side has not received
+    /// yet, so a difference there is not a fault of the card path.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn card_verify_view(&self) -> Option<CardVerifyView> {
+        let card = self.card.as_ref()?;
+        let mut dirty: Vec<(usize, usize)> = card.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        dirty.sort_unstable();
+        Some(CardVerifyView {
+            buffer: self.buffer.clone(),
+            cpu: self.data as usize,
+            start: self.start as usize,
+            len: self.len as usize,
+            window: self.window,
+            in_flight: self.writes_pending(),
+            dirty,
+            declared: joined(
+                self.declared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|e| e.0 + DECLARED_STAMPS >= crate::queue::presented())
+                    .map(|e| (e.1, e.2))
+                    .collect(),
+            ),
+        })
     }
 
     /// The declared range `[address, end)` as the compare on the card
@@ -3278,11 +3850,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging: Some(buffer),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    tiles: None,
                 };
                 (on_card, Some(card))
             }
@@ -3486,23 +4059,50 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+    // A lean window ([`lean_windows`]): the card's buffer alone, no CPU side.
+    // Reserved where the card can: only the tiles bytes are sent to cost memory.
+    let lean = lean_windows()
+        .then(|| window_card_for(len, true))
+        .flatten()
+        .map(|(on_card, reserved)| {
+            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card, lean"));
+            LEAN[0].fetch_add(1, Ordering::Relaxed);
+            LEAN[1].fetch_add(len, Ordering::Relaxed);
+            let tiles = reserved.then(|| Mutex::new(vec![None; len.div_ceil(crate::host::TILE) as usize]));
             let card = Card {
-                staging: buffer,
+                staging: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                tiles,
             };
-            (on_card, Some(card))
+            (on_card, std::ptr::null_mut(), Some(card))
+        });
+    let (buffer, data, card) = match lean {
+        Some(lean) => lean,
+        None => {
+            let (buffer, data) = host()?.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            // With room for windows on the card (`window_card_most`):
+            // shaders get a buffer there, and the one just made is the
+            // CPU's side.
+            match window_card_for(len, false) {
+                Some((on_card, _)) => {
+                    crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
+                    let card = Card {
+                        staging: Some(buffer),
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size: len,
+                        tiles: None,
+                    };
+                    (on_card, data, Some(card))
+                }
+                None => (buffer, data, None),
+            }
         }
-        None => (buffer, None),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

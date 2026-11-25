@@ -51,8 +51,16 @@ pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, si
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_w(module, out, size);
     };
+    if size == 0 {
+        host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if out.is_null() {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let wide: Vec<u16> = path.encode_utf16().collect();
-    // SAFETY: the title passes a buffer of `size` characters.
+    // SAFETY: `out` is non-null and the title passes a buffer of `size` characters.
     copy_truncated(&wide, unsafe {
         std::slice::from_raw_parts_mut(out, size as usize)
     })
@@ -63,7 +71,15 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
-    // SAFETY: the title passes a buffer of `size` bytes.
+    if size == 0 {
+        host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if out.is_null() {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: `out` is non-null and the title passes a buffer of `size` bytes.
     copy_truncated(path.as_bytes(), unsafe {
         std::slice::from_raw_parts_mut(out, size as usize)
     })
@@ -80,7 +96,7 @@ fn title_path(module: *mut c_void) -> Option<String> {
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
 /// truncate to the buffer, report `ERROR_INSUFFICIENT_BUFFER` and return
-/// the buffer size.
+/// the buffer size; otherwise clear the thread's last error.
 fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
     let Some(room) = out.len().checked_sub(1) else {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
@@ -93,9 +109,12 @@ fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return out.len() as u32;
     }
+    host::set_last_error(ERROR_SUCCESS);
     n as u32
 }
 
+const ERROR_SUCCESS: u32 = 0;
+const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 /// Console-only DLLs we implement load as a pseudo handle (titles load
@@ -155,13 +174,15 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
+    // Values below 0x10000 are ordinals; we export by name only. A miss
+    // fails as the host's does, with the last error set.
     if (name as usize) < 0x1_0000 {
         tracing::warn!(
             module = m.name,
             ordinal = name as usize,
             "GetProcAddress by ordinal"
         );
+        host::set_last_error(ERROR_PROC_NOT_FOUND);
         return std::ptr::null_mut();
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
@@ -170,6 +191,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -349,6 +371,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -613,6 +636,33 @@ mod tests {
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+
+        // Zero-length and null buffers never build a slice from a null pointer.
+        assert_eq!(GetModuleFileNameW(module, std::ptr::null_mut(), 0), 0);
+        assert_eq!(GetModuleFileNameA(module, std::ptr::null_mut(), 0), 0);
+        assert_eq!(GetModuleFileNameW(module, std::ptr::null_mut(), 8), 0);
+        assert_eq!(GetModuleFileNameA(module, std::ptr::null_mut(), 8), 0);
+
+        #[cfg(windows)]
+        {
+            let last_error = || {
+                // SAFETY: reads this thread's last error.
+                unsafe { windows_sys::Win32::Foundation::GetLastError() }
+            };
+            assert_eq!(GetModuleFileNameW(module, std::ptr::null_mut(), 0), 0);
+            assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(GetModuleFileNameW(module, std::ptr::null_mut(), 8), 0);
+            assert_eq!(last_error(), ERROR_INVALID_PARAMETER);
+            assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
+            assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
+            // A retry with a large-enough buffer clears ERROR_INSUFFICIENT_BUFFER.
+            let mut full = [0u16; 32];
+            assert_eq!(
+                GetModuleFileNameW(module, full.as_mut_ptr(), full.len() as u32),
+                17
+            );
+            assert_eq!(last_error(), ERROR_SUCCESS);
+        }
     }
 
     fn w(text: &str) -> Vec<u16> {
@@ -683,5 +733,27 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_export_of_our_modules_sets_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: sets and reads this thread's last error.
+        let clear = || unsafe { SetLastError(0) };
+        // SAFETY: as above.
+        let last = || unsafe { GetLastError() };
+        // The host's own modules, for comparison.
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        clear();
+        assert!(GetProcAddress(kernel32, c"NotAnExport".as_ptr().cast()).is_null());
+        assert_eq!(last(), ERROR_PROC_NOT_FOUND);
+        // Ours, by name and by ordinal.
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        for name in [c"NotAnExport".as_ptr().cast(), 9999 as *const u8] {
+            clear();
+            assert!(GetProcAddress(runtime, name).is_null());
+            assert_eq!(last(), ERROR_PROC_NOT_FOUND, "{name:?}");
+        }
     }
 }

@@ -410,6 +410,7 @@ fn unspill(
                 if parks[j].is_some_and(|p| p.0 && p.1 == reg && (p.3 == lane || p.3 == lane + 1))
                     || written[j].contains(&code)
                     || written[j].contains(&(code + 1))
+                    || read[j].contains(&code)
                     || read[j].contains(&(code + 1))
                 {
                     return None;
@@ -724,12 +725,90 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// Blocks reached by falling through the branch and stopping at its skip
+/// destination, and their membership for testing incoming edges at the join.
+fn skipped_region(p: &Program, branch: usize, first: usize, target: usize) -> Option<(Vec<usize>, Vec<bool>)> {
+    let mut seen = vec![false; p.blocks.len()];
+    let mut pending = vec![first];
+    let mut region = Vec::new();
+    while let Some(b) = pending.pop() {
+        if b == target || seen[b] {
+            continue;
+        }
+        if b == branch {
+            return None;
+        }
+        seen[b] = true;
+        region.push(b);
+        pending.extend(p.blocks[b].exit.successors());
+    }
+    // A saved value used here must have been defined during this walk.
+    // With other entrances a loop could carry one from before the skip.
+    if region.iter().any(|&b| p.blocks[b].preds.iter().any(|&pred| !seen[pred] && pred != branch)) {
+        return None;
+    }
+    Some((region, seen))
+}
+
+/// A scalar restore can re-enable lanes even when the region was entered
+/// with empty EXEC. A subsequent vector store would then be observable.
+fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
+    // An inner save captures the still-empty EXEC, so restoring that SSA
+    // value also keeps it empty. A mask saved outside the region is unknown.
+    let mut saved = std::collections::HashSet::new();
+    let mask = |op: &Operand| matches!(op,
+        Operand::Scalar { code: 126, dwords: 1 | 2 } | Operand::Scalar { code: 127, dwords: 1 });
+    for &b in region {
+        for inst in &p.blocks[b].insts {
+            let Fields::Sop { dst: Some(Operand::Scalar { code, dwords }), src, .. } = &inst.fields else { continue };
+            if inst.name().contains("_saveexec_")
+                || matches!(inst.name(), "s_mov_b32" | "s_mov_b64") && src.first().is_some_and(mask)
+            {
+                for i in 0..*dwords {
+                    if let Some(value) = inst.write(Reg::S(code + i)) {
+                        saved.insert(value);
+                    }
+                }
+            }
+        }
+    }
+    for &b in region {
+        for inst in &p.blocks[b].insts {
+            let name = inst.name();
+            if !inst.writes.iter().any(|(reg, _)| matches!(reg, Reg::S(126 | 127))) {
+                continue;
+            }
+            if name.starts_with("v_cmpx_") || matches!(name, "s_and_saveexec_b32" | "s_and_saveexec_b64") {
+                continue;
+            }
+            let Fields::Sop { src, .. } = &inst.fields else { return false };
+            let empty = |op: &Operand| mask(op) || match op {
+                Operand::Const(128) | Operand::Literal(0) => true,
+                Operand::Scalar { code, dwords } => (0..*dwords).all(|i|
+                    inst.read(Reg::S(code + i)).is_some_and(|v| saved.contains(&v))),
+                _ => false,
+            };
+            let stays_empty = match name {
+                "s_and_b32" | "s_and_b64" => src.iter().any(empty),
+                "s_xor_b32" | "s_xor_b64" | "s_or_b32" | "s_or_b64" => src.iter().all(empty),
+                "s_or_saveexec_b32" | "s_or_saveexec_b64" | "s_xor_saveexec_b32" | "s_xor_saveexec_b64"
+                | "s_andn2_saveexec_b32" | "s_andn2_saveexec_b64"
+                | "s_andn2_b32" | "s_andn2_b64" | "s_mov_b32" | "s_mov_b64" => src.first().is_some_and(empty),
+                _ => false,
+            };
+            if !stays_empty {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
-/// walk the body with EXEC clear. Vector instructions and every effect are
-/// masked by EXEC already, as on the console, where the branch is taken
-/// only when no lane of the wave is left; scalar code has no effects. The
+/// walk the body with EXEC clear. The region must keep EXEC clear, so a
+/// scalar restore there cannot activate vector operations for those lanes. The
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses.
 /// `None` if the program has no such branch.
@@ -740,11 +819,12 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for block in &mut blocks {
+    for (b, block) in blocks.iter_mut().enumerate() {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && skipped_region(p, b, not_taken, taken).is_some_and(|(region, _)| walks_with_empty_exec(p, &region)) {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;
@@ -840,29 +920,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         v
     };
-    // The region a skip of `b` to `target` leaves out, if it is a pure skip.
-    let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
-        let mut inside = vec![false; n];
-        let mut stack = vec![first];
-        while let Some(x) = stack.pop() {
-            if x == target || inside[x] {
-                continue;
-            }
-            if x == b {
-                return None; // a loop back to the branch
-            }
-            inside[x] = true;
-            match p.blocks[x].exit {
-                Exit::End | Exit::Indirect => return None,
-                exit => stack.extend(exit.successors()),
-            }
-        }
-        // entered only through the branch
-        for x in (0..n).filter(|&x| inside[x]) {
-            if p.blocks[x].preds.iter().any(|&q| q != b && !inside[q]) {
-                return None;
-            }
-        }
+    let scalars_unchanged = |b: usize, target: usize, inside: &[bool]| {
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
         for phi in &join.phis {
@@ -879,16 +937,13 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
             let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
             if within.into_iter().any(|a| !before.contains(&a)) {
-                return None;
+                return false;
             }
         }
         // Other ways into the join than the branch and the region (an inner branch that ends
         // together with an outer one) change nothing in that: the lanes that would have
         // skipped arrive from the region instead, with the same scalars.
-        if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
-            return None;
-        }
-        Some(inside)
+        deep || join.preds.iter().all(|&q| q == b || inside[q])
     };
     let mut blocks = p.blocks.clone();
     let mut any = false;
@@ -899,7 +954,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        let Some((region, inside)) = skipped_region(p, b, not_taken, taken) else { continue };
+        let pure = region.iter().all(|&x| !matches!(p.blocks[x].exit, Exit::End | Exit::Indirect));
+        if (ends(taken) || pure && scalars_unchanged(b, taken, &inside)) && walks_with_empty_exec(p, &region) {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
@@ -1210,30 +1267,57 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
             }
         }
     }
+    solve_liveness(blocks, order, &uses, &defs)
+}
+
+/// Backwards dataflow to the least fixed point. Only predecessors of a
+/// changed live-in set need revisiting; a changed live-out set alone does
+/// not affect them. Keep unreachable blocks at zero, as in the old sweep.
+fn solve_liveness(
+    blocks: &[Block],
+    order: &[usize],
+    uses: &[RegSet],
+    defs: &[RegSet],
+) -> (Vec<RegSet>, Vec<RegSet>) {
+    use std::collections::VecDeque;
+
+    let empty = [0; REGS.div_ceil(64)];
     let mut live_in = vec![empty; blocks.len()];
     let mut live_out = vec![empty; blocks.len()];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &b in order.iter().rev() {
-            let mut out = empty;
-            for s in blocks[b].exit.successors() {
-                for (o, i) in out.iter_mut().zip(&live_in[s]) {
-                    *o |= i;
+    let mut reachable = vec![false; blocks.len()];
+    for &b in order {
+        reachable[b] = true;
+    }
+    let mut queued = reachable.clone();
+    let mut work: VecDeque<usize> = order.iter().rev().copied().collect();
+    while let Some(b) = work.pop_front() {
+        queued[b] = false;
+        let mut out = empty;
+        for successor in blocks[b].exit.successors() {
+            for (o, i) in out.iter_mut().zip(&live_in[successor]) {
+                *o |= i;
+            }
+        }
+        let mut inn = empty;
+        for w in 0..inn.len() {
+            inn[w] = uses[b][w] | out[w] & !defs[b][w];
+        }
+        live_out[b] = out;
+        if inn != live_in[b] {
+            live_in[b] = inn;
+            for &p in &blocks[b].preds {
+                if reachable[p] && !queued[p] {
+                    queued[p] = true;
+                    work.push_back(p);
                 }
-            }
-            let mut inn = empty;
-            for w in 0..inn.len() {
-                inn[w] = uses[b][w] | out[w] & !defs[b][w];
-            }
-            if inn != live_in[b] || out != live_out[b] {
-                (live_in[b], live_out[b]) = (inn, out);
-                changed = true;
             }
         }
     }
     (live_in, live_out)
 }
+
+#[cfg(test)]
+mod liveness_tests;
 
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
@@ -1454,8 +1538,37 @@ fn effects(
             } else if let Some(d) = &v.dst {
                 if dst_indexed {
                     indexed(d, &mut w)?;
+                    indexed(d, &mut r)?;
                 } else {
                     regs(d, &mut w)?;
+                    let reads_dst = matches!(
+                        name,
+                        "v_fmac_f32"
+                            | "v_mac_f32"
+                            | "v_mac_legacy_f32"
+                            | "v_fmac_f16"
+                            | "v_mac_f16"
+                            | "v_pk_fmac_f16"
+                            | "v_dot2c_f32_f16"
+                            | "v_dot4c_i32_i8"
+                            | "v_writelane_b32"
+                    ) || (matches!(name, "v_permlane16_b32" | "v_permlanex16_b32")
+                        && v.opsel & 2 == 0)
+                        || v.opsel & 8 != 0
+                        || matches!(
+                            v.dpp,
+                            Some(gfx10::Dpp::Row {
+                                row_mask,
+                                bank_mask,
+                                bound_ctrl,
+                                ..
+                            }) if row_mask != 0xF || bank_mask != 0xF || !bound_ctrl
+                        )
+                        || matches!(v.sdwa, Some(sd) if sd.dst_unused == 2 && sd.dst_sel < 6)
+                        || (v.sdwa.is_none_or(|sd| sd.dst_unused == 2) && valu_writes_half(name));
+                    if reads_dst {
+                        regs(d, &mut r)?;
+                    }
                 }
             }
             if let Some(c) = &v.carry {
@@ -1470,9 +1583,6 @@ fn effects(
                 }
                 "v_swaprel_b32" => {
                     indexed(&v.src[0], &mut w)?;
-                    if let Some(d) = &v.dst {
-                        indexed(d, &mut r)?;
-                    }
                 }
                 "v_div_fmas_f32" | "v_div_fmas_f64" => r.extend(mask(VCC)),
                 _ => {}
@@ -1484,6 +1594,9 @@ fn effects(
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;
             r.push(Reg::S(M0));
+            if name == "v_interp_p2_f32" {
+                regs(dst, &mut r)?;
+            }
             regs(dst, &mut w)?;
         }
         Fields::Ds {
@@ -1497,6 +1610,9 @@ fn effects(
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
+                if name.contains("_d16") {
+                    regs(d, &mut r)?;
+                }
                 regs(d, &mut w)?;
             }
             if *gds
@@ -1529,6 +1645,9 @@ fn effects(
             if let Some(d) = data {
                 if name.contains("_load_") {
                     if !lds {
+                        if load_preserves_half(name) {
+                            regs(d, &mut r)?;
+                        }
                         regs(d, &mut w)?;
                     }
                 } else if name.contains("_store_") {
@@ -1548,6 +1667,8 @@ fn effects(
             addr,
             rsrc,
             sampler,
+            dmask,
+            d16,
             cache,
             ..
         } => {
@@ -1562,6 +1683,9 @@ fn effects(
                     regs(&atomic_result(data, name), &mut w)?;
                 }
             } else {
+                if *d16 && !name.starts_with("image_gather4") && dmask.count_ones() % 2 == 1 {
+                    regs(data, &mut r)?;
+                }
                 regs(data, &mut w)?;
             }
         }
@@ -1576,6 +1700,9 @@ fn effects(
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
+                if name.contains("_load_") && load_preserves_half(name) {
+                    regs(d, &mut r)?;
+                }
                 regs(d, &mut w)?;
             }
         }
@@ -1595,6 +1722,45 @@ fn effects(
         new
     });
     Ok(Some((r, w)))
+}
+
+/// Whether a VALU opcode writes a single 16-bit half of its destination VGPR
+/// (preserving the other 16-bit half on GFX10 unless overridden by SDWA).
+fn valu_writes_half(name: &str) -> bool {
+    if name.starts_with("v_cmp")
+        || name.starts_with("v_pk_")
+        || name.starts_with("v_pack_")
+        || name.starts_with("v_cvt_pk")
+        || name.starts_with("v_sad_")
+        || name.starts_with("v_dot")
+        || matches!(
+            name,
+            "v_mad_u32_u16" | "v_mad_i32_i16" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16"
+        )
+    {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix("v_cvt_") {
+        return rest.starts_with("f16_")
+            || rest.starts_with("u16_")
+            || rest.starts_with("i16_")
+            || rest.starts_with("norm_i16_")
+            || rest.starts_with("norm_u16_");
+    }
+    name.ends_with("_f16")
+        || name.ends_with("_u16")
+        || name.ends_with("_i16")
+        || name.ends_with("_b16")
+}
+
+/// Whether a D16 memory load writes an odd number of 16-bit halves, preserving
+/// the untouched half of its final destination VGPR.
+fn load_preserves_half(name: &str) -> bool {
+    name.ends_with("_d16")
+        || name.ends_with("_d16_hi")
+        || name.ends_with("_d16_x")
+        || name.ends_with("_d16_hi_x")
+        || name.ends_with("_d16_xyz")
 }
 
 /// Scalar ALU opcodes that set SCC (carry, overflow, comparison, or "result
@@ -1749,6 +1915,33 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn an_empty_exec_skip_keeps_a_store_behind_a_mask_restore() {
+        // A comparison rejected all lanes, so the console skips the store. If
+        // the branch disappears, restoring the saved incoming EXEC runs it.
+        const RESTORE: u32 = 0xBEFE_040C; // s_mov_b64 exec, s[12:13]
+        const STORE: [u32; 2] = [0xD834_0000, 0x0000_0C00]; // ds_write_b32 v0, v12
+        let kept = skip(&[RESTORE, STORE[0], STORE[1]], &[]);
+        assert!(without_skips(&kept, false).is_none());
+        assert!(without_skips(&kept, true).is_none());
+        let early = build_words(
+            &[0x7D88_0000, 0xBE8C_246A, 0xBF88_0003, RESTORE, STORE[0], STORE[1], S_ENDPGM],
+            true,
+        );
+        assert!(without_early_outs(&early).is_none());
+        assert!(without_skips(&early, true).is_none());
+        // With no restore the store stays masked and the branch can go.
+        assert_eq!(skips(&without_skips(&skip(&STORE, &[]), true).unwrap()), 0);
+        // A nested save of the already-empty EXEC, restored from precisely
+        // that definition before the store, cannot enable any lanes.
+        let nested = skip(&[0xBE90_246A, 0xBEFE_0410, STORE[0], STORE[1]], &[]);
+        assert_eq!(skips(&without_skips(&nested, true).unwrap()), 0);
+        // OR-save also activates lanes if its operand was saved before
+        // the skip, even though it saves the (empty) current EXEC.
+        let activates = skip(&[0xBE90_250C, STORE[0], STORE[1]], &[]);
+        assert!(without_skips(&activates, true).is_none());
     }
 
     #[test]
@@ -2046,5 +2239,78 @@ mod tests {
             .filter(|i| i.name() == "v_readlane_b32")
             .count();
         assert_eq!(restores, 2);
+    }
+
+    #[test]
+    fn operand_reads_includes_implicit_destination_reads_for_rmw_and_partial_writes() {
+        let words: &[u32] = &[
+            0x560A_0401, // 0: v_fmac_f32 v5, s1, v2 (reads accumulator v5)
+            0x060A_0401, // 1: v_add_f32 v5, s1, v2 (overwrites v5)
+            0xD761_0005,
+            0x0001_0001, // 2: v_writelane_b32 v5, s1, 0 (keeps other lanes of v5)
+            0xC815_0001, // 3: v_interp_p2_f32 v5, v1, attr0.x (accumulates into v5)
+            0xC814_0001, // 4: v_interp_p1_f32 v5, v1, attr0.x (overwrites v5)
+            0x640A_0401, // 5: v_add_f16 v5, s1, v2 (preserves high half of v5)
+            0x7E0A_02FA,
+            0xFF00_1101, // 6: v_mov_b32 v5, v1 row_shr:1 bound_ctrl:0 (preserves v5 on OOB)
+            0x7E0A_02FA,
+            0xFF08_1101, // 7: v_mov_b32 v5, v1 row_shr:1 bound_ctrl:1 (writes all active lanes)
+            0xD778_0005,
+            0x0201_0101, // 8: v_permlanex16_b32 v5, v1, 0, 0 (BOUND_CTRL=0 preserves v5)
+            0xD778_1005,
+            0x0201_0101, // 9: v_permlanex16_b32 v5, v1, 0, 0 bound_ctrl:1 (overwrites active lanes)
+            0x7E0A_02F9,
+            0x0606_1401, // 10: v_mov_b32_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+            0x7E0A_02F9,
+            0x0606_0401, // 11: v_mov_b32_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD
+            0xDA98_0000,
+            0x0500_0001, // 12: ds_read_u16_d16 v5, v1 (preserves high half of v5)
+            0xD8D8_0000,
+            0x0500_0001, // 13: ds_read_b32 v5, v1 (overwrites v5)
+            S_ENDPGM,
+        ];
+        let p = build_words(words, false);
+        let insts = &p.blocks[0].insts;
+        let reads_v5 = |idx: usize, expected_name: &str| {
+            assert_eq!(insts[idx].name(), expected_name);
+            operand_reads(&p, &insts[idx]).contains(&Reg::V(5))
+        };
+        assert!(reads_v5(0, "v_fmac_f32"));
+        assert!(!reads_v5(1, "v_add_f32"));
+        assert!(reads_v5(2, "v_writelane_b32"));
+        assert!(reads_v5(3, "v_interp_p2_f32"));
+        assert!(!reads_v5(4, "v_interp_p1_f32"));
+        assert!(reads_v5(5, "v_add_f16"));
+        assert!(reads_v5(6, "v_mov_b32"));
+        assert!(!reads_v5(7, "v_mov_b32"));
+        assert!(reads_v5(8, "v_permlanex16_b32"));
+        assert!(!reads_v5(9, "v_permlanex16_b32"));
+        assert!(reads_v5(10, "v_mov_b32"));
+        assert!(!reads_v5(11, "v_mov_b32"));
+        assert!(reads_v5(12, "ds_read_u16_d16"));
+        assert!(!reads_v5(13, "ds_read_b32"));
+    }
+
+    #[test]
+    fn unspill_does_not_pair_restore_across_read_of_first_register() {
+        // v_writelane_b32 v2, s4, 0
+        // v_writelane_b32 v2, s5, 1
+        // v_readlane_b32  s4, v2, 0
+        // s_mov_b32       s6, s4     <-- legge s4 prima che s5 venga ripristinato
+        // v_readlane_b32  s5, v2, 1
+        let separated_by_read: Vec<u32> = vec![
+            0xD761_0002, 0x0001_0004, // v_writelane_b32 v2, s4, 0
+            0xD761_0002, 0x0001_0205, // v_writelane_b32 v2, s5, 1
+            0xD760_0004, 0x0001_0102, // v_readlane_b32 s4, v2, 0
+            0xBE86_0304,              // s_mov_b32 s6, s4
+            0xD760_0005, 0x0001_0302, // v_readlane_b32 s5, v2, 1
+            S_ENDPGM,
+        ];
+        let p = build_words(&separated_by_read, true);
+        let names: Vec<_> = p.blocks[0].insts.iter().map(Inst::name).collect();
+        assert!(
+            !names.contains(&"s_mov_b64"),
+            "must not coalesce restore across read of first register: {names:?}"
+        );
     }
 }

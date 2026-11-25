@@ -675,6 +675,9 @@ fn record_clamp_at(
         ),
     ];
     let skip = usize::from(!waits);
+    // SAFETY: l is an open command list, dst is a live scratch buffer,
+    // barriers transition dst correctly, and constants and root arguments
+    // match c's compute pipeline layout.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -995,7 +998,8 @@ void main() {
         };
         // In part 5 of the second piece: its dword gets bit 5.
         let at = PIECE + 5 * 4096 + 1234;
-        // SAFETY (each): inside the mapping.
+        // SAFETY: `at` is inside the second piece, strictly inside the mapped
+        // buffer of size 3 * PIECE.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
         assert_eq!(run(&mut warp, 0), [7, 7, 7]);

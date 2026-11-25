@@ -136,10 +136,15 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+The title needs several GiB of available Windows commit at startup, and the
+world can use substantially more. One 16 GB system reported about 23 GB of
+private committed memory in the world. [Memory measurements (#366)](https://github.com/fxceless/victory-fork/issues/366)
+
+If loading appears to stall, check **Committed** under **Task Manager →
+Performance → Memory**. The diagnostics build warns once if the process has
+less than 2 GiB of available commit. If the system is near its commit limit or
+`crashes.log` reports Windows error 1455, close other applications or check the
+Windows paging file size and available disk space, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -147,6 +152,17 @@ copy victory.example.toml victory.toml   # then set your paths (outside the repo
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
+
+On Windows systems with multiple GPUs, select the hardware adapter used by the
+shader test harness with a case-insensitive substring of its DXGI name:
+
+```powershell
+$env:VICTORY_SHADER_ADAPTER = 'NVIDIA'
+cargo test -p victory-shader --lib
+Remove-Item Env:VICTORY_SHADER_ADAPTER
+```
+
+The default is the Windows-selected adapter. Explicit WARP runs still use WARP.
 
 Run the title:
 
@@ -205,6 +221,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_RUN_NAME=<text>` | shown in the window title before the frame rate, to tell test runs apart on screen |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_CAPTURE_SYNC=1` | finishes each presented frame's PNG before presenting it (normally PNG encoding runs on a worker) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
@@ -212,6 +229,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_CARD_VERIFY=<n>` | every `n`-th frame, compares each host copy held in the card's memory with its CPU side and logs `card verify:` lines (see [docs/card-verify.md](docs/card-verify.md); `VICTORY_CARD_VERIFY_MAX_MB` limits it, 256 by default) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |

@@ -1714,6 +1714,31 @@ impl State {
     /// of its own before every draw whose pixel shader is one of the
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
+    /// Claims the early or bake texture-upload budget for `frame` once a view
+    /// heap is known to be bound. Returns `Some(((ms, bytes), is_bake))`.
+    fn claim_early_budget(
+        frame: u64,
+        bake: bool,
+        early_ms: u64,
+        bake_ms: u64,
+        last_frame: &AtomicU64,
+        baked_ms: &AtomicU64,
+    ) -> Option<((u64, u64), bool)> {
+        let first = last_frame.swap(frame, Ordering::Relaxed) != frame;
+        if first {
+            baked_ms.store(0, Ordering::Relaxed);
+        }
+        let left = bake_ms.saturating_sub(baked_ms.load(Ordering::Relaxed));
+        if bake && left > 0 {
+            // What a bake may read must be there now: up to 2 GiB.
+            Some(((left, 2 << 30), true))
+        } else if first && early_ms > 0 {
+            Some(((early_ms, 64 << 20), false))
+        } else {
+            None
+        }
+    }
+
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
@@ -1725,20 +1750,30 @@ impl State {
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
-        let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
-        if first {
-            BAKED_MS.store(0, Ordering::Relaxed);
-        }
-        let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
-        let budget = if bake && left > 0 {
-            // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
-        } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
-        } else {
-            return;
-        };
+        let _ = self.early_textures_with(
+            list,
+            bake,
+            early_ms,
+            bake_ms,
+            crate::frame::current(),
+            &FRAME,
+            &BAKED_MS,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn early_textures_with(
+        &self,
+        list: &HostList,
+        bake: bool,
+        early_ms: u64,
+        bake_ms: u64,
+        frame: u64,
+        last_frame: &AtomicU64,
+        baked_ms: &AtomicU64,
+    ) -> bool {
+        // Check for a bound view heap before claiming the frame's early pass,
+        // so draws without a view heap do not burn the frame's one early run.
         let Some(heap) = self
             .heaps
             .iter()
@@ -1746,12 +1781,16 @@ impl State {
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| !h.samplers())
         else {
-            return;
+            return false;
         };
         let Some(host) = heap.host() else {
-            return;
+            return false;
         };
-        let bake = bake && left > 0;
+        let Some((budget, bake)) =
+            Self::claim_early_budget(frame, bake, early_ms, bake_ms, last_frame, baked_ms)
+        else {
+            return false;
+        };
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
             let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
@@ -1769,8 +1808,9 @@ impl State {
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
         if bake {
-            BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            baked_ms.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
+        true
     }
 
     /// The texture side of [`State::heap_buffers`]: textures the title fills
@@ -2185,8 +2225,11 @@ impl State {
 
     /// What a draw or dispatch runs, for the device-removed report
     /// (diagnostics): the pipeline, then per stage the user data it gets
-    /// (with the view at that heap index, if one is), the host addresses
-    /// of its root views and the views its tables name.
+    /// (`table` values with the view the table starts at; `const` values
+    /// with the view at that heap index, if one is, since dynamic resources
+    /// may index the heap with one, though most are plain numbers; `host`
+    /// values, which VIctory computes, with none), the host addresses of
+    /// its root views and the views its tables name.
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -2231,10 +2274,23 @@ impl State {
                     RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
                     _ => self.user_value(compute, u.slot, u.root, u.dword),
                 };
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
+                // A host word is an address VIctory computes, not a heap
+                // index: it gets no view.
+                let (root, index) = match u.root {
+                    RootType::Table => ("table", Some(v / 32)),
+                    RootType::Other(_) => ("host", None),
+                    _ => ("const", Some(v)),
+                };
+                let _ = write!(text, " u{}={v:#x} {root}", u.index);
+                if let Some(index) = index
+                    && let Some(slot) = views.and_then(|h| h.describe_slot(index))
+                {
+                    let at = if root == "table" {
+                        "heap"
+                    } else {
+                        "as heap index"
+                    };
+                    let _ = write!(text, " [{at} {index}: {slot}]");
                 }
             }
             for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
@@ -2685,20 +2741,18 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) = rect_vertex_span(v, first, count, rects) else {
+                once!(slot, "rectangle vertices outside their buffer");
+                return false;
+            };
+            if crate::shadow::find(from, src_bytes).is_none() {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             let n = rects as usize;
             list.defer_host_read(from as *const u8, n * 3 * stride, move || {
                 // The vertices are read in place, at submission: no change
@@ -2717,7 +2771,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -3138,6 +3192,28 @@ impl State {
     }
 }
 
+/// Computes `(src_address, src_bytes, expanded_dst_bytes)` for rectangle
+/// expansion over `first..first + count`, rejecting overflows, out-of-bounds
+/// views, and expanded sizes exceeding `u32::MAX`.
+fn rect_vertex_span(v: VertexView, first: u32, count: u32, rects: u64) -> Option<(u64, u64, u32)> {
+    let stride = u64::from(v.stride);
+    if v.address == 0 || stride == 0 {
+        return None;
+    }
+    let total_vertices = u64::from(first) + u64::from(count);
+    let end_bytes = total_vertices.checked_mul(stride)?;
+    if end_bytes > u64::from(v.size) {
+        return None;
+    }
+    let from = u64::from(first)
+        .checked_mul(stride)
+        .and_then(|off| v.address.checked_add(off))?;
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    let dst_bytes = rects.checked_mul(6)?.checked_mul(stride)?;
+    let dst_bytes = u32::try_from(dst_bytes).ok()?;
+    Some((from, src_bytes, dst_bytes))
+}
+
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
@@ -3460,5 +3536,124 @@ mod tests {
         drop(state);
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
         assert_eq!(release(heap_obj), 0);
+    }
+}
+
+#[cfg(test)]
+mod rect_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn rect_vertex_span_rejects_overflow_and_out_of_bounds() {
+        let view = VertexView {
+            address: 0x1000_0000,
+            size: 192,
+            stride: 16,
+        };
+        // Valid: 2 rectangles (6 vertices starting at 0) -> 96 src bytes, 192 dst bytes.
+        assert_eq!(rect_vertex_span(view, 0, 6, 2), Some((0x1000_0000, 96, 192)));
+        // Valid with non-zero first: 1 rect (3 vertices at first=3) -> 48 src bytes, 96 dst bytes.
+        assert_eq!(
+            rect_vertex_span(view, 3, 3, 1),
+            Some((0x1000_0000 + 48, 48, 96))
+        );
+        // u32 overflow in `first + count`: 0x8000_0000 + 0x8000_0000 wraps to 0 in u32!
+        assert_eq!(
+            rect_vertex_span(view, 0x8000_0000, 0x8000_0000, 0x8000_0000 / 3),
+            None
+        );
+        // `v.address + first * stride` u64 overflow.
+        let high = VertexView {
+            address: u64::MAX - 16,
+            size: 256,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_span(high, 4, 3, 1), None);
+        // Expanded 6-vertex buffer exceeding u32::MAX must not silently truncate SizeInBytes.
+        let huge = VertexView {
+            address: 0x1000_0000,
+            size: u32::MAX,
+            stride: 16,
+        };
+        assert_eq!(
+            rect_vertex_span(huge, 0, 0x0FFF_FFFC, 0x0FFF_FFFC / 3),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod early_textures_tests {
+    use super::*;
+
+    #[test]
+    fn early_budget_runs_once_per_frame_and_resets_bake_budget() {
+        let last_frame = AtomicU64::new(u64::MAX);
+        let baked_ms = AtomicU64::new(0);
+        // First draw with a view heap in frame 1 gets the early budget.
+        assert_eq!(
+            State::claim_early_budget(1, false, 12, 1500, &last_frame, &baked_ms),
+            Some(((12, 64 << 20), false))
+        );
+        // Second non-bake draw in the same frame gets none.
+        assert_eq!(
+            State::claim_early_budget(1, false, 12, 1500, &last_frame, &baked_ms),
+            None
+        );
+        // Bake draw in the same frame still gets the full bake budget.
+        assert_eq!(
+            State::claim_early_budget(1, true, 12, 1500, &last_frame, &baked_ms),
+            Some(((1500, 2 << 30), true))
+        );
+        baked_ms.store(1500, Ordering::Relaxed);
+        assert_eq!(
+            State::claim_early_budget(1, true, 12, 1500, &last_frame, &baked_ms),
+            None
+        );
+        // Next frame resets baked_ms and allows early budget again.
+        assert_eq!(
+            State::claim_early_budget(2, false, 12, 1500, &last_frame, &baked_ms),
+            Some(((12, 64 << 20), false))
+        );
+        assert_eq!(baked_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn early_textures_without_view_heap_does_not_burn_frame_pass() {
+        let Some(host) = crate::host::host() else { return };
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        let last_frame = AtomicU64::new(u64::MAX);
+        let baked_ms = AtomicU64::new(0);
+        // Draw 1 in frame 7 has no view heap bound: must NOT claim frame 7.
+        assert!(!state.early_textures_with(&list, false, 12, 1500, 7, &last_frame, &baked_ms));
+        assert_eq!(last_frame.load(Ordering::Relaxed), u64::MAX);
+
+        // Bind a real shader-visible view heap and draw again in the SAME frame 7.
+        // SAFETY: HeapDesc is repr(C) [kind, count, flags, nodes].
+        let desc: crate::descriptor::HeapDesc = unsafe { std::mem::transmute([0u32, 4, 1, 0]) };
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(std::ptr::null(), &desc, &iid, &mut heap),
+            crate::object::S_OK
+        );
+        state.set_heaps(&[heap]);
+        let before = EARLY_TEXTURE_PASSES[0].load(Ordering::Relaxed);
+        assert!(state.early_textures_with(&list, false, 12, 1500, 7, &last_frame, &baked_ms));
+        assert_eq!(last_frame.load(Ordering::Relaxed), 7);
+        assert_eq!(EARLY_TEXTURE_PASSES[0].load(Ordering::Relaxed), before + 1);
+        // A second non-bake draw in the same frame does not run again.
+        assert!(!state.early_textures_with(&list, false, 12, 1500, 7, &last_frame, &baked_ms));
+
+        list.close();
+        drop(list);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10);
+        assert_eq!(release(heap), 0);
     }
 }

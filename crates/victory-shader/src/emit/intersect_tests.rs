@@ -295,6 +295,13 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     let ids2 = [8, bvh::NONE, 24, 0x1fff_fffc];
     box_nodes.push((s.add(nodes::box32(ids2, around), 32), 5));
     box_nodes.push((s.add(nodes::box16(ids2, around), 16), 4));
+    // A child that is not there whose box the ray enters first: the
+    // reference's own test of it, in both widths, with its ray alone.
+    let (missing, missing_boxes) = nodes::MISSING_FIRST;
+    let missing_nodes = [
+        (s.add(nodes::box32(missing, missing_boxes), 32), 5),
+        (s.add(nodes::box16(missing, missing_boxes), 16), 4),
+    ];
     // Random boxes.
     for n in 0..6 {
         let boxes: [[f32; 6]; 4] = std::array::from_fn(|_| {
@@ -356,6 +363,10 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
         ] {
             cases.push(Some((n, kind, Ray::new(origin, direction, extent))));
         }
+    }
+    // The reference's test of a child that is not there, at its ray.
+    for &(n, kind) in &missing_nodes {
+        cases.push(Some((n, kind, nodes::missing_first())));
     }
     // Random rays at every box node, half of them aimed at a box.
     for &(n, kind) in &box_nodes {
@@ -687,6 +698,82 @@ fn with_rt_miss_no_node_is_read() {
         assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
         let (normal, _) = build(wide, WHOLE).expect("lowers");
         assert_ne!(normal.dxil, shader.dxil);
+    }
+}
+
+#[test]
+#[ignore = "requires the Windows WARP software adapter with shader model 6.6"]
+fn a_wide_box_crossing_two_title_pages_reads_both_host_copies() {
+    let host = Host::new(true).expect("requires SM 6.6 WARP");
+    let (shader, _) = build(true, WHOLE).expect("lowers through the production directory");
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("WARP compute pipeline");
+    assert_eq!(shader.root_uavs, [super::SLOT_FAULTS]);
+    assert_eq!(shader.root_srvs, [super::SLOT_MEMORY]);
+    assert!(shader.root_cbvs.is_empty());
+    let mut constants = vec![0; shader.user_data_dwords() as usize];
+    let base = shader
+        .user_data
+        .iter()
+        .find(|w| w.root == RootType::Other(super::shader::USER_MEMORY_BASE))
+        .expect("directory view base");
+    constants[base.index as usize] = 1;
+
+    // At byte 0x1ffc0, the first 64 bytes are in page 1 and the rest in
+    // page 2. Child 3's six bounds are all in page 2; its ID is in page 1.
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 20.0);
+    for y in [0.0, 4.0] {
+        let node = nodes::box32(
+            [bvh::NONE, bvh::NONE, bvh::NONE, 24],
+            [
+                [f32::NAN; 6],
+                [f32::NAN; 6],
+                [f32::NAN; 6],
+                [4.0, y - 1.0, -1.0, 6.0, y + 1.0, 1.0],
+            ],
+        );
+        let mut scene = Scene::new();
+        let n = scene.add(node, 32);
+        let mut records = buffer(&scene, &[Some((n, 5, ray))], 0x1ffc0);
+        records.truncate((NODES / 4) as usize);
+        let mut first = vec![0; 65536 / 4];
+        first[0xffc0 / 4..].copy_from_slice(&node[..16]);
+        let expected = bvh::intersect(&node, 5, &ray, true);
+        assert_eq!(expected[0], if y == 0.0 { 24 } else { bvh::NONE });
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(constants.clone())),
+                        (1, Root::OutputUav(3)),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: vec![0, 0, 1, 0, 2, 0],
+                            },
+                        ),
+                    ],
+                    views: &[
+                        View::Buffer {
+                            data: &records,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                        View::RawUavData(&first),
+                        View::RawUavData(&node[16..]),
+                        View::RawUav(super::shader::MEMORY_FAULTS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch through separate backing resources");
+        assert_eq!(&out[0][..4], &expected);
+        assert!(out[3][1..].iter().all(|&p| p == 0), "unexpected page fault");
     }
 }
 

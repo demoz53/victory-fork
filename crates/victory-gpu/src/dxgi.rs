@@ -131,12 +131,48 @@ struct AdapterDescription {
 }
 const _: () = assert!(size_of::<AdapterDescription>() == 0x130);
 
-const AMD: u32 = 0x1002;
+#[repr(C)]
+struct AdapterDescription2 {
+    base: AdapterDescription,
+    flags: u32,
+    graphics_preemption: i32,
+    compute_preemption: i32,
+}
 
-extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
-    if out.is_null() {
-        return E_INVALIDARG;
-    }
+const _: () = assert!(size_of::<AdapterDescription2>() == 0x140);
+
+const AMD: u32 = 0x1002;
+const ADAPTER_GET_DESC2: usize = 11;
+const DMA_BUFFER_PREEMPTION: i32 = 0;
+
+#[cfg(windows)]
+const _: () = {
+    use std::mem::{align_of, offset_of};
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_ADAPTER_DESC2, DXGI_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY,
+        DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY, IDXGIAdapter2_Vtbl,
+    };
+
+    assert!(offset_of!(IDXGIAdapter2_Vtbl, GetDesc2) == ADAPTER_GET_DESC2 * size_of::<*const ()>());
+    assert!(size_of::<AdapterDescription2>() == size_of::<DXGI_ADAPTER_DESC2>());
+    assert!(align_of::<AdapterDescription2>() == align_of::<DXGI_ADAPTER_DESC2>());
+    assert!(
+        offset_of!(AdapterDescription2, base.luid) == offset_of!(DXGI_ADAPTER_DESC2, AdapterLuid)
+    );
+    assert!(offset_of!(AdapterDescription2, flags) == offset_of!(DXGI_ADAPTER_DESC2, Flags));
+    assert!(
+        offset_of!(AdapterDescription2, graphics_preemption)
+            == offset_of!(DXGI_ADAPTER_DESC2, GraphicsPreemptionGranularity)
+    );
+    assert!(
+        offset_of!(AdapterDescription2, compute_preemption)
+            == offset_of!(DXGI_ADAPTER_DESC2, ComputePreemptionGranularity)
+    );
+    assert!(DMA_BUFFER_PREEMPTION == DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY.0);
+    assert!(DMA_BUFFER_PREEMPTION == DXGI_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY.0);
+};
+
+fn describe_adapter() -> AdapterDescription {
     let mut name = [0; 128];
     for (slot, unit) in name.iter_mut().zip("VIctory console GPU".encode_utf16()) {
         *slot = unit;
@@ -144,7 +180,7 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     // shortcut: memory sizes are the title's split (GPU-optimal, standard),
     // not measured; revisit once memory is emulated.
     let (gpu_optimal, standard) = crate::console::current().title_memory();
-    let description = AdapterDescription {
+    AdapterDescription {
         name,
         vendor: AMD,
         device: 0,
@@ -154,9 +190,32 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
         dedicated_system_memory: 0,
         shared_system_memory: standard,
         luid: [1, 0],
-    };
+    }
+}
+
+extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: checked non-null; the title passes room for the description.
-    unsafe { out.write(description) };
+    unsafe { out.write(describe_adapter()) };
+    S_OK
+}
+
+extern "system" fn adapter_description2(_: This, out: *mut AdapterDescription2) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; the caller passes room for a DXGI_ADAPTER_DESC2.
+    unsafe {
+        out.write(AdapterDescription2 {
+            base: describe_adapter(),
+            flags: 0,
+            // The logical adapter makes no guarantee of finer preemption.
+            graphics_preemption: DMA_BUFFER_PREEMPTION,
+            compute_preemption: DMA_BUFFER_PREEMPTION,
+        });
+    }
     S_OK
 }
 
@@ -193,6 +252,7 @@ static ADAPTER_FUNCTIONS: Table<24> = {
     f[6] = adapter_parent as *const (); // 0x30
     f[7] = adapter_outputs as *const (); // 0x38
     f[8] = adapter_description as *const (); // 0x40
+    f[ADAPTER_GET_DESC2] = adapter_description2 as *const (); // 0x58
     Table(f)
 };
 
@@ -296,6 +356,39 @@ mod tests {
     type Get = extern "system" fn(This, *mut This) -> HRESULT;
     type Indexed = extern "system" fn(This, u32, *mut This) -> HRESULT;
     type Describe = extern "system" fn(This, *mut AdapterDescription) -> HRESULT;
+
+    #[test]
+    fn adapter2_describes_the_console_adapter() {
+        const DESC2_SLOT: usize = 0x58;
+        type Describe2 = extern "system" fn(This, *mut AdapterDescription2) -> HRESULT;
+
+        let mut adapter2 = std::ptr::null();
+        let qi = slot::<Query>(&ADAPTER_OBJECT, 0);
+        assert_eq!(qi(&ADAPTER_OBJECT, &ADAPTER_IIDS[2], &mut adapter2), S_OK);
+        assert_eq!(adapter2, &ADAPTER_OBJECT as This);
+        // Do not call the unwired stub with a GetDesc2 signature.
+        assert_ne!(
+            slot::<*const ()>(adapter2, DESC2_SLOT),
+            object::missing_table::<ADAPTER, 24>()[DESC2_SLOT / 8],
+            "GetDesc2 is not wired for the advertised interface"
+        );
+
+        let get_desc2 = slot::<Describe2>(adapter2, DESC2_SLOT);
+        assert_eq!(get_desc2(adapter2, std::ptr::null_mut()), E_INVALIDARG);
+        let mut desc = std::mem::MaybeUninit::<AdapterDescription2>::uninit();
+        assert_eq!(get_desc2(adapter2, desc.as_mut_ptr()), S_OK);
+        // SAFETY: successful GetDesc2 wrote the descriptor.
+        let desc = unsafe { desc.assume_init() };
+        let name: Vec<_> = desc.base.name.into_iter().take_while(|&c| c != 0).collect();
+        assert_eq!(String::from_utf16(&name).unwrap(), "VIctory console GPU");
+        assert_eq!(desc.base.vendor, AMD);
+        assert_eq!(desc.base.luid, [1, 0]);
+        let (gpu_optimal, standard) = crate::console::current().title_memory();
+        assert_eq!(desc.base.dedicated_video_memory, gpu_optimal);
+        assert_eq!(desc.base.shared_system_memory, standard);
+        assert_eq!(desc.flags, 0);
+        assert_eq!((desc.graphics_preemption, desc.compute_preemption), (0, 0));
+    }
 
     /// Minecraft's startup: device → DXGI device (newest first) → adapter →
     /// description, factory, first output.

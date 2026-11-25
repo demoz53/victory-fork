@@ -75,6 +75,8 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A rasterizer-ordered UAV handle.
+    pub rov: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -198,6 +200,12 @@ pub(super) enum Effect {
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
+        // Reusing `annotateHandle` across basic blocks crashes AMD's DXIL
+        // compiler (`amdxc64.dll`, access violation) on compute programs
+        // that use a heap handle in several blocks. Treating it as
+        // block-local (`Lanes`) keeps same-block load reuse and dead-code
+        // removal while letting each block keep its own handle annotation.
+        Some(Attr::ReadNone) if name == "annotateHandle" => Effect::Lanes,
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
         Some(Attr::ReadOnly)
@@ -1006,6 +1014,8 @@ impl Module {
                 let name = name.strip_prefix("dx.op.").unwrap_or(name);
                 if name.starts_with("wave") || name.starts_with("quad") {
                     u.wave_ops = true;
+                } else if name == "annotateHandle" {
+                    u.rov |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
                 } else if name == "createHandleFromHeap" {
                     match args.get(2).and_then(|&s| self.int_k(s)) {
                         Some((_, 0)) => u.heap_views = true,
@@ -1622,6 +1632,35 @@ mod tests {
             super::tests::stores(&m, then),
             [vec![below, below], vec![top, top]]
         );
+        m.write();
+    }
+
+    #[test]
+    fn an_annotated_handle_is_not_reused_across_blocks() {
+        let Diamond {
+            k: Kit { mut m, b, writes, .. },
+            then,
+            ..
+        } = diamond();
+        let i32t = m.int(32);
+        let one = m.i32(1);
+        let two = m.i32(2);
+        let afty = m.func_ty(i32t, vec![i32t, i32t]);
+        let ann = m.function("dx.op.annotateHandle", afty, Some(Attr::ReadNone), false);
+        let first = m.call(b, ann, vec![one, two]);
+        let same_block = m.call(b, ann, vec![one, two]);
+        let unused = m.call(b, ann, vec![two, two]);
+        m.call(b, writes, vec![first, same_block]);
+        let below = m.call(then, ann, vec![one, two]);
+        m.call(then, writes, vec![below, below]);
+        m.optimise(DEAD | REUSE | LOADS);
+        // Same block: reused before any write; unused call dropped.
+        assert_eq!(stores(&m, b)[0], [first, first]);
+        assert!(m.blocks[b].body.iter().all(|&i| V::Inst(i) != unused));
+        // Dominated block: keeps its own annotateHandle (reusing across blocks
+        // crashes AMD's DXIL compiler on multi-block heap-handle shaders).
+        assert_eq!(stores(&m, then)[0], [below, below]);
+        assert_ne!(below, first);
         m.write();
     }
 

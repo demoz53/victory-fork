@@ -18,6 +18,10 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+/// `VICTORY_CARD_VERIFY`: copies in the card's memory against their CPU side.
+#[cfg(feature = "diagnostics")]
+mod card_verify;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -591,8 +595,7 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let debug = cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -603,7 +606,7 @@ fn create() -> windows::core::Result<Host> {
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
             // (directly indexed textures are not transitioned).
-            if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+            if env_flag("VICTORY_D3D12_GBV")
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
@@ -632,7 +635,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -1315,13 +1318,35 @@ fn record_twin_copy(
     }
 }
 
+/// Parses an opt-in boolean environment variable. Unset, empty/whitespace,
+/// `"0"`, `"false"`, `"no"`, and `"off"` (ASCII case-insensitive) disable
+/// the flag; any other value enables it so `FLAG=1` / `FLAG=true` keep
+/// working while `FLAG=0` / `FLAG=false` actually turn it off.
+pub(crate) fn parse_env_flag(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let trimmed = text.trim();
+    !(trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off"))
+}
+
+/// Whether the opt-in boolean environment variable `name` is enabled.
+pub(crate) fn env_flag(name: &str) -> bool {
+    parse_env_flag(std::env::var_os(name).as_deref())
+}
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_DRED"))
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
@@ -1364,7 +1389,7 @@ static WATCHED_RECORDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| env_flag("VICTORY_GPU_TIMING"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1648,6 +1673,162 @@ struct CardWork {
     taken: u32,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
+    /// The ring lean windows' bytes go up through
+    /// (`crate::shadow::lean_windows`), made with the first of them.
+    ring: Option<Ring>,
+}
+
+/// One upload buffer (PC memory, mapped) that lean windows' changed bytes go
+/// through from title memory to the card, used as a ring: each plan writes
+/// after the one before, and a fence of our own, signalled behind each plan's
+/// copies, tells when the card is done with a stretch. A stretch is written
+/// over only once the card has taken it, so the PC holds this one buffer
+/// however many submissions are in the air ([`late`], [`relay`]). (One upload
+/// buffer per plan instead held 2.3 GB more of the PC's memory with the relay.)
+struct Ring {
+    buffer: ID3D12Resource,
+    data: usize,
+    size: u64,
+    /// Where the next bytes go.
+    head: u64,
+    /// Stretches (from, to) the card may still be reading, each with the
+    /// fence value signalled behind it.
+    busy: std::collections::VecDeque<(u64, u64, u64)>,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    /// The last value signalled.
+    value: u64,
+}
+
+impl Ring {
+    /// Waits until the card is done with every stretch that overlaps `[from,
+    /// to)`, and forgets the stretches it is done with.
+    ///
+    /// # Safety
+    /// The ring's own objects, under the submission lock.
+    unsafe fn clear(&mut self, from: u64, to: u64) -> windows::core::Result<()> {
+        // SAFETY: as the function's.
+        let done = unsafe { self.fence.GetCompletedValue() };
+        self.busy.retain(|&(_, _, v)| v > done);
+        let Some(wait) = self.busy.iter().filter(|&&(a, b, _)| overlaps((a, b), (from, to))).map(|s| s.2).max() else {
+            return Ok(());
+        };
+        // SAFETY: as the function's.
+        unsafe {
+            self.fence.SetEventOnCompletion(wait, self.event)?;
+            WaitForSingleObject(self.event, INFINITE);
+        }
+        self.busy.retain(|&(_, _, v)| v > wait);
+        crate::shadow::lean_part();
+        Ok(())
+    }
+}
+
+/// Where `want` bytes go in a ring of `size` bytes whose next byte is at
+/// `head`: (offset, bytes), at most what fits before the ring's end; at the
+/// end it starts over.
+fn ring_take(head: u64, size: u64, want: u64) -> (u64, u64) {
+    let at = if head >= size { 0 } else { head };
+    (at, want.min(size - at))
+}
+
+/// Whether two stretches `[a, b)` and `[c, d)` share a byte.
+fn overlaps((a, b): (u64, u64), (c, d): (u64, u64)) -> bool {
+    a < d && c < b
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::{overlaps, ring_take};
+
+    /// Bytes go where the head is, as many as fit before the end.
+    #[test]
+    fn bytes_go_at_the_head_and_stop_at_the_end() {
+        assert_eq!(ring_take(0, 1000, 100), (0, 100));
+        assert_eq!(ring_take(900, 1000, 100), (900, 100));
+        assert_eq!(ring_take(950, 1000, 100), (950, 50));
+    }
+
+    /// At the end the ring starts over; nothing asked for, nothing taken.
+    #[test]
+    fn the_ring_starts_over_at_its_end() {
+        assert_eq!(ring_take(1000, 1000, 100), (0, 100));
+        assert_eq!(ring_take(1000, 1000, 5000), (0, 1000));
+        assert_eq!(ring_take(10, 1000, 0), (10, 0));
+    }
+
+    /// A long ask, taken piece by piece, sends every byte once, in order.
+    #[test]
+    fn a_long_ask_goes_around_in_pieces() {
+        let (mut head, mut left, mut pieces) = (700u64, 2500u64, Vec::new());
+        while left > 0 {
+            let (at, n) = ring_take(head, 1000, left);
+            pieces.push((at, n));
+            head = at + n;
+            left -= n;
+        }
+        assert_eq!(pieces, vec![(700, 300), (0, 1000), (0, 1000), (0, 200)]);
+    }
+
+    /// Stretches share a byte only when they overlap; touching ends do not.
+    #[test]
+    fn stretches_overlap_only_when_they_share_a_byte() {
+        assert!(overlaps((0, 10), (5, 15)));
+        assert!(overlaps((5, 15), (0, 10)));
+        assert!(overlaps((0, 100), (10, 20)));
+        assert!(!overlaps((0, 10), (10, 20)));
+        assert!(!overlaps((10, 20), (0, 10)));
+    }
+}
+
+/// A tile of a reserved buffer (`Host::reserved_buffer`).
+pub(crate) const TILE: u64 = 64 << 10;
+
+/// Tiles per heap of the tile pool: 64 MiB heaps.
+const HEAP_TILES: u32 = 1024;
+
+/// Heaps whose 64 KiB tiles lean windows' reserved buffers map as they are
+/// used (`crate::shadow::lean_windows`), and the tiles not in use (heap,
+/// tile). Heaps are kept for the run; a window let go gives its tiles back.
+struct TilePool {
+    heaps: Vec<ID3D12Heap>,
+    free: Vec<(u32, u32)>,
+}
+
+// SAFETY: D3D12 heaps are free-threaded; all access is under the mutex.
+unsafe impl Send for TilePool {}
+
+static TILE_POOL: Mutex<TilePool> = Mutex::new(TilePool { heaps: Vec::new(), free: Vec::new() });
+
+/// Tiles of the pool mapped in a buffer now.
+static TILES_MAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A window let go gives its tiles back to the pool. The card is done with
+/// them: a copy is let go only when nothing holds it, and what the card runs
+/// on a tile mapped to another buffer later is queued behind that mapping.
+pub(crate) fn give_back_tiles(tiles: impl IntoIterator<Item = (u32, u32)>) {
+    let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let before = pool.free.len();
+    pool.free.extend(tiles);
+    TILES_MAPPED.fetch_sub((pool.free.len() - before) as u64, Ordering::Relaxed);
+}
+
+/// The pool's heaps and the tiles mapped now, in bytes (the lean line).
+pub(crate) fn tile_bytes() -> (u64, u64) {
+    let heaps = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()).heaps.len() as u64;
+    (heaps * u64::from(HEAP_TILES) * TILE, TILES_MAPPED.load(Ordering::Relaxed) * TILE)
+}
+
+/// The bytes of the ring lean windows' bytes go through
+/// (`VICTORY_LEAN_UPLOAD_MB`, 64): a plan that sends more goes in parts, each
+/// waited for. In the world a submission's windows change by a few MB; at the
+/// world's load hundreds of windows are new at once, and the parts keep that
+/// from costing the PC their size again.
+fn lean_upload_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_LEAN_UPLOAD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64).max(1) << 20
+    })
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -2106,7 +2287,8 @@ pub(crate) fn late() -> bool {
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        #[cfg(feature = "diagnostics")]
+        if timing() {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
@@ -2464,8 +2646,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it (retaining a COM ref).
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -2996,15 +3178,18 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
-/// air, if there are any, and is set when they are settled. Whether it
-/// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+/// air, if there are any, and is set when they are settled. Returns `Ok(())`
+/// if queued, or `Err(fence)` if the caller should set the fence now.
+pub(crate) fn late_signal(
+    fence: crate::fence::FenceRef,
+    value: u64,
+) -> Result<(), crate::fence::FenceRef> {
     if !late() {
-        return false;
+        return Err(fence);
     }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
-        return false;
+        return Err(fence);
     }
     line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
@@ -3013,7 +3198,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     // the helper thread for it.
     LINE_MOVED.notify_one();
     RELAY_MOVED.notify_one();
-    true
+    Ok(())
 }
 
 /// A queue stands at `wait`, which memory does not meet now ([`late`]):
@@ -3947,8 +4132,32 @@ impl Host {
                 fetched: None,
                 taken: 0,
                 out: 0,
+                ring: None,
             })
         }
+    }
+
+    /// The ring lean windows' bytes go through ([`Ring`]): an upload buffer
+    /// of [`lean_upload_most`] bytes, and a fence and event of our own.
+    fn make_ring(&self) -> Option<Ring> {
+        let size = lean_upload_most();
+        let (buffer, data) = self.upload_buffer(size)?;
+        name(&buffer, || "lean windows: title memory on its way to the card".into());
+        // SAFETY: plain objects of our own.
+        let (fence, event) = unsafe {
+            let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            (fence, CreateEventW(None, false, false, None).ok()?)
+        };
+        Some(Ring {
+            buffer,
+            data: data as usize,
+            size,
+            head: 0,
+            busy: Default::default(),
+            fence,
+            event,
+            value: 0,
+        })
     }
 
     /// Before a submission's lists run, for copies in the card's memory
@@ -4017,6 +4226,26 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // Lean windows (`crate::shadow::lean_windows`) have no CPU side:
+        // their changed bytes go from title memory through the ring
+        // (`Ring`) to the card.
+        if work.ring.is_none() && dirty.iter().any(|(shadow, _)| shadow.lean()) {
+            work.ring = self.make_ring();
+            if work.ring.is_none() {
+                fail(format_args!("no upload ring for lean windows ({} bytes)", lean_upload_most()));
+            }
+        }
+        let mut ring = work.ring.take();
+        // Lean windows' reserved buffers: the tiles the bytes about to go up
+        // fall in get memory, mapped on the queue ahead of the copies.
+        for (shadow, ranges) in &dirty {
+            if shadow.lean() {
+                let maps = shadow.tiles_to_map(ranges, |n| self.take_tiles(n));
+                if !maps.is_empty() {
+                    self.map_tiles(&shadow.buffer, &maps);
+                }
+            }
+        }
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4029,13 +4258,70 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    // This plan's bytes would go over its own, not sent yet:
+                    // what is recorded so far runs and is waited for, and the
+                    // list starts again.
+                    let flush = |ring: &mut Ring| -> windows::core::Result<()> {
+                        list.Close()?;
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        ring.value += 1;
+                        self.queue.Signal(&ring.fence, ring.value)?;
+                        if ring.fence.GetCompletedValue() < ring.value {
+                            ring.fence.SetEventOnCompletion(ring.value, ring.event)?;
+                            WaitForSingleObject(ring.event, INFINITE);
+                        }
+                        ring.busy.clear();
+                        allocator.Reset()?;
+                        list.Reset(allocator, None)?;
+                        crate::shadow::lean_part();
+                        Ok(())
+                    };
+                    // The ring's stretches this plan wrote since its last
+                    // part was waited for, and their bytes.
+                    let (mut wrote, mut sent): (Vec<(u64, u64)>, u64) = (Vec::new(), 0);
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
-                        for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                        match staging {
+                            Some(staging) => {
+                                for &(a, b) in ranges {
+                                    list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                    crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                                }
+                            }
+                            None => {
+                                let ring = ring.as_mut().ok_or_else(windows::core::Error::empty)?;
+                                let title = shadow.span().0 as usize;
+                                for &(a, b) in ranges {
+                                    let mut at = a;
+                                    while at < b {
+                                        let (into, n) = ring_take(ring.head, ring.size, (b - at) as u64);
+                                        if sent + n > ring.size {
+                                            flush(ring)?;
+                                            (wrote, sent) = (Vec::new(), 0);
+                                        }
+                                        // Earlier plans' stretches here: the card is done with them first.
+                                        ring.clear(into, into + n)?;
+                                        crate::host::copy_mapped(
+                                            (ring.data + into as usize) as *mut u8,
+                                            (title + at) as *const u8,
+                                            n as usize,
+                                            false,
+                                        );
+                                        list.CopyBufferRegion(&shadow.buffer, at as u64, &ring.buffer, into, n);
+                                        crate::shadow::CARD_STATS[0].fetch_add(n, Ordering::Relaxed);
+                                        crate::shadow::lean_sent(n);
+                                        match wrote.last_mut() {
+                                            Some(last) if last.1 == into => last.1 = into + n,
+                                            _ => wrote.push((into, into + n)),
+                                        }
+                                        ring.head = into + n;
+                                        sent += n;
+                                        at += n as usize;
+                                    }
+                                }
+                            }
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         let Some(before) = before else {
@@ -4074,6 +4360,16 @@ impl Host {
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    // Behind the copies: the ring's stretches they read are
+                    // free again once this value is reached.
+                    if let Some(ring) = ring.as_mut()
+                        && !wrote.is_empty()
+                    {
+                        ring.value += 1;
+                        self.queue.Signal(&ring.fence, ring.value)?;
+                        let value = ring.value;
+                        ring.busy.extend(wrote.iter().map(|&(a, b)| (a, b, value)));
+                    }
                     Ok(())
                 })()
             };
@@ -4083,6 +4379,7 @@ impl Host {
             used.push((false, sync));
         }
         let order_after = order.as_deref().copied().unwrap_or(0);
+        work.ring = ring;
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
@@ -4483,7 +4780,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
             }
         }
         if last > 0 {
@@ -4936,7 +5233,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
             if last > 0 {
@@ -7067,8 +7364,10 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
-        // SAFETY: the query inspects an address and fills a local structure.
+        // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: VirtualQuery queries page status for any virtual address
+        // without dereferencing, and info points to a valid local struct.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
@@ -7390,6 +7689,7 @@ impl Meter {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        crate::pipeline::note_slow_makes();
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
@@ -7550,6 +7850,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::shadow::lean_line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -7706,6 +8007,9 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        // Diagnostics: every N-th frame, the card's copies against their CPU side.
+        #[cfg(feature = "diagnostics")]
+        card_verify::frame(self, frame);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -7806,7 +8110,7 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::finish_frame(frame, buffer, footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
@@ -7981,6 +8285,126 @@ impl Host {
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
+            }
+        }
+    }
+
+    /// Whether the card maps buffers' tiles one by one and reads a tile with
+    /// nothing mapped as zeros (tiled resources tier 2 or above): what lean
+    /// windows' reserved buffers need ([`Host::reserved_buffer`]).
+    pub(crate) fn tiles_read_zero(&self) -> bool {
+        static TIER2: OnceLock<bool> = OnceLock::new();
+        *TIER2.get_or_init(|| {
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: a sized structure of ours.
+            let asked = unsafe {
+                self.device
+                    .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut o).cast(), size_of_val(&o) as u32)
+            };
+            let tier2 = asked.is_ok() && o.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0;
+            tracing::info!(tier = o.TiledResourcesTier.0, tier2, "tiled resources (lean windows map 64 KiB tiles as they are used)");
+            tier2
+        })
+    }
+
+    /// A device-local buffer of `size` bytes as [`Host::uav_buffer`] makes,
+    /// but reserved: no memory stands behind it until tiles of the tile pool
+    /// are mapped into it ([`Host::map_tiles`]), and a tile with nothing
+    /// mapped reads as zeros. `None` below tiled resources tier 2.
+    pub(crate) fn reserved_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        if !self.tiles_read_zero() {
+            return None;
+        }
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a reserved buffer.
+        let made = unsafe { self.device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer) };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no reserved buffer");
+                None
+            }
+        }
+    }
+
+    /// `count` tiles of the tile pool (heap, tile in it), new heaps made as
+    /// needed; `None` if a heap could not be made.
+    pub(crate) fn take_tiles(&self, count: usize) -> Option<Vec<(u32, u32)>> {
+        let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        while pool.free.len() < count {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: u64::from(HEAP_TILES) * TILE,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                Alignment: TILE,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation of a heap.
+            if let Err(e) = unsafe { self.device.CreateHeap(&desc, &mut heap) } {
+                tracing::warn!(error = %e, "no heap for lean windows' tiles");
+                return None;
+            }
+            let heap = heap?;
+            name(&heap, || "lean windows: tiles".into());
+            let at = pool.heaps.len() as u32;
+            pool.heaps.push(heap);
+            // Handed out from the lowest tile up.
+            pool.free.extend((0..HEAP_TILES).rev().map(|tile| (at, tile)));
+        }
+        let from = pool.free.len() - count;
+        let taken = pool.free.split_off(from);
+        TILES_MAPPED.fetch_add(count as u64, Ordering::Relaxed);
+        Some(taken)
+    }
+
+    /// On the queue, ahead of what is sent after it: each of `maps`
+    /// (resource tile, (heap, heap tile)) mapped in `resource`.
+    pub(crate) fn map_tiles(&self, resource: &ID3D12Resource, maps: &[(u32, (u32, u32))]) {
+        let pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by_heap: std::collections::BTreeMap<u32, Vec<(u32, u32)>> = Default::default();
+        for &(at, (heap, tile)) in maps {
+            by_heap.entry(heap).or_default().push((at, tile));
+        }
+        for (heap, tiles) in by_heap {
+            let starts: Vec<D3D12_TILED_RESOURCE_COORDINATE> = tiles
+                .iter()
+                .map(|&(at, _)| D3D12_TILED_RESOURCE_COORDINATE { X: at, Y: 0, Z: 0, Subresource: 0 })
+                .collect();
+            let sizes = vec![D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), Width: 1, Height: 1, Depth: 1 }; tiles.len()];
+            let offsets: Vec<u32> = tiles.iter().map(|&(_, tile)| tile).collect();
+            let counts = vec![1u32; tiles.len()];
+            let n = tiles.len() as u32;
+            // SAFETY: live objects; each array holds `n` entries.
+            unsafe {
+                self.queue.UpdateTileMappings(
+                    resource,
+                    n,
+                    Some(starts.as_ptr()),
+                    Some(sizes.as_ptr()),
+                    &pool.heaps[heap as usize],
+                    n,
+                    None,
+                    Some(offsets.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
             }
         }
     }
@@ -8483,5 +8907,59 @@ mod fill_on_card_tests {
         // The title's memory was never read: it still holds 0xAA.
         assert!(title[64..1088].iter().all(|&b| b == 0xAA));
         crate::shadow::unregister(resource, start);
+    }
+
+    #[test]
+    fn vram_idle_ms_scales_with_pressure() {
+        use super::vram_idle_ms;
+        let gib = 1024 * 1024 * 1024;
+        // Normal (< 75%)
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
+        // Moderate (75%..85%)
+        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
+        // High (>= 85%, including over-budget)
+        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        // Missing or zero budget falls back to normal
+        assert_eq!(vram_idle_ms(None), 5_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn ram_idle_ms_scales_with_pressure() {
+        use super::ram_idle_ms;
+        let gib = 1024 * 1024 * 1024;
+        // Normal (>= 4 GiB)
+        assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
+        assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);
+        // Moderate (2 GiB..4 GiB)
+        assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 5_000);
+        assert_eq!(ram_idle_ms(Some(2 * gib)), 5_000);
+        // High (< 2 GiB)
+        assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
+        assert_eq!(ram_idle_ms(Some(0)), 2_000);
+        // Missing falls back to normal
+        assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn parse_env_flag_treats_explicit_falsey_values_as_off() {
+        use std::ffi::OsStr;
+        assert!(!super::parse_env_flag(None));
+        for off in ["", "   ", "0", " 0 ", "false", "FALSE", "False", "no", "NO", "off", "OFF"] {
+            assert!(
+                !super::parse_env_flag(Some(OsStr::new(off))),
+                "{off:?} must disable flag"
+            );
+        }
+        for on in ["1", " 1 ", "true", "TRUE", "yes", "YES", "on", "ON", "2"] {
+            assert!(
+                super::parse_env_flag(Some(OsStr::new(on))),
+                "{on:?} must enable flag"
+            );
+        }
     }
 }

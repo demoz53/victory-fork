@@ -221,7 +221,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         return None;
     }
     Some(AllocationInfo {
-        size: bytes.checked_next_multiple_of(KIB_64)?,
+        size: bytes.checked_next_multiple_of(alignment)?,
         alignment,
     })
 }
@@ -878,7 +878,7 @@ fn place<'a>(
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 0,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
@@ -908,6 +908,9 @@ fn place<'a>(
         );
         total.size = offset + one.size;
         total.alignment = total.alignment.max(one.alignment);
+    }
+    if total.alignment == 0 {
+        total.alignment = KIB_64;
     }
     total
 }
@@ -1518,6 +1521,24 @@ fn room_percent() -> u64 {
     })
 }
 
+/// Whether two half-open byte ranges share a byte: `[a_start, a_start +
+/// a_len)` and `[b_start, b_start + b_len)`. A range of no bytes shares
+/// none, and the ranges end at the last address there is.
+pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return false;
+    }
+    a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+/// Whether [`let_go_idle`] and [`evict_placed_in`] let host copies go at
+/// all: `VICTORY_TEXTURE_SWEEP=0` keeps every one.
+#[cfg(windows)]
+fn sweeping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1545,8 +1566,7 @@ fn room_percent() -> u64 {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    if !sweeping() {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
@@ -1598,6 +1618,83 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Lets go of the host copies of the placed textures the title fills that
+/// `[base, base + len)` covers, at once: the runtime unmapped or moved
+/// those pages of title memory (`crate::title_memory_remapped`), so what
+/// those host copies were filled from is gone and a copy of it is memory
+/// held for a texture the title has finished with. Where [`let_go_idle`]
+/// waits `IDLE_MS` and `IDLE_FRAMES` frames, this goes now: unmapping the
+/// memory is how the title says it is done with it (a streamed texture the
+/// title unmaps otherwise sat in the card for seconds more, and the run
+/// paged).
+///
+/// A host copy goes only when only the resource holds it, as in
+/// [`let_go_idle`]: a list not yet reset or a descriptor slot still names
+/// it, and it stays until they let it go (the next use makes it anew from
+/// title memory, which is what the title just mapped). Nothing here waits
+/// on a fence, so no submission is held up.
+/// Returns how many host copies went.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+#[cfg(windows)]
+pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !sweeping() || len == 0 {
+        return 0;
+    }
+    // For the trail (`crate::host::trail`): how many went, their bytes,
+    // and the first one.
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let size = footprint(&r.desc).map_or(0, |f| f.size);
+        if !ranges_overlap(r.data() as u64, size, base, len) {
+            continue;
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let only_here = made.as_ref().is_some_and(|(host, _)| {
+                std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            });
+            if only_here {
+                // Under the lock: the next use must not find the staging
+                // state of the texture let go (it says "uploaded").
+                crate::texture::unstage(at as This);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            went += 1;
+            bytes += host.bytes;
+            if first.is_none() {
+                first = Some(at);
+            }
+            crate::host::retire(host);
+        }
+    }
+    if went > 0 {
+        crate::host::trail(|| {
+            format!(
+                "unmapped: {went} host copies of placed textures let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                bytes >> 10,
+                first.unwrap_or(0)
+            )
+        });
+    }
+    went
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -2183,23 +2280,27 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
-/// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// Normalizes a placed resource description for keying: words 1 and 13 are
+/// struct padding (after `dimension`, and at the end) where the title leaves
+/// uninitialized stack values, so two views of the same texture can differ
+/// only there. `VICTORY_PLACED_FILLER=1` keeps them unchanged.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    // Words 1 and 13 of the description are the filler of its layout
-    // (after the dimension, and at the end): the title leaves there what
-    // its stack held, and two views of one texture that differed only in
-    // them each got a resource and a host copy of their own, on a card
-    // that fills at world entry. They are not part of what a texture is.
-    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
+pub(crate) fn placed_desc_key(desc: &[u32; 14]) -> [u32; 14] {
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
         key[1] = 0;
         key[13] = 0;
     }
+    key
+}
+
+/// The resource for a texture placed at `address` with the resource
+/// description `desc` (as words), made on first use.
+#[cfg(windows)]
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let raw = *desc;
+    let key = placed_desc_key(desc);
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
@@ -2241,6 +2342,99 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
+/// The resource for an unordered access view of a texture placed at
+/// `address` with resource description `desc` and view format `view_format`
+/// (0: the resource's own): an existing unordered-access texture at that
+/// address when its format allows the view, else a placed unordered-access
+/// resource made on first use (starting in `UNORDERED_ACCESS` and recorded
+/// in [`TARGETS_AT`] so shader views placed at `address` find its texels
+/// through [`alias_of`]).
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let own = pc_format(d.format);
+    let wanted = if view_format == 0 {
+        own
+    } else {
+        pc_format(view_format)
+    };
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other) = targets.get(&address) {
+            let o = resource(other as This);
+            let o_fmt = target_format(pc_format(o.desc.format));
+            let w_fmt = target_format(wanted);
+            let typeless = family(o_fmt) == o_fmt && family(o_fmt + 1) == o_fmt;
+            let srgb = SRGB.iter().any(|&(s, _)| s == o_fmt);
+            let compatible = o_fmt == w_fmt || ((typeless || srgb) && family(w_fmt) == family(o_fmt));
+            if o.desc.dimension == d.dimension
+                && o.desc.width == d.width
+                && o.desc.height == d.height
+                && o.desc.mip_levels == d.mip_levels
+                && o.desc.depth_or_array_size == d.depth_or_array_size
+                && o.desc.sample_count <= 1
+                && d.sample_count <= 1
+                && o.desc.flags & (DEPTH | UNORDERED) == UNORDERED
+                && compatible
+            {
+                return Some(other as This);
+            }
+        }
+    }
+    let mut r = *desc;
+    r[12] = (r[12] & !DEPTH) | UNORDERED;
+    if view_format != 0 && target_format(own) != target_format(wanted) {
+        if family(own) == family(wanted) {
+            r[8] = family(wanted);
+        } else if element(own) == element(wanted) {
+            r[8] = wanted;
+        }
+    }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = map.get(&(address, r)) {
+        return Some(existing as This);
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let uav_desc = unsafe { r.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        uav_desc,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        UNORDERED_ACCESS,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    if made != S_OK {
+        return None;
+    }
+    map.insert((address, r), out as usize);
     resource(out)
         .host
         .placed
@@ -2481,6 +2675,33 @@ mod tests {
     }
 
     #[test]
+    fn ranges_overlap_handles_boundaries_zero_len_and_overflow() {
+        // Side by side, in both orders: nothing shared.
+        assert!(!ranges_overlap(0, KIB_64, KIB_64, KIB_64));
+        assert!(!ranges_overlap(KIB_64, KIB_64, 0, KIB_64));
+        // A byte of one inside the other: shared.
+        assert!(ranges_overlap(0, KIB_64, KIB_64 - 1, KIB_64));
+        assert!(ranges_overlap(KIB_64 - 1, KIB_64, 0, KIB_64));
+        // One wholly inside the other: shared, and either way round.
+        assert!(ranges_overlap(0, 4 * KIB_64, KIB_64, KIB_64));
+        assert!(ranges_overlap(KIB_64, KIB_64, 0, 4 * KIB_64));
+        // Nothing at all shares nothing, wherever it is.
+        assert!(!ranges_overlap(0, 0, 0, KIB_64));
+        assert!(!ranges_overlap(0, KIB_64, 0, 0));
+        assert!(!ranges_overlap(0, 0, 0, 0));
+        assert!(!ranges_overlap(u64::MAX, 0, u64::MAX, 0));
+        // A range running off the end of the address space does not wrap
+        // into a false `true`: `saturating_add` stops it at the last
+        // address, so what starts there ends there too. No title address
+        // comes near, and nothing panics.
+        assert!(!ranges_overlap(u64::MAX, u64::MAX, 0, 1));
+        assert!(!ranges_overlap(0, 1, u64::MAX, 1));
+        assert!(!ranges_overlap(u64::MAX, 1, u64::MAX, 1));
+        assert!(ranges_overlap(u64::MAX - 1, 1, u64::MAX - 1, 1));
+        assert!(ranges_overlap(u64::MAX - 1, u64::MAX, u64::MAX - 1, 1));
+    }
+
+    #[test]
     fn heaps_are_zeroed_aligned_memory() {
         let heap = heap(1 << 20);
         // SAFETY: a heap we just made.
@@ -2629,6 +2850,66 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+
+        // Standalone 4 KiB console textures must preserve their 4 KiB alignment
+        // through `allocation_info` / `allocation_info2`, rather than clamping up
+        // to 64 KiB; empty queries still default to 64 KiB.
+        let bc7_desc = texture(512, 512, 98, 10);
+        allocation_info(&mut info, std::ptr::null(), 0, 1, &bc7_desc);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        let mut each = std::array::from_fn::<_, 2, _>(|_| AllocationInfo1 {
+            offset: 0,
+            alignment: 0,
+            size: 0,
+        });
+        let two_bc7 = [
+            ResourceDesc1 {
+                desc: bc7_desc,
+                mip_region: [0; 3],
+            },
+            ResourceDesc1 {
+                desc: bc7_desc,
+                mip_region: [0; 3],
+            },
+        ];
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            two_bc7.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 2 * 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        assert_eq!(each[0].alignment, 0x1000);
+        assert_eq!(each[1].offset, 0x56000);
+
+        // Fallback path (`footprint` without `texture_layout`) rounds `size`
+        // up to `alignment`, not unconditionally to 64 KiB.
+        let aligned_buf = ResourceDesc {
+            alignment: MIB_4,
+            ..buffer(100)
+        };
+        allocation_info(&mut info, std::ptr::null(), 0, 1, &aligned_buf);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: MIB_4,
+                alignment: MIB_4,
+            }
+        );
     }
 
     #[test]

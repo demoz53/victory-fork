@@ -548,6 +548,7 @@ pub extern "system" fn ReadFile(
     } else {
         drop(writing);
     }
+    // SAFETY: SetLastError only sets this thread's last-error value.
     unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
     done
 }

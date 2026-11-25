@@ -85,7 +85,29 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                if let Ok(requested) = std::env::var("VICTORY_SHADER_ADAPTER") {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    let requested = requested.to_lowercase();
+                    let mut index = 0;
+                    loop {
+                        let adapter = factory.EnumAdapters1(index).map_err(|e| {
+                            format!("cannot select hardware adapter {requested:?}: {e}")
+                        })?;
+                        let desc = adapter.GetDesc1().map_err(err)?;
+                        let end = desc.Description.iter().position(|&c| c == 0)
+                            .unwrap_or(desc.Description.len());
+                        let name = String::from_utf16_lossy(&desc.Description[..end]);
+                        if desc.Flags & 2 == 0 && name.to_lowercase().contains(&requested) {
+                            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                                .map_err(err)?;
+                            break;
+                        }
+                        index += 1;
+                    }
+                } else {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                }
                 // A machine without a graphics card gives the software
                 // adapter as its default device (a hosted test runner,
                 // whose first adapter is a display stub that cannot make a
@@ -121,6 +143,29 @@ impl Host {
             }
             Ok(Host { device })
         }
+    }
+
+    /// The device's wave sizes (`WaveLaneCountMin`, `WaveLaneCountMax`); `None` if it does not
+    /// say.
+    pub fn wave_lanes(&self) -> Option<(u32, u32)> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a valid out pointer of the feature's own type and size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .ok()?;
+        }
+        Some((o.WaveLaneCountMin, o.WaveLaneCountMax))
+    }
+
+    /// Whether the device can run waves of `lanes` (a program declaring `WaveSize(lanes)`);
+    /// true when it does not say.
+    pub fn runs_waves_of(&self, lanes: u32) -> bool {
+        self.wave_lanes().is_none_or(|(min, max)| (min..=max).contains(&lanes))
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -618,6 +663,8 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV pointing to a buffer in the dispatch's UAV outputs.
+    OutputUav(usize),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -855,7 +902,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::OutputUav(_) => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -986,6 +1035,8 @@ pub enum View<'a> {
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw buffer UAV initialized from these dwords.
+    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1224,7 +1275,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1236,6 +1287,10 @@ impl Host {
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
+                            View::RawUavData(data) => {
+                                let n = data.len() as u32;
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
@@ -1244,6 +1299,16 @@ impl Host {
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
                             D3D12_RESOURCE_STATE_COMMON,
                         )?;
+                        if let View::RawUavData(data) = v {
+                            let initial = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &initial, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(initial);
+                        }
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
                             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1389,6 +1454,10 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::OutputUav(index) => {
+                        let (b, ..) = uavs.get(*index).ok_or("missing dispatch UAV")?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
                     }
                 }
             }
