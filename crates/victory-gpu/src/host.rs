@@ -6141,7 +6141,13 @@ impl HostList {
                         staging.note_upload();
                     }
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if wide_textures() {
+                            batch.texture_later(staging);
+                        } else {
+                            staging.refresh();
+                        }
+                    } else if *uploads && wide_textures() {
+                        batch.noted_upload(staging);
                     }
                     continue;
                 }
@@ -6216,6 +6222,31 @@ struct Batch {
     index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`wide_textures`]: the textures due to be refreshed at the next
+    /// flush, in order, and whether a list noted an upload of one after it
+    /// came due (that note is made again once it is refreshed).
+    pending: Vec<(std::sync::Arc<crate::texture::Staging>, bool)>,
+}
+
+/// Whether the textures a submission brings up to date are detiled on
+/// several threads, all of those due before the next title write together
+/// (`VICTORY_WIDE_TEXTURES=0`: one after the other where their step is, as
+/// before).
+///
+/// Each texture's refresh reads its own title memory (asking the write
+/// watch, hashing, reading through the kernel where pages may be missing)
+/// and writes its own staging buffer, and it was done on the submitting
+/// thread one texture at a time: the frame line's "textures", 15-33 ms of
+/// the 89-139 ms of preparing in gpu-w1, with the card idle behind us for
+/// 64 ms a frame. They now run on the threads kept for the snapshots and
+/// the refreshes of host copies, at the flush that precedes the next step
+/// writing title memory (as the copies' refreshes are): nothing between the
+/// texture's step and that flush writes title memory or reads its staging
+/// buffer on the CPU, and the lists that copy from it run on the card
+/// afterwards.
+fn wide_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0"))
 }
 
 impl Batch {
@@ -6272,7 +6303,49 @@ impl Batch {
         self.textures.clear();
     }
 
+    /// With [`wide_textures`]: `staging` is due; refreshed at the next flush.
+    fn texture_later(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        self.pending.push((staging.clone(), false));
+    }
+
+    /// With [`wide_textures`]: a list noted an upload of `staging`, which
+    /// may be waiting for the flush: if so the note is made again after its
+    /// refresh, as when the refresh ran where its step was.
+    fn noted_upload(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        if let Some(entry) = self.pending.iter_mut().rev().find(|(s, _)| std::sync::Arc::ptr_eq(s, staging)) {
+            entry.1 = true;
+        }
+    }
+
+    /// The textures due ([`wide_textures`]), on several threads.
+    fn refresh_textures(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        // The time counted is the time it took, not the threads' sum.
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = pending
+            .into_iter()
+            .map(|(staging, noted)| {
+                Box::new(move || {
+                    staging.refresh();
+                    if noted {
+                        staging.note_upload();
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+    }
+
     fn flush(&mut self) {
+        // The textures first, where they were refreshed before: ahead of
+        // the copies' asking of the write watch.
+        self.refresh_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
