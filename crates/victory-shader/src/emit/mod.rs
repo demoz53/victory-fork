@@ -186,8 +186,52 @@ pub fn group_sync() -> u8 {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    if let Some(passes) = OPT_FOR.get() {
+        return passes;
+    }
+    run_shader_opt()
+}
+
+/// The run's clean-up passes (`VICTORY_SHADER_OPT`), whatever
+/// [`with_shader_opt`] gives the program being translated.
+pub fn run_shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+thread_local! {
+    /// The passes [`with_shader_opt`] gives the translation on this thread.
+    static OPT_FOR: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (a translation) with the clean-up passes `passes` instead of the
+/// run's: for telling which program a clean-up fault is in
+/// (`victory-gpu`'s `VICTORY_SHADER_OPT_RANGE`).
+pub fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    let was = OPT_FOR.replace(Some(passes & bitcode::opt::ALL));
+    let r = f();
+    OPT_FOR.set(was);
+    r
+}
+
+/// `VICTORY_SHADER_OPT_RANGE`'s bounds (`lo-hi`, hexadecimal, read as the
+/// leading digits of a 64-bit hash: `0-8` is the first half, `8-` the
+/// second): whether the 16-digit `hash` lies in `[lo, hi)`. None if the
+/// value is not of that form. Pure, for testing.
+pub fn in_opt_range(range: &str, hash: &str) -> Option<bool> {
+    let bound = |s: &str| -> Option<u64> {
+        let s = s.trim();
+        if s.is_empty() || s.len() > 16 {
+            return None;
+        }
+        let v = u64::from_str_radix(s, 16).ok()?;
+        Some(v << (4 * (16 - s.len())))
+    };
+    let (lo, hi) = range.split_once('-')?;
+    let lo = bound(lo)?;
+    let hi = if hi.trim().is_empty() { None } else { Some(bound(hi)?) };
+    let h = u64::from_str_radix(hash.get(..16)?, 16).ok()?;
+    Some(h >= lo && hi.is_none_or(|hi| h < hi))
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
@@ -860,6 +904,28 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    #[test]
+    fn a_clean_up_range_takes_the_hashes_between_its_bounds() {
+        use super::in_opt_range;
+        let (low, mid, high) = ("0123456789abcdef", "8000000000000000", "ffffffffffffffff");
+        assert_eq!(in_opt_range("0-8", low), Some(true));
+        assert_eq!(in_opt_range("0-8", mid), Some(false));
+        assert_eq!(in_opt_range("8-", mid), Some(true));
+        assert_eq!(in_opt_range("8-", high), Some(true));
+        assert_eq!(in_opt_range("8-", low), Some(false));
+        assert_eq!(in_opt_range("01-02", low), Some(true));
+        assert_eq!(in_opt_range("0123456789abcdef-0123456789abcdf0", low), Some(true));
+        assert_eq!(in_opt_range("0-", low), Some(true));
+        for bad in ["", "8", "x-9", "-", "0-12345678901234567"] {
+            assert_eq!(in_opt_range(bad, low), None, "{bad:?}");
+        }
+        // the passes one translation is given, and the run's again after it
+        let run = super::run_shader_opt();
+        assert_eq!(super::with_shader_opt(0, super::shader_opt), 0);
+        assert_eq!(super::with_shader_opt(59, super::shader_opt), 59);
+        assert_eq!(super::shader_opt(), run);
     }
 
     #[test]

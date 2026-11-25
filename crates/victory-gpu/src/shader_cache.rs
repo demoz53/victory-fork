@@ -66,6 +66,9 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_LDS_REGIONS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    "VICTORY_SHADER_OPT_RANGE",
+                    "VICTORY_SHADER_OPT_IN",
+                    "VICTORY_SHADER_OPT_STAGE",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -75,7 +78,7 @@ fn build() -> &'static [u8; 32] {
                     bytes.push(0);
                 }
                 // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                bytes.extend_from_slice(&victory_shader::emit::run_shader_opt().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
