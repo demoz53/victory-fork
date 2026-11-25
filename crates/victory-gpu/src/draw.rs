@@ -663,14 +663,19 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     // A fill reads title memory at submission, and settles the flights
     // whose shaders may write it: copied on the card instead, behind them
     // (`crate::host::fill_on_card`, as a table's constant buffer view is).
-    if crate::host::late() && crate::host::flights_write(address as usize, (address + len) as usize) {
+    let flights = crate::host::late() && crate::host::flights_write(address as usize, (address + len) as usize);
+    if flights {
         FILL_FLIGHTS[0].fetch_add(1, Ordering::Relaxed);
-        if crate::host::fill_on_card() {
-            shadow.refresh(list, address, len);
-            if let Some(gpu) = list.card_constants(&shadow, address, len) {
-                FILL_FLIGHTS[1].fetch_add(1, Ordering::Relaxed);
-                return Some(gpu);
-            }
+    }
+    let written = !flights && crate::host::late() && crate::host::fill_written_on_card() && shadow.shaders_wrote();
+    if written {
+        FILL_FLIGHTS[6].fetch_add(1, Ordering::Relaxed);
+    }
+    if (flights || written) && crate::host::fill_on_card() {
+        shadow.refresh(list, address, len);
+        if let Some(gpu) = list.card_constants(&shadow, address, len) {
+            FILL_FLIGHTS[1].fetch_add(1, Ordering::Relaxed);
+            return Some(gpu);
         }
     }
     let (gpu, to) = list.scratch(len)?;
@@ -684,7 +689,10 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
 /// (`crate::host::fill_on_card`): of root constant views, then of table
 /// constant views, then of these the ones with no host copy to copy from,
 /// then of texture copies' sources (`crate::list`).
-pub(crate) static FILL_FLIGHTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Then the fills copied on the card instead because shaders have written
+/// their host copy before (`crate::host::fill_written_on_card`), not
+/// counted above.
+pub(crate) static FILL_FLIGHTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -1696,6 +1704,20 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        // While many host copies are being made (the world loading: the
+        // last pass made 16 or more), those the slots' views read are made
+        // first, on several threads (`shadow::buffer_makers`); the look at
+        // each slot below then finds them made.
+        static MADE_BY_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+        let made_before = crate::shadow::COPIES_MADE.load(Ordering::Relaxed);
+        let last = MADE_BY_LAST.load(Ordering::Relaxed);
+        if crate::shadow::buffer_makers() && slots.len() >= 256 && (last == u64::MAX || last >= 16) {
+            let views: Vec<crate::descriptor::View> = slots
+                .iter()
+                .filter_map(|&index| heap.handle(index).and_then(crate::descriptor::view))
+                .collect();
+            crate::shadow::make_ahead(views);
+        }
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1732,6 +1754,7 @@ impl State {
             ranges.insert(index, (shadow, address, address + len, unordered));
         }
         let views = ranges.len() as u32;
+        MADE_BY_LAST.store(crate::shadow::COPIES_MADE.load(Ordering::Relaxed) - made_before, Ordering::Relaxed);
         let slots_done = std::time::Instant::now();
         HEAP_PASS_PARTS[9].fetch_add((slots_done - started).as_micros() as u64, Ordering::Relaxed);
         // Per host copy, the span its picked views cover.
@@ -2642,12 +2665,21 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 let view = crate::descriptor::view(table + u64::from(k) * 32);
-                let over = matches!(view, Some(View::Constant(address, size))
+                let flights = matches!(view, Some(View::Constant(address, size))
                     if crate::host::late()
                         && crate::host::flights_write(address as usize, address as usize + size as usize));
-                if over {
+                if flights {
                     FILL_FLIGHTS[2].fetch_add(1, Ordering::Relaxed);
                 }
+                let written = !flights
+                    && crate::host::late()
+                    && crate::host::fill_written_on_card()
+                    && matches!(view, Some(View::Constant(address, size))
+                        if crate::shadow::find(address, u64::from(size)).is_some_and(|s| s.shaders_wrote()));
+                if written {
+                    FILL_FLIGHTS[6].fetch_add(1, Ordering::Relaxed);
+                }
+                let over = flights || written;
                 match view {
                     Some(View::Constant(address, size))
                         if over
@@ -3431,8 +3463,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
+            let aliasing = std::time::Instant::now();
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            crate::texture::UPLOAD_PARTS[4].fetch_add(aliasing.elapsed().as_micros() as u64, Ordering::Relaxed);
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
