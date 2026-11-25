@@ -1599,6 +1599,35 @@ pub(crate) fn room() -> bool {
     }
 }
 
+/// Whether a bake draw's own sources may still be made while [`room`] says
+/// no: up to a higher share of the card's budget, 96 percent unless
+/// `VICTORY_BAKE_ROOM_PERCENT` says another (from [`room_percent`] to 98;
+/// 0: never). A bake samples its sources once, and what it bakes from a
+/// texture never made stays for the run (black faces); a few dozen MB past
+/// the line are worth that, and the line keeps the rest of the queue
+/// waiting. Not with `VICTORY_TEXTURE_BUDGET_MB`, a limit of its own.
+#[cfg(windows)]
+pub(crate) fn room_for_bake() -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
+            return 0;
+        }
+        match std::env::var("VICTORY_BAKE_ROOM_PERCENT").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(0) => 0,
+            Some(percent) => percent.clamp(room_percent(), 98),
+            None => 96u64.max(room_percent()),
+        }
+    });
+    if percent == 0 {
+        return false;
+    }
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => used < budget / 100 * percent,
+        None => false,
+    }
+}
+
 /// The share of the card's budget, in percent, up to which host copies of
 /// textures picked by index are made ([`room`]): 90 unless
 /// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a

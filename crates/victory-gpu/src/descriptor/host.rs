@@ -1310,6 +1310,24 @@ impl HostHeap {
         textures.due(frame, max)
     }
 
+    /// Of the title slots `among`, in their order, those the queue holds
+    /// due for an upload at `frame`, with the write each was handed out as
+    /// (as [`HostHeap::texture_slots_due`]): a bake's own sources, which go
+    /// first in the pass before it.
+    pub(crate) fn texture_slots_due_of(&self, frame: u64, among: &[u32]) -> Vec<(u32, u64)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(u32, u64)> = Vec::new();
+        for &index in among {
+            if out.iter().any(|&(i, _)| i == index) {
+                continue;
+            }
+            if let Some(w) = textures.slots.get(&index).filter(|w| w.due <= frame) {
+                out.push((index, w.write));
+            }
+        }
+        out
+    }
+
     /// Every title slot of the queue that is due at `frame`, and whether
     /// it was uploaded before (in part, or whole and waiting for another
     /// look): for the card accounting line
