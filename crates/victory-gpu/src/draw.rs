@@ -527,6 +527,13 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+/// [`RECHECK_FRAMES`] with `VICTORY_HEAP_RECHECK=dense`: two more looks,
+/// for textures still streaming in a minute or more after their upload.
+const RECHECK_FRAMES_DENSE: [u64; 7] = [4, 12, 40, 120, 400, 1200, 3600];
+
+fn recheck_frames() -> &'static [u64] {
+    if crate::texture::dense_recheck() { &RECHECK_FRAMES_DENSE } else { &RECHECK_FRAMES }
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1908,7 +1915,7 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    match recheck_frames().get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
@@ -2065,7 +2072,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    host.texture_slot_recheck(index, write, frame + recheck_frames()[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
