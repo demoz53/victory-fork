@@ -254,6 +254,36 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
 }
 
+/// Whether the clean-up passes keep `dx.op.createHandleFromHeap` in its own
+/// block, as they keep `annotateHandle` (`VICTORY_HEAP_HANDLE_LOCAL=1`): one
+/// block's handle is not reused by the blocks it dominates. Off by default:
+/// reused, as before. Same-block reuse and dead-code removal stay. From
+/// DexNom/VIctory PR #7 (an AMD compiler crash there); here a lead for the
+/// face blotches that `VICTORY_SHADER_OPT=0` removes. It changes the code of
+/// most programs: a run with it makes their pipelines anew. Part of the
+/// translation: the shader cache keys on it (`victory-gpu`'s does).
+pub fn heap_handles_local() -> bool {
+    if let Some(on) = HEAP_HANDLES_LOCAL_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_HANDLE_LOCAL").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// [`with_heap_handles_local`]'s setting for translations on this thread.
+    static HEAP_HANDLES_LOCAL_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`heap_handles_local`] giving `on` on this thread (tests).
+pub fn with_heap_handles_local<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = HEAP_HANDLES_LOCAL_HERE.replace(Some(on));
+    let r = f();
+    HEAP_HANDLES_LOCAL_HERE.set(was);
+    r
+}
+
 /// `VICTORY_RT_MISS=1`: every ray-tracing node test
 /// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) returns "no
 /// node hit" (`0xffffffff` in its four results) without reading the node,

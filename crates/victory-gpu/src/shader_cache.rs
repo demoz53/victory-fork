@@ -95,6 +95,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_PIXEL_HELPERS",
                     "VICTORY_LDS_FIT",
                     "VICTORY_HALF_BITS",
+                    "VICTORY_HEAP_HANDLE_LOCAL",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
