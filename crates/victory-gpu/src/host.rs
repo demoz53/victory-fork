@@ -8334,4 +8334,40 @@ mod fill_on_card_tests {
         assert!(title[64..1088].iter().all(|&b| b == 0xAA));
         crate::shadow::unregister(resource, start);
     }
+
+    #[test]
+    fn vram_idle_ms_scales_with_pressure() {
+        use super::vram_idle_ms;
+        let gib = 1024 * 1024 * 1024;
+        // Normal (< 75%)
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
+        // Moderate (75%..85%)
+        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
+        // High (>= 85%, including over-budget)
+        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        // Missing or zero budget falls back to normal
+        assert_eq!(vram_idle_ms(None), 5_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn ram_idle_ms_scales_with_pressure() {
+        use super::ram_idle_ms;
+        let gib = 1024 * 1024 * 1024;
+        // Normal (>= 4 GiB)
+        assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
+        assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);
+        // Moderate (2 GiB..4 GiB)
+        assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 5_000);
+        assert_eq!(ram_idle_ms(Some(2 * gib)), 5_000);
+        // High (< 2 GiB)
+        assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
+        assert_eq!(ram_idle_ms(Some(0)), 2_000);
+        // Missing falls back to normal
+        assert_eq!(ram_idle_ms(None), 10_000);
+    }
 }
