@@ -48,6 +48,9 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// With [`pieces`]: per page, which of its kernel pages the last
+    /// askings found written ([`Pieces`]).
+    pieces: BTreeMap<usize, Pieces>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -57,7 +60,127 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    pieces: BTreeMap::new(),
 });
+
+/// The kernel pages of a page, one bit each.
+const PIECES: usize = PAGE / KERNEL_PAGE;
+const _: () = assert!(PIECES == 16);
+/// Every kernel page of a page: what a write of unknown extent marks, and
+/// what a copy takes when the history cannot say.
+pub(crate) const ALL_PIECES: u16 = u16::MAX;
+
+/// A page's last writes by kernel page: the askings that found it written
+/// (the latest last; 0 for none) and the kernel pages each found. A copy
+/// that last took the page at asking `a` needs the pieces of the askings
+/// after `a`, which are all here if `a` is at or after `lost`.
+#[derive(Clone, Copy, Default)]
+struct Pieces {
+    last: [(u64, u16); PIECE_HISTORY],
+    /// The latest asking whose pieces are no longer here.
+    lost: u64,
+}
+
+/// How many askings a page's [`Pieces`] remember. A copy refreshed less
+/// often than its page is written takes the whole page, as without them.
+const PIECE_HISTORY: usize = 4;
+
+/// Whether a host copy's refresh takes only the kernel pages (4 KiB) the
+/// title wrote of each written page (64 KiB), not the whole page
+/// (`VICTORY_SUBPAGE_COPIES=1`; off by default).
+///
+/// The journal keeps 64 KiB pages: the checks of the world's big buffers
+/// walk them, and finer pages made those checks cost more than the copies
+/// they saved. But the kernel's answers name 4 KiB pages, and a 64 KiB page
+/// one 4 KiB write touched was copied whole: 120-130 MB of page copies a
+/// frame, 20-23 ms ("moves"), and what is copied goes up to the copies in
+/// the card's memory after it (70-80 MB a frame). With the switch the
+/// journal also keeps, per page, the kernel pages its last few askings
+/// found written ([`Pieces`]), and a refresh copies those of the askings
+/// since it last took the page; the whole page when that history is
+/// incomplete (written more often than refreshed, written by a guard's
+/// fault or by our own writes of unknown extent, never copied).
+pub(crate) fn pieces() -> bool {
+    #[cfg(test)]
+    if FORCE_PIECES.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBPAGE_COPIES").is_some_and(|v| v == "1"))
+}
+
+/// Tests: [`pieces`] on, whatever the switch says. Pages noted before it
+/// was set have no pieces and are copied whole.
+#[cfg(test)]
+pub(crate) static FORCE_PIECES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Notes that asking `asking` found kernel pages `mask` of page `page`
+/// written ([`pieces`]). An asking older than the latest noted counts as
+/// the latest: a copy that needs it needs that one too.
+fn note_pieces(j: &mut Journal, page: usize, asking: u64, mask: u16) {
+    let p = j.pieces.entry(page).or_default();
+    let newest = &mut p.last[PIECE_HISTORY - 1];
+    if newest.0 != 0 && asking <= newest.0 {
+        newest.1 |= mask;
+        return;
+    }
+    let oldest = p.last[0].0;
+    p.lost = p.lost.max(oldest);
+    p.last.rotate_left(1);
+    p.last[PIECE_HISTORY - 1] = (asking, mask);
+}
+
+/// Notes a write of page `page` at asking `asking` in the journal, with
+/// the kernel pages it wrote ([`pieces`]).
+fn note_written(j: &mut Journal, page: usize, asking: u64, mask: u16) {
+    j.written.insert(page, asking);
+    if pieces() {
+        note_pieces(j, page, asking, mask);
+    }
+}
+
+/// The kernel pages of `[at, at + len)` in page `page`, one bit each.
+fn pieces_of(page: usize, at: usize, len: usize) -> u16 {
+    let (start, end) = ((page * PAGE).max(at), ((page + 1) * PAGE).min(at.saturating_add(len)));
+    if start >= end {
+        return 0;
+    }
+    let (first, last) = ((start - page * PAGE) / KERNEL_PAGE, (end - page * PAGE).div_ceil(KERNEL_PAGE));
+    (first..last).fold(0u16, |mask, piece| mask | 1 << piece)
+}
+
+/// With [`pieces`]: for each `(page, last written, last taken)` of a copy's
+/// stale pages, the kernel pages written since it last took the page
+/// ([`ALL_PIECES`] where the journal cannot say: never taken, the history
+/// does not reach back so far, or a write it does not hold the pieces of).
+pub(crate) fn pieces_since(pages: &[(usize, u64, u64)]) -> Vec<u16> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    pages.iter().map(|&(page, written, taken)| pieces_after(j.pieces.get(&page), written, taken)).collect()
+}
+
+/// [`pieces_since`] of one page whose pieces are `pieces`.
+fn pieces_after(pieces: Option<&Pieces>, written: u64, taken: u64) -> u16 {
+    match pieces {
+        Some(p) if taken != 0 && taken >= p.lost && written <= p.last[PIECE_HISTORY - 1].0 => {
+            p.last.iter().filter(|e| e.0 > taken).fold(0, |mask, e| mask | e.1)
+        }
+        _ => ALL_PIECES,
+    }
+}
+
+/// Groups the kernel's answer (4 KiB page addresses, in order) by page:
+/// `(page, kernel pages)`.
+fn by_page(found: &[usize]) -> Vec<(usize, u16)> {
+    let mut pages: Vec<(usize, u16)> = Vec::new();
+    for &at in found {
+        let (page, piece) = (at / PAGE, (at % PAGE) / KERNEL_PAGE);
+        match pages.last_mut() {
+            Some(last) if last.0 == page => last.1 |= 1 << piece,
+            _ => pages.push((page, 1 << piece)),
+        }
+    }
+    pages
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -218,6 +341,7 @@ pub(crate) fn forget_pages(start: usize, end: usize) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     j.written.retain(|&page, _| !(first..last).contains(&page));
+    j.pieces.retain(|&page, _| !(first..last).contains(&page));
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking
@@ -232,7 +356,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     let now = j.asked;
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        note_written(&mut j, page, now, pieces_of(page, at, len));
     }
 }
 
@@ -287,9 +411,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+    for (page, mask) in by_page(&j.found[..count]) {
+        note_written(j, page, now, mask);
     }
     true
 }
@@ -368,9 +491,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    // A guard's block is a page: all of it.
+    let pages: Vec<(usize, u16)> =
+        by_page(&j.found[..count]).into_iter().chain(guarded.into_iter().map(|page| (page, ALL_PIECES))).collect();
+    for (page, mask) in pages {
+        note_written(j, page, now, mask);
     }
     Some((
         now,
@@ -453,31 +578,59 @@ fn kernel_open_long() -> bool {
 /// and guards them again) or [`KernelWrite::pending`] says the write goes
 /// on.
 #[must_use = "the blocks may be guarded again as soon as it is dropped"]
-pub struct KernelWrite(u64);
+pub struct KernelWrite {
+    write: u64,
+    /// The title's write ([`title_writing`]): `[at, at + len)`.
+    title: Option<(usize, usize)>,
+}
 
 impl KernelWrite {
     /// The write goes on after the call that started it returned (an
     /// overlapped read the kernel finishes later): its blocks stay writable
     /// for [`KERNEL_OPEN_MS`] from now.
-    pub fn pending(self) {
-        if self.0 != 0 {
+    pub fn pending(mut self) {
+        if self.write != 0 {
             let until = crate::host::now_ms().saturating_add(KERNEL_OPEN_MS);
             let mut g = guards();
-            for open in g.kernel.iter_mut().filter(|open| open.write == self.0) {
+            for open in g.kernel.iter_mut().filter(|open| open.write == self.write) {
                 open.until = until;
                 open.write = 0;
             }
+            self.write = 0;
         }
-        std::mem::forget(self);
+        // Dropped: the journal hears of it now ([`title_writing`]).
     }
 }
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
-        if self.0 != 0 {
-            let id = self.0;
+        if self.write != 0 {
+            let id = self.write;
             guards().kernel.retain(|open| open.write != id);
         }
+        if let Some((at, len)) = self.title {
+            journal_written(at, len);
+        }
+    }
+}
+
+/// With [`pieces`]: the title's write through the kernel into `[at, at +
+/// len)` is done; the journal takes its pages as written now, with the
+/// kernel pages it wrote. The kernel's own answer should say as much; a
+/// write by a device that passes the page tables by would not, and a
+/// whole-page copy took it with the page's other writes.
+fn journal_written(at: usize, len: usize) {
+    if !pieces() || len == 0 {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    // Answers from the journal stand at or above what it holds
+    // ([`wrote`]).
+    j.ahead_asked = now;
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        note_written(&mut j, page, now, pieces_of(page, at, len));
     }
 }
 
@@ -813,11 +966,19 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Before the title's kernel read into its own memory `[at, at + len)`
+/// (the runtime calls it as `kernel_will_write`): [`writing`], and the
+/// journal hears of the write when it is done ([`journal_written`]).
+pub fn title_writing(at: usize, len: usize) -> KernelWrite {
+    let mut write = writing(at, len);
+    write.title = Some((at, len));
+    write
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks,
 /// which no guard makes read-only again until the returned [`KernelWrite`]
-/// is dropped, after the write. The runtime calls it (as
-/// `kernel_will_write`) before the title's kernel reads into its own memory.
+/// is dropped, after the write.
 pub fn writing(at: usize, len: usize) -> KernelWrite {
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     // The length is the title's (`fread`'s size times count, saturated).
@@ -848,7 +1009,7 @@ pub fn writing(at: usize, len: usize) -> KernelWrite {
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(write)
+    KernelWrite { write, title: None }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -1899,5 +2060,66 @@ mod wrote_tests {
             now >= w,
             "writes() returned now={now} < written timestamp w={w} after wrote()"
         );
+    }
+}
+
+#[cfg(test)]
+mod piece_tests {
+    use super::{ALL_PIECES, KERNEL_PAGE, PAGE, PIECE_HISTORY, Pieces, by_page, pieces_after, pieces_of};
+
+    /// The kernel pages a byte range covers, cut to the page.
+    #[test]
+    fn a_range_covers_the_kernel_pages_it_touches() {
+        assert_eq!(pieces_of(3, 3 * PAGE, 1), 1);
+        assert_eq!(pieces_of(3, 3 * PAGE + KERNEL_PAGE - 1, 2), 0b11);
+        assert_eq!(pieces_of(3, 3 * PAGE - 100, 200), 1, "begins in the page before");
+        assert_eq!(pieces_of(3, 2 * PAGE, 3 * PAGE), ALL_PIECES);
+        assert_eq!(pieces_of(3, 4 * PAGE, 10), 0, "outside");
+        assert_eq!(pieces_of(3, 4 * PAGE - 1, usize::MAX), 1 << 15, "to the end of the address space");
+    }
+
+    /// The kernel's answer, in order, folds into one mask per page.
+    #[test]
+    fn the_kernels_pages_fold_by_page() {
+        let found = [2 * PAGE, 2 * PAGE + 5 * KERNEL_PAGE, 3 * PAGE + 15 * KERNEL_PAGE, 9 * PAGE + KERNEL_PAGE];
+        assert_eq!(by_page(&found), vec![(2, 1 | 1 << 5), (3, 1 << 15), (9, 1 << 1)]);
+        assert!(by_page(&[]).is_empty());
+    }
+
+    /// A copy needs the pieces of the askings after the one it took the
+    /// page at; the whole page when the history does not reach back so far,
+    /// when it never took the page, or when the page was written without
+    /// pieces.
+    #[test]
+    fn the_history_says_what_a_copy_needs_or_gives_up() {
+        let mut j = super::Journal {
+            asked: 0,
+            written: Default::default(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+            pieces: Default::default(),
+        };
+        super::note_pieces(&mut j, 7, 10, 1);
+        super::note_pieces(&mut j, 7, 12, 1 << 3);
+        super::note_pieces(&mut j, 7, 12, 1 << 4);
+        // Out of order: counted with the latest.
+        super::note_pieces(&mut j, 7, 11, 1 << 9);
+        let p = j.pieces.get(&7).copied();
+        assert_eq!(pieces_after(p.as_ref(), 12, 9), 1 | 1 << 3 | 1 << 4 | 1 << 9);
+        assert_eq!(pieces_after(p.as_ref(), 12, 10), 1 << 3 | 1 << 4 | 1 << 9);
+        assert_eq!(pieces_after(p.as_ref(), 12, 12), 0, "taken after its last write");
+        assert_eq!(pieces_after(p.as_ref(), 12, 0), ALL_PIECES, "never taken");
+        assert_eq!(pieces_after(p.as_ref(), 13, 10), ALL_PIECES, "a write the history does not hold");
+        assert_eq!(pieces_after(None, 12, 10), ALL_PIECES, "no history");
+        // More askings than the history holds: the oldest goes.
+        for asking in 13..13 + PIECE_HISTORY as u64 - 1 {
+            super::note_pieces(&mut j, 7, asking, 1 << 6);
+        }
+        let p: Pieces = j.pieces[&7];
+        assert_eq!(p.lost, 10);
+        assert_eq!(pieces_after(Some(&p), 15, 9), ALL_PIECES, "from before what was lost");
+        assert_eq!(pieces_after(Some(&p), 15, 10), 1 << 3 | 1 << 4 | 1 << 9 | 1 << 6);
     }
 }

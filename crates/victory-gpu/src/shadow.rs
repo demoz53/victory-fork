@@ -2663,6 +2663,9 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        if crate::watch::pieces() {
+            return self.copy_stale_pieces(from, to, now, written);
+        }
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -2692,6 +2695,97 @@ impl Shadow {
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        bytes
+    }
+
+    /// [`Shadow::copy_stale`] with `crate::watch::pieces`: of each stale
+    /// page, only the kernel pages (4 KiB) written since the copy last took
+    /// it, where the journal can say; the whole page otherwise.
+    fn copy_stale_pieces(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        const KERNEL_PAGE: usize = 4096;
+        let base = self.start as usize / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        // The stale pages first: (page, last written, last taken).
+        let mut stale: Vec<(usize, u64, u64)> = Vec::new();
+        let mut writes = written.iter().peekable();
+        for page in from / PAGE..=(to - 1) / PAGE {
+            let write = match writes.peek() {
+                Some(&&(p, w)) if p == page => {
+                    writes.next();
+                    w
+                }
+                _ => 0,
+            };
+            let at = &mut copied[page - base];
+            if *at == 0 || write > *at {
+                stale.push((page, write, *at));
+                // A page only partly in the range is copied in part: it
+                // stays stale for the rest.
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+            }
+        }
+        if stale.is_empty() {
+            return 0;
+        }
+        let masks = crate::watch::pieces_since(&stale);
+        // Then their written kernel pages as runs of bytes, cut to the range
+        // (next to it shaders may be writing the copy).
+        let (mut bytes, mut run): (usize, Option<(usize, usize)>) = (0, None);
+        #[cfg(feature = "diagnostics")]
+        let mut left_out = 0usize;
+        for (&(page, _, _), &mask) in stale.iter().zip(&masks) {
+            #[cfg(feature = "diagnostics")]
+            if mask != crate::watch::ALL_PIECES {
+                let whole = ((page + 1) * PAGE).min(to).saturating_sub((page * PAGE).max(from));
+                let pieces = (0..16)
+                    .filter(|piece| mask & 1 << piece != 0)
+                    .map(|piece| {
+                        let a = page * PAGE + piece * KERNEL_PAGE;
+                        (a + KERNEL_PAGE).min(to).saturating_sub(a.max(from))
+                    })
+                    .sum::<usize>();
+                left_out += whole.saturating_sub(pieces);
+            }
+            let mut piece = 0;
+            while piece < 16 {
+                if mask & 1 << piece == 0 {
+                    piece += 1;
+                    continue;
+                }
+                let first = piece;
+                while piece < 16 && mask & 1 << piece != 0 {
+                    piece += 1;
+                }
+                let (a, e) = (
+                    (page * PAGE + first * KERNEL_PAGE).max(from),
+                    (page * PAGE + piece * KERNEL_PAGE).min(to),
+                );
+                if a >= e {
+                    continue;
+                }
+                match &mut run {
+                    Some(r) if r.1 == a => r.1 = e,
+                    _ => {
+                        if let Some((ra, re)) = run.replace((a, e)) {
+                            bytes += self.copy(ra, re);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((ra, re)) = run {
+            bytes += self.copy(ra, re);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::PieceBytesLeftOut, left_out as u64);
+            add(C::PiecePages, masks.iter().filter(|&&m| m != crate::watch::ALL_PIECES).count() as u64);
+            add(C::PiecePagesWhole, masks.iter().filter(|&&m| m == crate::watch::ALL_PIECES).count() as u64);
         }
         bytes
     }
@@ -3340,6 +3434,65 @@ mod skip_tests {
             assert_ne!(VirtualFree(title.cast(), 0, MEM_RELEASE), 0);
             // The journal is the process's: what it learnt here is not the
             // next allocation's at this address.
+            crate::watch::forget_pages(start, start + LEN);
+        }
+    }
+}
+
+#[cfg(test)]
+mod subpage_tests {
+    use super::{PAGE, Shadow};
+
+    /// With `watch::pieces`: a refresh takes only the 4 KiB pages the title
+    /// wrote of each written 64 KiB page, and the whole page when the
+    /// journal's history of it does not reach back to the copy's last take.
+    #[test]
+    fn a_refresh_takes_the_written_kernel_pages_or_the_whole_page() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        const PIECE: usize = 4096;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        crate::watch::FORCE_PIECES.store(true, std::sync::atomic::Ordering::Relaxed);
+        const LEN: usize = 2 * PAGE;
+        // SAFETY: a private write-watched region of the test's own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }
+            as *mut u8;
+        assert!(!title.is_null());
+        let start = title as usize;
+        let (buffer, data) = host.shared_buffer(LEN as u64).unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, start as u64, LEN as u64);
+        let at = |i: usize| (start + i) as *mut u8;
+        // SAFETY: the region and the copy's mapping hold LEN bytes.
+        unsafe {
+            std::ptr::write_bytes(title, 1, LEN);
+            assert_eq!(copy.update(start, LEN), LEN, "never taken: all of it");
+            assert_eq!(*data.add(3 * PIECE + 9), 1);
+            // Bytes only the copy holds (as a shader's would be), in a
+            // kernel page the title does not write.
+            *data.add(3 * PIECE + 9) = 0x77;
+            at(100).write(2);
+            at(5 * PIECE + 7).write(3);
+            at(PAGE + 15 * PIECE + 1).write(4);
+            assert_eq!(copy.update(start, LEN), 3 * PIECE, "three kernel pages");
+            assert_eq!(*data.add(100), 2);
+            assert_eq!(*data.add(5 * PIECE + 7), 3);
+            assert_eq!(*data.add(PAGE + 15 * PIECE + 1), 4);
+            assert_eq!(*data.add(3 * PIECE + 9), 0x77, "a kernel page not written is left");
+            // Written at more askings (other copies' refreshes) than the
+            // history holds before this copy looks again: all of the page.
+            for k in 0..6 {
+                at((6 + k) * PIECE).write(5);
+                assert!(crate::watch::writes(start, start + LEN, false).is_some());
+            }
+            copy.update(start, LEN);
+            assert_eq!(*data.add(6 * PIECE), 5);
+            assert_eq!(*data.add(11 * PIECE), 5);
+            assert_eq!(*data.add(3 * PIECE + 9), 1, "the whole page, the title's byte");
+            assert_ne!(VirtualFree(title.cast(), 0, MEM_RELEASE), 0);
             crate::watch::forget_pages(start, start + LEN);
         }
     }
