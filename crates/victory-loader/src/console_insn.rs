@@ -10,10 +10,20 @@ mod decode;
 
 use decode::ConsoleOnly;
 use std::cell::Cell;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
+
+/// Serializes `clwb` NOP-patching and records already-patched addresses so
+/// concurrent threads trapping on the same `clwb` resume on the NOPs instead
+/// of crashing with `#UD`.
+fn clwb_patches() -> &'static Mutex<HashSet<usize>> {
+    static PATCHED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    PATCHED.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 /// Whether what Windows said about memory is remembered per thread (the regions it found
 /// writable, the code bytes it found readable) and not asked again at every emulated
@@ -125,7 +135,19 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     };
     // SAFETY: `n` bytes at `rip` are readable.
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let Some((what, len)) = decode::decode(code) else {
+        // Another thread may have just patched a `clwb` at `rip` to NOPs while
+        // this thread was entering the VEH; resume at `rip` to execute the NOPs.
+        if code.first() == Some(&0x90)
+            && clwb_patches()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&rip)
+        {
+            return CONTINUE_EXECUTION;
+        }
+        return 0;
+    };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -138,14 +160,40 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
+            // Nothing to write back on the PC: patch to NOPs atomically when a
+            // single naturally aligned 8-byte store covers the instruction, so
+            // no executing thread can observe `90 0F AE /6` (`nop; xsaveopt`).
+            // Instructions spanning an 8-byte boundary or exceeding 8 bytes are
+            // stepped over without risking torn cross-modifying code.
+            use std::sync::atomic::Ordering;
+            use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
             use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+            let mut patched = clwb_patches().lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: `n` bytes at `rip` are readable.
+            let live = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
+            if patched.contains(&rip) && live.first() == Some(&0x90) {
+                return CONTINUE_EXECUTION;
+            }
+            let aligned = rip & !7;
+            let off = rip - aligned;
+            if off + len <= 8 && readable(aligned, 8) {
+                let mut old = 0u32;
+                // SAFETY: `aligned..aligned+8` is readable and serialized under
+                // `patched`; the aligned `AtomicU64` store replaces all `len`
+                // bytes indivisibly.
+                unsafe {
+                    if VirtualProtect(aligned as *const _, 8, PAGE_EXECUTE_READWRITE, &mut old) != 0
+                    {
+                        let slot = &*(aligned as *const AtomicU64);
+                        let mut buf = slot.load(Ordering::Acquire).to_ne_bytes();
+                        buf[off..off + len].fill(0x90);
+                        slot.store(u64::from_ne_bytes(buf), Ordering::Release);
+                        FlushInstructionCache(GetCurrentProcess(), rip as *const _, len);
+                        VirtualProtect(aligned as *const _, 8, old, &mut old);
+                        patched.insert(rip);
+                    }
                 }
             }
         }
@@ -337,5 +385,106 @@ mod tests {
         assert_eq!(ctx.Rax, base + 12);
         assert!(buf.0[..64].iter().all(|&b| b == 0));
         assert!(buf.0[64..].iter().all(|&b| b == 0xDD));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect, VirtualQuery,
+    };
+
+    #[test]
+    fn clwb_patch_is_atomic_recovers_concurrent_trap_and_preserves_page_protection() {
+        // SAFETY: allocate one page of our own, populate two `clwb [rax]` instructions
+        // (one within an 8-byte slot, one crossing an 8-byte boundary), protect RX, and
+        // clean up with VirtualFree.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+
+            // Offset 0 (aligned, fits in 8-byte slot): `clwb [rax]; ret`
+            let aligned_rip = page as usize;
+            std::ptr::copy_nonoverlapping([0x66, 0x0f, 0xae, 0x30, 0xc3].as_ptr(), page, 5);
+
+            // Offset 14 (rip & 7 == 6, crosses 8-byte boundary): `clwb [rax]; ret`
+            let split_rip = page.add(14) as usize;
+            std::ptr::copy_nonoverlapping([0x66, 0x0f, 0xae, 0x30, 0xc3].as_ptr(), page.add(14), 5);
+
+            // Distinct aligned clwb sites for multi-threaded VirtualProtect concurrency test.
+            let sites: Vec<usize> = (2..=33)
+                .map(|i| {
+                    let at = page.add(i * 16);
+                    std::ptr::copy_nonoverlapping([0x66, 0x0f, 0xae, 0x30, 0xc3].as_ptr(), at, 5);
+                    at as usize
+                })
+                .collect();
+
+            let mut old = 0u32;
+            assert_ne!(VirtualProtect(page.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+
+            // First thread traps on aligned `clwb [rax]` -> patched to NOPs, steps over 4 bytes.
+            let mut ctx1: CONTEXT = std::mem::zeroed();
+            ctx1.Rip = aligned_rip as u64;
+            assert_eq!(emulate(&mut ctx1), CONTINUE_EXECUTION);
+            assert_eq!(ctx1.Rip, aligned_rip as u64 + 4);
+            assert_eq!(std::slice::from_raw_parts(page, 5), &[0x90, 0x90, 0x90, 0x90, 0xc3]);
+
+            // Second thread trapped concurrently on the same `rip` -> resumes on NOPs instead of #UD.
+            let mut ctx2: CONTEXT = std::mem::zeroed();
+            ctx2.Rip = aligned_rip as u64;
+            assert_eq!(emulate(&mut ctx2), CONTINUE_EXECUTION);
+            assert_eq!(ctx2.Rip, aligned_rip as u64);
+
+            // Unaligned `clwb` crossing an 8-byte boundary -> stepped over without unsafe torn patch.
+            let mut ctx3: CONTEXT = std::mem::zeroed();
+            ctx3.Rip = split_rip as u64;
+            assert_eq!(emulate(&mut ctx3), CONTINUE_EXECUTION);
+            assert_eq!(ctx3.Rip, split_rip as u64 + 4);
+            assert_eq!(
+                std::slice::from_raw_parts(page.add(14), 5),
+                &[0x66, 0x0f, 0xae, 0x30, 0xc3]
+            );
+
+            // Two threads concurrently patching distinct sites on the same page must never
+            // fault or leave the page RWX.
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let s_a = sites.clone();
+            let b_a = barrier.clone();
+            let t1 = std::thread::spawn(move || {
+                b_a.wait();
+                for &rip in &s_a {
+                    let mut c: CONTEXT = std::mem::zeroed();
+                    c.Rip = rip as u64;
+                    assert_eq!(emulate(&mut c), CONTINUE_EXECUTION);
+                }
+            });
+            let s_b = sites.clone();
+            let b_b = barrier;
+            let t2 = std::thread::spawn(move || {
+                b_b.wait();
+                for &rip in s_b.iter().rev() {
+                    let mut c: CONTEXT = std::mem::zeroed();
+                    c.Rip = rip as u64;
+                    assert_eq!(emulate(&mut c), CONTINUE_EXECUTION);
+                }
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(page.cast(), &mut mbi, size_of_val(&mbi)), 0);
+            assert_eq!(mbi.Protect, PAGE_EXECUTE_READ);
+
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
     }
 }
