@@ -839,6 +839,32 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+/// Inside [`with_lds_regions_approx`]: [`lds_meetings`] takes a region with an LDS write and
+/// read too, which otherwise keeps the program at 64 lanes (`WaveSize(64)`, refused by a
+/// 32-lane host, so its dispatches are dropped). The host waves still meet around the
+/// region; inside it, a read of a word the other half of the console wave writes there may
+/// see the word before or after the write.
+fn lds_regions_approx() -> bool {
+    LDS_REGIONS_APPROX.get()
+}
+
+thread_local! {
+    /// Set by [`with_lds_regions_approx`] for this thread.
+    static LDS_REGIONS_APPROX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`lds_regions_approx`]: for `VICTORY_WAVE_LDS_REGIONS=approx`, the last forms
+/// `emit` tries for a console wave64 program on a 32-lane host that nothing else takes.
+// shortcut: approximate and opt-in (upstream VIctory #1845 runs such programs in 32-lane waves
+// too); for the programs of groups of several console waves that the wave-wide form cannot
+// take.
+pub(super) fn with_lds_regions_approx<R>(f: impl FnOnce() -> R) -> R {
+    let was = LDS_REGIONS_APPROX.replace(true);
+    let r = f();
+    LDS_REGIONS_APPROX.set(was);
+    r
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -853,6 +879,9 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+/// Inside [`with_lds_regions_approx`] (`VICTORY_WAVE_LDS_REGIONS=approx`): a write and a read inside one
+/// region get the meetings around the region all the same, and their order inside it between
+/// the two host waves is left to the card.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -899,7 +928,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    if (0..n).any(|r| reads[r] && writes[r]) && !lds_regions_approx() {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -12127,5 +12156,37 @@ mod tests {
             err.contains("a first-lane read where not every lane runs"),
             "per-lane ds_read_b32 must still require all lanes, got: {err}"
         );
+    }
+
+    /// An LDS write and a read of another lane's word in one lane branch: two host waves
+    /// cannot be kept in the console's order there, so `lds_meetings` refuses it, unless
+    /// [`super::with_lds_regions_approx`] asks for the meetings around the region anyway.
+    #[test]
+    fn an_lds_write_and_read_in_one_lane_branch_meet_around_it_only_when_approximate() {
+        let words: [u32; 13] = [
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x3A04_02FF,
+            0x0000_0080, // v_xor_b32 v2, 128, v1 (lane t ^ 32's byte)
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0005, // s_cbranch_execz to the restore of EXEC
+            0xD834_0000,
+            0x0000_0001, // ds_write_b32 v1, v0
+            0xD8D8_0000,
+            0x0300_0002, // ds_read_b32 v3, v2
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 8).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let all = super::all_lane_blocks(&st).expect("all-lane blocks");
+        assert!(all.iter().any(|a| !a), "the branch's blocks are not run by every lane");
+        assert!(super::lds_meetings(&p, &st, &all).is_none(), "refused as it is");
+        let meet = super::with_lds_regions_approx(|| super::lds_meetings(&p, &st, &all))
+            .expect("meetings when approximate");
+        assert!(meet.iter().any(|m| m.0 || m.1), "the host waves meet around the region");
+        assert!(super::lds_meetings(&p, &st, &all).is_none(), "and refused again after it");
     }
 }
