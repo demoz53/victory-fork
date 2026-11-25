@@ -3676,6 +3676,12 @@ impl Host {
             };
             let supported = ok && options.DepthBoundsTestSupported.as_bool();
             tracing::info!(supported, "host depth bounds support");
+            // `VICTORY_DEPTH_BOUNDS=0`: taken as unsupported, so the draws of a
+            // pipeline that enables the test pass at every depth, as before #82.
+            if supported && std::env::var_os("VICTORY_DEPTH_BOUNDS").is_some_and(|v| v == "0") {
+                tracing::warn!("VICTORY_DEPTH_BOUNDS=0: the depth bounds test is off; its draws pass at every depth");
+                return false;
+            }
             supported
         })
     }
