@@ -177,7 +177,7 @@ fn stuck_after() -> Option<Duration> {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(15);
-            (seconds > 0).then(|| Duration::from_secs(seconds))
+            (seconds > 0).then_some(Duration::from_secs(seconds))
         })
     }
 }
@@ -493,7 +493,7 @@ fn pipeline_stack() -> Option<usize> {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(64)
     });
-    (mb > 0).then(|| mb << 20)
+    (mb > 0).then_some(mb << 20)
 }
 
 /// Starts one more pipeline worker of `kind` (0: other pipelines, 1: passes
