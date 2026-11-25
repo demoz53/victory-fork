@@ -136,6 +136,12 @@ pub(crate) enum C {
     /// pages shown at too many addresses for that (`watch::guard_aliases`).
     GuardAliasProtects,
     GuardAliasMany,
+    /// With `watch::pieces`: bytes of stale pages a refresh left out as
+    /// not written (their other kernel pages), and the stale pages copied
+    /// by their written kernel pages and copied whole.
+    PieceBytesLeftOut,
+    PiecePages,
+    PiecePagesWhole,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1077,7 +1083,7 @@ pub(crate) fn log(frames: f64) {
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults ({:.0} other views of guarded pages made read-only with \
          them, {:.0} pages shown at too many places for that, VICTORY_GUARD_ALIASES); textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed, {:.1} changes the guard did not see",
+         changed, {:.1} MB hashed, {:.1} MB of them changed, {:.1} changes the guard did not see;          stale pages by their written 4 KiB pages: {:.0}, whole {:.0}, {:.1} MB left out (VICTORY_SUBPAGE_COPIES)",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1104,6 +1110,9 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
         c[C::TexHot as usize],
+        c[C::PiecePages as usize],
+        c[C::PiecePagesWhole as usize],
+        mb(c[C::PieceBytesLeftOut as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
