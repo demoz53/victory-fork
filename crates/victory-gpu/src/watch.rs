@@ -1555,8 +1555,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // written.
     crate::descriptor::host::remapped(at, len);
     // Textures already uploaded from there must be uploaded again, or the
-    // next list that samples them reads their old contents.
-    crate::texture::remapped(at, len);
+    // next list that samples them reads their old contents
+    // (`VICTORY_REMAP_REUPLOAD=0`: not, as before fxceless #606).
+    static REUPLOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *REUPLOAD.get_or_init(|| std::env::var_os("VICTORY_REMAP_REUPLOAD").is_none_or(|v| v != "0")) {
+        crate::texture::remapped(at, len);
+    }
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
