@@ -147,23 +147,28 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 14 GiB` (8–12 GB cards): `(16, 512)` MiB,
-///   matching the original 12 GB baseline.
-/// - `> 14 GiB` and `< 20 GiB` (16 GB cards): `(4, 2048)` MiB.
+/// - Unknown (`None`, e.g. WARP) or `<= 14 GiB` (8–12 GB cards): `(1, 1024)` MiB
+///   (fxceless c96b4f2's defaults; it was 16 and 512).
+/// - `> 14 GiB` and `< 20 GiB` (16 GB cards): `(1, 2048)` MiB (it was 4 and 2048).
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
+///
+/// From 1 MiB up on every card (fxceless c96b4f2): the shader writes of the
+/// smaller buffers are then found by the card's hashes too, and with that the
+/// first room's walls were drawn in every run of theirs (RTX 4070).
+/// `VICTORY_CARD_BUFFERS_MIN_MB=4` (16 GB cards) or `=16` (others) as before.
 fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     let Some(budget_bytes) = local_vram_budget else {
-        return (16, 512);
+        return (1, 1024);
     };
     let budget_mb = budget_bytes >> 20;
     const FOURTEEN_GIB_MB: u64 = 14 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= FOURTEEN_GIB_MB {
-        (16, 512)
+        (1, 1024)
     } else if budget_mb < TWENTY_GIB_MB {
-        (4, 2048)
+        (1, 2048)
     } else {
         (1, (budget_mb / 4).min(8192))
     }
@@ -525,7 +530,12 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    // On by default (stage 2, `crate::host::relay_exact`); `VICTORY_RELAY=0`
+    // turns it off, `=1` asks for the first stage.
+    // The crate's own tests run without it unless they ask: several of
+    // them look at title memory right after a submission, which the
+    // relay's landing thread may still be writing.
+    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what
@@ -1100,7 +1110,8 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    // On by default; `VICTORY_WIDE_BACK=0` turns it off.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -3357,15 +3368,15 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 14 GiB keep the 12 GB baseline.
-        assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (16, 512));
+        // Unknown (WARP / query failure) and <= 14 GiB: fxceless c96b4f2's defaults.
+        assert_eq!(default_card_limits_mb(None), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (1, 1024));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (1, 1024));
 
         // 16 GB tier (> 14 GiB, < 20 GiB).
-        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
-        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (1, 2048));
 
         // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
@@ -3376,7 +3387,7 @@ mod window_tests {
         // Explicit env overrides always win, and min is clamped to at least 1 MiB.
         assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
         assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
-        assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+        assert_eq!(resolve_card_limits(None, None, None), (MIB, 1024 * MIB));
     }
 
     /// An ask that may take any window takes the longest that holds all of
