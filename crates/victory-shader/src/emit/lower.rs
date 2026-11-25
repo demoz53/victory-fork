@@ -55,6 +55,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -246,6 +248,9 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1397,6 +1402,20 @@ pub fn pixel_helpers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIXEL_HELPERS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a d16 typed buffer access through a view of a descriptor table moves
+/// each channel's 16 bits as an unsigned integer (`bufferLoad.i32`,
+/// `bufferStore.i32`, the handle annotated `u32`) and names the table descriptor in
+/// [`super::HostShader::half_views`] (`VICTORY_HALF_BITS=0`: as 32-bit floats through
+/// `legacyF16ToF32` and back, as before). The title moves its face network's tensors
+/// this way, in `R16G16B16A16_UINT` and `R16_UINT` views: as floats through an
+/// integer view every value read 0 and the faces did not move. (fxceless #927 by
+/// tippythetaidum.) Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn half_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
+}
+
 /// Whether [`early_depth`] is declared (`VICTORY_EARLY_DEPTH=0`: never, the
 /// host testing after every shader, as before). Part of the translation: the
 /// shader cache keys on it (`victory-gpu`'s does).
@@ -1776,6 +1795,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2569,6 +2589,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2577,6 +2598,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -6220,7 +6242,11 @@ impl<'a> Lower<'a> {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    // (Unsigned integers where the access moves halves: [`half_bits`].)
+                    let halves = half_bits()
+                        && un.contains("_format_d16_")
+                        && used.is_some_and(|u| u.root == RootType::Table);
+                    (10 | u, if halves { 0x405 } else { 0x409 })
                 } else {
                     (11 | u, 0)
                 };

@@ -132,6 +132,7 @@ fn lowered_on(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     })
 }
 
@@ -1279,6 +1280,7 @@ fn wave32_pixel_shader_runs_as_32_lane_halves_on_wave64_hosts() {
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: vec![],
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = ps.dxil.clone();
@@ -1352,6 +1354,7 @@ fn wave32_pixel_shader_runs_as_32_lane_halves_on_wave64_hosts() {
             root_srvs: vl.root_srvs,
             root_uavs: vl.root_uavs,
             root_indexed_views: vec![],
+            half_views: Vec::new(),
         }
     };
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -1525,6 +1528,7 @@ fn spilled_compute_masks_partial_dispatch_threads_on_wave64_and_wave32() {
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views.clone(),
+            half_views: Vec::new(),
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
