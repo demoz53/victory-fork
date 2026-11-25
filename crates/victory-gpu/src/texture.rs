@@ -75,6 +75,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The largest mip whose bytes (and the smaller ones') were all mapped
+    /// then ([`first_resident_mip`]; none: not even the smallest's).
+    resident: Option<u32>,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
@@ -962,10 +965,19 @@ impl Staging {
             // Poll at most every 30 frames: the guard conservatively reports
             // unprotectable sparse blocks even without an actual write.
             let frame = crate::frame::current();
-            if !last.partial_due(frame) {
+            let resident = (resident_mips() || partial_prompt())
+                .then(|| first_resident_mip(&self.layout, self.memory))
+                .flatten();
+            // A larger mip has come since the last read: read at once.
+            let more = partial_prompt()
+                && resident.is_some_and(|r| last.resident.is_none_or(|was| r < was));
+            if !more && !last.partial_due(frame) {
                 return 0;
             }
             last.partial = Some(frame);
+            last.resident = resident;
+            // The mips not all there keep what the staging buffer holds.
+            let from = resident.filter(|_| resident_mips()).unwrap_or(0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
@@ -977,7 +989,7 @@ impl Staging {
                 if self.busy() {
                     drop(mapped.take());
                 }
-                self.detile(read);
+                self.detile_from(read, from);
                 #[cfg(feature = "diagnostics")]
                 if unreported {
                     self.unreported_change();
@@ -995,6 +1007,7 @@ impl Staging {
         }
         // Fully mapped again: a later partial mapping starts a new poll.
         last.partial = None;
+        last.resident = None;
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
@@ -1096,6 +1109,12 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        self.detile_from(tiled, 0);
+    }
+
+    /// [`Staging::detile`] of the mips from `first` on (the smaller ones);
+    /// the larger keep what the staging buffer holds.
+    fn detile_from(&self, tiled: &[u8], first: u32) {
         use std::sync::atomic::Ordering::Relaxed;
         let fence = self.last_upload.swap(0, Relaxed);
         if fence != 0 {
@@ -1112,6 +1131,9 @@ impl Staging {
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            if mip < first {
+                continue;
+            }
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1243,6 +1265,46 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     };
     let size = s.layout.size as usize;
     Some((size as u64, committed(s.memory, size)))
+}
+
+/// `VICTORY_RESIDENT_MIPS=1` (off by default): a texture whose memory is
+/// only partly mapped (one streaming in: its smaller mips, at the start of
+/// its memory, come first) has only the mips whose bytes are all there
+/// detiled into its staging buffer; the larger keep what they held, not
+/// the zeros that stand for pages not there. (Marvisak/VIctory #2859,
+/// 0xkn0wh3r3, after DexNom/VIctory 570a941; GPL-3.0. Upstream uploaded
+/// zeros for every mip then; here the mips that are there were uploaded
+/// already, the larger ones as zeros.)
+fn resident_mips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENT_MIPS").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_PARTIAL_PROMPT=1` (off by default): a partly mapped texture is
+/// read again as soon as a larger mip's bytes are all there, not at the
+/// next of its reads every 30 frames (`Last::partial_due`): until then the
+/// mip the title has streamed in (and may sample) is the zeros it was
+/// before, a black face for up to 30 frames after a cut.
+fn partial_prompt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTIAL_PROMPT").is_some_and(|v| v == "1"))
+}
+
+/// The largest mip from which on a texture whose memory is not all mapped
+/// has every byte its mips take mapped (`None`: not even its smallest
+/// mip's, or a layout whose slices each hold a whole chain). After
+/// Marvisak/VIctory #2859.
+fn first_resident_mip(layout: &victory_formats::texture::Layout, memory: *const u8) -> Option<u32> {
+    let size = layout.size;
+    let mips = layout.desc.mips;
+    let smallest = layout.bytes_from(mips.checked_sub(1)?);
+    if smallest >= size || !committed(memory, smallest as usize) {
+        return None;
+    }
+    (1..mips).find(|&m| {
+        let len = layout.bytes_from(m);
+        len < size && committed(memory, len as usize)
+    })
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
