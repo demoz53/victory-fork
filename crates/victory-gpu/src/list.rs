@@ -1847,7 +1847,8 @@ impl ValueWait {
     /// Whether the memory holds what is waited for now.
     /// shortcut: the comparison codes are taken to be the comparison
     /// functions' (1 never .. 8 always, value against reference); one not
-    /// known counts as met, and so does memory that is not mapped.
+    /// known counts as met, and so does memory that is not mapped (unless
+    /// `VICTORY_WAIT_UNMAPPED_UNMET=1`, [`Self::holds_unreadable`]).
     ///
     /// The value is read through the kernel, which reports memory that is
     /// not there instead of faulting (as the copies of title memory are
@@ -1880,17 +1881,33 @@ impl ValueWait {
             return true;
         }
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static UNMET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let unmet = *UNMET.get_or_init(|| {
+            std::env::var_os("VICTORY_WAIT_UNMAPPED_UNMET").is_some_and(|v| v == "1")
+        });
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
-            return true;
+            return self.holds_unreadable(unmet);
         }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
         if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return true;
+            return self.holds_unreadable(unmet);
         }
         self.holds_for(u64::from_le_bytes(raw))
+    }
+
+    /// Whether the wait holds on memory that cannot be read. Before (and by
+    /// default): it does. `VICTORY_WAIT_UNMAPPED_UNMET=1` (`unmet`): it
+    /// does not, unless the comparison reads nothing (always, or one not
+    /// known), as upstream Marvisak/VIctory issue #2604 / PR #2605 has it
+    /// (832fffeff, 5de820a83 by BastienRdz): a list waiting on a page not
+    /// mapped yet then waits for its producer instead of running before
+    /// it. Opt-in: a queue that stands at such a wait is only let go at
+    /// the next present (`release_held(true)`).
+    fn holds_unreadable(&self, unmet: bool) -> bool {
+        !unmet || !(1..=7).contains(&self.comparison)
     }
 
     /// Where the value waited for is: address and bytes.
@@ -2252,6 +2269,27 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Upstream #2604: memory that cannot be read meets a wait only by
+    /// default; with the switch, only a comparison that reads nothing does.
+    #[test]
+    fn unreadable_memory_meets_a_wait_only_without_the_switch() {
+        let wait = |comparison| ValueWait {
+            address: 0x10,
+            comparison,
+            reference: 1,
+            wide: false,
+        };
+        for comparison in 0..=9 {
+            assert!(wait(comparison).holds_unreadable(false), "{comparison}");
+        }
+        for comparison in 1..=7 {
+            assert!(!wait(comparison).holds_unreadable(true), "{comparison}");
+        }
+        for comparison in [0, 8, 9] {
+            assert!(wait(comparison).holds_unreadable(true), "{comparison}");
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
