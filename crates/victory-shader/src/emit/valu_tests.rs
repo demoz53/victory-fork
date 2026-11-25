@@ -82,6 +82,22 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
+/// MUBUF `buffer_load_dword vdst, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
+const fn buffer_load_dword(vdst: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x0C << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8,
+    ]
+}
+
+/// MUBUF `buffer_atomic_<op> vdata, off, s[srsrc:srsrc+3], 0 [glc]`.
+const fn buffer_atomic(op: u16, vdata: u8, srsrc: u8, glc: bool) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32 & 0x7F) << 18 | (glc as u32) << 14,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
 const fn sgpr(n: u8) -> u16 {
     n as u16
 }
@@ -3111,4 +3127,120 @@ fn ds_cmpst_f32_compares_as_ieee_floats() {
             "{backend}: ds_cmpst_f32 new value case {i}",
         );
     });
+}
+
+#[test]
+fn buffer_atomic_extended_ops_match_rdna2() {
+    // Helper: write v1 to UAV[0], apply atomic op using v2 (or v[2:3]), return old (glc) or new (load).
+    let run_op = |op: u16, name: &str, cases: &[([u32; 4], u32)]| {
+        let mut body_old = Vec::new();
+        body_old.extend(buffer_store_dword(1, 8, 0));
+        body_old.extend(buffer_atomic(op, 2, 8, true));
+        body_old.push(vop1(0x001, 0, vgpr(2)));
+        let s_old = build_valu_cs(&body_old);
+
+        let mut body_new = Vec::new();
+        body_new.extend(buffer_store_dword(1, 8, 0));
+        body_new.extend(buffer_atomic(op, 2, 8, false));
+        body_new.extend(buffer_load_dword(0, 8, 0));
+        let s_new = build_valu_cs(&body_new);
+
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&s_old, &inputs, |backend, i, inp, got| {
+            assert_eq!(
+                got, inp[0],
+                "{backend}: {name} (glc old) case {i} ({:#010x}, {:#010x}) = {got:#010x}, want {:#010x}",
+                inp[0], inp[1], inp[0],
+            );
+        });
+        run_cases(&s_new, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {name} (new) case {i} ({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    };
+
+    // buffer_atomic_sub (0x33): wrapping subtract.
+    run_op(
+        0x33,
+        "buffer_atomic_sub",
+        &[
+            ([10, 3, 0, 0], 7),
+            ([2, 5, 0, 0], 2u32.wrapping_sub(5)),
+            ([0, 0, 0, 0], 0),
+        ],
+    );
+
+    // buffer_atomic_csub (0x34): clamped unsigned subtract (saturating_sub).
+    run_op(
+        0x34,
+        "buffer_atomic_csub",
+        &[
+            ([10, 3, 0, 0], 7),
+            ([3, 3, 0, 0], 0),
+            ([2, 5, 0, 0], 0),
+            ([0x8000_0005, 0x8000_0000, 0, 0], 5),
+        ],
+    );
+
+    // buffer_atomic_inc (0x3c): (old >= data) ? 0 : old + 1.
+    run_op(
+        0x3c,
+        "buffer_atomic_inc",
+        &[
+            ([0, 5, 0, 0], 1),
+            ([4, 5, 0, 0], 5),
+            ([5, 5, 0, 0], 0),
+            ([9, 5, 0, 0], 0),
+            ([u32::MAX, u32::MAX, 0, 0], 0),
+        ],
+    );
+
+    // buffer_atomic_dec (0x3d): (old == 0 || old > data) ? data : old - 1.
+    run_op(
+        0x3d,
+        "buffer_atomic_dec",
+        &[
+            ([5, 5, 0, 0], 4),
+            ([1, 5, 0, 0], 0),
+            ([0, 5, 0, 0], 5),
+            ([9, 5, 0, 0], 5),
+            ([3, 0, 0, 0], 0),
+        ],
+    );
+
+    // buffer_atomic_fcmpswap (0x3e): data = (new=v2, cmp=v3), IEEE-754 float equality.
+    run_op(
+        0x3e,
+        "buffer_atomic_fcmpswap",
+        &[
+            ([1.5f32.to_bits(), 4.25f32.to_bits(), 1.5f32.to_bits(), 0], 4.25f32.to_bits()),
+            ([1.5f32.to_bits(), 4.25f32.to_bits(), 2.5f32.to_bits(), 0], 1.5f32.to_bits()),
+            ([0x8000_0000, 3.0f32.to_bits(), 0x0000_0000, 0], 3.0f32.to_bits()),
+            ([0x7FC0_0000, 1.0f32.to_bits(), 0x7FC0_0000, 0], 0x7FC0_0000),
+        ],
+    );
+
+    // buffer_atomic_fmin (0x3f) and buffer_atomic_fmax (0x40).
+    let float_pairs: &[(u32, u32)] = &[
+        (1.0f32.to_bits(), 2.0f32.to_bits()),
+        ((-2.5f32).to_bits(), 1.5f32.to_bits()),
+        (0x0000_0000, 0x8000_0000),
+        (0x7FC0_0000, 3.0f32.to_bits()),
+        (3.0f32.to_bits(), 0x7FC0_0000),
+        (0x7F80_0001, 3.0f32.to_bits()), // sNaN in memory quieted
+    ];
+    let fmin_cases: Vec<([u32; 4], u32)> = float_pairs
+        .iter()
+        .map(|&(old, data)| ([old, data, 0, 0], lds_min_max_ref(old, data, false)))
+        .collect();
+    let fmax_cases: Vec<([u32; 4], u32)> = float_pairs
+        .iter()
+        .map(|&(old, data)| ([old, data, 0, 0], lds_min_max_ref(old, data, true)))
+        .collect();
+    run_op(0x3f, "buffer_atomic_fmin", &fmin_cases);
+    run_op(0x40, "buffer_atomic_fmax", &fmax_cases);
 }
