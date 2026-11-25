@@ -4012,6 +4012,12 @@ impl Host {
             };
             let supported = ok && options.CastingFullyTypedFormatSupported.as_bool();
             tracing::info!(supported, "host typed format casting support");
+            // `VICTORY_SRGB_VIEWS=0`: taken as unsupported, so an RGBA8 shader view
+            // gets its texture's format, as before fxceless #644.
+            if supported && std::env::var_os("VICTORY_SRGB_VIEWS").is_some_and(|v| v == "0") {
+                tracing::warn!("VICTORY_SRGB_VIEWS=0: RGBA8 shader views take their texture's format, as before");
+                return false;
+            }
             supported
         })
     }
