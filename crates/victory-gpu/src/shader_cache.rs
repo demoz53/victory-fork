@@ -124,21 +124,45 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    host_shader_from_group(container, 0)
+}
+
+/// [`host_shader`] with `base` added to the thread group's id x
+/// (`victory_shader::emit::with_group_base`; 0: as it is): the program of
+/// the second parts of indirect dispatches over 65,535 groups in x
+/// (`VICTORY_INDIRECT_SPLIT`). The base is in the entry's key.
+pub(crate) fn host_shader_from_group(container: &[u8], base: u32) -> Result<HostShader, String> {
     use victory_shader::emit;
     // The hash the log names the shader by (`pipeline.rs`), which the
     // per-program switches take.
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
-    let translate = |c: &[u8]| emit::for_program(&hash, || emit::translate(c)).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        emit::for_program(&hash, || emit::with_group_base(base, || emit::translate(c))).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => {
             // (`wave64_retried` second: it parses the container, and only a
             // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
             // any, gets there)
             let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-            cached(cache, &program_key(build(), off), emit::host_uses_wave32(), container, translate)
+            let key = group_key(&program_key(build(), off), base);
+            cached(cache, &key, emit::host_uses_wave32(), container, translate)
         }
         None => translate(container),
     }
+}
+
+/// `key` mixed with a group base other than 0 ([`host_shader_from_group`]);
+/// with 0, `key` as it is.
+fn group_key(key: &[u8; 32], base: u32) -> [u8; 32] {
+    if base == 0 {
+        return *key;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(key);
+    h.update(b"group id x from");
+    h.update(&base.to_le_bytes());
+    *h.finalize().as_bytes()
 }
 
 /// The key of one program's entries: the build's, mixed with the
@@ -516,6 +540,30 @@ mod tests {
             cached(&cache, &program_key(&build, false), false, c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    /// `VICTORY_INDIRECT_SPLIT`: the program translated with a group base
+    /// is an entry of its own, beside the one without.
+    #[test]
+    fn a_group_base_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        assert_eq!(group_key(&build, 0), build, "no base: the key as it was");
+        let based = group_key(&build, 65_535);
+        assert_ne!(based, build);
+        assert_eq!(group_key(&build, 65_535), based);
+        assert_ne!(group_key(&build, 1), based, "another base, another key");
+        assert_ne!(group_key(&program_key(&build, true), 65_535), based, "and still the program's");
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        for key in [build, based, build, based] {
+            cached(&cache, &key, false, b"program", translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "each translated once");
     }
 
     #[test]

@@ -104,6 +104,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 asked = src_args.Load3(src_at);
+        // Bit 2: the second part of records over 65,535 groups in x (`with_remainder`):
+        // the groups from 65,535 on, run by the program translated with that base.
+        bool rest = (has_count & 4u) != 0;
+        if (rest) {
+            asked.x = asked.x > 65535u ? asked.x - 65535u : 0u;
+        }
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         bool huge = g.z != 0 && g.x * g.y > GROUPS / g.z;
@@ -112,12 +118,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the groups run in all, and the records cut down (a dimension over
         // 65,535, or more groups than a dispatch runs).
         uint was;
-        budget.InterlockedMax(12, asked.x, was);
-        if (huge || any(asked > g)) {
-            budget.InterlockedAdd(20, 1u, was);
-            // word 6: the largest first dimension a cut record asked for (18
-            // bits), and the execution it came from (14 bits)
-            budget.InterlockedMax(24, (min(asked.x, 0x3ffffu) << 14) | (execution & 0x3fffu), was);
+        if (!rest) {
+            budget.InterlockedMax(12, asked.x, was);
+            if (huge || any(asked > g)) {
+                budget.InterlockedAdd(20, 1u, was);
+                // word 6: the largest first dimension a cut record asked for (18
+                // bits), and the execution it came from (14 bits)
+                budget.InterlockedMax(24, (min(asked.x, 0x3ffffu) << 14) | (execution & 0x3fffu), was);
+            }
         }
         if (huge) {
             g = uint3(0, 0, 0);
@@ -355,6 +363,46 @@ pub(crate) fn with_dispatch<R>(label: impl FnOnce() -> String, f: impl FnOnce() 
     r
 }
 
+thread_local! {
+    /// The clamp on this thread writes the second parts of its dispatch records
+    /// ([`with_remainder`]).
+    static REMAINDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (the clamp of an indirect dispatch's records) for the records'
+/// second parts: the groups from 65,535 on in x of a record that asks for
+/// more (none of a record that does not), which the pipeline translated with
+/// that group base runs (`VICTORY_INDIRECT_SPLIT`, `crate::draw`).
+pub(crate) fn with_remainder<R>(f: impl FnOnce() -> R) -> R {
+    let was = REMAINDER.replace(true);
+    let r = f();
+    REMAINDER.set(was);
+    r
+}
+
+/// `VICTORY_INDIRECT_SPLIT=<hash>,...`: whether the indirect dispatches of
+/// the pipeline `label` names (`compute 0123456789abcdef`) run a record over
+/// 65,535 groups in x in two parts, the second by the program translated with
+/// a group base of 65,535 (exact up to 131,070 groups). Off by default.
+pub(crate) fn splits(label: impl FnOnce() -> String) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_SPLIT")
+            .map(|v| {
+                v.split([',', ';', ' '])
+                    .map(|h| h.trim().trim_start_matches('#').to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    if list.is_empty() {
+        return false;
+    }
+    let label = label();
+    list.iter().any(|h| label.contains(h.as_str()))
+}
+
 /// What [`with_dispatch`] noted for execution `n`, if the ring still holds it.
 pub(crate) fn dispatch_label(n: u32) -> Option<std::sync::Arc<str>> {
     let ring = DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
@@ -532,7 +580,8 @@ fn record_clamp_at(
         None => (src_gpu, 0u32, 0u32),
     };
     let execution = EXECUTION.with(std::cell::Cell::get);
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset, execution];
+    let rest = u32::from(REMAINDER.with(std::cell::Cell::get)) << 2;
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | rest, count_offset, execution];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -1266,6 +1315,69 @@ void main() {
                 assert_eq!(largest, u32::MAX);
             }
         }
+    }
+
+    /// `with_remainder`: a dispatch record over 65,535 groups in x is clamped
+    /// to its first 65,535, and its second part to the rest, which the
+    /// program translated with that group base runs; a record within the
+    /// limit has an empty second part. y and z stay as asked.
+    #[test]
+    fn warp_a_dispatch_over_the_limit_is_clamped_in_two_parts() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let records: [[u32; 3]; 3] = [[86_568, 1, 1], [1_000, 2, 1], [140_000, 1, 1]];
+        let bytes = (STRIDE as usize) * records.len();
+        let (src_buf, src_ptr, _) = warp.shared_buffer(bytes as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(2 * bytes as u64);
+        let dst_buf = warp.default_uav(2 * bytes as u64);
+        let words: Vec<u8> = records.iter().flatten().flat_map(|w| w.to_le_bytes()).collect();
+        // SAFETY: mapped buffers have sufficient capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr(), src_ptr, bytes);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        let spec = (KIND_DISPATCH, STRIDE, records.len() as u32);
+        let first = record_clamp_at(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON, 0),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            spec,
+            false,
+        );
+        let second = with_remainder(|| {
+            record_clamp_at(
+                &warp.clamp,
+                &warp.list,
+                (&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, bytes as u64),
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                spec,
+                false,
+            )
+        });
+        assert!(first && second);
+        // SAFETY: open command list; the clamped records are copied back.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 2 * bytes as u64);
+        }
+        warp.submit_and_wait();
+        // SAFETY: GPU work completed.
+        let out: Vec<u32> = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 2 * bytes / 4).to_vec() };
+        assert_eq!(&out[..9], &[65_535, 1, 1, 1_000, 2, 1, 65_535, 1, 1], "the first parts");
+        assert_eq!(&out[9..], &[21_033, 1, 1, 0, 2, 1, 65_535, 1, 1], "the second parts");
     }
 
     #[test]

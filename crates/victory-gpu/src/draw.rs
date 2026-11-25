@@ -507,6 +507,13 @@ fn dropped(pipeline: usize) {
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Indirect dispatches whose second parts ran (`VICTORY_INDIRECT_SPLIT`) so far.
+static SPLIT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn split_parts() -> u64 {
+    SPLIT.load(Ordering::Relaxed)
+}
+
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
@@ -2872,6 +2879,43 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        // `VICTORY_INDIRECT_SPLIT`: the records' second parts (the groups from
+        // 65,535 on in x), clamped where the first parts were (the clamp's
+        // barrier waits for the execution that read them) and run by the
+        // program translated with that group base, on the same root arguments.
+        if kind == DISPATCH
+            && !windowed
+            && crate::indirect::splits(|| crate::pipeline::shaders_label(self.pipeline as This))
+            && let Some(part) = crate::pipeline::host::split_part(p)
+        {
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let rest = crate::indirect::with_remainder(|| {
+                crate::indirect::bound_at(list, (&args.buffer, offset), count_arg, (kind, stride, max), (at, 0))
+            });
+            if let Some(rest) = rest {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+                if self.bind(list, p, true) {
+                    // SAFETY: an open list with `p`'s root signature and
+                    // arguments set; the part's pipeline shares that root
+                    // signature, and it and the scratch buffer are kept alive.
+                    unsafe {
+                        list.list.SetPipelineState(&part);
+                        list.list.ExecuteIndirect(
+                            &signature,
+                            max,
+                            &rest,
+                            at,
+                            counter.as_ref().map(|(s, _)| &s.buffer),
+                            counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                        );
+                    }
+                    list.keep(&part);
+                    self.host_pipeline = part.as_raw() as usize;
+                    SPLIT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
