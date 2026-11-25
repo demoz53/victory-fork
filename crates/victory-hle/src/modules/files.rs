@@ -528,15 +528,44 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let writing = victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    if done != 0 {
+        return done;
+    }
+    // An overlapped read the kernel finishes later: nothing here says when,
+    // so its destination stays open for a while. Every other read is done
+    // when the call returns.
+    const ERROR_IO_PENDING: u32 = 997;
+    // SAFETY: plain calls; the title reads the error after us, so it is
+    // put back once the announcement is let go.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if error == ERROR_IO_PENDING && !overlapped.is_null() {
+        writing.pending();
+        pending_reads();
+    } else {
+        drop(writing);
+    }
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
+    done
+}
+
+/// Counts the title's `ReadFile`s still under way when the call returned,
+/// whose destinations stay open for a while (`victory_gpu::KernelWrite::pending`),
+/// and says so at powers of two.
+fn pending_reads() {
+    static PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = PENDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(n, "ReadFile: an overlapped read still under way after its call; its destination stays open 2 s");
+    }
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+    let _writing = victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )

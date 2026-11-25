@@ -393,17 +393,35 @@ struct Guards {
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
     /// Blocks a write through the kernel was announced for ([`writing`]),
-    /// and the other views of their pages: first block, end, and when
-    /// (`crate::host::now_ms`). For [`KERNEL_OPEN_MS`] no guard makes them
-    /// read-only again: the kernel's write fails at a read-only page (a
-    /// file read straight into title memory then fails with
-    /// ERROR_INVALID_USER_BUFFER), and nothing says when it is done.
-    kernel: Vec<(usize, usize, u64)>,
+    /// and the other views of their pages. While one is there no guard
+    /// makes them read-only again: the kernel's write fails at a read-only
+    /// page (a file read straight into title memory then fails with
+    /// ERROR_INVALID_USER_BUFFER).
+    kernel: Vec<KernelOpen>,
 }
 
-/// How long blocks announced to a write through the kernel stay writable
-/// ([`Guards::kernel`]). While they do, every check of a guard over them
-/// finds them written and its copy takes them again.
+/// Blocks `[first, end)` a write through the kernel may be writing
+/// ([`Guards::kernel`]): until the write is done ([`KernelWrite`], `until`
+/// [`IN_FLIGHT`]), or until `until` (`crate::host::now_ms`) for a write that
+/// goes on after the call that started it ([`KernelWrite::pending`]).
+struct KernelOpen {
+    first: usize,
+    end: usize,
+    until: u64,
+    /// The [`KernelWrite`] that holds it; 0 for none (it ends with time).
+    write: u64,
+}
+
+/// [`KernelOpen::until`] of a write under way: it ends when its
+/// [`KernelWrite`] is dropped.
+const IN_FLIGHT: u64 = u64::MAX;
+
+/// How long blocks stay writable after a write through the kernel that goes
+/// on after the call that started it ([`KernelWrite::pending`]: an
+/// overlapped `ReadFile` the kernel finishes later; with
+/// [`kernel_open_long`], after every announced write). While they do, every
+/// check of a guard over them finds them written and its copy takes them
+/// again.
 ///
 /// Two runs with other views of guarded pages guarded too (fxceless #115,
 /// `guard_aliases`) crashed in the opening cutscene a second after one
@@ -411,6 +429,65 @@ struct Guards {
 /// was opened before the read, and a guard check over another view of the
 /// same pages made it read-only again while the read was under way.
 const KERNEL_OPEN_MS: u64 = 2000;
+
+/// Whether every announced write through the kernel keeps its blocks
+/// writable for [`KERNEL_OPEN_MS`] (`VICTORY_KERNEL_OPEN_LONG=1`, as in
+/// 498c2d5), not only while it is under way.
+///
+/// Our own writes into title memory announce themselves too: the title's
+/// buffer copies done at submission (`crate::host::copy_mapped`, some
+/// 14,000 a frame) and every write back of what shaders wrote. Kept open
+/// for 2 s, their blocks were taken as written at every guard check for a
+/// dozen frames: all6-cold and all6-base copied 350 MB a frame against 130
+/// (page copies 48 ms against 23, 256 MB a frame sent up to copies in the
+/// card's memory against 76). Those writes, the runtime's file reads and
+/// DirectStorage's are all done when the call that makes them returns.
+fn kernel_open_long() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KERNEL_OPEN_LONG").is_some_and(|v| v == "1"))
+}
+
+/// A write through the kernel announced with [`writing`]: the blocks it
+/// writes stay writable, out of every guard's reach, until this is dropped
+/// (the write is done; the next guard check over them takes them as written
+/// and guards them again) or [`KernelWrite::pending`] says the write goes
+/// on.
+#[must_use = "the blocks may be guarded again as soon as it is dropped"]
+pub struct KernelWrite(u64);
+
+impl KernelWrite {
+    /// The write goes on after the call that started it returned (an
+    /// overlapped read the kernel finishes later): its blocks stay writable
+    /// for [`KERNEL_OPEN_MS`] from now.
+    pub fn pending(self) {
+        if self.0 != 0 {
+            let until = crate::host::now_ms().saturating_add(KERNEL_OPEN_MS);
+            let mut g = guards();
+            for open in g.kernel.iter_mut().filter(|open| open.write == self.0) {
+                open.until = until;
+                open.write = 0;
+            }
+        }
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            let id = self.0;
+            guards().kernel.retain(|open| open.write != id);
+        }
+    }
+}
+
+/// [`Guards::kernel`] without the entries whose time is up.
+fn kernel_expire(g: &mut Guards) {
+    if !g.kernel.is_empty() {
+        let now = crate::host::now_ms();
+        g.kernel.retain(|open| now < open.until);
+    }
+}
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
@@ -610,11 +687,14 @@ fn guard_aliases() -> usize {
 /// read-only, for a write through them to fault).
 fn protect_here(g: &mut Guards, from: usize, to: usize, clean: bool) {
     // Not blocks a write through the kernel may be writing now.
+    kernel_expire(g);
     if !g.kernel.is_empty() {
-        let now = crate::host::now_ms();
-        g.kernel.retain(|k| now < k.2 + KERNEL_OPEN_MS);
-        let mut busy: Vec<(usize, usize)> =
-            g.kernel.iter().filter(|k| k.0 < to && k.1 > from).map(|k| (k.0.max(from), k.1.min(to))).collect();
+        let mut busy: Vec<(usize, usize)> = g
+            .kernel
+            .iter()
+            .filter(|k| k.first < to && k.end > from)
+            .map(|k| (k.first.max(from), k.end.min(to)))
+            .collect();
         if !busy.is_empty() {
             busy.sort_unstable();
             let mut at = from;
@@ -734,21 +814,25 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
+/// kernel (which does not fault into our handler): opens its guarded blocks,
+/// which no guard makes read-only again until the returned [`KernelWrite`]
+/// is dropped, after the write. The runtime calls it (as
+/// `kernel_will_write`) before the title's kernel reads into its own memory.
+pub fn writing(at: usize, len: usize) -> KernelWrite {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     // The length is the title's (`fread`'s size times count, saturated).
     let end = at.saturating_add(len);
+    let long = kernel_open_long();
+    let write = if long || at >= end { 0 } else { WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
     {
         let mut g = guards();
         open(&mut g, at, end);
-        // Left writable for a while, here and at the other views of the
-        // pages ([`KERNEL_OPEN_MS`]).
-        let now = crate::host::now_ms();
-        g.kernel.retain(|k| now < k.2 + KERNEL_OPEN_MS);
+        // Left writable, here and at the other views of the pages, while
+        // the write is under way ([`KERNEL_OPEN_MS`] with the switch).
+        kernel_expire(&mut g);
         if at < end {
-            g.kernel.push((at / BLOCK, end.div_ceil(BLOCK), now));
+            let until = if long { crate::host::now_ms().saturating_add(KERNEL_OPEN_MS) } else { IN_FLIGHT };
+            g.kernel.push(KernelOpen { first: at / BLOCK, end: end.div_ceil(BLOCK), until, write });
             let most = guard_aliases();
             if most > 0 {
                 let (aliases, _) =
@@ -757,13 +841,14 @@ pub fn writing(at: usize, len: usize) {
                 blocks.sort_unstable();
                 blocks.dedup();
                 for (first, last) in block_runs(&blocks) {
-                    g.kernel.push((first, last, now));
+                    g.kernel.push(KernelOpen { first, end: last, until, write });
                 }
             }
         }
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    KernelWrite(write)
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -1038,7 +1123,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     // A write through the kernel announced there wrote what the memory
     // showed before (or failed): the new memory may be guarded at once.
-    g.kernel.retain(|k| k.1 <= range.start || k.0 >= range.end);
+    g.kernel.retain(|k| k.end <= range.start || k.first >= range.end);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1174,8 +1259,9 @@ mod tests {
             !read(&mut file),
             "the kernel does not fault into our handler"
         );
-        writing(view + 100, 13);
+        let open = writing(view + 100, 13);
         assert!(read(&mut file));
+        drop(open);
         // SAFETY: the bytes just read.
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
@@ -1518,26 +1604,55 @@ mod tests {
         drop_views(section, &[guarded, other], SIZE);
     }
 
-    /// Blocks a write through the kernel was announced for stay writable:
-    /// a guard check over them takes them as written and leaves them so,
-    /// beside blocks it guards again.
+    /// Blocks a write through the kernel was announced for stay writable
+    /// while it is under way: a guard check over them takes them as written
+    /// and leaves them so, beside blocks it guards again. Once the write is
+    /// done, the next check takes them once more and guards them again.
     #[test]
-    fn blocks_announced_to_the_kernel_stay_writable() {
+    fn blocks_announced_to_the_kernel_stay_writable_while_it_writes() {
         const SIZE: usize = 3 * BLOCK;
         let (section, view, other) = two_views(SIZE);
         let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        let middle = (view + BLOCK) / BLOCK;
         assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1), pages(2)]));
         assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
         // A file read into the middle block is announced; then a guard
         // check of the view runs while the read is under way.
-        writing(view + BLOCK, BLOCK);
+        let read = writing(view + BLOCK, BLOCK);
         assert_eq!(guard(view, view + SIZE), Some(vec![pages(1)]));
         // Still writable: the kernel's write would succeed (a write of
         // ours here would fault if it were not).
-        assert!(!guards().protected.contains(&((view + BLOCK) / BLOCK)), "made read-only under the read");
+        assert!(!guards().protected.contains(&middle), "made read-only under the read");
         assert!(guards().protected.contains(&(view / BLOCK)));
         assert_eq!(guard(view, view + SIZE), Some(vec![pages(1)]), "taken as written while it is open");
+        // The read is done: taken once more, then guarded again (unless the
+        // switch keeps every announced write open for a while).
+        drop(read);
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(1)]), "what the read wrote is taken");
+        if !kernel_open_long() {
+            assert!(guards().protected.contains(&middle), "guarded again after the read");
+            assert_eq!(guard(view, view + SIZE), Some(Vec::new()), "not taken again once guarded");
+        }
         drop_views(section, &[view, other], SIZE);
+    }
+
+    /// A write through the kernel that goes on after its call (an
+    /// overlapped read) keeps its blocks writable for a while after the
+    /// announcement is let go.
+    #[test]
+    fn a_pending_kernel_write_stays_open_after_its_call() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1)]));
+        writing(view, BLOCK).pending();
+        for _ in 0..2 {
+            assert_eq!(guard(view, view + SIZE), Some(vec![pages(0)]), "taken as written while it may be writing");
+            assert!(!guards().protected.contains(&(view / BLOCK)), "made read-only under the read");
+        }
+        // Remapping the memory ends it.
+        drop_views(section, &[view, other], SIZE);
+        assert!(!guards().kernel.iter().any(|k| k.first < (view + SIZE) / BLOCK && k.end > view / BLOCK));
     }
 
     /// Blocks in order make runs of consecutive ones.
@@ -1637,7 +1752,7 @@ mod tests {
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;
-        writing(top, PAGE);
+        drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
     }
 }
