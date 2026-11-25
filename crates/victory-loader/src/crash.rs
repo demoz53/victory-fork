@@ -8,9 +8,12 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Panics of ours go to the crash log too.
+//! often states the reason. Diagnostics builds can also append first-chance
+//! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
+//! crash log too.
 
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -45,17 +48,21 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// Read before installing the exception handler.
+static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
     if LOG.set(file).is_ok() {
+        let _ = HOST.set(host());
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
-                title_output()
+                report_end()
             ));
         }));
     }
@@ -65,7 +72,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
     let text = format!("{text}
-{}", title_output());
+{}", report_end());
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -108,6 +115,57 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
+/// The host's line in a crash report. Its CPU and Windows build decide what
+/// title code runs (Intel CPUs lack some of the console's AMD-only
+/// instructions) and which D3D12 runtime there is, so a report needs both.
+/// Set along with the crash log, so a crash queries nothing.
+static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// What ends a crash report: the host, then the title's last debug output.
+fn report_end() -> String {
+    let host = HOST.get().map_or("", String::as_str);
+    format!("{host}{}", title_output())
+}
+
+/// The line [`HOST`] holds.
+fn host() -> String {
+    format!("  host: {}, Windows {}\n", cpu_name(), windows_version())
+}
+
+/// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
+fn cpu_name() -> String {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+        return "an unnamed CPU".into();
+    }
+    let bytes: Vec<u8> = (0x8000_0002..=0x8000_0004)
+        .flat_map(|leaf| {
+            let r = __cpuid(leaf);
+            [r.eax, r.ebx, r.ecx, r.edx]
+        })
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let padding = |c: char| c == '\0' || c.is_whitespace();
+    let name = String::from_utf8_lossy(&bytes);
+    name.trim_matches(padding).to_owned()
+}
+
+/// The running Windows as `major.minor.build`. `RtlGetVersion` gives the
+/// real one; `GetVersionEx` gives what the executable's manifest declares.
+fn windows_version() -> String {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    // SAFETY: a zeroed OSVERSIONINFOW is valid; its size field is set.
+    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
+    // SAFETY: fills the structure passed, whose size it was told.
+    if unsafe { RtlGetVersion(&mut info) } != 0 {
+        return "of unknown version".into();
+    }
+    let (major, minor, build) = (info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
+    format!("{major}.{minor}.{build}")
+}
+
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -115,13 +173,152 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
+    LOG_FIRST_CHANCE_BREAKPOINTS.store(
+        cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
+        Ordering::Relaxed,
+    );
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
     unsafe {
+        // The AMD-only instructions first: the title traps on them tens of
+        // thousands of times a second, and every handler ahead of this one
+        // would see each of those traps (`VICTORY_AMD_FIRST=0`: last, with
+        // the crash report, as before).
+        if amd_first() {
+            AddVectoredExceptionHandler(1, Some(amd_handler));
+        }
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
     }
+    amd_counts_logger();
+}
+
+/// Whether the AMD-only instructions have a vectored handler of their own,
+/// first in the chain ([`amd_handler`]).
+fn amd_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMD_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// The AMD-only instructions, ahead of every other vectored handler: they
+/// are emulated, anything else goes on down the chain.
+unsafe extern "system" fn amd_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { emulate_amd_only(info) } { -1 } else { EXCEPTION_CONTINUE_SEARCH }
+}
+
+/// The AMD-only instructions emulated, by kind: clzero (exceptions, and the
+/// lines they zeroed), monitorx, mwaitx (exceptions; of them, waits that
+/// saw their line change), rdpru, clwb, SSE4a's extrq/insertq.
+static AMD_COUNTS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+const AMD_NAMES: [&str; 8] = [
+    "clzero",
+    "lines clzero zeroed",
+    "monitorx",
+    "mwaitx",
+    "mwaitx waits that saw their line change",
+    "rdpru",
+    "clwb",
+    "extrq/insertq",
+];
+
+fn amd_count(kind: usize, n: u64) {
+    AMD_COUNTS[kind].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Every five seconds, what was emulated in them (nothing when nothing was).
+fn amd_counts_logger() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-amd-counts".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let counts: Vec<u64> = AMD_COUNTS.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+            if counts.iter().all(|&c| c == 0) {
+                continue;
+            }
+            let named: Vec<String> =
+                AMD_NAMES.iter().zip(&counts).map(|(name, n)| format!("{name} {:.0}", *n as f64 / 5.0)).collect();
+            tracing::info!("AMD-only instructions emulated per second: {}", named.join(", "));
+        });
+    });
+}
+
+thread_local! {
+    /// The line the thread's last `monitorx` named ([`mwaitx`]).
+    static MONITORED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `mwaitx` waits until the line `monitorx` named is written, or its timer
+/// (with `ecx` bit 1, `ebx` cycles), or a millisecond at most, has run
+/// out: the title spins on a fence value in memory this way, and returned
+/// at once (a yield) every pass of its spin was two exceptions, hundreds of
+/// thousands a second, the thread's whole core. Waking early is what the
+/// instruction may always do. `VICTORY_MWAITX_WAIT=0`: a yield, as before.
+fn mwaitx(context: &CONTEXT) {
+    static WAITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let line = MONITORED.with(std::cell::Cell::get) & !7;
+    if line == 0
+        || !*WAITS.get_or_init(|| std::env::var_os("VICTORY_MWAITX_WAIT").is_none_or(|v| v != "0"))
+        || !readable_word(line)
+    {
+        std::thread::yield_now();
+        return;
+    }
+    // SAFETY: a readable word (checked above) the title watches.
+    let read = || unsafe { (line as *const u64).read_volatile() };
+    let was = read();
+    const MOST: u64 = 1_000_000; // nanoseconds
+    let most = if context.Rcx & 2 != 0 {
+        // The timer counts the time-stamp counter's cycles: at about 3 GHz.
+        (u64::from(context.Rbx as u32) / 3).clamp(1_000, MOST)
+    } else {
+        MOST
+    };
+    let started = std::time::Instant::now();
+    let mut spins = 0u32;
+    loop {
+        if read() != was {
+            amd_count(4, 1);
+            return;
+        }
+        if started.elapsed().as_nanos() as u64 >= most {
+            return;
+        }
+        spins += 1;
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Whether the 8 bytes at `at` can be read (one `VirtualQuery`, cached per
+/// thread for the page last asked about).
+fn readable_word(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    thread_local! {
+        static LAST: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((usize::MAX, false)) };
+    }
+    let page = at & !0xfff;
+    if (at & 0xfff) > 0x1000 - 8 {
+        return false;
+    }
+    let (last, ok) = LAST.with(std::cell::Cell::get);
+    if last == page {
+        return ok;
+    }
+    // SAFETY: plain data filled in by VirtualQuery.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the structure's size.
+    let found = unsafe { VirtualQuery(page as *const _, &mut m, size_of_val(&m)) } != 0;
+    let ok = found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.Protect != 0;
+    LAST.with(|l| l.set((page, ok)));
+    ok
 }
 
 /// What the vectored handler reports as it happens.
@@ -134,27 +331,54 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
+/// Whether the 64-byte line at `line` can be written (a clzero's).
+///
+/// The region a `VirtualQuery` finds writable is kept per thread, and a
+/// line inside it is not asked about again: the system finds a region's
+/// size by walking its pages, and for the title's memory (gigabytes of one
+/// region) that took milliseconds a call; at a call for every clzero the
+/// title runs, it took whole seconds a frame (all13n0-prof: the hottest
+/// thread in `NtQueryVirtualMemory` under this function). A block of it
+/// made read-only since (the write watch's guards) is still written: the
+/// write faults inside the handler, and the guards' own vectored handler
+/// takes that fault as it takes the title's writes.
 fn writable_line(line: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
     };
+    thread_local! {
+        static WRITABLE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
     let Some(end) = line.checked_add(64) else {
         return false;
     };
+    let (from, to) = WRITABLE.with(std::cell::Cell::get);
+    if from <= line && end <= to {
+        return true;
+    }
     // SAFETY: plain data filled in by VirtualQuery.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: valid out pointer of exact struct size.
     let found = unsafe { VirtualQuery(line as *const _, &mut m, size_of_val(&m)) } != 0;
-    found
+    let region_end = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+    let ok = found
         && m.State == MEM_COMMIT
         && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
+        && region_end >= end;
+    if ok {
+        WRITABLE.with(|w| w.set((m.BaseAddress as usize, region_end)));
+    }
+    ok
 }
 
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// line at `rax` (see [`clzero`] for the loops around it);
+/// `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so a spin loop
+/// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
+/// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
+/// frequency, and gets the time-stamp counter for both: a core that never
+/// changes frequency.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable inside its page, as the CPU just fetched them.
@@ -171,44 +395,56 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         let mut bytes = [0u8; 32];
         let n = room.min(bytes.len());
         std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-        match &bytes[..n] {
+        let slice = &bytes[..n];
+        match slice {
             [0x0f, 0x01, 0xfc, ..] => {
-                let line = (context.Rax & !63) as usize;
-                if !writable_line(line) {
+                if !writable_line((context.Rax & !63) as usize) {
                     return false;
                 }
-                (line as *mut u8).write_bytes(0, 64);
+                amd_count(0, 1);
+                return clzero(context);
             }
-            [0x0f, 0x01, 0xfa, ..] => {}
-            [0x0f, 0x01, 0xfb, ..] => std::thread::yield_now(),
-            slice => {
-                if let Some(pass) = clwb_loop(slice) {
+            [0x0f, 0x01, 0xfa, ..] => {
+                amd_count(2, 1);
+                MONITORED.with(|m| m.set(context.Rax as usize));
+            }
+            [0x0f, 0x01, 0xfb, ..] => {
+                amd_count(3, 1);
+                mwaitx(context);
+            }
+            [0x0f, 0x01, 0xfd, ..] => {
+                amd_count(5, 1);
+                // Flags are left as they are: a Zen 3 changes none, for
+                // known counters or not (measured in user mode).
+                let known = context.Rcx as u32 <= 1;
+                let cycles = if known { std::arch::x86_64::_rdtsc() } else { 0 };
+                context.Rax = cycles & 0xffff_ffff;
+                context.Rdx = cycles >> 32;
+            }
+            _ => {
+                if let Some(pass) = clwb_loop(slice)
+                    && let Some(end) =
+                        clwb_loop_end(*gpr(context, pass.base), *gpr(context, pass.limit))
+                {
                     // A whole write-back loop in one exception (see `clwb_loop`).
                     let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
+                    *gpr(context, pass.base) = end;
+                    let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
+                    amd_count(6, 1);
                     return true;
                 }
-                let mut padded = [0u8; 15];
-                let copy = n.min(padded.len());
-                padded[..copy].copy_from_slice(&slice[..copy]);
-                if let Some(len) = clwb_len(padded)
-                    && len <= n
-                {
+                if let Some(len) = clwb_len(slice) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
+                    amd_count(6, 1);
                     return true;
                 }
                 let Some(len) = sse4a(slice, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
+                amd_count(7, 1);
                 context.Rip += len as u64;
                 return true;
             }
@@ -220,12 +456,12 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
 /// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: [u8; 15]) -> Option<usize> {
-    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
-    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
+fn clwb_len(code: &[u8]) -> Option<usize> {
+    let at = if *code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
+    if *code.first()? != 0x66 || code.get(at..at + 2)? != [0x0f, 0xae] {
         return None;
     }
-    let modrm = code[at + 2];
+    let modrm = *code.get(at + 2)?;
     let (mode, rm) = (modrm >> 6, modrm & 7);
     if mode == 3 || (modrm >> 3) & 7 != 6 {
         return None;
@@ -233,7 +469,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
     let mut len = at + 3;
     let mut base = rm;
     if rm == 4 {
-        base = code[len] & 7;
+        base = *code.get(len)? & 7;
         len += 1;
     }
     len += match mode {
@@ -242,7 +478,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
         2 => 4,
         _ => 0,
     };
-    Some(len)
+    (len <= code.len()).then_some(len)
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -263,6 +499,19 @@ struct ClwbLoop {
     limit: u8,
     /// Bytes from `clwb` to the instruction after `jbe`.
     len: usize,
+}
+
+/// The `base` value left after a `clwb_loop` finishes without wrapping past
+/// `u64::MAX`, or `None` if `add base, 0x40` would overflow or wrap (in which
+/// case we fall through to single-instruction `clwb` emulation).
+fn clwb_loop_end(base: u64, limit: u64) -> Option<u64> {
+    let step = if base <= limit {
+        ((limit - base) / 64 + 1).checked_mul(64)?
+    } else {
+        64
+    };
+    let end = base.checked_add(step)?;
+    (end > limit).then_some(end)
 }
 
 fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
@@ -301,6 +550,98 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
         return None;
     }
     (limit != base).then_some(ClwbLoop { base, limit, len })
+}
+
+/// `clzero` at `context.Rip`. An exception costs about a microsecond and
+/// titles clear tens of kilobytes at a time, a line per pass, so the two
+/// loops compilers build around the instruction are done whole in one
+/// exception, leaving registers and flags as their last pass would (`a`
+/// and `b` any registers but `rax`):
+///
+/// ```text
+/// top: clzero                 top: mov rax, a
+///      add rax, 0x40               add a, 0x40
+///      cmp rax, b                  clzero
+///      jb  top                     cmp a, b
+///                                  jb  top
+/// ```
+///
+/// Anything else around it is one line and the next instruction.
+///
+/// # Safety
+/// `context` is the state of a thread that faulted at a `clzero`; the
+/// lines its registers name are the title's to zero.
+unsafe fn clzero(context: &mut CONTEXT) -> bool {
+    let zero = |rax: u64| {
+        amd_count(1, 1);
+        // SAFETY: (every use) a line the title asked to zero.
+        unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) }
+    };
+    let at = context.Rip as usize;
+    // The loops' other instructions are read only where that stays inside
+    // the faulting instruction's page (the next one may not be mapped).
+    let page = at & 0xfff;
+    if page + 12 <= 0x1000 {
+        // SAFETY: inside the page the CPU fetched the instruction from.
+        let after = unsafe { &*((at + 3) as *const [u8; 9]) };
+        if let [0x48, 0x83, 0xc0, 0x40, cmp @ .., 0x72, 0xf4] = after
+            && let Some((0, limit)) = compare_registers(cmp)
+            && limit != 0
+        {
+            let limit = *gpr(context, limit);
+            loop {
+                zero(context.Rax);
+                context.Rax = context.Rax.wrapping_add(0x40);
+                if context.Rax >= limit {
+                    break;
+                }
+            }
+            context.EFlags = context.EFlags & !CMP_FLAGS | cmp_flags(context.Rax, limit);
+            context.Rip += 12;
+            return true;
+        }
+    }
+    if (7..=0x1000 - 8).contains(&page) {
+        // SAFETY: inside the page the CPU fetched the instruction from.
+        let (before, after) =
+            unsafe { (&*((at - 7) as *const [u8; 7]), &*((at + 3) as *const [u8; 5])) };
+        if let [rex @ (0x48 | 0x4c), 0x89, load, add_rex @ (0x48 | 0x49), 0x83, add, 0x40] = *before
+            && let [cmp @ .., 0x72, 0xf1] = after
+            && let Some((a, b)) = compare_registers(cmp)
+            && load & 0xc7 == 0xc0
+            && a == (load >> 3) & 7 | (rex & 4) << 1
+            && add & 0xf8 == 0xc0
+            && a == add & 7 | (add_rex & 1) << 3
+            && a != 0
+            && b != 0
+        {
+            let limit = *gpr(context, b);
+            loop {
+                zero(context.Rax);
+                let next = *gpr(context, a);
+                if next >= limit {
+                    break;
+                }
+                context.Rax = next;
+                *gpr(context, a) = next.wrapping_add(0x40);
+            }
+            context.EFlags =
+                context.EFlags & !CMP_FLAGS | cmp_flags(*gpr(context, a), limit);
+            context.Rip += 8;
+            return true;
+        }
+    }
+    zero(context.Rax);
+    context.Rip += 3;
+    true
+}
+
+/// `cmp rm, reg` between 64-bit registers (`REX.W 39 /r`): (`rm`, `reg`).
+fn compare_registers(code: &[u8]) -> Option<(u8, u8)> {
+    let &[rex @ 0x48..=0x4f, 0x39, modrm] = code else {
+        return None;
+    };
+    (modrm >> 6 == 3).then_some((modrm & 7 | (rex & 1) << 3, (modrm >> 3) & 7 | (rex & 4) << 1))
 }
 
 /// The general register numbered `n` as instructions encode it.
@@ -385,23 +726,17 @@ fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // an instruction of the console's CPU this one lacks: emulated, the title goes on
-    // SAFETY: the system passes valid exception pointers.
-    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
-        // SAFETY: the faulting thread's context, for the exception being dispatched.
-        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
-        if r != 0 {
-            return r;
-        }
-    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
+    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    if FATAL.contains(&code) {
+        let to_file =
+            code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
         // SAFETY: as above.
-        unsafe { report("first-chance exception", info, false) };
+        unsafe { report("first-chance exception", info, to_file) };
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -555,9 +890,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
-        let said = title_output();
-        eprint!("{said}");
-        text.push_str(&said);
+        let end = report_end();
+        eprint!("{end}");
+        text.push_str(&end);
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
@@ -876,26 +1211,115 @@ mod tests {
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
 
+    /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
+    type Captured = (Vec<u64>, Vec<usize>);
+
+    /// A frame we expect [`unwind`] to report: the helper it is in, and the
+    /// helper's name for the message.
+    type Expected = (&'static str, fn() -> Captured);
+
+    /// The runtime function entry start covering `at`: the image base the
+    /// lookup writes, plus the entry's `BeginAddress`. Asking the system for
+    /// both sides of the comparison means a thunk or an incremental-link jump
+    /// is not mistaken for a different function.
+    fn entry_start_at(at: u64) -> Option<u64> {
+        let mut image = 0;
+        // SAFETY: looks up the function table entry covering `at`; nothing
+        // keeps a reference to the entry past this call.
+        let entry = unsafe { RtlLookupFunctionEntry(at, &mut image, null_mut()) };
+        if entry.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
+        // and `BeginAddress` is an offset into that image.
+        Some(image + u64::from(unsafe { (*entry).BeginAddress }))
+    }
+
     #[test]
-    #[inline(never)]
     fn unwinds_like_the_system_walk() {
-        // SAFETY: zeroed CONTEXT is valid; both calls write our buffers.
-        let (frames, walked) = unsafe {
-            // `RtlCaptureContext` wants it 16-byte aligned too.
+        // Asking the system's own walk whether the stack looks right is not
+        // reliable: on Windows 10 x64 debug builds `RtlCaptureStackBackTrace`
+        // returns no frames about half the time. The frames above us are
+        // known instead (see `level_a`), so check those first.
+        let (frames, walked) = level_a();
+        // Frame 0 is in `capture_frames`, which took the context; then its
+        // callers in call order, each named by its runtime function entry.
+        let helpers: [Expected; 4] = [
+            ("capture_frames", capture_frames),
+            ("level_c", level_c),
+            ("level_b", level_b),
+            ("level_a", level_a),
+        ];
+        assert!(frames.len() >= helpers.len(), "{frames:?}");
+        for (i, (name, helper)) in helpers.iter().enumerate() {
+            let want = entry_start_at(*helper as usize as u64)
+                .unwrap_or_else(|| panic!("no unwind data for {name}"));
+            let got = entry_start_at(frames[i])
+                .unwrap_or_else(|| panic!("no unwind data for frame {i} at {:#x}", frames[i]));
+            assert_eq!(got, want, "frame {i} should be {name}: {frames:?}");
+        }
+        // A walk that repeats an address is not a walk.
+        let mut distinct = frames[..helpers.len()].to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), helpers.len(), "repeated: {frames:?}");
+        // Where the system's walk does return frames, it must still agree with
+        // ours: frame 0 differs (both are in `capture_frames`, at different
+        // call sites), and the callers above are the same.
+        if walked.len() >= helpers.len() {
+            assert!(frames.len() >= walked.len(), "{frames:?} vs {walked:?}");
+            let ours: Vec<usize> = frames[1..walked.len()]
+                .iter()
+                .map(|&f| f as usize)
+                .collect();
+            assert_eq!(ours.as_slice(), &walked[1..]);
+        }
+    }
+
+    /// The frames of this call, both ways: our [`unwind`], and the system's
+    /// walk, which Windows 10 can come up empty on.
+    #[inline(never)]
+    fn capture_frames() -> Captured {
+        // SAFETY: a zeroed CONTEXT is valid and both calls write buffers of
+        // ours; `RtlCaptureContext` wants the context 16-byte aligned too.
+        unsafe {
             let mut context = Aligned16(std::mem::zeroed());
             RtlCaptureContext(&mut context.0);
             let mut walked = [null_mut(); 8];
             let n = RtlCaptureStackBackTrace(0, 8, walked.as_mut_ptr(), null_mut());
-            (unwind(context.0), walked[..usize::from(n)].to_vec())
-        };
-        // Frame 0 differs (two call sites in this function); callers agree.
-        assert!(walked.len() >= 4, "{walked:?}");
-        let ours: Vec<_> = frames[1..walked.len()]
-            .iter()
-            .map(|&f| f as usize)
-            .collect();
-        let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
-        assert_eq!(ours, system);
+            let frames = unwind(context.0);
+            let walked = walked[..usize::from(n)]
+                .iter()
+                .map(|&f| f as usize)
+                .collect();
+            (frames, walked)
+        }
+    }
+
+    /// `level_a` → `level_b` → `level_c` → [`capture_frames`]: three known
+    /// callers above the capture. `black_box` after each call keeps it from
+    /// becoming a tail call, which would erase the caller's frame.
+    #[inline(never)]
+    fn level_a() -> Captured {
+        let captured = level_b();
+        std::hint::black_box(&captured);
+        captured
+    }
+
+    /// See [`level_a`].
+    #[inline(never)]
+    fn level_b() -> Captured {
+        let captured = level_c();
+        std::hint::black_box(&captured);
+        captured
+    }
+
+    /// See [`level_a`].
+    #[inline(never)]
+    fn level_c() -> Captured {
+        let captured = capture_frames();
+        std::hint::black_box(&captured);
+        captured
     }
 
     #[test]
@@ -970,27 +1394,124 @@ mod tests {
     }
 
     #[test]
-    fn clwb_lengths() {
-        let pad = |b: &[u8]| {
-            let mut c = [0u8; 15];
-            c[..b.len()].copy_from_slice(b);
-            c
+    fn clwb_loop_wrapping_ranges_do_not_overflow_and_fall_back_to_single_clwb() {
+        assert_eq!(clwb_loop_end(0x1000, 0x1080), Some(0x10c0));
+        assert_eq!(clwb_loop_end(0x10c0, 0x1080), Some(0x1100));
+        assert_eq!(clwb_loop_end(0, u64::MAX - 10), None);
+        assert_eq!(clwb_loop_end(u64::MAX - 16, 0x100), None);
+        assert_eq!(clwb_loop_end(u64::MAX - 63, u64::MAX), None);
+
+        // clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top (13 bytes, clwb is 4 bytes).
+        let mut bytes = [0xcc_u8; 16];
+        bytes[..13].copy_from_slice(&[
+            0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf3,
+        ]);
+        let run = |base: u64, limit: u64| -> (u64, u64) {
+            let start = bytes.as_ptr() as u64;
+            // SAFETY: zeroed record/context are valid; `emulate_amd_only` only
+            // reads `bytes` and updates `context`.
+            unsafe {
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = start;
+                context.Rcx = base;
+                context.Rax = limit;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                assert!(emulate_amd_only(&mut pointers));
+                (context.Rip - start, context.Rcx)
+            }
         };
-        assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
-            Some(8)
-        ); // [rax+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
-            Some(8)
-        ); // [rip+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
-        assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+        // Normal range completes the whole 13-byte loop in one exception.
+        assert_eq!(run(0x1000, 0x1080), (13, 0x10c0));
+        // Overflowing/wrapping ranges must not panic or skip the loop: emulate
+        // just the 4-byte `clwb` instruction and let the CPU run add/cmp/jbe.
+        assert_eq!(run(0, u64::MAX - 10), (4, 0));
+        assert_eq!(run(u64::MAX - 16, 0x100), (4, u64::MAX - 16));
+    }
+
+    #[test]
+    fn clwb_lengths() {
+        assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5)); // clwb [r9]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x30]), Some(4)); // clwb [rax]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70, 0x40]), Some(5)); // clwb [rax+0x40]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0]), Some(8)); // [rax+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x24]), Some(5)); // clwb [rsp]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]), Some(8)); // [rip+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x38]), None); // clflushopt, /7
+        assert_eq!(clwb_len(&[0x0f, 0xae, 0x30]), None); // xsaveopt, no 66
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xf0]), None); // register form
+    }
+
+    #[test]
+    fn a_clwb_at_the_end_of_a_page_is_decoded() {
+        // Exact-length slices, as at the end of a page.
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x30]), Some(4));
+        assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5));
+        // Cut short by the slice: returns None without panicking.
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1]), None); // disp32, 6 of 8 bytes
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70]), None); // disp8, 4 of 5 bytes
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34]), None); // SIB missing
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x25, 0, 0]), None); // SIB disp32 cut short
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae]), None); // ModRM missing
+        assert_eq!(clwb_len(&[0x66]), None);
+        assert_eq!(clwb_len(&[]), None);
+
+        // Emulation at the last 4 and 5 bytes of a page with an unreadable page after it.
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: two pages of ours, the second unreadable so reading past the first faults.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let mut old = 0;
+            let guard = page.add(0x1000).cast();
+            assert_ne!(VirtualProtect(guard, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            for insn in [
+                &[0x66, 0x0f, 0xae, 0x30][..],
+                &[0x66, 0x41, 0x0f, 0xae, 0x31][..],
+            ] {
+                let end = page.add(0x1000 - insn.len());
+                end.copy_from_nonoverlapping(insn.as_ptr(), insn.len());
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = end as u64;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                assert!(emulate_amd_only(&mut pointers));
+                assert_eq!(context.Rip, end as u64 + insn.len() as u64);
+            }
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn the_host_line_names_the_cpu_and_windows() {
+        // e.g. "  host: AMD EPYC 7763 64-Core Processor, Windows 10.0.26100\n"
+        let line = host();
+        let framed = line.starts_with("  host: ") && line.ends_with('\n');
+        assert!(framed, "{line:?}");
+        let inner = line.trim_start_matches("  host: ").trim_end();
+        let (cpu, windows) = inner.rsplit_once(", Windows ").expect(&line);
+        let named = !cpu.is_empty() && cpu == cpu.trim() && !cpu.contains('\0');
+        assert!(named, "{line:?}");
+        let version: Vec<u32> = windows.split('.').filter_map(|n| n.parse().ok()).collect();
+        assert!(version.len() == 3 && version[0] >= 10, "{line:?}");
+        println!("{line}");
     }
 
     #[test]
@@ -1023,6 +1544,74 @@ mod tests {
             std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
                 in("rax") at, in("ecx") 0, in("edx") 0)
         };
+        // rdpru of MPERF: a count in edx:eax, their high halves clear.
+        let (low, high): (u64, u64);
+        // SAFETY: touches only the named registers.
+        unsafe {
+            std::arch::asm!(".byte 0x0f, 0x01, 0xfd",
+                out("rax") low, inout("rcx") 0u64 => _, out("rdx") high)
+        };
+        assert_ne!(high << 32 | low, 0);
+        assert!(high >> 32 == 0 && low >> 32 == 0);
+    }
+
+    /// The flags a native `cmp a, b` leaves.
+    fn native_compare(a: u64, b: u64) -> u32 {
+        let flags: u64;
+        // SAFETY: compares two registers and reads the flags.
+        unsafe {
+            std::arch::asm!("cmp {a}, {b}", "pushfq", "pop {f}",
+                a = in(reg) a, b = in(reg) b, f = out(reg) flags)
+        };
+        flags as u32 & CMP_FLAGS
+    }
+
+    #[test]
+    fn compare_sets_flags_like_the_cpu() {
+        let values = [0, 1, 0x40, 0x7f, 0x80, 0xff, 1 << 63, (1 << 63) - 1, !0, !0 - 0x40];
+        for a in values {
+            for b in values {
+                assert_eq!(cmp_flags(a, b), native_compare(a, b), "cmp {a:#x}, {b:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn clzero_loops_end_like_their_last_pass() {
+        report_crashes();
+        #[repr(align(64))]
+        struct Lines([u8; 192]);
+        let zeroed = |l: &Lines| [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0];
+        // clzero; add rax, 0x40; cmp rax, r10; jb
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        let (end, flags): (u64, u64);
+        // SAFETY: zeroes the first two lines of `mem`.
+        unsafe {
+            std::arch::asm!(
+                ".byte 0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4",
+                "pushfq", "pop {f}",
+                inout("rax") start => end, in("r10") start + 100, f = out(reg) flags)
+        };
+        assert_eq!(end, start + 128);
+        assert_eq!(flags as u32 & CMP_FLAGS, native_compare(end, start + 100));
+        assert_eq!(zeroed(&mem), [true, true, false]);
+        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        let (last, next, flags): (u64, u64, u64);
+        // SAFETY: zeroes the last two lines of `mem`.
+        unsafe {
+            std::arch::asm!(
+                ".byte 0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc",
+                ".byte 0x4c, 0x39, 0xc2, 0x72, 0xf1",
+                "pushfq", "pop {f}",
+                out("rax") last, inout("rdx") start + 64 => next, in("r8") start + 192,
+                f = out(reg) flags)
+        };
+        assert_eq!((last, next), (start + 128, start + 192));
+        assert_eq!(flags as u32 & CMP_FLAGS, native_compare(next, start + 192));
+        assert_eq!(zeroed(&mem), [false, true, true]);
     }
 
     fn reg(low: u64, high: u64) -> M128A {
@@ -1081,6 +1670,255 @@ mod tests {
         assert_eq!(emulate(&[0x0f, 0x01, 0xfc], at, &mut xmm), Some(3));
         assert!(line.0[..64].iter().all(|&b| b == 0));
         assert!(line.0[64..].iter().all(|&b| b == 0xff));
+    }
+
+    /// Gives `code` to the emulation as if it faulted at `code[at]` with
+    /// `context` as the saved state, on any CPU; returns whether it
+    /// emulated and leaves the state after in `context`.
+    fn emulate_in(code: &[u8], at: usize, context: &mut CONTEXT) -> bool {
+        // At a fixed place in a page, so the loops' neighbours are always
+        // read (they are not near a page's edges).
+        #[repr(align(4096))]
+        struct Page([u8; 4096]);
+        let mut page = Box::new(Page([0xcc; 4096]));
+        let bytes = &mut page.0[0x800..];
+        bytes[..code.len()].copy_from_slice(code);
+        context.Rip = bytes.as_ptr() as u64 + at as u64;
+        // SAFETY: a zeroed record is valid; the emulation reads only
+        // `bytes` and writes `context` and the lines the caller owns.
+        unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: context,
+            };
+            let emulated = emulate_amd_only(&mut pointers);
+            context.Rip -= bytes.as_ptr() as u64;
+            emulated
+        }
+    }
+
+    #[test]
+    fn emulated_clzero_loops_end_like_their_last_pass() {
+        #[repr(align(64))]
+        struct Lines([u8; 192]);
+        let zeroed = |l: &Lines| [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0];
+        // clzero; add rax, 0x40; cmp rax, r10; jb
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.R10 = start + 100;
+        context.EFlags = 0x202 | CMP_FLAGS;
+        let code = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4];
+        assert!(emulate_in(&code, 0, &mut context));
+        assert_eq!((context.Rip, context.Rax), (12, start + 128));
+        assert_eq!(context.EFlags, 0x202 | native_compare(start + 128, start + 100));
+        assert_eq!(zeroed(&mem), [true, true, false]);
+        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb (faults at clzero,
+        // after the first pass's mov and add)
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start + 64;
+        context.Rdx = start + 128;
+        context.R8 = start + 192;
+        let code = [
+            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x4c, 0x39, 0xc2, 0x72,
+            0xf1,
+        ];
+        assert!(emulate_in(&code, 7, &mut context));
+        assert_eq!((context.Rip, context.Rax, context.Rdx), (15, start + 128, start + 192));
+        assert_eq!(context.EFlags, native_compare(start + 192, start + 192));
+        assert_eq!(zeroed(&mem), [false, true, true]);
+        // cmp rax, rax is not the loop (the limit would move with rax): one
+        // line, flags untouched.
+        let mut mem = Lines([0xff; 192]);
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = mem.0.as_mut_ptr() as u64;
+        context.EFlags = 0x202;
+        let code = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xc0, 0x72, 0xf4];
+        assert!(emulate_in(&code, 0, &mut context));
+        assert_eq!((context.Rip, context.EFlags), (3, 0x202));
+        assert_eq!(zeroed(&mem), [true, false, false]);
+        // Any other neighbours: one line, then the next instruction.
+        let mut mem = Lines([0xff; 192]);
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = mem.0.as_mut_ptr() as u64 + 70;
+        context.R10 = !0;
+        let code = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x20, 0x4c, 0x39, 0xd0, 0x72, 0xf4];
+        assert!(emulate_in(&code, 0, &mut context));
+        assert_eq!(context.Rip, 3);
+        assert_eq!(zeroed(&mem), [false, true, false]);
+    }
+
+    #[test]
+    fn emulated_clzero_loop_stops_when_the_limit_is_on_a_line_boundary() {
+        #[repr(align(64))]
+        struct Lines([u8; 256]);
+        // clzero; add rax, 0x40; cmp rax, r10; jb, with r10 exactly two lines
+        // on: the loop ends when rax reaches the limit (`>=`, not `>`).
+        let mut mem = Lines([0xff; 256]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.R10 = start + 128;
+        let code = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
+        ];
+        assert!(emulate_in(&code, 0, &mut context));
+        assert_eq!((context.Rip, context.Rax), (12, start + 128));
+        assert_eq!(
+            context.EFlags & CMP_FLAGS,
+            native_compare(start + 128, start + 128)
+        );
+        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
+        assert_eq!(zeroed, [true, true, false, false]);
+    }
+
+    #[test]
+    fn emulated_clzero_second_loop_with_extended_registers() {
+        #[repr(align(64))]
+        struct Lines([u8; 256]);
+        // mov rax, r9; add r9, 0x40; clzero; cmp r9, r12; jb. `a` = r9 needs
+        // REX.R in the mov and REX.B in the add and in the cmp; `b` = r12
+        // needs REX.R in the cmp.
+        let mut mem = Lines([0xff; 256]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start;
+        context.R9 = start + 64;
+        context.R12 = start + 192;
+        let code = [
+            0x4c, 0x89, 0xc8, 0x49, 0x83, 0xc1, 0x40, 0x0f, 0x01, 0xfc, 0x4d, 0x39, 0xe1, 0x72,
+            0xf1,
+        ];
+        assert!(emulate_in(&code, 7, &mut context));
+        assert_eq!(
+            (context.Rip, context.Rax, context.R9),
+            (15, start + 128, start + 192)
+        );
+        assert_eq!(
+            context.EFlags & CMP_FLAGS,
+            native_compare(start + 192, start + 192)
+        );
+        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
+        assert_eq!(zeroed, [true, true, true, false]);
+        // Every `a` in r9..r15 (r12 as the limit, so skip it as `a`).
+        for a in [9_u8, 10, 11, 13, 14, 15] {
+            let mut mem = Lines([0xff; 256]);
+            let start = mem.0.as_mut_ptr() as u64;
+            // SAFETY: an all-zero context is valid.
+            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+            context.Rax = start;
+            *gpr(&mut context, a) = start + 64;
+            context.R12 = start + 192;
+            let n = a & 7;
+            let code = [
+                0x4c,
+                0x89,
+                0xc0 | n << 3,
+                0x49,
+                0x83,
+                0xc0 | n,
+                0x40,
+                0x0f,
+                0x01,
+                0xfc,
+                0x4d,
+                0x39,
+                0xe0 | n,
+                0x72,
+                0xf1,
+            ];
+            assert!(emulate_in(&code, 7, &mut context), "r{a}");
+            assert_eq!(context.Rip, 15, "r{a}");
+            assert_eq!(*gpr(&mut context, a), start + 192, "r{a}");
+            assert_eq!(context.Rax, start + 128, "r{a}");
+            let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
+            assert_eq!(zeroed, [true, true, true, false], "r{a}");
+        }
+    }
+
+    #[test]
+    fn emulated_clzero_loops_with_rax_as_the_limit_are_one_line() {
+        #[repr(align(64))]
+        struct Lines([u8; 192]);
+        let zeroed = |l: &Lines| [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0];
+        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, rax; jb: the limit
+        // would be the line just zeroed, not a loop: one line, the next
+        // instruction, flags untouched.
+        let mut mem = Lines([0xff; 192]);
+        let start = mem.0.as_mut_ptr() as u64;
+        // SAFETY: an all-zero context is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rax = start + 64;
+        context.Rdx = start + 128;
+        context.EFlags = 0x202;
+        let code = [
+            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x48, 0x39, 0xc2, 0x72,
+            0xf1,
+        ];
+        assert!(emulate_in(&code, 7, &mut context));
+        assert_eq!(
+            (context.Rip, context.Rax, context.Rdx),
+            (10, start + 64, start + 128)
+        );
+        assert_eq!(context.EFlags, 0x202);
+        assert_eq!(zeroed(&mem), [false, true, false]);
+    }
+
+    #[test]
+    fn emulated_rdpru_reads_known_counters_and_keeps_flags() {
+        let cases = [(0, true), (1, true), (2, false), (0x1_0000_0000, true)];
+        let starts = [0x202, 0x202 | CMP_FLAGS];
+        for ((ecx, known), flags) in cases.into_iter().flat_map(|c| starts.map(|f| (c, f))) {
+            // SAFETY: an all-zero context is valid.
+            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+            context.Rcx = ecx;
+            context.Rax = !0;
+            context.Rdx = !0;
+            context.EFlags = flags;
+            assert!(emulate_in(&[0x0f, 0x01, 0xfd], 0, &mut context));
+            assert_eq!(context.Rip, 3);
+            assert_eq!(context.EFlags, flags, "ecx {ecx:#x}");
+            let count = context.Rdx << 32 | context.Rax;
+            assert!(context.Rax >> 32 == 0 && context.Rdx >> 32 == 0);
+            assert_eq!(count != 0, known, "ecx {ecx:#x}");
+        }
+    }
+
+    /// `mwaitx` after `monitorx`: back as soon as the watched word changes,
+    /// and with the timer within about its time when it does not.
+    #[test]
+    fn mwaitx_waits_for_its_line_or_its_timer() {
+        let word = Box::new(std::sync::atomic::AtomicU64::new(1));
+        let at = std::ptr::from_ref(&*word) as u64;
+        let mut xmm = [reg(0, 0); 16];
+        assert_eq!(emulate(&[0x0f, 0x01, 0xfa], at, &mut xmm), Some(3));
+        // No change: the millisecond at most (no timer in this context).
+        let started = std::time::Instant::now();
+        assert_eq!(emulate(&[0x0f, 0x01, 0xfb], 0, &mut xmm), Some(3));
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_micros(900), "{waited:?}");
+        assert!(waited < std::time::Duration::from_millis(100), "{waited:?}");
+        // A write from another thread ends the wait.
+        let address = at as usize;
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            // SAFETY: the box outlives the thread (joined below).
+            unsafe { (*(address as *const std::sync::atomic::AtomicU64)).store(2, Ordering::Relaxed) };
+        });
+        assert_eq!(emulate(&[0x0f, 0x01, 0xfb], 0, &mut xmm), Some(3));
+        writer.join().unwrap();
+        assert_eq!(word.load(Ordering::Relaxed), 2);
     }
 
     #[test]
