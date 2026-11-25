@@ -285,6 +285,17 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
+    /// Whether this state describes a pass over the screen: no vertex input, no depth or
+    /// stencil test, triangles. The title fills its lighting tables with such draws once, at
+    /// the world's first frame (`PS_IntegrateEnvBRDF*`, `PS_AreaLightIlluminance`); their
+    /// pipelines get workers and a wait budget of their own ([`super::make`]).
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
@@ -1695,4 +1706,27 @@ mod tests {
             unsafe { host.device.CreateComputePipelineState(&desc) };
         eprintln!("REPLAY RESULT {}", made.map_or_else(|e| format!("refused: {e}"), |_| "made".into()));
     }
+    /// Upstream VIctory #2435: a screen pass is triangles with no vertex input and no depth
+    /// or stencil test.
+    #[test]
+    fn screen_pass_requires_triangles_without_inputs_or_depth() {
+        let mut g = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            depth_format: DXGI_FORMAT_UNKNOWN,
+            ..Default::default()
+        };
+        assert!(g.screen_pass());
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        g.depth.DepthEnable = true.into();
+        assert!(!g.screen_pass());
+        g.depth.DepthEnable = false.into();
+        g.depth.StencilEnable = false.into();
+        assert!(g.screen_pass());
+        g.inputs.push(D3D12_INPUT_ELEMENT_DESC::default());
+        assert!(!g.screen_pass());
+        g.inputs.clear();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        assert!(!g.screen_pass());
+    }
+
 }
