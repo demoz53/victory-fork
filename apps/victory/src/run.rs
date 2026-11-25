@@ -20,12 +20,14 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    apply_title_patches(&mut prepared, build, console);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -346,4 +348,52 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// Bytes as lower-case hex.
+#[cfg(windows)]
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The known build's code patches: the title's upscaler choice made the one
+/// a Series X makes (fxceless/victory-fork PR #798 by KyleS98, as in
+/// Geckomacabre/vx-layer 7bdd8c621). On a Series S the title picks FSR 4,
+/// whose output never reaches the screen here (every world frame black, 20
+/// of its compute shaders without a DXIL part); its own upscaler, the one a
+/// Series X runs, works. Applied with `--console series-s`;
+/// `VICTORY_TITLE_PATCHES=1` applies them on any console (a Series X already
+/// chooses that upscaler), `=0` never. Every expected byte is checked
+/// before anything is written: if one is not there (another build), nothing
+/// is patched and that is said. Each patch applied is said once.
+#[cfg(windows)]
+fn apply_title_patches(
+    prepared: &mut victory_loader::PreparedImage,
+    build: Option<&victory_game::KnownBuild>,
+    console: Console,
+) {
+    let wanted = match std::env::var("VICTORY_TITLE_PATCHES").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => matches!(console, Console::SeriesS),
+    };
+    if !wanted {
+        return;
+    }
+    let Some(build) = build.filter(|b| !b.patches.is_empty()) else {
+        println!("title patch    none: no patches for this build (it runs unpatched; a Series S may show black world frames)");
+        return;
+    };
+    let patches: Vec<(u32, Vec<u8>, Vec<u8>)> =
+        build.patches.iter().map(|p| (p.rva, p.expect.to_vec(), p.write.to_vec())).collect();
+    match prepared.patch(&patches) {
+        Ok(()) => {
+            for p in build.patches {
+                println!("title patch    +{:#x} {}: {} -> {}", p.rva, p.name, hex_str(p.expect), hex_str(p.write));
+            }
+        }
+        Err(e) => {
+            println!("title patch    none applied ({e}): the title runs unpatched");
+        }
+    }
 }
