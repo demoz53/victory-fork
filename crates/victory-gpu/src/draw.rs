@@ -555,10 +555,31 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // A fill reads title memory at submission, and settles the flights
+    // whose shaders may write it: copied on the card instead, behind them
+    // (`crate::host::fill_on_card`, as a table's constant buffer view is).
+    if crate::host::late() && crate::host::flights_write(address as usize, (address + len) as usize) {
+        FILL_FLIGHTS[0].fetch_add(1, Ordering::Relaxed);
+        if crate::host::fill_on_card() {
+            shadow.refresh(list, address, len);
+            if let Some(gpu) = list.card_constants(&shadow, address, len) {
+                FILL_FLIGHTS[1].fetch_add(1, Ordering::Relaxed);
+                return Some(gpu);
+            }
+        }
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
 }
+
+/// Since the last frame line, fills of upload memory recorded over title
+/// memory that flights in the air may write (each settles the flights at
+/// its submission), and of them those copied on the card instead
+/// (`crate::host::fill_on_card`): of root constant views, then of table
+/// constant views, then of these the ones with no host copy to copy from,
+/// then of texture copies' sources (`crate::list`).
+pub(crate) static FILL_FLIGHTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -2293,17 +2314,27 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                let over = matches!(view, Some(View::Constant(address, size))
+                    if crate::host::late()
+                        && crate::host::flights_write(address as usize, address as usize + size as usize));
+                if over {
+                    FILL_FLIGHTS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                match view {
                     Some(View::Constant(address, size))
-                        if crate::host::fill_on_card()
-                            && crate::host::late()
-                            && crate::host::flights_write(address as usize, address as usize + size as usize)
-                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        if over
+                            && crate::host::fill_on_card()
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size)).or_else(|| {
+                                FILL_FLIGHTS[4].fetch_add(1, Ordering::Relaxed);
+                                None
+                            })
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));
                                 list.card_constants(&shadow, address, u64::from(size))
                             } =>
                     {
+                        FILL_FLIGHTS[3].fetch_add(1, Ordering::Relaxed);
                         host.constant_at(index, gpu, size);
                     }
                     Some(View::Constant(address, size)) => {

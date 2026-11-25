@@ -7361,6 +7361,20 @@ impl Meter {
         }
         late_line(frames);
         {
+            let f = crate::draw::FILL_FLIGHTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+            if f.iter().any(|&n| n > 0.0) {
+                tracing::info!(
+                    "fills of upload memory over what flights write, per frame (each settles the flights at its                      submission unless copied on the card, VICTORY_FILL_ON_CARD): {:.1} of root constant views ({:.1} copied                      on the card), {:.1} of table constant views ({:.1} copied on the card, {:.1} with no host copy to copy                      from), {:.1} of texture copies' sources",
+                    f[0],
+                    f[1],
+                    f[2],
+                    f[3],
+                    f[4],
+                    f[5],
+                );
+            }
+        }
+        {
             let [events, us, longest] = [0, 1, 2].map(|i| crate::fence::EVENT_WAITS[i].swap(0, Ordering::Relaxed));
             if events > 0 {
                 tracing::info!(
