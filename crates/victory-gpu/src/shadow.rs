@@ -234,11 +234,51 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// The parts a 64 KiB piece is hashed in on the card (`CARD_COMPARE` in
+/// host.rs): 4 KiB each, cut at multiples of 4 KiB of title memory. The
+/// compare flags parts, and only flagged parts are fetched and merged.
+pub(crate) const CARD_PARTS: u32 = 16;
+
+/// The bytes of one part of [`CARD_PARTS`].
+const CARD_PART: usize = PIECE / CARD_PARTS as usize;
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
-/// for each 64 KiB piece (a copy that does not start on a piece boundary
-/// has one piece more).
+/// for each 4 KiB part of each 64 KiB piece (a copy that does not start on
+/// a piece boundary has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    (size / PIECE as u64 + 2) * 16 * u64::from(CARD_PARTS)
+}
+
+/// The offsets of piece `i` of `span` that lie in the span and in a part
+/// whose bit is set in `mask` (the compare's dword for the piece), part by
+/// part, in order, for a copy of `len` bytes of title memory from `start`
+/// on.
+fn card_piece_parts_of(
+    start: usize,
+    len: usize,
+    span: &CardSpan,
+    i: u32,
+    mask: u32,
+) -> Vec<(usize, usize)> {
+    let (lo, hi) = card_piece_of(start, len, span, i);
+    let mut parts: Vec<(usize, usize)> = Vec::new();
+    if lo >= hi {
+        return parts;
+    }
+    // Where the piece starts in the copy (before offset 0 for piece 0 of
+    // a copy that starts inside its piece).
+    let base = ((start / PIECE + (span.first + i) as usize) * PIECE) as isize - start as isize;
+    for part in 0..CARD_PARTS as usize {
+        if mask & (1 << part) == 0 {
+            continue;
+        }
+        let a = (base + (part * CARD_PART) as isize).max(lo as isize) as usize;
+        let b = ((base + ((part + 1) * CARD_PART) as isize).max(0) as usize).min(hi);
+        if a < b {
+            parts.push((a, b));
+        }
+    }
+    parts
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -495,6 +535,77 @@ mod card_tests {
                     at = hi;
                 }
                 assert_eq!(at, to, "{start:#x} {from} {to}");
+            }
+        }
+    }
+
+    /// The offsets the compare's shader takes for part `part` of a piece,
+    /// before it widens them to 16 bytes.
+    fn shader_part(span: &CardSpan, i: u32, part: u32) -> (u32, u32) {
+        let piece = span.first + i;
+        let lo = piece * 65536 + part * 4096;
+        let lo = if lo > span.skew { lo - span.skew } else { 0 };
+        let end = piece * 65536 + (part + 1) * 4096;
+        let hi = if end > span.skew { end - span.skew } else { 0 };
+        (lo, hi)
+    }
+
+    /// The parts of a piece, all flagged, cover what the piece covers,
+    /// each part as the shader hashes it (cut to the span); parts not
+    /// flagged are left out, and every part lies on a 4 KiB line of title
+    /// memory.
+    #[test]
+    fn the_shader_and_the_merge_cut_the_same_parts() {
+        use super::{CARD_PARTS, card_piece_parts_of};
+        for start in [
+            0usize,
+            4096,
+            0x1234,
+            PIECE - 16,
+            PIECE,
+            3 * PIECE + 0x1f00,
+            0xd_b790_df00,
+        ] {
+            let len = 5 * PIECE + 4096;
+            for (from, to) in [
+                (0, len),
+                (0, 1),
+                (16, PIECE),
+                (PIECE - 4, PIECE + 4),
+                (2 * PIECE, len),
+                (12345, 4 * PIECE + 7),
+            ] {
+                let span = card_span_of(start, from, to);
+                for i in 0..span.pieces {
+                    let (lo, hi) = card_piece_of(start, len, &span, i);
+                    let all = card_piece_parts_of(start, len, &span, i, u32::MAX);
+                    let mut at = lo;
+                    for &(a, b) in &all {
+                        assert_eq!(a, at, "{start:#x} {from} {to} piece {i}");
+                        assert!(b > a && b - a <= 4096);
+                        assert!((start + b).is_multiple_of(4096) || b == hi);
+                        at = b;
+                    }
+                    assert_eq!(at, hi, "{start:#x} {from} {to} piece {i}");
+                    for part in 0..CARD_PARTS {
+                        let (sa, sb) = shader_part(&span, i, part);
+                        let (sa, sb) = ((sa as usize).max(lo), (sb as usize).min(hi));
+                        let one = card_piece_parts_of(start, len, &span, i, 1 << part);
+                        if sa < sb {
+                            assert_eq!(
+                                one,
+                                [(sa, sb)],
+                                "{start:#x} {from} {to} piece {i} part {part}"
+                            );
+                        } else {
+                            assert!(
+                                one.is_empty(),
+                                "{start:#x} {from} {to} piece {i} part {part}"
+                            );
+                        }
+                    }
+                    assert!(card_piece_parts_of(start, len, &span, i, 0).is_empty());
+                }
             }
         }
     }
@@ -2871,9 +2982,16 @@ impl Shadow {
         card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
     }
 
-    /// The offsets of piece `i` of `span` that lie in the span.
-    pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
-        card_piece_of(self.start as usize, self.len as usize, span, i)
+    /// The offsets of piece `i` of `span` that lie in the span and in the
+    /// 4 KiB parts `mask` flags (the compare's dword for the piece; all
+    /// sixteen bits for a piece not compared), part by part.
+    pub(crate) fn card_piece_parts(
+        &self,
+        span: &CardSpan,
+        i: u32,
+        mask: u32,
+    ) -> Vec<(usize, usize)> {
+        card_piece_parts_of(self.start as usize, self.len as usize, span, i, mask)
     }
 
     /// After a submission, for a copy in the card's memory: `gpu` is what
