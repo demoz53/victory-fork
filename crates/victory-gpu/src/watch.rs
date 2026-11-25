@@ -392,12 +392,31 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks a write through the kernel was announced for ([`writing`]),
+    /// and the other views of their pages: first block, end, and when
+    /// (`crate::host::now_ms`). For [`KERNEL_OPEN_MS`] no guard makes them
+    /// read-only again: the kernel's write fails at a read-only page (a
+    /// file read straight into title memory then fails with
+    /// ERROR_INVALID_USER_BUFFER), and nothing says when it is done.
+    kernel: Vec<(usize, usize, u64)>,
 }
+
+/// How long blocks announced to a write through the kernel stay writable
+/// ([`Guards::kernel`]). While they do, every check of a guard over them
+/// finds them written and its copy takes them again.
+///
+/// Two runs with other views of guarded pages guarded too (fxceless #115,
+/// `guard_aliases`) crashed in the opening cutscene a second after one
+/// DirectStorage plain read failed with 0x800706f8: the read's destination
+/// was opened before the read, and a guard check over another view of the
+/// same pages made it read-only again while the read was under way.
+const KERNEL_OPEN_MS: u64 = 2000;
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    kernel: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -590,6 +609,32 @@ fn guard_aliases() -> usize {
 /// `clean`: the blocks' bytes were just taken (else they are only made
 /// read-only, for a write through them to fault).
 fn protect_here(g: &mut Guards, from: usize, to: usize, clean: bool) {
+    // Not blocks a write through the kernel may be writing now.
+    if !g.kernel.is_empty() {
+        let now = crate::host::now_ms();
+        g.kernel.retain(|k| now < k.2 + KERNEL_OPEN_MS);
+        let mut busy: Vec<(usize, usize)> =
+            g.kernel.iter().filter(|k| k.0 < to && k.1 > from).map(|k| (k.0.max(from), k.1.min(to))).collect();
+        if !busy.is_empty() {
+            busy.sort_unstable();
+            let mut at = from;
+            for (a, e) in busy {
+                if a > at {
+                    protect_runs(g, at, a, clean);
+                }
+                at = at.max(e);
+            }
+            if at < to {
+                protect_runs(g, at, to, clean);
+            }
+            return;
+        }
+    }
+    protect_runs(g, from, to, clean);
+}
+
+/// [`protect_here`] of blocks no write through the kernel is announced for.
+fn protect_runs(g: &mut Guards, from: usize, to: usize, clean: bool) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -694,7 +739,29 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    {
+        let mut g = guards();
+        open(&mut g, at, end);
+        // Left writable for a while, here and at the other views of the
+        // pages ([`KERNEL_OPEN_MS`]).
+        let now = crate::host::now_ms();
+        g.kernel.retain(|k| now < k.2 + KERNEL_OPEN_MS);
+        if at < end {
+            g.kernel.push((at / BLOCK, end.div_ceil(BLOCK), now));
+            let most = guard_aliases();
+            if most > 0 {
+                let (aliases, _) =
+                    crate::inplace::aliases_between(at / BLOCK * BLOCK, end.div_ceil(BLOCK).saturating_mul(BLOCK), most);
+                let mut blocks: Vec<usize> = aliases.into_iter().map(|alias| alias / BLOCK).collect();
+                blocks.sort_unstable();
+                blocks.dedup();
+                for (first, last) in block_runs(&blocks) {
+                    g.kernel.push((first, last, now));
+                }
+            }
+        }
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -964,11 +1031,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    // A write through the kernel announced there wrote what the memory
+    // showed before (or failed): the new memory may be guarded at once.
+    g.kernel.retain(|k| k.1 <= range.start || k.0 >= range.end);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1446,6 +1516,28 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// Blocks a write through the kernel was announced for stay writable:
+    /// a guard check over them takes them as written and leaves them so,
+    /// beside blocks it guards again.
+    #[test]
+    fn blocks_announced_to_the_kernel_stay_writable() {
+        const SIZE: usize = 3 * BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1), pages(2)]));
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        // A file read into the middle block is announced; then a guard
+        // check of the view runs while the read is under way.
+        writing(view + BLOCK, BLOCK);
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(1)]));
+        // Still writable: the kernel's write would succeed (a write of
+        // ours here would fault if it were not).
+        assert!(!guards().protected.contains(&((view + BLOCK) / BLOCK)), "made read-only under the read");
+        assert!(guards().protected.contains(&(view / BLOCK)));
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(1)]), "taken as written while it is open");
+        drop_views(section, &[view, other], SIZE);
     }
 
     /// Blocks in order make runs of consecutive ones.

@@ -44,6 +44,10 @@ const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
 const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
+/// ERROR_INVALID_USER_BUFFER and ERROR_NOACCESS as HRESULTs: a read into a
+/// destination page that is read-only.
+const INVALID_USER_BUFFER: HRESULT = 0x8007_06F8_u32 as i32;
+const NOACCESS: HRESULT = 0x8007_03E6_u32 as i32;
 
 type Out = *mut *mut c_void;
 
@@ -821,8 +825,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        return into_destination(request, size, |out| match read_into(request, out) {
+            // A destination page read-only for a moment (the GPU side's
+            // guard over title memory made it so under the read): read
+            // into memory of ours, and copy in with writes of the CPU,
+            // which the guard sees and lets through.
+            Err(hr) if hr == INVALID_USER_BUFFER || hr == NOACCESS => {
+                static AGAIN: AtomicU32 = AtomicU32::new(0);
+                let again = AGAIN.fetch_add(1, Ordering::Relaxed) + 1;
+                if again.is_power_of_two() {
+                    tracing::info!(again, hr = format_args!("{hr:#x}"), "dstorage: a read into title memory read again through memory of ours");
+                }
+                let mut bytes = vec![0; out.len()];
+                read_into(request, &mut bytes)?;
+                out.copy_from_slice(&bytes);
+                Ok(size)
+            }
+            done => done.map(|()| size),
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
