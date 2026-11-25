@@ -153,7 +153,7 @@ fn wide_windows() -> bool {
 
 /// Since the last frame-rate line, by the `W_` names: what indirect
 /// executions did with windows ([`windows`]).
-static WINDOW_STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static WINDOW_STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 const W_HIT: usize = 0;
 const W_CLAMPED: usize = 1;
 const W_ONE: usize = 2;
@@ -166,6 +166,7 @@ const W_KEPT_DRAW: usize = 8;
 const W_END_STORE: usize = 9;
 const W_GROWN: usize = 10;
 const W_ASIDE: usize = 11;
+const W_AROUND: usize = 12;
 
 fn window_count(what: usize) {
     WINDOW_STATS[what].fetch_add(1, Ordering::Relaxed);
@@ -184,7 +185,7 @@ pub(crate) fn window_line(frames: f64) {
          {:.0} with a count buffer, {:.0} of more than one record, {:.0} whose shaders store, {:.0} dispatches; \
          windows ended by {:.0} direct draws or dispatches, kept over {:.0} that store nothing, ended by {:.0} \
          indirect executions whose shaders store, {:.0} times by a bigger scratch buffer; {:.0} windowable \
-         executions found a window of their buffer that neither held their record nor walked on to it",
+         executions found a window of their buffer that neither held their record nor walked on to it, {:.0}          windows clamped around such a record (=2)",
         window_mode(),
         w[W_HIT],
         w[W_CLAMPED],
@@ -198,6 +199,7 @@ pub(crate) fn window_line(frames: f64) {
         w[W_END_STORE],
         w[W_GROWN],
         w[W_ASIDE],
+        w[W_AROUND],
     );
 }
 
@@ -244,8 +246,7 @@ pub(crate) fn window_line(frames: f64) {
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
 fn windows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    window_mode() > 0
 }
 
 /// Whether the shaders of title pipeline `pipeline` may store to buffers
@@ -2600,14 +2601,37 @@ impl State {
                 if windowed && walked.is_none() && self.windows.iter().any(same) {
                     window_count(W_ASIDE);
                 }
-                let (step, records) = match walked.map(|i| &self.windows[i]) {
-                    Some(w) => {
+                // Wide windows: a record on the step of a window of its
+                // buffer, but neither in it nor after it (the title draws
+                // that buffer's records out of order, or backwards: 1,700-
+                // 1,800 such a frame in gpu-w1, each clamped alone). A
+                // window is clamped around it: up to half of the most
+                // before it, the rest after.
+                let around = if wide && windowed && walked.is_none() {
+                    self.windows
+                        .iter()
+                        .rev()
+                        .find(|w| same(w) && w.records > 1 && offset.abs_diff(w.base) % u64::from(w.step) == 0)
+                        .map(|w| u64::from(w.step))
+                        .filter(|&step| args.left(arguments) >= step)
+                } else {
+                    None
+                };
+                let (step, records, back) = match (walked.map(|i| &self.windows[i]), around) {
+                    (Some(w), _) => {
                         let step = walks(w).unwrap_or(u64::from(stride));
                         let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                        (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                        (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1), 0)
                     }
-                    None => (stride, max),
+                    (None, Some(step)) => {
+                        let before = ((arguments - args.span().0) / step).min(WINDOW_MOST / 2);
+                        let after = (args.left(arguments) / step).min(WINDOW_MOST - before);
+                        (step as u32, (before + after) as u32, before)
+                    }
+                    (None, None) => (stride, max, 0),
                 };
+                // The window's first record: `back` steps before this one.
+                let (arguments, offset) = (arguments - back * u64::from(step), offset - back * u64::from(step));
                 // Where the records go. With wide windows: a window in the
                 // part of the walk it goes on (else a free part, else the
                 // oldest window's), anything else after the windows' parts.
@@ -2658,6 +2682,9 @@ impl State {
                 };
                 if windowed {
                     window_count(if records > 1 { W_CLAMPED } else { W_ONE });
+                    if back > 0 {
+                        window_count(W_AROUND);
+                    }
                 }
                 // A bigger scratch buffer replaced the one the windows lie in.
                 let before = self.windows.len();
@@ -2679,7 +2706,7 @@ impl State {
                         at: place.0,
                     });
                 }
-                (bounded, place.0)
+                (bounded, place.0 + back * u64::from(step))
             }
         };
         let ran = match kind {
