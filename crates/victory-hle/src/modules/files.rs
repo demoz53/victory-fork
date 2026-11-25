@@ -548,6 +548,8 @@ pub extern "system" fn ReadFile(
     } else {
         drop(writing);
     }
+    // SAFETY: a plain call: the thread's last error goes back to what the
+    // host's ReadFile left.
     unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
     done
 }
