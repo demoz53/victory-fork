@@ -3858,17 +3858,22 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        // `VICTORY_INDIRECT_SPLIT`: the records' second parts (the groups from
-        // 65,535 on in x), clamped where the first parts were (the clamp's
-        // barrier waits for the execution that read them) and run by the
-        // program translated with that group base, on the same root arguments.
-        if kind == DISPATCH
-            && !windowed
-            && crate::indirect::splits(|| crate::pipeline::shaders_label(self.pipeline as This))
-            && let Some(part) = crate::pipeline::host::split_part(p)
-        {
+        // `VICTORY_INDIRECT_SPLIT` (and `_AUTO`): the records' further parts (the
+        // groups from 65,535 x the part on in x, up to 65,535 of them), each
+        // clamped where the first parts were (the clamp's barrier waits for the
+        // execution that read them) and run by the program translated with that
+        // group base, on the same root arguments.
+        let parts = if kind == DISPATCH && !windowed {
+            crate::indirect::parts(|| crate::pipeline::shaders_label(self.pipeline as This))
+        } else {
+            1
+        };
+        for n in 1..parts {
+            let Some(part) = crate::pipeline::host::split_part(p, n) else {
+                break;
+            };
             let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-            let rest = crate::indirect::with_remainder(|| {
+            let rest = crate::indirect::with_part(n, || {
                 crate::indirect::bound_at(list, (&args.buffer, offset), count_arg, (kind, stride, max), (at, 0))
             });
             if let Some(rest) = rest {

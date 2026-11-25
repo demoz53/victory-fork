@@ -45,10 +45,13 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bits 2 and up: the part of
+    // dispatch records over 65,535 groups in x this clamp writes (0: the
+    // first; `with_part`).
     uint has_count;
     uint count_offset;
-    // The execution (`note_dispatch`), noted with a record it cuts down.
+    // The execution (`note_dispatch`), noted with a record it cuts down; bits
+    // 28 to 30: the parts after the first its records run in (`parts`).
     uint execution;
 };
 ByteAddressBuffer src_args : register(t0);
@@ -104,11 +107,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 asked = src_args.Load3(src_at);
-        // Bit 2: the second part of records over 65,535 groups in x (`with_remainder`):
-        // the groups from 65,535 on, run by the program translated with that base.
-        bool rest = (has_count & 4u) != 0;
+        // Bits 2 and up: part `part` of records over 65,535 groups in x (`with_part`):
+        // the groups from 65,535 x part on, run by the program translated with that base.
+        uint part = has_count >> 2;
+        bool rest = part != 0;
         if (rest) {
-            asked.x = asked.x > 65535u ? asked.x - 65535u : 0u;
+            uint base = 65535u * part;
+            asked.x = asked.x > base ? asked.x - base : 0u;
         }
         uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
@@ -120,7 +125,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint was;
         if (!rest) {
             budget.InterlockedMax(12, asked.x, was);
-            if (huge || any(asked > g)) {
+            // (cut: past what the record's parts run, 65,535 groups in x each)
+            uint covered = 65535u * (((execution >> 28) & 7u) + 1u);
+            if (huge || asked.x > covered || any(asked.yz > g.yz)) {
                 budget.InterlockedAdd(20, 1u, was);
                 // word 6: the largest first dimension a cut record asked for (18
                 // bits), and the execution it came from (14 bits)
@@ -377,50 +384,145 @@ pub(crate) fn with_dispatch<R>(label: impl FnOnce() -> String, f: impl FnOnce() 
         watched = watching(&label);
         ring[n as usize] = Some(label);
     }
-    let was = EXECUTION.replace(n | if watched { 1 << 31 } else { 0 });
+    // (the parts its records run in, for the clamp's count of records cut)
+    let parts = parts(|| ring_label(n));
+    let was = EXECUTION.replace(n | ((parts - 1).min(7) << 28) | if watched { 1 << 31 } else { 0 });
     let r = f();
     EXECUTION.set(was);
     r
 }
 
 thread_local! {
-    /// The clamp on this thread writes the second parts of its dispatch records
-    /// ([`with_remainder`]).
-    static REMAINDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The part of its dispatch records the clamp on this thread writes (0: the
+    /// first; [`with_part`]).
+    static PART: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Runs `f` (the clamp of an indirect dispatch's records) for the records'
-/// second parts: the groups from 65,535 on in x of a record that asks for
-/// more (none of a record that does not), which the pipeline translated with
-/// that group base runs (`VICTORY_INDIRECT_SPLIT`, `crate::draw`).
-pub(crate) fn with_remainder<R>(f: impl FnOnce() -> R) -> R {
-    let was = REMAINDER.replace(true);
+/// The most parts a dispatch record is run in: 65,535 groups in x each, up to
+/// 262,140 (the clamp notes what a cut record asked for in 18 bits).
+pub(crate) const MOST_PARTS: u32 = 4;
+
+/// Runs `f` (the clamp of an indirect dispatch's records) for part `part`
+/// (1 and up) of the records: the groups from 65,535 x `part` on in x of a
+/// record that asks for more, up to 65,535 of them (none of a record that does
+/// not), which the pipeline translated with that group base runs
+/// (`VICTORY_INDIRECT_SPLIT`, `crate::draw`).
+pub(crate) fn with_part<R>(part: u32, f: impl FnOnce() -> R) -> R {
+    let was = PART.replace(part);
     let r = f();
-    REMAINDER.set(was);
+    PART.set(was);
     r
 }
 
-/// `VICTORY_INDIRECT_SPLIT=<hash>,...`: whether the indirect dispatches of
-/// the pipeline `label` names (`compute 0123456789abcdef`) run a record over
-/// 65,535 groups in x in two parts, the second by the program translated with
-/// a group base of 65,535 (exact up to 131,070 groups). Off by default.
-pub(crate) fn splits(label: impl FnOnce() -> String) -> bool {
+/// [`with_part`] for the second part (groups 65,535 to 131,069).
+#[cfg(test)]
+pub(crate) fn with_remainder<R>(f: impl FnOnce() -> R) -> R {
+    with_part(1, f)
+}
+
+/// `VICTORY_INDIRECT_SPLIT=<hash>,...`: pipelines (`compute 0123456789abcdef`) whose indirect
+/// dispatches run a record over 65,535 groups in x in parts ([`parts`]).
+fn split_list() -> &'static [String] {
     static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let list = LIST.get_or_init(|| {
+    LIST.get_or_init(|| {
         std::env::var("VICTORY_INDIRECT_SPLIT")
             .map(|v| {
                 v.split([',', ';', ' '])
                     .map(|h| h.trim().trim_start_matches('#').to_ascii_lowercase())
-                    .filter(|h| !h.is_empty())
+                    .filter(|h| !h.is_empty() && h != "0")
                     .collect()
             })
             .unwrap_or_default()
-    });
-    if list.is_empty() {
+    })
+}
+
+/// Whether a pipeline whose indirect dispatch record was cut down (more than 65,535 groups in
+/// x: the groups past them did not run) is split from then on ([`note_cut`]), in as many
+/// parts as the record asked for (`VICTORY_INDIRECT_SPLIT_AUTO=0`: only the pipelines
+/// `VICTORY_INDIRECT_SPLIT` names, in two parts, as before). The boat scene's black
+/// rectangles were `649850fad69f9228`'s (97,368 groups asked), and 27 more pipelines were cut
+/// in that run. A cut is seen once its list has run: the frames until then still lose it.
+fn auto() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_SPLIT_AUTO").is_none_or(|v| v != "0"))
+}
+
+/// The pipelines [`note_cut`] has seen cut down, by the hash in their label, with the parts
+/// their largest record needs.
+static LEARNED: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The parts a record of `asked` groups in x needs (65,535 each), at most [`MOST_PARTS`].
+fn parts_for(asked: u32) -> u32 {
+    asked.div_ceil(65_535).clamp(1, MOST_PARTS)
+}
+
+/// A dispatch record of the pipeline `label` names (`compute 0123456789abcdef`) asked for
+/// `asked` groups in x and was cut down: with [`auto`], that pipeline's dispatches run in
+/// parts from now on. Whether that is new, or more parts than before.
+pub(crate) fn note_cut(label: &str, asked: u32) -> bool {
+    if !auto() || asked <= 65_535 {
         return false;
     }
+    let Some(hash) = label.split_whitespace().last().filter(|h| h.len() == 16) else {
+        return false;
+    };
+    let parts = parts_for(asked);
+    let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    match learned.iter_mut().find(|(h, _)| h == hash) {
+        Some((_, n)) if *n >= parts => false,
+        Some((_, n)) => {
+            *n = parts;
+            tracing::info!(pipeline = %label, asked, parts, "an indirect dispatch record asked for more groups than its parts run: more parts from now on (VICTORY_INDIRECT_SPLIT_AUTO)");
+            true
+        }
+        None => {
+            learned.push((hash.to_owned(), parts));
+            tracing::info!(pipeline = %label, asked, parts, "an indirect dispatch record was cut down: its pipeline's dispatches run in parts from now on (VICTORY_INDIRECT_SPLIT_AUTO)");
+            true
+        }
+    }
+}
+
+/// How many parts the indirect dispatches of the pipeline `label` names (`compute
+/// 0123456789abcdef`) run a record in: 1 (as it is), or 2 and up, the parts after the first by
+/// the program translated with a group base of 65,535 x the part (exact up to 65,535 x the
+/// parts groups). The pipelines `VICTORY_INDIRECT_SPLIT` names run in two parts at least; with
+/// [`auto`] those seen cut run in as many as their largest record needed.
+pub(crate) fn parts(label: impl FnOnce() -> String) -> u32 {
+    let list = split_list();
+    let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if list.is_empty() && learned.is_empty() {
+        return 1;
+    }
     let label = label();
-    list.iter().any(|h| label.contains(h.as_str()))
+    let mut parts = if list.iter().any(|h| label.contains(h.as_str())) { 2 } else { 1 };
+    if let Some((_, n)) = learned.iter().find(|(h, _)| label.contains(h.as_str())) {
+        parts = parts.max(*n);
+    }
+    parts
+}
+
+/// Whether any pipeline's indirect dispatches may run in parts ([`parts`]), for the frame line.
+pub(crate) fn splitting() -> bool {
+    !split_list().is_empty() || auto()
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::{MOST_PARTS, parts_for};
+
+    /// A record runs in one part per 65,535 groups in x, at most [`MOST_PARTS`].
+    #[test]
+    fn a_record_runs_in_a_part_per_65535_groups() {
+        assert_eq!(parts_for(0), 1);
+        assert_eq!(parts_for(65_535), 1);
+        assert_eq!(parts_for(65_536), 2);
+        assert_eq!(parts_for(97_368), 2);
+        assert_eq!(parts_for(131_070), 2);
+        assert_eq!(parts_for(131_071), 3);
+        assert_eq!(parts_for(262_140), MOST_PARTS);
+        assert_eq!(parts_for(262_143), MOST_PARTS);
+    }
 }
 
 /// `VICTORY_INDIRECT_WATCH=<hash>,...`: whether the pipeline `label` names
@@ -467,6 +569,11 @@ pub(crate) fn note_watched(label: impl FnOnce() -> String, arguments: u64, count
         let n = if crate::host::read_into(at as *const u8, &mut n) { u32::from_le_bytes(n) } else { u32::MAX };
         WATCHED_CPU[3].fetch_max(u64::from(n), Relaxed);
     }
+}
+
+/// The label [`with_dispatch`] noted for execution `n` (empty if none).
+fn ring_label(n: u32) -> String {
+    dispatch_label(n).map(|l| l.to_string()).unwrap_or_default()
 }
 
 /// What [`with_dispatch`] noted for execution `n`, if the ring still holds it.
@@ -646,7 +753,7 @@ fn record_clamp_at(
         None => (src_gpu, 0u32, 0u32),
     };
     let execution = EXECUTION.with(std::cell::Cell::get);
-    let rest = u32::from(REMAINDER.with(std::cell::Cell::get)) << 2;
+    let rest = PART.with(std::cell::Cell::get) << 2;
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | rest, count_offset, execution];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
@@ -1388,12 +1495,13 @@ void main() {
         }
     }
 
-    /// `with_remainder`: a dispatch record over 65,535 groups in x is clamped
-    /// to its first 65,535, and its second part to the rest, which the
-    /// program translated with that group base runs; a record within the
-    /// limit has an empty second part. y and z stay as asked.
+    /// `with_part`: a dispatch record over 65,535 groups in x is clamped to
+    /// its first 65,535, its second part to the next 65,535 and its third to
+    /// the rest, which the program translated with each part's group base
+    /// runs; a record within the limit has empty further parts. y and z stay
+    /// as asked.
     #[test]
-    fn warp_a_dispatch_over_the_limit_is_clamped_in_two_parts() {
+    fn warp_a_dispatch_over_the_limit_is_clamped_in_parts() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
@@ -1403,8 +1511,8 @@ void main() {
         let bytes = (STRIDE as usize) * records.len();
         let (src_buf, src_ptr, _) = warp.shared_buffer(bytes as u64);
         let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (readback_buf, readback_ptr, _) = warp.shared_buffer(2 * bytes as u64);
-        let dst_buf = warp.default_uav(2 * bytes as u64);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(3 * bytes as u64);
+        let dst_buf = warp.default_uav(3 * bytes as u64);
         let words: Vec<u8> = records.iter().flatten().flat_map(|w| w.to_le_bytes()).collect();
         // SAFETY: mapped buffers have sufficient capacity.
         unsafe {
@@ -1434,7 +1542,19 @@ void main() {
                 false,
             )
         });
-        assert!(first && second);
+        let third = with_part(2, || {
+            record_clamp_at(
+                &warp.clamp,
+                &warp.list,
+                (&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, 2 * bytes as u64),
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                spec,
+                false,
+            )
+        });
+        assert!(first && second && third);
         // SAFETY: open command list; the clamped records are copied back.
         unsafe {
             warp.list.ResourceBarrier(&[transition(
@@ -1442,13 +1562,14 @@ void main() {
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 2 * bytes as u64);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 3 * bytes as u64);
         }
         warp.submit_and_wait();
         // SAFETY: GPU work completed.
-        let out: Vec<u32> = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 2 * bytes / 4).to_vec() };
+        let out: Vec<u32> = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 3 * bytes / 4).to_vec() };
         assert_eq!(&out[..9], &[65_535, 1, 1, 1_000, 2, 1, 65_535, 1, 1], "the first parts");
-        assert_eq!(&out[9..], &[21_033, 1, 1, 0, 2, 1, 65_535, 1, 1], "the second parts");
+        assert_eq!(&out[9..18], &[21_033, 1, 1, 0, 2, 1, 65_535, 1, 1], "the second parts");
+        assert_eq!(&out[18..], &[0, 1, 1, 0, 2, 1, 8_930, 1, 1], "the third parts");
     }
 
     #[test]

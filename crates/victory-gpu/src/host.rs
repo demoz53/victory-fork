@@ -6837,6 +6837,8 @@ impl HostList {
                 if worst != 0 {
                     let (asked, n) = (worst >> 14, worst & 0x3fff);
                     let label = crate::indirect::dispatch_label(n).unwrap_or_else(|| "an execution no longer noted".into());
+                    // (with VICTORY_INDIRECT_SPLIT_AUTO, that pipeline runs in parts from now on)
+                    crate::indirect::note_cut(&label, asked);
                     let mut cut = COMPUTE_CUT.lock().unwrap_or_else(|e| e.into_inner());
                     if cut.as_ref().is_none_or(|(x, _)| asked > *x) {
                         *cut = Some((asked, label));
@@ -8050,8 +8052,8 @@ impl Meter {
         if let Some((asked, label)) = COMPUTE_CUT.lock().unwrap_or_else(|e| e.into_inner()).take() {
             tracing::info!(asked, pipeline = %label, "indirect compute dispatches: the record cut down most (first dimension asked for, at most 262143 noted) was of this pipeline");
         }
-        if std::env::var_os("VICTORY_INDIRECT_SPLIT").is_some() {
-            tracing::info!("indirect dispatches run in two parts (VICTORY_INDIRECT_SPLIT) so far: {}", crate::draw::split_parts());
+        if crate::indirect::splitting() {
+            tracing::info!("indirect dispatches run in parts (VICTORY_INDIRECT_SPLIT, _AUTO) so far: {}", crate::draw::split_parts());
         }
         if std::env::var_os("VICTORY_INDIRECT_WATCH").is_some() {
             let watched = WATCHED_GROUPS.swap(0, Ordering::Relaxed) as f64 / frames;

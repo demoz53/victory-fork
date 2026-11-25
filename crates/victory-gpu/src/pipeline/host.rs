@@ -1113,19 +1113,20 @@ fn root_signature(
 /// base of 65,535 (`victory_shader::emit::with_group_base`), on `p`'s root
 /// signature, which the base leaves as it is. Made at the first need, then
 /// kept with `p`'s; `None` if it does not translate or the host refuses it.
-pub(crate) fn split_part(p: &HostPipeline) -> Option<ID3D12PipelineState> {
-    type Made = Vec<(ID3D12PipelineState, Option<ID3D12PipelineState>)>;
+pub(crate) fn split_part(p: &HostPipeline, n: u32) -> Option<ID3D12PipelineState> {
+    type Made = Vec<(ID3D12PipelineState, u32, Option<ID3D12PipelineState>)>;
     static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, part)) = made.iter().find(|(whole, _)| whole == &p.pso) {
+    if let Some((_, _, part)) = made.iter().find(|(whole, k, _)| whole == &p.pso && *k == n) {
         return part.clone();
     }
+    let base = 65_535 * n;
     let part = (|| {
         if !p.compute {
             return None;
         }
         let shader = &p.stages.first()?.shader;
-        let host_shader = match shader.translated_from_group(65_535) {
+        let host_shader = match shader.translated_from_group(base) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, shader = ?shader, "VICTORY_INDIRECT_SPLIT: the second part does not translate");
@@ -1155,8 +1156,8 @@ pub(crate) fn split_part(p: &HostPipeline) -> Option<ID3D12PipelineState> {
         // SAFETY: the description points at live data.
         match unsafe { host()?.device.CreateComputePipelineState::<ID3D12PipelineState>(&desc) } {
             Ok(pso) => {
-                tracing::info!(shader = ?shader, "VICTORY_INDIRECT_SPLIT: the second part's pipeline (group base 65535)");
-                crate::host::name(&pso, || format!("{shader:?} from group 65535"));
+                tracing::info!(shader = ?shader, base, "VICTORY_INDIRECT_SPLIT: a further part's pipeline");
+                crate::host::name(&pso, || format!("{shader:?} from group {base}"));
                 Some(pso)
             }
             Err(e) => {
@@ -1165,7 +1166,7 @@ pub(crate) fn split_part(p: &HostPipeline) -> Option<ID3D12PipelineState> {
             }
         }
     })();
-    made.push((p.pso.clone(), part.clone()));
+    made.push((p.pso.clone(), n, part.clone()));
     part
 }
 
