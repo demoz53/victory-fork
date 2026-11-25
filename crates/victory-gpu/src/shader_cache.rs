@@ -75,6 +75,14 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_SHADER_OPT_RANGE",
                     "VICTORY_SHADER_OPT_IN",
                     "VICTORY_SHADER_OPT_STAGE",
+                    // Read by the translation too, and missing here until
+                    // they were looked for: an A/B of one of them on one
+                    // executable was served the other side's translations.
+                    "VICTORY_FIRSTLANE_OWN",
+                    "VICTORY_STRICT_JOINS",
+                    "VICTORY_MESH_OUTPUT_STRICT",
+                    "VICTORY_WAVE_LOCAL",
+                    "VICTORY_FIRST_HALF",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
