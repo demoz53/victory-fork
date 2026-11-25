@@ -93,6 +93,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_WIDE_LANE_RESOURCES",
                     "VICTORY_EARLY_DEPTH",
                     "VICTORY_PIXEL_HELPERS",
+                    "VICTORY_LDS_FIT",
                     "VICTORY_HALF_BITS",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());

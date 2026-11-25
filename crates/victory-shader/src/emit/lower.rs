@@ -328,6 +328,9 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// Whether `halves` is the program's own first LDS dword, borrowed because the group's
+    /// LDS had no room past the program's ([`lds_fit`]).
+    halves_borrowed: bool,
     /// The first dword of the scatter's scratch, a dword per lane of every console wave in the
     /// group (`ds_permute_b32`), allocated past the program's LDS.
     scatter: Option<u32>,
@@ -1392,6 +1395,23 @@ pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
         && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
 }
 
+/// The most thread-group shared memory D3D12 gives a compute group, in dwords (32 KiB).
+const MAX_LDS_DWORDS: u32 = 8192;
+
+/// Whether the dwords a console wave64 program on 32-lane host waves needs beyond its own
+/// LDS keep within [`MAX_LDS_DWORDS`] where they can: no exchange pair is reserved with each
+/// host wave a wave of its own (nothing goes through it there), and the counter that hands
+/// console threads to host waves (`Lower::wave_base`) borrows the program's first dword, met
+/// past by the whole group, when the program's LDS takes all 32 KiB. `6b82bc7d22016cb5`
+/// (the whole 32 KiB, a group of 16 console waves) needed 32,900 bytes in its only form,
+/// which the validator refuses and a driver need not take. `VICTORY_LDS_FIT=0`: reserved past
+/// the program's LDS whatever the total, as before. Part of the translation: the shader cache
+/// keys on it (`victory-gpu`'s does).
+pub fn lds_fit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_FIT").is_none_or(|v| v != "0"))
+}
+
 /// Whether pixel shaders read their quads' other lanes with quad reads, helper
 /// lanes included, and a helper lane's `v_readfirstlane_b32` gives its own value
 /// (`Lower::helpers_read`, `Lower::helper_reads_own`; `VICTORY_PIXEL_HELPERS=0`:
@@ -1552,6 +1572,8 @@ impl<'a> Lower<'a> {
         let mut halves: Option<u32> = None;
         // the scatter's scratch base (`ds_permute_b32`)
         let mut scatter: Option<u32> = None;
+        // whether `halves` borrows the program's first LDS dword ([`lds_fit`])
+        let mut halves_borrowed = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1640,7 +1662,14 @@ impl<'a> Lower<'a> {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                // (Not with each host wave a wave of its own: nothing is
+                                // exchanged there, `exchange_halves` answers each half for
+                                // itself and the lane reads that would need the pair refuse.
+                                // Reserved anyway, a program with the whole 32 KiB of LDS went
+                                // past what D3D12 allows: [`lds_fit`].)
+                                if !(LOCAL_WAVES.get() && lds_fit()) {
+                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1686,8 +1715,16 @@ impl<'a> Lower<'a> {
             }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                if lds_fit() && s.lds_dwords >= MAX_LDS_DWORDS {
+                    // No room past the program's LDS: the counter borrows its first dword,
+                    // which the program cannot have written yet (`wave_base` meets the group
+                    // again before handing it back).
+                    halves = Some(0);
+                    halves_borrowed = true;
+                } else {
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1855,6 +1892,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            halves_borrowed,
             scatter,
             lane_blocks: all_lane_blocks(x.st),
             wave_base: None,
@@ -2525,6 +2563,11 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        if self.halves_borrowed {
+            // The borrowed dword's counter first of all, before any code of the program's
+            // own can write that dword.
+            self.wave_base();
+        }
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -3904,6 +3947,10 @@ impl<'a> Lower<'a> {
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        if self.halves_borrowed {
+            // every wave has taken its base before the program's code writes the dword
+            self.group_sync(e);
+        }
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)

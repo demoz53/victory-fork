@@ -1583,3 +1583,65 @@ fn spilled_compute_masks_partial_dispatch_threads_on_wave64_and_wave32() {
         eprintln!("ran on the hardware device (host_wave={host_wave}): partial dispatch limits 45, 1, 0 exact");
     }
 }
+
+/// `VICTORY_LDS_FIT` (on by default): a console wave64 program whose LDS takes the whole
+/// 32 KiB, in a group of one console wave on a host of 32-lane waves, that reads lane numbers
+/// (`v_mbcnt`, so the halves would exchange) and its LDS. Each host wave a wave of its own,
+/// it reserves no exchange pair and its counter of console threads borrows the program's
+/// first dword, so the group keeps within D3D12's 32 KiB (`6b82bc7d22016cb5` needed 32,900
+/// bytes, which the validator refuses); on a 32-lane card every thread still stores its own
+/// console thread index (which the counter hands out) through its LDS dword.
+#[test]
+fn a_program_with_all_32_kib_of_lds_keeps_within_it_on_32_lane_waves() {
+    let mut native = native(&[
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1 (the console lane)
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0 (this thread's byte)
+        0xD834_0000,
+        0x0000_0002, // ds_write_b32 v2, v0 (this thread's console index)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000,
+        0x0300_0002, // ds_read_b32 v3, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 3 << 8 | 2, // buffer_store_dword v3, v2, s[8:11], 0 offen
+    ]);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 64 << 15; // 64 x 512 bytes: all 32 KiB of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lower::with_local_waves_any(|| lowered(&native, &p, &HashSet::new()))
+        .expect("lower with each host wave a wave of its own");
+    let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) else {
+        eprintln!("no validator; the 32 KiB check needs it");
+        return;
+    };
+    let mut copy = shader.dxil.clone();
+    v.validate(&mut copy).expect("within 32 KiB of thread-group shared memory");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    let lanes: Vec<u32> = (0..64).collect();
+    assert_eq!(&out[0][..64], &lanes[..], "each console thread through its own LDS dword");
+    eprintln!("ran on the hardware device: 32 KiB of LDS and the borrowed counter");
+}
