@@ -431,6 +431,14 @@ fn no_wait() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
+/// Whether the refresh of a new staging buffer always reads and detiles the
+/// texture's memory before the upload that copies from it runs: not with
+/// [`no_wait`], where a read that meets a remapping leaves the buffer as it
+/// was (`crate::draw`'s `VICTORY_TEXTURE_SAME_SKIP` counts on it).
+pub(crate) fn uploads_read_whole() -> bool {
+    !no_wait()
+}
+
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
@@ -728,6 +736,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    // What the host copy holds changes with this upload
+    // (`crate::resource::upload_mark`).
+    crate::resource::note_upload(resource);
     let copies_began = std::time::Instant::now();
     UPLOAD_PARTS[2].fetch_add(staging.footprints.len() as u64, Relaxed);
     UPLOAD_PARTS[3].fetch_add(1, Relaxed);
@@ -1146,6 +1157,18 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// (a texture streams in whole mips; the small ones lie first). Read
 /// through the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    fingerprint_with(at, len, dense_recheck())
+}
+
+/// [`fingerprint`] of 4 KiB of every 64 KiB of the memory and its last
+/// 4 KiB (all of it up to 48 KiB), as `VICTORY_HEAP_RECHECK=dense` takes it:
+/// a change anywhere in a streamed texture shows (`crate::draw`'s
+/// `VICTORY_TEXTURE_SAME_SKIP`).
+pub(crate) fn fingerprint_dense(at: u64, len: u64) -> u64 {
+    fingerprint_with(at, len, true)
+}
+
+fn fingerprint_with(at: u64, len: u64, dense: bool) -> u64 {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1162,7 +1185,7 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         };
         if len <= 3 * WINDOW {
             take(0, len);
-        } else if dense_recheck() {
+        } else if dense {
             // 4 KiB of every 64 KiB, and the last 4 KiB: a piece the title's
             // streaming fills later anywhere in the texture changes it.
             const STEP: usize = 64 << 10;

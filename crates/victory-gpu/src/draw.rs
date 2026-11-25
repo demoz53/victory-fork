@@ -566,30 +566,122 @@ pub(crate) static HEAP_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// info line every 5 s says how many of ours are such re-sends.
 fn resent(at: u64, len: u64, print: u64, bytes: u64) {
     static LAST: std::sync::Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = std::sync::Mutex::new(None);
-    // Whole uploads, of them unchanged, and the bytes of each.
-    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-    static SAID: AtomicU64 = AtomicU64::new(0);
     let same = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         last.get_or_insert_with(std::collections::HashMap::new).insert((at, len), print) == Some(print)
     };
-    COUNTS[0].fetch_add(1, Ordering::Relaxed);
-    COUNTS[2].fetch_add(bytes, Ordering::Relaxed);
+    RESENT[0].fetch_add(1, Ordering::Relaxed);
+    RESENT[2].fetch_add(bytes, Ordering::Relaxed);
     if same {
-        COUNTS[1].fetch_add(1, Ordering::Relaxed);
-        COUNTS[3].fetch_add(bytes, Ordering::Relaxed);
+        RESENT[1].fetch_add(1, Ordering::Relaxed);
+        RESENT[3].fetch_add(bytes, Ordering::Relaxed);
     }
+    resent_line();
+}
+
+/// For [`resent`]'s line, since it was last said: whole uploads, of them
+/// unchanged, and the bytes of each; whole uploads left out as the same as
+/// the last one (`VICTORY_TEXTURE_SAME_SKIP`), and their bytes.
+static RESENT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`resent`]'s line, every 5 s.
+fn resent_line() {
+    static SAID: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
     let said = SAID.load(Ordering::Relaxed);
     if now.saturating_sub(said) >= 5000 && SAID.compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        let [whole, unchanged, all_bytes, unchanged_bytes] = COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        let [whole, unchanged, all_bytes, unchanged_bytes, skipped, skipped_bytes] =
+            RESENT.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
         tracing::info!(
             whole,
             unchanged,
             mb = all_bytes >> 20,
             unchanged_mb = unchanged_bytes >> 20,
-            "textures picked by index uploaded whole in the last 5 s, and of them sent again with nothing changed since their last whole upload"
+            skipped,
+            skipped_mb = skipped_bytes >> 20,
+            "textures picked by index uploaded whole in the last 5 s, and of them sent again with nothing changed since their last whole upload; whole uploads left out as the same as the last (VICTORY_TEXTURE_SAME_SKIP=1)"
         );
+    }
+}
+
+/// Whether the pass over the heap's textures leaves out the whole upload
+/// of a due slot that would send what its host texture holds already
+/// (`VICTORY_TEXTURE_SAME_SKIP=1`; off by default): a slot written again
+/// with the same view gets its record of the last upload wiped
+/// (`TextureQueue::written`), and its texture was uploaded whole again with
+/// nothing changed (all11h-resent: 40-55% of the whole uploads once the
+/// cutscene is loaded, 230-980 MB per 5 s).
+fn same_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME_SKIP").is_some_and(|v| v == "1"))
+}
+
+/// What the last whole upload of a slot's placed texture sent
+/// ([`same_skip`]): the title's view (resource description and view words,
+/// with the address), the memory (address, bytes) and its dense fingerprint
+/// (`crate::texture::fingerprint_dense`), the title texture, and which host
+/// copy it went into with how many uploads it had then
+/// (`crate::resource::upload_mark`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sent {
+    view: [u32; 30],
+    memory: (u64, u64),
+    print: u64,
+    texture: usize,
+    mark: (u64, u64),
+}
+
+/// [`Sent`] by host heap and title slot.
+static SENT: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32), Sent>>> = std::sync::Mutex::new(None);
+
+/// A placed texture view's words as [`Sent::view`].
+fn sent_view(resource: &[u32; 14], desc: &[u32; 16]) -> [u32; 30] {
+    let mut view = [0u32; 30];
+    view[..14].copy_from_slice(resource);
+    view[14..].copy_from_slice(desc);
+    view
+}
+
+/// Whether a whole upload now would send what the last one did into the
+/// host copy that still holds it: the same view, memory, title texture and
+/// fingerprint, and the host copy the same one with no upload since (a
+/// host copy let go and made again, or filled by another upload, has
+/// another mark; none at all is no mark). Any doubt: upload.
+fn same_as_sent(last: &Sent, view: &[u32; 30], memory: (u64, u64), texture: usize, mark: Option<(u64, u64)>, print: impl FnOnce() -> u64) -> bool {
+    last.print != 0
+        && last.view == *view
+        && last.memory == memory
+        && last.texture == texture
+        && mark == Some(last.mark)
+        && print() == last.print
+}
+
+/// A whole upload of slot `index`'s placed texture `texture` (title view
+/// `resource`, `desc`) was recorded: what it sent, for [`same_as_sent`].
+fn note_sent(host: &crate::descriptor::host::HostHeap, index: u32, resource: &[u32; 14], desc: &[u32; 16], texture: This) {
+    let key = (std::ptr::from_ref(host) as usize, index);
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let len = crate::resource::placed_bytes(resource).unwrap_or(0);
+    let mark = crate::resource::upload_mark(texture);
+    let sent = match mark {
+        Some(mark) if len > 0 => Some(Sent {
+            view: sent_view(resource, desc),
+            memory: (address, len),
+            print: crate::texture::fingerprint_dense(address, len),
+            texture: texture as usize,
+            mark,
+        }),
+        _ => None,
+    };
+    let mut all = SENT.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(std::collections::HashMap::new);
+    match sent {
+        Some(sent) => {
+            all.insert(key, sent);
+        }
+        None => {
+            all.remove(&key);
+        }
     }
 }
 pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
@@ -2350,6 +2442,47 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            // `VICTORY_TEXTURE_SAME_SKIP=1`: a whole upload that would send
+            // what the host copy holds already is left out, and the slot
+            // goes on to the looks after an upload (a title that fills the
+            // texture later is still caught).
+            let placed_words = match &view {
+                Some(View::Placed(false, words, desc)) if placed.is_some() && words[0] != 1 => Some((*words, *desc)),
+                _ => None,
+            };
+            if same_skip()
+                && !tabled
+                && partly.is_none()
+                && crate::texture::uploads_read_whole()
+                && let Some((words, desc)) = &placed_words
+            {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let len = crate::resource::placed_bytes(words).unwrap_or(0);
+                let last = SENT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|sent| sent.get(&(std::ptr::from_ref(host) as usize, index)).copied());
+                let view_words = sent_view(words, desc);
+                if len > 0
+                    && let Some(last) = last
+                    && same_as_sent(&last, &view_words, (address, len), resource as usize, crate::resource::upload_mark(resource), || {
+                        crate::texture::fingerprint_dense(address, len)
+                    })
+                {
+                    RESENT[4].fetch_add(1, Ordering::Relaxed);
+                    RESENT[5].fetch_add(len, Ordering::Relaxed);
+                    resent_line();
+                    HEAP_PASS_PARTS[6].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    if heap_recheck() {
+                        let print = crate::texture::fingerprint(address, len);
+                        host.texture_slot_recheck(index, write, frame + recheck_frames()[0], (address, len), print, 0, frame);
+                    } else {
+                        host.texture_slot_done(index, write, None);
+                    }
+                    continue;
+                }
+            }
             let uploading = std::time::Instant::now();
             HEAP_PASS_PARTS[6].fetch_add((uploading - making).as_micros() as u64, Ordering::Relaxed);
             if let Some(view) = &view {
@@ -2408,6 +2541,11 @@ impl State {
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
                     resent(at, len, print, bytes);
+                    if same_skip()
+                        && let Some((words, desc)) = &placed_words
+                    {
+                        note_sent(host, index, words, desc, resource);
+                    }
                     host.texture_slot_recheck(index, write, frame + recheck_frames()[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
@@ -4176,6 +4314,46 @@ fn dispatch_dimensions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_TEXTURE_SAME_SKIP`: a whole upload is left out only when the
+    /// view, the memory, the title texture, the host copy with its uploads
+    /// and the fingerprint are all as at the last whole upload; the
+    /// fingerprint is read only when everything else is.
+    #[test]
+    fn a_whole_upload_is_left_out_only_when_nothing_differs() {
+        let mut words = [0u32; 14];
+        words[0] = 3;
+        let mut desc = [0u32; 16];
+        desc[10] = 0x1000;
+        let view = sent_view(&words, &desc);
+        let last = Sent {
+            view,
+            memory: (0x1000, 0x2c000),
+            print: 77,
+            texture: 0x55,
+            mark: (9, 3),
+        };
+        let mark = Some((9, 3));
+        assert!(same_as_sent(&last, &view, last.memory, last.texture, mark, || 77));
+        // The memory changed.
+        assert!(!same_as_sent(&last, &view, last.memory, last.texture, mark, || 78));
+        // Anything else that differs: not even the fingerprint is read.
+        let never = || -> u64 { panic!("the fingerprint is read only when the rest is the same") };
+        let mut other_view = view;
+        other_view[14 + 4] = 1; // another most detailed level
+        assert!(!same_as_sent(&last, &other_view, last.memory, last.texture, mark, never));
+        assert!(!same_as_sent(&last, &view, (0x1000, 0x2b000), last.texture, mark, never));
+        assert!(!same_as_sent(&last, &view, (0x2000, 0x2c000), last.texture, mark, never));
+        assert!(!same_as_sent(&last, &view, last.memory, 0x56, mark, never));
+        // The host copy let go (none now), made again (another serial), or
+        // filled by another upload since.
+        assert!(!same_as_sent(&last, &view, last.memory, last.texture, None, never));
+        assert!(!same_as_sent(&last, &view, last.memory, last.texture, Some((10, 3)), never));
+        assert!(!same_as_sent(&last, &view, last.memory, last.texture, Some((9, 4)), never));
+        // No fingerprint taken: never the same.
+        let unprinted = Sent { print: 0, ..last };
+        assert!(!same_as_sent(&unprinted, &view, last.memory, last.texture, mark, never));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

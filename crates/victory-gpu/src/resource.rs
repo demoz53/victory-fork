@@ -1164,7 +1164,16 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// Which host copy it has: a number of [`HOST_COPY_SERIAL`] given when
+    /// it was made (a host copy let go and made again gets a new one).
+    serial: std::sync::atomic::AtomicU64,
+    /// Uploads recorded into its host copy (`crate::texture::upload`).
+    uploads: std::sync::atomic::AtomicU64,
 }
+
+/// The last number given to a host copy of a title texture ([`Hosted`]).
+#[cfg(windows)]
+static HOST_COPY_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
@@ -1523,6 +1532,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        r.host.serial.store(HOST_COPY_SERIAL.fetch_add(1, Relaxed) + 1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -2315,6 +2325,29 @@ impl Resource {
     }
 }
 
+/// A list recorded an upload into title texture `this`'s host copy
+/// (`crate::texture::upload`).
+#[cfg(windows)]
+pub(crate) fn note_upload(this: This) {
+    resource(this).host.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Which host copy title texture `this` has and how many uploads were
+/// recorded into it, if it has one now: while both stay the same the host
+/// copy holds what the last of those uploads put there (not let go and
+/// made again empty, not filled by another upload since).
+#[cfg(windows)]
+pub(crate) fn upload_mark(this: This) -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref()?;
+    Some((r.host.serial.load(Relaxed), r.host.uploads.load(Relaxed)))
+}
+
 fn resource<'a>(this: This) -> &'a Resource {
     // SAFETY: called from resource methods only.
     unsafe { &*this.cast::<Resource>() }
@@ -2351,6 +2384,8 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            serial: std::sync::atomic::AtomicU64::new(0),
+            uploads: std::sync::atomic::AtomicU64::new(0),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -3123,6 +3158,33 @@ mod tests {
         let ranges = [(at + 0x100, 0x100), (at + 0x200, 0x100), (at + 0x8000, 0x10)];
         assert_eq!(evict_placed_in_ranges(&ranges), 2);
         assert!(has_host_copy(made[1]) && !has_host_copy(made[0]) && !has_host_copy(made[2]));
+        drop(memory);
+    }
+
+    /// A host copy's mark (`upload_mark`) changes with every upload
+    /// recorded into it, and when it is let go (none) and made again
+    /// (another serial).
+    #[cfg(windows)]
+    #[test]
+    fn a_host_copys_mark_follows_its_uploads_and_its_making() {
+        if crate::host::host().is_none() || !sweeping() {
+            return; // no host GPU, or the sweep turned off
+        }
+        let memory = vec![0u8; 0x10000];
+        let at = (memory.as_ptr() as u64).next_multiple_of(0x1000);
+        // 32x32 RGBA8, one level: 4 KiB.
+        let words = [3, 0, 0, 0, 32, 0, 32, 1 << 16 | 1, 28, 1, 0, 0x105, 0, 0];
+        let texture = texture_at(at, &words).expect("placed texture");
+        assert_eq!(upload_mark(texture), None, "no host copy yet");
+        assert!(hosted(texture, true).is_some());
+        let (serial, uploads) = upload_mark(texture).expect("made");
+        note_upload(texture);
+        assert_eq!(upload_mark(texture), Some((serial, uploads + 1)));
+        assert_eq!(evict_placed_in_ranges(&[(at, 0x1000)]), 1);
+        assert_eq!(upload_mark(texture), None, "let go");
+        assert!(hosted(texture, true).is_some());
+        let (again, _) = upload_mark(texture).expect("made again");
+        assert_ne!(again, serial);
         drop(memory);
     }
 
