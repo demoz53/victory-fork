@@ -3101,7 +3101,7 @@ mod tests {
         unsafe { ((start + 17 * TITLE_SLOT_BYTES) as *mut u8).write_bytes(0, 32) };
         title_cbv(start, 30, 0x9_0000);
         assert_eq!(entry(heap, 17), (0, None), "given back");
-        assert_eq!(entry(heap, 16).1.is_some() && entry(heap, 19).1.is_some(), true);
+        assert!(entry(heap, 16).1.is_some() && entry(heap, 19).1.is_some());
         // Handed out once the submissions running when it was given back
         // have finished (other tests' may be).
         let (running, _) = crate::host::submissions();

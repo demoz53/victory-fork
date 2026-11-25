@@ -365,11 +365,14 @@ pub(crate) fn removal_note() -> String {
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
-        || crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
+    {
+        return;
+    }
+    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
         return;
