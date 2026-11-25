@@ -305,7 +305,41 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// ours. Bigger blocks are allocations of their own in the map, and heaps
 /// other than the process heap (AMD's compiler keeps one) count apart, as
 /// "segments of other heaps".
-static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+///
+/// Striped: each thread adds to one of [`STRIPES`] copies of the eight
+/// counters, each copy on cache lines of its own, and a reading sums them
+/// (wrapping: a block freed on another thread than made it takes from
+/// another stripe). With one shared copy, the 12 pipeline workers spent
+/// 60-75% of their time on these additions while a cutscene's shaders were
+/// translated (VICTORY_PROFILE, play-5, 2026-11-25): every allocation and
+/// release of every thread went through the same cache line.
+static OWN: [Stripe; STRIPES] = [const { Stripe([const { AtomicU64::new(0) }; 8]) }; STRIPES];
+
+/// One thread group's copy of the counters, alone on its cache lines.
+#[repr(align(128))]
+struct Stripe([AtomicU64; 8]);
+const STRIPES: usize = 32;
+
+/// This thread's stripe: handed out in turn on a thread's first count. The
+/// thread-local has a constant initialiser and no destructor, so reading it
+/// inside the allocator neither allocates nor runs after the thread's end.
+fn stripe() -> &'static [AtomicU64; 8] {
+    use std::cell::Cell;
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! { static MINE: Cell<usize> = const { Cell::new(usize::MAX) }; }
+    let i = MINE.with(|m| {
+        if m.get() == usize::MAX {
+            m.set(NEXT.fetch_add(1, Relaxed) % STRIPES);
+        }
+        m.get()
+    });
+    &OWN[i].0
+}
+
+/// The counter `i` of [`OWN`] over all stripes.
+fn own_total(i: usize) -> u64 {
+    OWN.iter().fold(0u64, |sum, s| sum.wrapping_add(s.0[i].load(Relaxed)))
+}
 
 /// The class of [`OWN`] a block of `size` bytes counts in.
 fn block_class(size: usize) -> usize {
@@ -319,12 +353,13 @@ fn block_class(size: usize) -> usize {
 
 fn own(size: usize, made: bool) {
     let class = block_class(size);
+    let own = stripe();
     if made {
-        OWN[class].fetch_add(size as u64, Relaxed);
-        OWN[4 + class].fetch_add(1, Relaxed);
+        own[class].fetch_add(size as u64, Relaxed);
+        own[4 + class].fetch_add(1, Relaxed);
     } else {
-        OWN[class].fetch_sub(size as u64, Relaxed);
-        OWN[4 + class].fetch_sub(1, Relaxed);
+        own[class].fetch_sub(size as u64, Relaxed);
+        own[4 + class].fetch_sub(1, Relaxed);
     }
 }
 
@@ -475,7 +510,7 @@ mod heap_tests {
 
 #[cfg(test)]
 mod own_tests {
-    use super::{OWN, block_class};
+    use super::{block_class, own_total};
     use std::sync::atomic::Ordering::Relaxed;
 
     #[test]
@@ -513,10 +548,10 @@ mod own_tests {
     #[test]
     fn a_block_is_counted_while_it_lives() {
         let block = vec![1u8; 8 << 20];
-        assert!(OWN[3].load(Relaxed) >= 8 << 20);
-        assert!(OWN[7].load(Relaxed) >= 1);
+        assert!(own_total(3) >= 8 << 20);
+        assert!(own_total(7) >= 1);
         drop(block);
-        assert!(OWN[7].load(Relaxed) < u64::MAX / 2, "no count below zero");
+        assert!(own_total(7) < u64::MAX / 2, "no count below zero");
     }
 }
 
@@ -945,7 +980,7 @@ fn log_memory() {
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
     let views = crate::descriptor::views_kept();
-    let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
+    let own: Vec<u64> = (0..8).map(own_total).collect();
     tracing::info!(
         "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
