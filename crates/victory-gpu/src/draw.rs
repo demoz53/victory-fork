@@ -191,7 +191,7 @@ fn wide_windows() -> bool {
 
 /// Since the last frame-rate line, by the `W_` names: what indirect
 /// executions did with windows ([`windows`]).
-static WINDOW_STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static WINDOW_STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 const W_HIT: usize = 0;
 const W_CLAMPED: usize = 1;
 const W_ONE: usize = 2;
@@ -205,6 +205,22 @@ const W_END_STORE: usize = 9;
 const W_GROWN: usize = 10;
 const W_ASIDE: usize = 11;
 const W_AROUND: usize = 12;
+const W_STORE_HIT: usize = 13;
+
+/// Whether an indirect execution of one record whose shaders store reads
+/// its record from a window that holds it clamped (`VICTORY_WINDOW_STORES=1`;
+/// off by default), instead of a clamp of its own.
+///
+/// Such an execution ends the windows (its shaders may write the arguments
+/// of the records after it), and was clamped alone: 667 a frame in
+/// all8-base, each a compute pass of ours between two waits in the middle
+/// of the title's drawing, beside 1,020 windowable ones clamped alone. Its
+/// own record is as the window clamped it: what ran since, by the windows'
+/// rules, wrote no arguments. It still ends the windows after it.
+fn window_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_STORES").is_some_and(|v| v == "1"))
+}
 
 fn window_count(what: usize) {
     WINDOW_STATS[what].fetch_add(1, Ordering::Relaxed);
@@ -223,7 +239,7 @@ pub(crate) fn window_line(frames: f64) {
          {:.0} with a count buffer, {:.0} of more than one record, {:.0} whose shaders store, {:.0} dispatches; \
          windows ended by {:.0} direct draws or dispatches, kept over {:.0} that store nothing, ended by {:.0} \
          indirect executions whose shaders store, {:.0} times by a bigger scratch buffer; {:.0} windowable \
-         executions found a window of their buffer that neither held their record nor walked on to it, {:.0}          windows clamped around such a record (=2)",
+         executions found a window of their buffer that neither held their record nor walked on to it, {:.0}          windows clamped around such a record (=2); {:.0} executions whose shaders store read a window (VICTORY_WINDOW_STORES=1)",
         window_mode(),
         w[W_HIT],
         w[W_CLAMPED],
@@ -238,6 +254,7 @@ pub(crate) fn window_line(frames: f64) {
         w[W_GROWN],
         w[W_ASIDE],
         w[W_AROUND],
+        w[W_STORE_HIT],
     );
 }
 
@@ -494,7 +511,9 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// (`readable`), microseconds.
 /// Then the slots left for the next frame while the makers make their
 /// textures' host copies (`resource::texture_makers`).
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// Then, of the buffer views: the slots looked at and the refreshes of the
+/// host copies their views read, microseconds, and the copies refreshed.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -601,10 +620,31 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // A fill reads title memory at submission, and settles the flights
+    // whose shaders may write it: copied on the card instead, behind them
+    // (`crate::host::fill_on_card`, as a table's constant buffer view is).
+    if crate::host::late() && crate::host::flights_write(address as usize, (address + len) as usize) {
+        FILL_FLIGHTS[0].fetch_add(1, Ordering::Relaxed);
+        if crate::host::fill_on_card() {
+            shadow.refresh(list, address, len);
+            if let Some(gpu) = list.card_constants(&shadow, address, len) {
+                FILL_FLIGHTS[1].fetch_add(1, Ordering::Relaxed);
+                return Some(gpu);
+            }
+        }
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
 }
+
+/// Since the last frame line, fills of upload memory recorded over title
+/// memory that flights in the air may write (each settles the flights at
+/// its submission), and of them those copied on the card instead
+/// (`crate::host::fill_on_card`): of root constant views, then of table
+/// constant views, then of these the ones with no host copy to copy from,
+/// then of texture copies' sources (`crate::list`).
+pub(crate) static FILL_FLIGHTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -1589,6 +1629,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        let slots_done = std::time::Instant::now();
+        HEAP_PASS_PARTS[9].fetch_add((slots_done - started).as_micros() as u64, Ordering::Relaxed);
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1633,6 +1675,8 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         let textures = std::time::Instant::now();
+        HEAP_PASS_PARTS[10].fetch_add((textures - slots_done).as_micros() as u64, Ordering::Relaxed);
+        HEAP_PASS_PARTS[11].fetch_add(spans.len() as u64, Ordering::Relaxed);
         HEAP_PASS_PARTS[0].fetch_add((textures - started).as_micros() as u64, Ordering::Relaxed);
         HEAP_PASS_PARTS[4].fetch_add(slots.len() as u64, Ordering::Relaxed);
         self.heap_textures(list, heap, host);
@@ -2420,17 +2464,27 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                let over = matches!(view, Some(View::Constant(address, size))
+                    if crate::host::late()
+                        && crate::host::flights_write(address as usize, address as usize + size as usize));
+                if over {
+                    FILL_FLIGHTS[2].fetch_add(1, Ordering::Relaxed);
+                }
+                match view {
                     Some(View::Constant(address, size))
-                        if crate::host::fill_on_card()
-                            && crate::host::late()
-                            && crate::host::flights_write(address as usize, address as usize + size as usize)
-                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                        if over
+                            && crate::host::fill_on_card()
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size)).or_else(|| {
+                                FILL_FLIGHTS[4].fetch_add(1, Ordering::Relaxed);
+                                None
+                            })
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));
                                 list.card_constants(&shadow, address, u64::from(size))
                             } =>
                     {
+                        FILL_FLIGHTS[3].fetch_add(1, Ordering::Relaxed);
                         host.constant_at(index, gpu, size);
                     }
                     Some(View::Constant(address, size)) => {
@@ -2811,6 +2865,24 @@ impl State {
         if windows() && list.first_use(WINDOW_USE) {
             self.windows.clear();
         }
+        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
+        let holds = |w: &Window| {
+            same(w)
+                && offset >= w.base
+                && (offset - w.base).is_multiple_of(u64::from(w.step))
+                && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+        };
+        // A record of one whose shaders store, that a window holds clamped
+        // (`window_stores`): read from there; the window ends after it, as
+        // it does now, since its shaders may write the arguments.
+        let store_hit = if window_stores() && windows() && kind != DISPATCH && max == 1 && count.is_none() && stores {
+            self.windows.iter().rev().find(|w| holds(w)).map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
+        } else {
+            None
+        };
+        if store_hit.is_some() {
+            window_count(W_STORE_HIT);
+        }
         if windows() && !windowed {
             window_count(if count.is_some() {
                 W_COUNTED
@@ -2828,19 +2900,10 @@ impl State {
                 self.windows.clear();
             }
         }
-        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = if windowed {
-            self.windows
-                .iter()
-                .rev()
-                .filter(|w| same(w) && offset >= w.base)
-                .find(|w| {
-                    (offset - w.base) % u64::from(w.step) == 0
-                        && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
-                })
-                .map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
+            self.windows.iter().rev().find(|w| holds(w)).map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
         } else {
-            None
+            store_hit
         };
         let (bounded, at) = match hit {
             Some(hit) => {

@@ -206,6 +206,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
+    #[cfg(feature = "diagnostics")]
+    let _who = asking_for(1);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
@@ -242,9 +244,48 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 #[cfg(feature = "diagnostics")]
 static SLOW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Who asks the kernel ([`asking_for`]): 0 other, 1 a submission's
+/// refreshes together ([`ask_ahead`], [`ask_once`]), 2 one copy's refresh,
+/// 3 a copy's check under shader writes, 4 a texture's check.
+#[cfg(feature = "diagnostics")]
+pub(crate) const ASKERS: usize = 5;
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static WHO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Since the last frame line, per [`ASKERS`]: kernel askings and their
+/// microseconds.
+#[cfg(feature = "diagnostics")]
+static BY_WHO: [[std::sync::atomic::AtomicU64; 2]; ASKERS] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; ASKERS];
+
+/// The askings this thread makes until the result is dropped are counted
+/// as `who`'s ([`ASKERS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn asking_for(who: usize) -> impl Drop {
+    struct Was(usize);
+    impl Drop for Was {
+        fn drop(&mut self) {
+            WHO.with(|w| w.set(self.0));
+        }
+    }
+    Was(WHO.with(|w| w.replace(who)))
+}
+
+/// [`BY_WHO`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn asks_by_who() -> [[u64; 2]; ASKERS] {
+    BY_WHO.each_ref().map(|w| w.each_ref().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)))
+}
+
 #[cfg(feature = "diagnostics")]
 fn slow(us: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    let who = WHO.with(|w| w.get()).min(ASKERS - 1);
+    BY_WHO[who][0].fetch_add(1, Relaxed);
+    BY_WHO[who][1].fetch_add(us, Relaxed);
     if us >= 1000 {
         SLOW[0].fetch_add(1, Relaxed);
         SLOW[1].fetch_add(us, Relaxed);
@@ -299,6 +340,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
+    #[cfg(feature = "diagnostics")]
+    let _who = asking_for(1);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -653,6 +696,19 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`guards`] for a guard's check, the wait for the lock counted.
+fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+    #[cfg(feature = "diagnostics")]
+    {
+        let waiting = std::time::Instant::now();
+        let g = guards();
+        crate::copystat::add(crate::copystat::C::GuardLockUs, waiting.elapsed().as_micros() as u64);
+        g
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    guards()
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -666,15 +722,26 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
+        let g = guards_timed();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
-    if !known && !is_view(start, end) {
-        return None;
+    if !known {
+        #[cfg(feature = "diagnostics")]
+        let asking = std::time::Instant::now();
+        let view = is_view(start, end);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::GuardQueries, 1);
+            add(C::GuardQueryUs, asking.elapsed().as_micros() as u64);
+        }
+        if !view {
+            return None;
+        }
     }
     install();
-    let mut g = guards();
+    let mut g = guards_timed();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -871,15 +938,24 @@ fn protect_runs(g: &mut Guards, from: usize, to: usize, clean: bool) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let protecting = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        let done = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::GuardProtects, 1);
+            add(C::GuardProtectUs, protecting.elapsed().as_micros() as u64);
         }
+        done
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);

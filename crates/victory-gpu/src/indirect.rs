@@ -885,7 +885,7 @@ void main() {
     }
 
     /// The compare of copies in the card's memory (`crate::host`), on the
-    /// software adapter. Told 1 it flags the pieces whose bytes are not
+    /// software adapter. Told 1 it flags the parts of pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed
     /// and a later one changed back then looks untouched, which is right
     /// only if the piece was fetched after both. Told 2 (submissions sent
@@ -902,7 +902,8 @@ void main() {
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
-        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_hashes, _, hashes_gpu) =
+            warp.shared_buffer(16 * u64::from(PIECES * crate::shadow::CARD_PARTS));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
@@ -929,7 +930,8 @@ void main() {
             // SAFETY: as above.
             [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
         };
-        let at = PIECE + 1234;
+        // In part 5 of the second piece: its dword gets bit 5.
+        let at = PIECE + 5 * 4096 + 1234;
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
@@ -938,25 +940,25 @@ void main() {
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 32, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 32, 0]);
         // Changed back: with 1 the piece looks untouched.
         set(content[at]);
         assert_eq!(run(&mut warp, 1), [0, 0, 0]);
         // With 2 the change is flagged once, and the hash is the new one.
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 32, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
         // Changed back: flagged, where 1 saw nothing.
         set(content[at]);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 32, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
-        // Every lane's slice is hashed: first byte of piece 0 (lane 0),
-        // last byte of piece 2 (lane 63), and swapping two 16-byte blocks
-        // across lanes in piece 1 must all be detected.
+        // Every lane's slice is hashed: first byte of piece 0 (part 0),
+        // last byte of piece 2 (part 15, its last lane), and swapping two
+        // 16-byte blocks across lanes in piece 1 must all be detected.
         for &(offset, expected) in &[
             (0usize, [1, 0, 0]),
-            (PIECE * 3 - 1, [0, 0, 1]),
+            (PIECE * 3 - 1, [0, 0, 1 << 15]),
             (63 * 16 + 7, [1, 0, 0]),
         ] {
             // SAFETY: offset is inside the mapped buffer.
@@ -974,16 +976,15 @@ void main() {
         }
         assert_eq!(run(&mut warp, 1), [0, 1, 0]);
         // Restore piece 1, then flip the sign bit of the first u32 in both
-        // lane 0's and lane 32's final 16-byte loads of piece 0 (offsets
-        // 64,512 and 65,024). The asymmetric reduction must not let the pair
-        // cancel out.
+        // two 16-byte loads of piece 0's last part (offsets 64,512 and
+        // 65,024). The pair must not cancel out.
         // SAFETY: all offsets are inside the mapped buffer.
         unsafe {
             std::ptr::copy_nonoverlapping(content[PIECE..PIECE + 32].as_ptr(), now_ptr.add(PIECE), 32);
             now_ptr.add(64_512 + 3).write_volatile(content[64_512 + 3] ^ 0x80);
             now_ptr.add(65_024 + 3).write_volatile(content[65_024 + 3] ^ 0x80);
         }
-        assert_eq!(run(&mut warp, 1), [1, 0, 0]);
+        assert_eq!(run(&mut warp, 1), [1 << 15, 0, 0]);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

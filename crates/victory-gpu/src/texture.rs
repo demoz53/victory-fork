@@ -62,6 +62,9 @@ pub(crate) struct Staging {
     /// Highest late-submission number (`crate::host::STARTED`) that may
     /// still be reading this staging buffer on the GPU (`0` if none).
     in_flight: std::sync::atomic::AtomicU64,
+    /// Whether its memory is write-watched, as its first check found: 0 not
+    /// known yet, 1 yes, 2 no (view memory, guarded).
+    watched: std::sync::atomic::AtomicU8,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -701,6 +704,13 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Its memory `[start, end)`, if an earlier check found it write-watched
+    /// (`crate::host`'s one asking of a submission takes it then).
+    pub(crate) fn watched_memory(&self) -> Option<(usize, usize)> {
+        let (at, len) = self.memory();
+        (self.watched.load(std::sync::atomic::Ordering::Relaxed) == 1 && len > 0).then(|| (at, at + len))
+    }
+
     /// Notes that late submission `submission` may still be reading this
     /// staging buffer on the GPU.
     pub(crate) fn mark_in_flight(&self, submission: u64) {
@@ -734,11 +744,15 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _who = crate::watch::asking_for(4);
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let watched = waited(1, || crate::watch::writes(start, start + size, false));
+        self.watched.store(if watched.is_some() { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+        if let Some((now, written)) = watched {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1010,6 +1024,11 @@ pub(crate) fn unstage(resource: This) {
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
     }
+    // And one made ahead that no upload took (its host copy let go).
+    if let Some(a) = take_ahead(resource) {
+        STAGED_AHEAD[1].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        a.give_back();
+    }
 }
 
 /// Where a staged title texture's memory is: address and bytes.
@@ -1253,12 +1272,20 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 }
 
 /// The staging state of a title texture, made on first use.
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
-    }
+/// What a texture's staging needs of the texture: its title memory, its
+/// console layout, and the host's copyable footprints (`None` where the
+/// contents are not uploaded: no console layout, an XOR mode).
+#[allow(clippy::type_complexity)]
+fn staging_parts(
+    resource: This,
+    texture: &ID3D12Resource,
+    footprints_too: bool,
+) -> Option<(
+    *const u8,
+    victory_formats::texture::Layout,
+    Option<(Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, Vec<u32>, u64)>,
+    D3D12_RESOURCE_DESC,
+)> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1275,6 +1302,9 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    if !footprints_too {
+        return Some((memory, layout, None, d));
+    }
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1296,22 +1326,178 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data, bytes, kept) = host.staging_buffer(total)?;
-    if kept {
-        // What the texture before it left: a texture whose memory reads
-        // as zeros, or is not read at its first check, is uploaded with
-        // the buffer as it is (a new buffer is zeros).
-        // SAFETY: the mapping holds `bytes >= total` bytes, and nothing
-        // else holds the buffer.
-        unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+    Some((memory, layout, Some((footprints, rows, total)), d))
+}
+
+/// A staging buffer a texture maker made ahead for a texture the pass over
+/// the heap is about to upload ([`stage_ahead`]): cleared, its footprints
+/// found, waiting for the texture's next [`staging`].
+struct Ahead {
+    buffer: ID3D12Resource,
+    data: usize,
+    bytes: u64,
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    total: u64,
+    /// When it was made (`crate::host::now_ms`).
+    at: u64,
+}
+
+impl Ahead {
+    /// Not taken (and out of [`AHEAD_BYTES`]): the buffer serves another
+    /// staging.
+    fn give_back(self) {
+        crate::host::spare_staging(self.buffer, self.data as *mut u8, self.bytes);
     }
+}
+
+/// [`Ahead`] stagings by texture, and their bytes.
+static AHEAD: Mutex<Option<HashMap<usize, Ahead>>> = Mutex::new(None);
+static AHEAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the start: stagings made ahead, and taken by their texture's
+/// upload ([`stage_ahead`]).
+pub(crate) static STAGED_AHEAD: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// How long a staging made ahead waits for its texture's upload before its
+/// buffer goes back to the spare ones.
+const AHEAD_MS: u64 = 4000;
+
+/// The most bytes of stagings made ahead and not taken yet
+/// (`VICTORY_STAGE_AHEAD_MB`, 512; 0: none made ahead, as before).
+///
+/// The pass over the heap's views uploads the textures the title's shaders
+/// pick by index, on a recording thread. In the first minute after the
+/// world loads (all7-base) its uploads took 40-190 ms a frame: each made
+/// its texture's staging buffer there (the copyable footprints, a buffer
+/// taken from the spare ones or a committed upload buffer made, 1,500-3,500
+/// made a frame, and a kept one cleared), and the detile at submission then
+/// took the page faults of the new ones (30,000-93,000 a frame against
+/// 5,000-13,000 later). The texture makers (`resource::texture_makers`),
+/// which make the host copy of such a texture a frame before the pass
+/// uploads it, now make its staging buffer too, cleared (which brings its
+/// pages in), and the upload takes it.
+pub(crate) fn stage_ahead_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGE_AHEAD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20
+    })
+}
+
+/// On a texture maker's thread: makes the staging buffer of `resource`
+/// (whose host copy `texture` was just made) for its coming upload
+/// ([`stage_ahead_most`]), unless it has one or the room for them is used.
+pub(crate) fn stage_ahead(resource: This, texture: &ID3D12Resource) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let most = stage_ahead_most();
+    if most == 0 || !title_written(texture) || is_staged(resource) {
+        return;
+    }
+    {
+        let mut ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+        let ahead = ahead.get_or_insert_with(HashMap::new);
+        if ahead.contains_key(&(resource as usize)) {
+            return;
+        }
+        if AHEAD_BYTES.load(Relaxed) >= most / 2 {
+            // Those no upload took in time go back.
+            let now = crate::host::now_ms();
+            let old: Vec<usize> =
+                ahead.iter().filter(|(_, a)| now.saturating_sub(a.at) > AHEAD_MS).map(|(&k, _)| k).collect();
+            for key in old {
+                if let Some(a) = ahead.remove(&key) {
+                    AHEAD_BYTES.fetch_sub(a.bytes, Relaxed);
+                    a.give_back();
+                }
+            }
+        }
+        if AHEAD_BYTES.load(Relaxed) >= most {
+            return;
+        }
+    }
+    let Some((_, _, Some((footprints, rows, total)), _)) = staging_parts(resource, texture, true) else {
+        return;
+    };
+    let Some(host) = host() else {
+        return;
+    };
+    let Some((buffer, data, bytes, _)) = host.staging_buffer(total) else {
+        return;
+    };
+    // Cleared as `staging` clears a kept buffer; a new one's pages come in
+    // here, not under the detile at submission.
+    // SAFETY: the mapping holds `bytes >= total` bytes, and nothing else
+    // holds the buffer.
+    unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+    let made = Ahead { buffer, data: data as usize, bytes, footprints, rows, total, at: crate::host::now_ms() };
+    let mut ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    match ahead.get_or_insert_with(HashMap::new).entry(resource as usize) {
+        std::collections::hash_map::Entry::Occupied(_) => made.give_back(),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            AHEAD_BYTES.fetch_add(bytes, Relaxed);
+            slot.insert(made);
+            STAGED_AHEAD[0].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// The staging made ahead for `resource`, if there is one ([`stage_ahead`]).
+fn take_ahead(resource: This) -> Option<Ahead> {
+    let a = AHEAD.lock().unwrap_or_else(|e| e.into_inner()).as_mut()?.remove(&(resource as usize))?;
+    AHEAD_BYTES.fetch_sub(a.bytes, std::sync::atomic::Ordering::Relaxed);
+    STAGED_AHEAD[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(a)
+}
+
+/// Tests: whether a staging made ahead waits for `resource`.
+#[cfg(test)]
+pub(crate) fn has_ahead(resource: This) -> bool {
+    AHEAD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| a.contains_key(&(resource as usize)))
+}
+
+/// Tests: [`staging`] of `resource`, made or found.
+#[cfg(test)]
+pub(crate) fn staging_now(resource: This, texture: &ID3D12Resource) -> bool {
+    staging(resource, texture).is_some()
+}
+
+fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if let Some(s) = map.get(&(resource as usize)) {
+        return Some(s.clone());
+    }
+    let ahead = take_ahead(resource);
+    let Some((memory, layout, parts, d)) = staging_parts(resource, texture, ahead.is_none()) else {
+        if let Some(a) = ahead {
+            a.give_back();
+        }
+        return None;
+    };
+    let (footprints, rows, total, buffer, data, bytes) = match (ahead, parts) {
+        (Some(a), _) => (a.footprints, a.rows, a.total, a.buffer, a.data as *mut u8, a.bytes),
+        (None, Some((footprints, rows, total))) => {
+            let (buffer, data, bytes, kept) = host()?.staging_buffer(total)?;
+            if kept {
+                // What the texture before it left: a texture whose memory reads
+                // as zeros, or is not read at its first check, is uploaded with
+                // the buffer as it is (a new buffer is zeros).
+                // SAFETY: the mapping holds `bytes >= total` bytes, and nothing
+                // else holds the buffer.
+                unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+            }
+            (footprints, rows, total, buffer, data, bytes)
+        }
+        (None, None) => return None,
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(desc = ?d, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
@@ -1331,6 +1517,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         last_upload: std::sync::atomic::AtomicU64::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         in_flight: std::sync::atomic::AtomicU64::new(0),
+        watched: std::sync::atomic::AtomicU8::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)

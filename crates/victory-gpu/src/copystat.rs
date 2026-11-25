@@ -142,8 +142,17 @@ pub(crate) enum C {
     PieceBytesLeftOut,
     PiecePages,
     PiecePagesWhole,
+    /// Of the guards' checks (`watch::guard`): questions to Windows whether
+    /// a range is view memory and their microseconds, calls that make
+    /// blocks read-only and their microseconds, and microseconds waiting
+    /// for the guards' lock.
+    GuardQueries,
+    GuardQueryUs,
+    GuardProtects,
+    GuardProtectUs,
+    GuardLockUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1113,6 +1122,16 @@ pub(crate) fn log(frames: f64) {
         c[C::PiecePages as usize],
         c[C::PiecePagesWhole as usize],
         mb(c[C::PieceBytesLeftOut as usize]),
+    );
+    tracing::info!(
+        "guards per frame: {:.1} ms in all; {:.0} questions whether a range is view memory {:.1} ms, {:.0} calls making \
+         blocks read-only {:.1} ms, {:.1} ms waiting for the guards' lock",
+        ms(c[C::GuardUs as usize]),
+        c[C::GuardQueries as usize],
+        ms(c[C::GuardQueryUs as usize]),
+        c[C::GuardProtects as usize],
+        ms(c[C::GuardProtectUs as usize]),
+        ms(c[C::GuardLockUs as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

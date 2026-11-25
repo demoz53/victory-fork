@@ -991,6 +991,9 @@ extern "system" fn copy_texture_region(
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
+            if crate::host::late() && crate::host::flights_write(data as usize, data as usize + bytes as usize) {
+                crate::draw::FILL_FLIGHTS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;

@@ -1649,13 +1649,18 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one 64-thread group per 64 KiB piece (cut at
-/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
-/// each lane strides through the piece 1024 bytes at a time for coalesced
-/// 16-byte loads, then the group reduces the 64 partial hashes in shared
-/// memory. `differs` gets a dword per piece, 1 where a byte differs. The
-/// offsets are widened to 16 bytes; buffers are multiples of 64 KiB, and a
-/// piece flagged for a byte just outside the range costs a fetch that finds
-/// nothing.
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece_parts` cuts
+/// them), four lanes per 4 KiB part of it (`crate::shadow::CARD_PARTS`):
+/// each lane strides through its part 64 bytes at a time (the four lanes of
+/// a part load 64 bytes side by side), the part's four hashes are combined
+/// in shared memory, and each part's hash is kept. `differs` gets a dword
+/// per piece, with bit `j` set where a byte of part `j` differs (0: the
+/// piece is unchanged). Only the flagged parts are fetched and merged
+/// (triippywhale's 6ca2743c2): a shader that wrote a few words of a piece
+/// cost a fetch and a merge of all 64 KiB of it (1,000-1,200 pieces, 65-75
+/// MB a frame in all7-base). The offsets are widened to 16 bytes; buffers
+/// are multiples of 64 KiB, and a part flagged for a byte just outside it
+/// costs a fetch that finds nothing.
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1671,58 +1676,80 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+// The part hashes of the group's piece: four lanes' a part.
 groupshared uint4 shared_h[64];
+// The parts of the group's piece that differ.
+groupshared uint mask;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint idx = gid.x;
     if (idx >= pieces) return;
     uint lane = gtid.x;
+    uint part = lane >> 2;
+    uint sub = lane & 3u;
+    if (lane == 0u) mask = 0u;
     uint piece = first + idx;
-    uint lo = piece * 65536u;
+    uint lo = piece * 65536u + part * 4096u;
     lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
+    uint end = piece * 65536u + (part + 1u) * 4096u;
+    uint hi = end > skew ? min(end - skew, size) : 0u;
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ (lane * 0x9E3779B9u);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ (sub * 0x9E3779B9u);
     [loop]
-    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+    for (uint at = lo + sub * 16u; at < hi; at += 64u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
     shared_h[lane] = h;
     GroupMemoryBarrierWithGroupSync();
-    [unroll]
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            uint4 a = shared_h[lane];
-            uint4 b = shared_h[lane + stride];
-            // Mix `b` asymmetrically (fmix32 + component swizzle) before
-            // combining with `a` so identical high-bit flips on paired lanes
-            // (e.g. lane 0 and lane 32's last loads) cannot cancel in `a ^ b`.
+    if (sub == 0u) {
+        uint4 a = shared_h[lane];
+        [unroll]
+        for (uint k = 1u; k < 4u; k++) {
+            uint4 b = shared_h[lane + k];
+            // Mixed asymmetrically before it is combined, so that the same
+            // high-bit flips in two lanes cannot cancel.
             b ^= b >> 16;
             b *= uint4(0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu, 0x165667B1u);
             b ^= b >> 13;
             b *= uint4(0xC2B2AE35u, 0x27D4EB2Fu, 0x165667B1u, 0x85EBCA6Bu);
             b ^= b >> 16;
             a = (a ^ b.zwxy) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-            shared_h[lane] = a.yzwx ^ (a >> 15);
+            a = a.yzwx ^ (a >> 15);
         }
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (lane == 0u) {
-        uint4 final_h = shared_h[0];
+        uint slot = (piece * 16u + part) * 16u;
+        bool differ = false;
         if (compare != 0u) {
-            differs.Store(out_at + idx * 4u, any(final_h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+            differ = any(a != hashes.Load4(slot));
             // With the copy-back on its own thread: the next compare of the
-            // piece finds what is written from here on.
-            if (compare == 2u) hashes.Store4(piece * 16u, final_h);
+            // part finds what is written from here on.
+            if (compare == 2u) hashes.Store4(slot, a);
         } else {
-            hashes.Store4(piece * 16u, final_h);
+            hashes.Store4(slot, a);
+        }
+        if (differ) {
+            uint was;
+            InterlockedOr(mask, 1u << part, was);
         }
     }
+    GroupMemoryBarrierWithGroupSync();
+    if (lane == 0u && compare != 0u) differs.Store(out_at + idx * 4u, mask);
 }
 "#;
+
+/// What the compare's dword for a piece says to fetch: the parts it flags,
+/// or all of a flagged piece (`VICTORY_CARD_PARTS=0`: whole pieces, as
+/// before the parts).
+fn part_mask(flagged: u32) -> u32 {
+    static PARTS: OnceLock<bool> = OnceLock::new();
+    if flagged == 0 || *PARTS.get_or_init(|| std::env::var_os("VICTORY_CARD_PARTS").is_none_or(|v| v != "0")) {
+        flagged
+    } else {
+        u32::MAX
+    }
+}
 
 /// Dispatch [`CARD_COMPARE`] for `pieces` pieces (one thread group per piece),
 /// chunking at D3D12's 65,535-group per-dimension limit if ever exceeded.
@@ -2196,8 +2223,10 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
 /// card with nothing to land, microseconds it waited for fetches of card
-/// copies' pieces, microseconds of landing in all.
-static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// copies' pieces, microseconds of landing in all; of the landing,
+/// microseconds of the card copies' fetch and merge (with the fetch's wait)
+/// and of the other copies' compare and merge.
+static RELAY_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
@@ -2211,20 +2240,24 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
-/// piece's number in the copy and whether the compare flagged it there (or
-/// did not run). The pieces to fetch, under whichever range: all of them
-/// flagged under any. Two ranges of a plan may hold parts of the same
-/// 64 KiB piece; the compare hashes the whole piece for each and stores
-/// the hash, so the second of them may find it stored already and not
-/// flag it.
-fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
-    flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
+/// piece's number in the copy and the parts the compare flagged there
+/// (all bits where it did not run). The parts to fetch, under whichever
+/// range: all of them flagged under any. Two ranges of a plan may hold
+/// parts of the same 64 KiB piece; the compare hashes the whole piece for
+/// each and stores the hashes, so the second of them may find them stored
+/// already and not flag them.
+fn flagged_parts(flags: &[(usize, u32, u32)]) -> std::collections::HashMap<(usize, u32), u32> {
+    let mut parts = std::collections::HashMap::new();
+    for &(copy, piece, mask) in flags.iter().filter(|f| f.2 != 0) {
+        *parts.entry((copy, piece)).or_insert(0) |= mask;
+    }
+    parts
 }
 
 #[cfg(test)]
 mod relay_tests {
     use super::{
-        Step, WHY_READ, WHY_RUN, blocked_by_steps, flagged_pieces, join_copy_ranges, join_ranges, landable,
+        Step, WHY_READ, WHY_RUN, blocked_by_steps, flagged_parts, join_copy_ranges, join_ranges, landable,
         touches_other,
     };
 
@@ -2248,19 +2281,21 @@ mod relay_tests {
         assert_eq!(landable(&line[3..], 6), 2);
     }
 
-    /// A piece flagged under one range of a plan is fetched under every
-    /// range that holds a part of it; pieces of other copies are not.
+    /// A part flagged under one range of a plan is fetched under every
+    /// range that holds its piece, with the parts flagged under the
+    /// others; pieces of other copies and pieces flagged nowhere are not.
     #[test]
-    fn a_piece_flagged_under_one_range_is_fetched_under_all() {
+    fn a_part_flagged_under_one_range_is_fetched_under_all() {
         let (a, b) = (0x1000usize, 0x2000usize);
-        // Copy a: piece 3 under two ranges, flagged under the first only;
-        // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
-        let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
-        let fetch = flagged_pieces(&flags);
-        assert!(fetch.contains(&(a, 3)));
-        assert!(!fetch.contains(&(a, 4)));
-        assert!(!fetch.contains(&(b, 3)));
-        assert!(fetch.contains(&(b, 9)));
+        // Copy a: piece 3 under two ranges, parts 0 and 5 flagged under
+        // the first, part 7 under the second; piece 4 not flagged; copy b:
+        // piece 3 not flagged, piece 9 not compared (all parts).
+        let flags = [(a, 3, 0b10_0001), (a, 4, 0), (a, 3, 0b1000_0000), (b, 3, 0), (b, 9, u32::MAX)];
+        let fetch = flagged_parts(&flags);
+        assert_eq!(fetch.get(&(a, 3)), Some(&0b1010_0001));
+        assert!(!fetch.contains_key(&(a, 4)));
+        assert!(!fetch.contains_key(&(b, 3)));
+        assert_eq!(fetch.get(&(b, 9)), Some(&u32::MAX));
         assert_eq!(fetch.len(), 2);
     }
 
@@ -3356,12 +3391,16 @@ fn late_line(frames: f64) {
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
              fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
-             \"settles\" above are waits of other threads for it)",
+             \"settles\" above are waits of other threads for it); of the landing, {:.1} ms fetching and merging what \
+             shaders wrote to copies in the card's memory (with the waits for the fetches), {:.1} ms comparing and merging \
+             the other copies'",
             r[1],
             r[0],
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+            r[5] / 1000.0,
+            r[6] / 1000.0,
         );
     }
     if late_exact() {
@@ -3911,7 +3950,7 @@ impl Host {
     /// lists. `None` if there is nothing to do.
     ///
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
-    /// then stores the hashes it makes (see [`flagged_pieces`] and
+    /// then stores the hashes it makes (see [`flagged_parts`] and
     /// `relay`).
     fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
         use std::sync::Arc;
@@ -4208,7 +4247,7 @@ impl Host {
     /// this thread's own, and what shaders wrote in them goes into title
     /// memory (`Shadow::card_merge_relay`). As [`Host::card_back`], but:
     /// no submission lock; a piece flagged under one range of a plan is
-    /// fetched under all ([`flagged_pieces`]); the fetch runs behind
+    /// fetched under all ([`flagged_parts`]); the fetch runs behind
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
@@ -4226,26 +4265,37 @@ impl Host {
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
             let mut seen = std::collections::HashSet::new();
             for plan in plans {
-                let flags: Vec<(usize, u32, bool)> = plan
+                let flags: Vec<(usize, u32, u32)> = plan
                     .ranges
                     .iter()
                     .flat_map(|r| {
                         (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
+                            let mask = if r.compared {
+                                differs.get((r.at + p) as usize).copied().map_or(u32::MAX, part_mask)
+                            } else {
+                                u32::MAX
+                            };
+                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, mask)
                         })
                     })
                     .collect();
-                let fetched = flagged_pieces(&flags);
+                let fetched = flagged_parts(&flags);
                 for r in &plan.ranges {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
-                        if !fetched.contains(&(copy, r.span.first + p)) {
+                        let Some(&mask) = fetched.get(&(copy, r.span.first + p)) else {
                             continue;
-                        }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
+                        };
+                        // Only the 4 KiB parts flagged, each once; touching
+                        // parts are fetched and merged as one.
+                        for (lo, hi) in r.shadow.card_piece_parts(&r.span, p, mask) {
+                            if !seen.insert((copy, lo, hi)) {
+                                continue;
+                            }
+                            match pieces.last_mut() {
+                                Some(last) if std::sync::Arc::ptr_eq(&last.0, &r.shadow) && last.2 == lo => last.2 = hi,
+                                _ => pieces.push((r.shadow.clone(), lo, hi, total)),
+                            }
                             total += (hi - lo) as u64;
                         }
                     }
@@ -4375,7 +4425,9 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                let carded = std::time::Instant::now();
                 self.relay_card_back(&plans, fetch);
+                RELAY_STATS[5].fetch_add(carded.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -4391,7 +4443,9 @@ impl Host {
                         }
                     }
                 }
+                let handing = std::time::Instant::now();
                 relay_hand_back(&back);
+                RELAY_STATS[6].fetch_add(handing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -4502,12 +4556,20 @@ impl Host {
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
-                if r.compared && differs[(r.at + p) as usize] == 0 {
+                let mask = if r.compared { part_mask(differs[(r.at + p) as usize]) } else { u32::MAX };
+                if mask == 0 {
                     continue;
                 }
-                let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
+                // Only the 4 KiB parts the compare flagged, each once;
+                // touching parts are fetched and merged as one.
+                for (lo, hi) in r.shadow.card_piece_parts(&r.span, p, mask) {
+                    if !seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                        continue;
+                    }
+                    match pieces.last_mut() {
+                        Some(last) if last.0 == i && last.2 == lo => last.2 = hi,
+                        _ => pieces.push((i, lo, hi, total)),
+                    }
                     total += (hi - lo) as u64;
                 }
             }
@@ -5087,6 +5149,7 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let textures = ask_textures();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
@@ -5096,6 +5159,14 @@ impl Host {
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
                         *span = (span.0.min(*address), span.1.max(*address + *len));
+                    }
+                    // The textures checked at their steps too, those whose
+                    // memory is write-watched (`ask_textures`).
+                    if textures
+                        && let Step::Texture { staging, .. } = step
+                        && let Some(range) = staging.watched_memory()
+                    {
+                        spans.entry(std::sync::Arc::as_ptr(staging) as *const () as usize).or_insert(range);
                     }
                 }
             }
@@ -6882,6 +6953,22 @@ impl Batch {
     }
 }
 
+/// Whether a submission's one write-watch asking (`crate::watch::ask_once`)
+/// covers the memory of the textures its steps check too, where that is
+/// write-watched (`VICTORY_ASK_TEXTURES=1`; off by default).
+///
+/// The askings stayed at 2,500-2,700 a frame (28-33 ms of preparing in
+/// all7) when the title's buffer copies no longer split the refreshes
+/// (186f383): most are not the copies' refreshes. Each texture a step
+/// checks (`Staging::refresh`) asked the kernel on its own, outside the
+/// submission's one asking, which holds only the copies' ranges. With the
+/// switch the textures' ranges join it, and their checks are answered from
+/// the journal while it stands, as the copies' are.
+fn ask_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_TEXTURES").is_some_and(|v| v == "1"))
+}
+
 /// Whether a title buffer copy done at submission flushes every pending
 /// refresh (`VICTORY_COPY_FLUSH_ALL=1`), not only those over its
 /// destination ([`Batch::copy_written`]).
@@ -7310,6 +7397,20 @@ impl Meter {
         }
         late_line(frames);
         {
+            let f = crate::draw::FILL_FLIGHTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+            if f.iter().any(|&n| n > 0.0) {
+                tracing::info!(
+                    "fills of upload memory over what flights write, per frame (each settles the flights at its                      submission unless copied on the card, VICTORY_FILL_ON_CARD): {:.1} of root constant views ({:.1} copied                      on the card), {:.1} of table constant views ({:.1} copied on the card, {:.1} with no host copy to copy                      from), {:.1} of texture copies' sources",
+                    f[0],
+                    f[1],
+                    f[2],
+                    f[3],
+                    f[4],
+                    f[5],
+                );
+            }
+        }
+        {
             let [events, us, longest] = [0, 1, 2].map(|i| crate::fence::EVENT_WAITS[i].swap(0, Ordering::Relaxed));
             if events > 0 {
                 tracing::info!(
@@ -7385,7 +7486,7 @@ impl Meter {
                 tracing::info!(
                     "the pass over the heap's views per frame (on a recording thread): {:.1} ms buffer views ({:.0} slots looked at),                      {:.1} ms textures ({:.0} slots looked at), of them {:.1} ms asking what of their memory is mapped and {:.1} ms                      making their views, host textures and uploads ({:.1} ms the views and host textures, {:.1} ms the uploads); \
                      {:.0} slots left for the next frame while their host copies are made ahead ({} made ahead of {} handed over \
-                     since the start, VICTORY_TEXTURE_MAKERS)",
+                     since the start, VICTORY_TEXTURE_MAKERS; {} stagings made ahead, {} taken, VICTORY_STAGE_AHEAD_MB);                      of the buffer views, {:.1} ms the slots and {:.1} ms refreshing the {:.0} host copies they read",
                     parts[0] / 1e3,
                     parts[4],
                     parts[1] / 1e3,
@@ -7397,6 +7498,11 @@ impl Meter {
                     parts[8],
                     crate::resource::MADE_AHEAD[0].load(Ordering::Relaxed),
                     crate::resource::MADE_AHEAD[1].load(Ordering::Relaxed),
+                    crate::texture::STAGED_AHEAD[0].load(Ordering::Relaxed),
+                    crate::texture::STAGED_AHEAD[1].load(Ordering::Relaxed),
+                    parts[9] / 1e3,
+                    parts[10] / 1e3,
+                    parts[11],
                 );
             }
         }
@@ -7442,12 +7548,30 @@ impl Meter {
                 );
             }
             #[cfg(feature = "diagnostics")]
-            tracing::info!(
-                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
-                slow[0] as f64 / frames,
-                slow[1] as f64 / 1e3 / frames,
-                slow[2] as f64 / 1e3
-            );
+            {
+                let who = crate::watch::asks_by_who();
+                let n = |i: usize| who[i][0] as f64 / frames;
+                let ms = |i: usize| who[i][1] as f64 / 1e3 / frames;
+                tracing::info!(
+                    "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms; \
+                     by who asks, per frame: {:.0} ({:.1} ms) for a submission's refreshes together, {:.0} ({:.1} ms) by one \
+                     copy's refresh, {:.0} ({:.1} ms) under shader writes, {:.0} ({:.1} ms) by textures' checks, {:.0} ({:.1} ms) \
+                     other",
+                    slow[0] as f64 / frames,
+                    slow[1] as f64 / 1e3 / frames,
+                    slow[2] as f64 / 1e3,
+                    n(1),
+                    ms(1),
+                    n(2),
+                    ms(2),
+                    n(3),
+                    ms(3),
+                    n(4),
+                    ms(4),
+                    n(0),
+                    ms(0),
+                );
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(

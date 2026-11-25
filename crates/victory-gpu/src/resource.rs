@@ -1328,6 +1328,11 @@ pub(crate) fn make_host_copy_soon(this: This) -> bool {
                     // itself once there is (or leaves the slot due).
                     if room() && hosted(next as This, true).is_some() {
                         MADE_AHEAD[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // And its staging, for the upload the pass makes
+                        // next (`texture::stage_ahead_most`).
+                        if let Some(texture) = host_resource(next as This) {
+                            crate::texture::stage_ahead(next as This, texture);
+                        }
                     }
                     MAKERS.lock().unwrap_or_else(|e| e.into_inner()).queued.remove(&next);
                 }
@@ -2681,6 +2686,20 @@ mod tests {
         while !has_host_copy(made) {
             assert!(since.elapsed() < std::time::Duration::from_secs(10), "no maker made it");
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Its staging is made ahead too (`texture::stage_ahead_most`), kept
+        // apart: the texture is not staged until its upload takes it.
+        if crate::texture::stage_ahead_most() > 0 {
+            while !crate::texture::has_ahead(made) {
+                assert!(since.elapsed() < std::time::Duration::from_secs(10), "no staging made ahead");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(!crate::texture::is_staged(made), "made ahead is not staged");
+            let texture = host_resource(made).unwrap();
+            assert!(crate::texture::staging_now(made, texture));
+            assert!(!crate::texture::has_ahead(made), "the staging took it");
+            assert!(crate::texture::is_staged(made));
+            crate::texture::unstage(made);
         }
         drop(memory);
     }
