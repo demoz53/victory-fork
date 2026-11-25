@@ -129,6 +129,9 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Of `ResetNs`: letting go of what the lists held (their steps, upload
+    /// buffers and objects), where the reset was called.
+    ResetDropNs,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1132,7 +1135,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "frame account per frame: after a present {:.1} ms until the first list call and {:.1} ms \
          until the first submission; {:.1} ms from the last submission to the present call; \
-         lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
+         lists reset in {:.1} ms ({:.1} ms of it letting go of what they held, VICTORY_RESET_REAPER); the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
          putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
@@ -1142,6 +1145,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::UntilSubmitUs as usize]),
         ms(c[C::TailUs as usize]),
         c[C::ResetNs as usize] / 1e6,
+        c[C::ResetDropNs as usize] / 1e6,
         ms(c[C::BackScanUs as usize]),
         c[C::BackDiffer as usize],
         ms(c[C::BackSyncUs as usize]),

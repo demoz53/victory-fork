@@ -1875,18 +1875,37 @@ impl Deferred {
 
     /// Clears all recorded entries while retaining container capacities so
     /// list resets do not free and reallocate `Vec`/`HashSet` storage every
-    /// frame.
+    /// frame. What the steps, upload buffers, kept objects and read-back
+    /// buffers hold is let go by [`reaper`]'s thread, not here.
     fn clear(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
         self.upload_bytes = 0;
+        #[cfg(feature = "diagnostics")]
+        let dropping = std::time::Instant::now();
+        if reaper() {
+            // Moved out, each vector keeping its room for the next recording.
+            fn moved<T>(v: &mut Vec<T>) -> Vec<T> {
+                let mut out = Vec::with_capacity(v.len());
+                out.append(v);
+                out
+            }
+            reap(Reaped {
+                _steps: moved(&mut self.copies),
+                _uploads: moved(&mut self.uploads),
+                _kept: moved(&mut self.kept),
+                _backs: moved(&mut self.backs),
+            });
+        }
         self.copies.clear();
         self.uploads.clear();
         self.kept.clear();
+        self.backs.clear();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetDropNs, dropping.elapsed().as_nanos() as u64);
         self.refreshed.clear();
         self.textures.clear();
         self.writes.clear();
-        self.backs.clear();
         self.budget_zeroed = false;
         // As a new list's (fxceless #205: the watermarks start again at
         // every reset).
@@ -1908,6 +1927,61 @@ impl Deferred {
             total
         };
         (read_from, write_from)
+    }
+}
+
+/// What a list's reset lets go of, for [`reaper`]'s thread.
+struct Reaped {
+    _steps: Vec<Step>,
+    _uploads: Vec<ID3D12Resource>,
+    _kept: Vec<windows::core::IUnknown>,
+    _backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+}
+
+// SAFETY: D3D12 objects (free-threaded) and steps nothing will run any
+// more (the list was reset after its submissions ran); they are only
+// dropped there.
+unsafe impl Send for Reaped {}
+
+/// Whether what host lists held is let go on a thread of its own, not where
+/// the title resets them (`VICTORY_RESET_REAPER=0`: where they are reset,
+/// as before).
+///
+/// The title resets its lists on the threads that record them: "lists
+/// reset in 35-54 ms" a frame (gpu-cold, gpu-w1), on the recording threads
+/// whose list calls the submitting thread waits for. What a reset lets go
+/// of is most of it: the last holds on upload buffers, read-back buffers,
+/// staging, host copies and the objects the list named (each a release,
+/// some a kernel call that frees memory), and the steps' closures. They
+/// stay alive until that thread drops them, a little later than before;
+/// nothing reads them (the card ran the lists, and the reset forgot them).
+fn reaper() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESET_REAPER").is_none_or(|v| v != "0"))
+}
+
+/// Hands `reaped` to the thread that lets go of it ([`reaper`]); drops it
+/// here if there is no such thread.
+fn reap(reaped: Reaped) {
+    static LINE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Reaped>>>> = OnceLock::new();
+    let line = LINE.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::channel::<Reaped>();
+        std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || {
+                for reaped in receive {
+                    drop(reaped);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    if let Some(line) = line {
+        let line = line.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(std::sync::mpsc::SendError(reaped)) = line.send(reaped) {
+            drop(line);
+            drop(reaped);
+        }
     }
 }
 
