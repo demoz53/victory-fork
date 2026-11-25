@@ -1185,6 +1185,92 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The title textures the title fills, by the memory they take ([`Resource::data`]
+/// and their bytes), for [`evict_placed_in`]: kept with [`TEXTURES`] and
+/// under its lock (taken first), so a texture leaves both before it is freed.
+/// Walking every texture alive at each change of title memory's mapping
+/// (some 6,000 a frame while the world streams in) took ~325 µs a change,
+/// under the runtime's own lock: 2 s of a frame, and the boot screens froze
+/// for 18-28 s (all11b-cold).
+#[cfg(windows)]
+static TEXTURES_AT: std::sync::Mutex<ByAddress> = std::sync::Mutex::new(ByAddress::new());
+
+/// Textures by start address and bytes: up to [`ByAddress::SMALL`] bytes in
+/// a map by start (a range query looks back that far at most), larger ones
+/// in a list looked at whole (few).
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct ByAddress {
+    small: std::collections::BTreeMap<u64, Vec<(usize, u64)>>,
+    large: Vec<(usize, u64, u64)>,
+}
+
+#[cfg(windows)]
+impl ByAddress {
+    const SMALL: u64 = 8 << 20;
+
+    const fn new() -> Self {
+        ByAddress {
+            small: std::collections::BTreeMap::new(),
+            large: Vec::new(),
+        }
+    }
+
+    /// Texture `at` takes `[start, start + bytes)`.
+    fn insert(&mut self, at: usize, start: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if bytes <= Self::SMALL {
+            self.small.entry(start).or_default().push((at, bytes));
+        } else {
+            self.large.push((at, start, bytes));
+        }
+    }
+
+    /// Texture `at`, which started at `start`, is gone.
+    fn remove(&mut self, at: usize, start: u64) {
+        if let Some(entries) = self.small.get_mut(&start) {
+            entries.retain(|e| e.0 != at);
+            if entries.is_empty() {
+                self.small.remove(&start);
+            }
+        }
+        self.large.retain(|e| e.0 != at);
+    }
+
+    /// The textures whose memory overlaps `[base, base + len)`.
+    fn overlapping(&self, base: u64, len: u64) -> Vec<usize> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let end = base.saturating_add(len);
+        let mut found: Vec<usize> = self
+            .small
+            .range(base.saturating_sub(Self::SMALL - 1)..end)
+            .flat_map(|(&start, entries)| entries.iter().map(move |&(at, bytes)| (at, start, bytes)))
+            .filter(|&(_, start, bytes)| ranges_overlap(start, bytes, base, len))
+            .map(|(at, ..)| at)
+            .collect();
+        found.extend(
+            self.large
+                .iter()
+                .filter(|&&(_, start, bytes)| ranges_overlap(start, bytes, base, len))
+                .map(|e| e.0),
+        );
+        found
+    }
+}
+
+/// Whether [`evict_placed_in`] walks every texture alive, as fxceless #432
+/// made it (`VICTORY_EVICT_WALK=1`), instead of finding those in the range
+/// by address ([`TEXTURES_AT`]).
+#[cfg(windows)]
+fn evict_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_WALK").is_some_and(|v| v == "1"))
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1850,10 +1936,16 @@ pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    // Held throughout: a texture leaves the table (and the index by
+    // address) before it is freed, under this lock (`Drop for Resource`).
     let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
+    let candidates: Vec<usize> = if evict_walk() {
+        all.iter().copied().collect()
+    } else {
+        TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner()).overlapping(base, len)
+    };
+    for at in candidates {
+        // SAFETY: in the table, whose lock is held (see above).
         let r = unsafe { &*(at as *const Resource) };
         if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
@@ -2214,7 +2306,17 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        textures().insert(at);
+        {
+            let mut all = textures();
+            all.insert(at);
+            if fills(&desc) {
+                let bytes = footprint(&desc).map_or(0, |f| f.size);
+                TEXTURES_AT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(at, resource.data() as u64, bytes);
+            }
+        }
         if !fills(&desc) {
             TARGETS_AT
                 .lock()
@@ -2239,7 +2341,17 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let at = std::ptr::from_ref::<Resource>(self) as usize;
+            {
+                let mut all = textures();
+                all.remove(&at);
+                if fills(&self.desc) {
+                    TEXTURES_AT
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(at, self.data() as u64);
+                }
+            }
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -2889,6 +3001,70 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// The index by address finds every texture whose memory meets a range,
+    /// small ones by a look back of at most their largest size, large ones
+    /// by the list, and none after it is removed.
+    #[cfg(windows)]
+    #[test]
+    fn textures_are_found_by_the_memory_they_take() {
+        let mut index = ByAddress::new();
+        let small = ByAddress::SMALL;
+        index.insert(1, 0x10_0000, 0x2c000);
+        index.insert(2, 0x10_2000, 0x2c000); // packed into 1's absent levels
+        index.insert(3, 0x40_0000, small);
+        index.insert(4, 0x100_0000, small + 1); // large
+        index.insert(5, 0x200_0000, 0); // no bytes: not kept
+        fn found_in(index: &ByAddress, base: u64, len: u64) -> Vec<usize> {
+            let mut v = index.overlapping(base, len);
+            v.sort_unstable();
+            v
+        }
+        assert_eq!(found_in(&index, 0x10_0000, 0x1000), [1]);
+        assert_eq!(found_in(&index, 0x10_3000, 0x1000), [1, 2]);
+        assert_eq!(found_in(&index, 0x12_c000, 0x1000), [2]);
+        assert_eq!(found_in(&index, 0x12_e000, 0x1000), [] as [usize; 0]);
+        // The last byte of the largest small one, from 8 MiB before.
+        assert_eq!(found_in(&index, 0x40_0000 + small - 1, 1), [3]);
+        assert_eq!(found_in(&index, 0x40_0000 + small, 1), [] as [usize; 0]);
+        // A large one, from anywhere inside.
+        assert_eq!(found_in(&index, 0x100_0000 + small, 0x10000), [4]);
+        assert_eq!(found_in(&index, 0x200_0000, 0x10000), [] as [usize; 0]);
+        assert_eq!(found_in(&index, 0, 0), [] as [usize; 0]);
+        assert_eq!(found_in(&index, u64::MAX - 1, 16), [] as [usize; 0]);
+        index.remove(1, 0x10_0000);
+        index.remove(4, 0x100_0000);
+        assert_eq!(found_in(&index, 0x10_3000, 0x1000), [2]);
+        assert_eq!(found_in(&index, 0x100_0000 + small, 0x10000), [] as [usize; 0]);
+        assert!(index.large.is_empty());
+    }
+
+    /// A change of mapping under a placed texture's memory lets its host
+    /// copy go (fxceless #432), found by address: those of the textures
+    /// beside it stay.
+    #[cfg(windows)]
+    #[test]
+    fn an_unmapped_placed_texture_lets_its_host_copy_go() {
+        if crate::host::host().is_none() || !sweeping() {
+            return; // no host GPU, or the sweep turned off
+        }
+        let memory = vec![0u8; 3 * 0x10000];
+        let at = (memory.as_ptr() as u64).next_multiple_of(0x1000);
+        // 64x64 RGBA8, one level: 16 KiB each, side by side.
+        let words = [3, 0, 0, 0, 64, 0, 64, 1 << 16 | 1, 28, 1, 0, 0x105, 0, 0];
+        let made: Vec<This> = (0..3)
+            .map(|i| texture_at(at + i * 0x4000, &words).expect("placed texture"))
+            .collect();
+        for &texture in &made {
+            assert!(hosted(texture, true).is_some());
+            assert!(has_host_copy(texture));
+        }
+        assert_eq!(evict_placed_in(at + 0x4000 + 0x100, 0x100), 1);
+        assert!(has_host_copy(made[0]) && !has_host_copy(made[1]) && has_host_copy(made[2]));
+        assert_eq!(evict_placed_in(at + 0x3000, 0x2000), 1, "the first only, 1 is gone");
+        assert!(!has_host_copy(made[0]) && has_host_copy(made[2]));
+        drop(memory);
     }
 
     #[test]
