@@ -7349,7 +7349,7 @@ impl Meter {
                 tracing::info!(
                     "the pass over the heap's views per frame (on a recording thread): {:.1} ms buffer views ({:.0} slots looked at),                      {:.1} ms textures ({:.0} slots looked at), of them {:.1} ms asking what of their memory is mapped and {:.1} ms                      making their views, host textures and uploads ({:.1} ms the views and host textures, {:.1} ms the uploads); \
                      {:.0} slots left for the next frame while their host copies are made ahead ({} made ahead of {} handed over \
-                     since the start, VICTORY_TEXTURE_MAKERS)",
+                     since the start, VICTORY_TEXTURE_MAKERS; {} stagings made ahead, {} taken, VICTORY_STAGE_AHEAD_MB);                      of the buffer views, {:.1} ms the slots and {:.1} ms refreshing the {:.0} host copies they read",
                     parts[0] / 1e3,
                     parts[4],
                     parts[1] / 1e3,
@@ -7361,6 +7361,11 @@ impl Meter {
                     parts[8],
                     crate::resource::MADE_AHEAD[0].load(Ordering::Relaxed),
                     crate::resource::MADE_AHEAD[1].load(Ordering::Relaxed),
+                    crate::texture::STAGED_AHEAD[0].load(Ordering::Relaxed),
+                    crate::texture::STAGED_AHEAD[1].load(Ordering::Relaxed),
+                    parts[9] / 1e3,
+                    parts[10] / 1e3,
+                    parts[11],
                 );
             }
         }

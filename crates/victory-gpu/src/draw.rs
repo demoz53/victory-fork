@@ -453,7 +453,9 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// (`readable`), microseconds.
 /// Then the slots left for the next frame while the makers make their
 /// textures' host copies (`resource::texture_makers`).
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// Then, of the buffer views: the slots looked at and the refreshes of the
+/// host copies their views read, microseconds, and the copies refreshed.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1531,6 +1533,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        let slots_done = std::time::Instant::now();
+        HEAP_PASS_PARTS[9].fetch_add((slots_done - started).as_micros() as u64, Ordering::Relaxed);
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1575,6 +1579,8 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         let textures = std::time::Instant::now();
+        HEAP_PASS_PARTS[10].fetch_add((textures - slots_done).as_micros() as u64, Ordering::Relaxed);
+        HEAP_PASS_PARTS[11].fetch_add(spans.len() as u64, Ordering::Relaxed);
         HEAP_PASS_PARTS[0].fetch_add((textures - started).as_micros() as u64, Ordering::Relaxed);
         HEAP_PASS_PARTS[4].fetch_add(slots.len() as u64, Ordering::Relaxed);
         self.heap_textures(list, heap, host);
