@@ -386,6 +386,19 @@ pub(crate) struct HostPipeline {
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+    // `VICTORY_DUMP_REFUSED=<folder>`: each refused shader's console
+    // container, as `<hash>.<stage>.bin`, for replaying its translation
+    // offline (a host compiler crash, for one).
+    if let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED") {
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        for s in shaders {
+            let path = dir.join(format!("{}.{}.bin", s.hash, s.stage));
+            if !path.exists() {
+                let _ = std::fs::write(path, s.container());
+            }
+        }
+    }
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
         seen.push(reason);
@@ -1499,5 +1512,137 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+
+    /// Replays one cached compute translation (`VICTORY_REPLAY_FILE`, a
+    /// `VSH1` shader cache entry) through the runtime's root signature into
+    /// `CreateComputePipelineState`: for host compiler crashes, run once per
+    /// file in a process of its own. Knobs for narrowing a crash down:
+    /// `VICTORY_REPLAY_NO_CMP=1` makes comparison samplers plain ones;
+    /// `VICTORY_REPLAY_SAMPLER_ORDER=rev` reverses the static samplers'
+    /// registers; `VICTORY_REPLAY_SAME_SAMPLER=n` makes every static sampler
+    /// a copy of sampler n.
+    #[test]
+    #[ignore = "a host GPU and a cache entry named by VICTORY_REPLAY_FILE"]
+    fn replay_compute_pipeline() {
+        let Ok(path) = std::env::var("VICTORY_REPLAY_FILE") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("the cache entry");
+        // A cache entry, or a console container (`VICTORY_DUMP_REFUSED`)
+        // translated here, under this process's translation switches.
+        let t = crate::shader_cache::decode(&bytes).unwrap_or_else(|| {
+            victory_shader::emit::translate(&bytes).expect("a VSH1 entry or a translatable container")
+        });
+        let Some(host) = host() else {
+            return;
+        };
+        let visibility = D3D12_SHADER_VISIBILITY_ALL;
+        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
+        let dwords = t.user_data_dwords();
+        if dwords > 0 {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: USER_DATA_SPACE,
+                        Num32BitValues: dwords,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+        }
+        for (slots, kind) in [
+            (&t.root_cbvs, D3D12_ROOT_PARAMETER_TYPE_CBV),
+            (&t.root_srvs, D3D12_ROOT_PARAMETER_TYPE_SRV),
+            (&t.root_uavs, D3D12_ROOT_PARAMETER_TYPE_UAV),
+        ] {
+            for &slot in slots {
+                let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
+                let ours = if uav {
+                    slot == victory_shader::emit::SLOT_FAULTS
+                } else {
+                    slot == victory_shader::emit::SLOT_STRIDES || slot == victory_shader::emit::SLOT_MEMORY
+                };
+                if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                        RangeType: if uav {
+                            D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                        } else {
+                            D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                        },
+                        NumDescriptors: 1,
+                        BaseShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                            | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                        OffsetInDescriptorsFromTableStart: 0,
+                    }));
+                    let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last().unwrap();
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                NumDescriptorRanges: 1,
+                                pDescriptorRanges: range,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                    continue;
+                }
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: kind,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
+        }
+        let env = |k: &str| std::env::var(k).ok();
+        let no_cmp = env("VICTORY_REPLAY_NO_CMP").is_some_and(|v| v == "1");
+        let same: Option<usize> = env("VICTORY_REPLAY_SAME_SAMPLER").and_then(|v| v.parse().ok());
+        let rev = env("VICTORY_REPLAY_SAMPLER_ORDER").is_some_and(|v| v == "rev");
+        let n_samplers = t.static_samplers.len();
+        let mut samplers = Vec::new();
+        for n in 0..n_samplers {
+            let s = &t.static_samplers[same.unwrap_or(n).min(n_samplers - 1)];
+            let filter = if no_cmp { s.filter & !0x80 } else { s.filter };
+            samplers.push(D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER(filter as i32),
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+                MipLODBias: s.mip_lod_bias,
+                MaxAnisotropy: s.max_anisotropy,
+                ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+                BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+                MinLOD: s.min_lod,
+                MaxLOD: s.max_lod,
+                ShaderRegister: if rev { (n_samplers - 1 - n) as u32 } else { n as u32 },
+                RegisterSpace: SAMPLER_SPACE,
+                ShaderVisibility: visibility,
+            });
+        }
+        let filters: Vec<String> = samplers.iter().map(|s| format!("{:#x}", s.Filter.0)).collect();
+        eprintln!("REPLAY {path}: {} samplers {filters:?}, {} params", samplers.len(), params.len());
+        let (root, _) = root_signature(&host.device, &params, &samplers, true).expect("root signature");
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: code(&t.dxil),
+            ..Default::default()
+        };
+        // SAFETY: the description points at live data.
+        let made: windows::core::Result<ID3D12PipelineState> =
+            unsafe { host.device.CreateComputePipelineState(&desc) };
+        eprintln!("REPLAY RESULT {}", made.map_or_else(|e| format!("refused: {e}"), |_| "made".into()));
     }
 }
