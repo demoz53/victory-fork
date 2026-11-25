@@ -3884,10 +3884,35 @@ pub(crate) fn buffer_makers() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_MAKERS").is_none_or(|v| v != "0"))
 }
 
+/// Title buffers' host copies made since the start ([`make_copy`]).
+pub(crate) static COPIES_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// With [`buffer_makers`]: the host copies the views `views` read, made on
+/// the threads kept for the copies' work where there is none yet (eight
+/// parts at a time), ahead of the look one at a time that makes the slots.
+pub(crate) fn make_ahead(views: Vec<crate::descriptor::View>) {
+    if views.is_empty() {
+        return;
+    }
+    let chunk = views.len().div_ceil(8);
+    let mut views = views;
+    let mut jobs: Vec<Job> = Vec::new();
+    while !views.is_empty() {
+        let part: Vec<crate::descriptor::View> = views.drain(..chunk.min(views.len())).collect();
+        jobs.push(Box::new(move || {
+            for view in &part {
+                let _ = crate::descriptor::host::buffer_copy(view);
+            }
+        }));
+    }
+    wide(jobs);
+}
+
 /// A title buffer's host copy, of `len` bytes at `start` (its buffer
 /// `size` bytes): in the PC's memory, or in the card's with that as its
 /// CPU side ([`card_for`]).
 fn make_copy(start: u64, len: u64, size: u64) -> Option<Arc<Shadow>> {
+    COPIES_MADE.fetch_add(1, Ordering::Relaxed);
     {
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", start));
