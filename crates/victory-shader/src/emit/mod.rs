@@ -517,6 +517,33 @@ fn emit_once(
                 }
             }
         }
+        // `VICTORY_WAVE_LDS_REGIONS=approx`: after that, an LDS write and read in one
+        // lane-branch region taken as two host waves all the same
+        // ([`lower::with_lds_regions_approx`]), the program and its forms as above, then each
+        // host wave on its own with every mask and lane read.
+        if lds_last() {
+            let mut tries = vec![("as it is", p, st, io, res)];
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    tries.push((name, p, st, io, res));
+                }
+            }
+            for local in [false, true] {
+                for &(name, p, st, io, res) in &tries {
+                    let again = lower::with_lds_regions_approx(|| {
+                        if local {
+                            lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res))
+                        } else {
+                            emit_program(c, native, p, st, io, res)
+                        }
+                    });
+                    report(&format!("LDS regions APPROXIMATE{}, {name}", if local { ", local waves" } else { "" }), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -548,10 +575,22 @@ fn wide_last() -> bool {
     std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last")
 }
 
+/// `VICTORY_WAVE_LDS_REGIONS=approx` ([`emit_once`]): approximate LDS order for 64-lane
+/// programs that no other form takes.
+fn lds_last() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_LAST.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_WAVE_LDS_REGIONS").is_some_and(|v| v == "approx")
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's `VICTORY_WAVE_WIDE=last`, for its thread only.
     static TEST_WIDE_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's `VICTORY_WAVE_LDS_REGIONS=approx`, for its thread only.
+    static TEST_LDS_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
