@@ -2288,6 +2288,18 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    Some(View::Constant(address, size))
+                        if crate::host::fill_on_card()
+                            && crate::host::late()
+                            && crate::host::flights_write(address as usize, address as usize + size as usize)
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && let Some(gpu) = {
+                                shadow.refresh(list, address, u64::from(size));
+                                list.card_constants(&shadow, address, u64::from(size))
+                            } =>
+                    {
+                        host.constant_at(index, gpu, size);
+                    }
                     Some(View::Constant(address, size)) => {
                         // Mirror `root_view`: when the constant buffer lives in
                         // an existing shadow copy at a 256-byte-aligned host GPU
