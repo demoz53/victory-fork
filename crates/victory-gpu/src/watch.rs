@@ -206,6 +206,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
+    #[cfg(feature = "diagnostics")]
+    let _who = asking_for(1);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
@@ -242,9 +244,48 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 #[cfg(feature = "diagnostics")]
 static SLOW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Who asks the kernel ([`asking_for`]): 0 other, 1 a submission's
+/// refreshes together ([`ask_ahead`], [`ask_once`]), 2 one copy's refresh,
+/// 3 a copy's check under shader writes, 4 a texture's check.
+#[cfg(feature = "diagnostics")]
+pub(crate) const ASKERS: usize = 5;
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static WHO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Since the last frame line, per [`ASKERS`]: kernel askings and their
+/// microseconds.
+#[cfg(feature = "diagnostics")]
+static BY_WHO: [[std::sync::atomic::AtomicU64; 2]; ASKERS] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; ASKERS];
+
+/// The askings this thread makes until the result is dropped are counted
+/// as `who`'s ([`ASKERS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn asking_for(who: usize) -> impl Drop {
+    struct Was(usize);
+    impl Drop for Was {
+        fn drop(&mut self) {
+            WHO.with(|w| w.set(self.0));
+        }
+    }
+    Was(WHO.with(|w| w.replace(who)))
+}
+
+/// [`BY_WHO`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn asks_by_who() -> [[u64; 2]; ASKERS] {
+    BY_WHO.each_ref().map(|w| w.each_ref().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)))
+}
+
 #[cfg(feature = "diagnostics")]
 fn slow(us: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    let who = WHO.with(|w| w.get()).min(ASKERS - 1);
+    BY_WHO[who][0].fetch_add(1, Relaxed);
+    BY_WHO[who][1].fetch_add(us, Relaxed);
     if us >= 1000 {
         SLOW[0].fetch_add(1, Relaxed);
         SLOW[1].fetch_add(us, Relaxed);
@@ -299,6 +340,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
+    #[cfg(feature = "diagnostics")]
+    let _who = asking_for(1);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {

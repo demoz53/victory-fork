@@ -675,6 +675,8 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _who = crate::watch::asking_for(4);
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));

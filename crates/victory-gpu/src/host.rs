@@ -7411,12 +7411,30 @@ impl Meter {
                 );
             }
             #[cfg(feature = "diagnostics")]
-            tracing::info!(
-                "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
-                slow[0] as f64 / frames,
-                slow[1] as f64 / 1e3 / frames,
-                slow[2] as f64 / 1e3
-            );
+            {
+                let who = crate::watch::asks_by_who();
+                let n = |i: usize| who[i][0] as f64 / frames;
+                let ms = |i: usize| who[i][1] as f64 / 1e3 / frames;
+                tracing::info!(
+                    "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms; \
+                     by who asks, per frame: {:.0} ({:.1} ms) for a submission's refreshes together, {:.0} ({:.1} ms) by one \
+                     copy's refresh, {:.0} ({:.1} ms) under shader writes, {:.0} ({:.1} ms) by textures' checks, {:.0} ({:.1} ms) \
+                     other",
+                    slow[0] as f64 / frames,
+                    slow[1] as f64 / 1e3 / frames,
+                    slow[2] as f64 / 1e3,
+                    n(1),
+                    ms(1),
+                    n(2),
+                    ms(2),
+                    n(3),
+                    ms(3),
+                    n(4),
+                    ms(4),
+                    n(0),
+                    ms(0),
+                );
+            }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
