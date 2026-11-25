@@ -32,6 +32,11 @@ enum Mode {
     /// Movies that play once.
     NotLooping,
     All,
+    /// Movies that play once and open before the title's world has begun
+    /// (its first frame of 500 draws or more): the intro at boot, not a
+    /// movie a cutscene shows (a 1920x1080 one opened about 30 s into the
+    /// end-of-prologue cutscene, 2026-11-25).
+    Intro,
 }
 
 fn parse_mode(value: Option<&OsStr>) -> Mode {
@@ -42,6 +47,7 @@ fn parse_mode(value: Option<&OsStr>) -> Mode {
         "" | "0" => Mode::Off,
         "1" => Mode::NotLooping,
         v if v.eq_ignore_ascii_case("all") => Mode::All,
+        v if v.eq_ignore_ascii_case("intro") => Mode::Intro,
         v => {
             tracing::warn!(
                 value = v,
@@ -168,7 +174,15 @@ fn skipped(movie: *mut Movie) -> bool {
         // the movie structure, which starts with `Movie`.
         let m = unsafe { &*movie };
         let looping = m.open_flags & WILL_LOOP != 0;
-        let skip = m.frames > 0 && (!looping || MODE.load(Ordering::Relaxed) == Mode::All as u8);
+        let mode = MODE.load(Ordering::Relaxed);
+        let skip = m.frames > 0
+            && if mode == Mode::All as u8 {
+                true
+            } else if mode == Mode::Intro as u8 {
+                !looping && !victory_gpu::world_began()
+            } else {
+                !looping
+            };
         tracing::info!(
             width = m.width,
             height = m.height,
@@ -260,6 +274,7 @@ mod tests {
         assert_eq!(mode("1"), Mode::NotLooping);
         assert_eq!(mode("all"), Mode::All);
         assert_eq!(mode(" ALL "), Mode::All);
+        assert_eq!(mode("intro"), Mode::Intro);
         assert_eq!(mode("yes"), Mode::Off);
     }
 

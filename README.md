@@ -173,7 +173,10 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute
 
 `VICTORY_SKIP_BINK=1` skips the title's movies that play once (logos and
 the intro); `VICTORY_SKIP_BINK=all` skips the looping ones too, so menu
-backgrounds stay dark.
+backgrounds stay dark. `VICTORY_SKIP_BINK=intro` skips only those that open
+before the title's world has begun (its first frame of 500 draws or more, seen
+in diagnostics builds; elsewhere it is `1`), so a movie a cutscene shows still
+plays.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
