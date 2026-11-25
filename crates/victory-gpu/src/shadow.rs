@@ -229,16 +229,76 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
 
 /// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
 /// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
-/// `VICTORY_CARD_BUFFERS_MB`.
+/// `VICTORY_CARD_BUFFERS_MB` (tests: the run uses [`resolve_card_limits_with`]).
+#[cfg(test)]
 fn resolve_card_limits(
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
     max_mb_override: Option<u64>,
 ) -> (u64, u64) {
+    resolve_card_limits_with(local_vram_budget, None, min_mb_override, max_mb_override, false)
+}
+
+/// [`resolve_card_limits`], with `VICTORY_CARD_BUFFERS_MIN_KB` (it wins over
+/// the MiB one) and `small` ([`card_reserve_on`]): every copy from 64 KiB up
+/// by default (copies are 64 KiB and more), and on cards whose default is
+/// 1,024 MB in all 1,280 (PainDe0Mie/VIctory 162701b17: room for the
+/// world's ~3,700 small copies, 230 MB on the card, beside the ~950 MB of
+/// the copies from 1 MiB up). The least is 64 KiB with either, else 1 MiB.
+fn resolve_card_limits_with(
+    local_vram_budget: Option<u64>,
+    min_kb_override: Option<u64>,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+    small: bool,
+) -> (u64, u64) {
     let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
-    let min_bytes = (min_mb_override.unwrap_or(default_min_mb) << 20).max(1 << 20);
+    let floor = if small || min_kb_override.is_some() { 64 << 10 } else { 1 << 20 };
+    let min_bytes = match (min_kb_override, min_mb_override) {
+        (Some(kb), _) => kb << 10,
+        (None, Some(mb)) => mb << 20,
+        (None, None) if small => 64 << 10,
+        (None, None) => default_min_mb << 20,
+    }
+    .max(floor);
+    let default_max_mb = if small && default_max_mb == 1024 { 1280 } else { default_max_mb };
     let max_bytes = max_mb_override.unwrap_or(default_max_mb) << 20;
     (min_bytes, max_bytes)
+}
+
+/// `VICTORY_CARD_RESERVE=1` (off by default): copies of title buffers keep a
+/// reserve on the card against the texture queue, and the small ones go
+/// there too.
+///
+/// - The texture queue (`resource::room`) leaves room for the copies not
+///   made yet ([`card_reserve`]), and a copy may fill the card as far as
+///   textures do (`resource::copy_fits`; before, only while a fifth of the
+///   budget was free). In 19 of 45 of their runs the textures came first
+///   and 40-90 of the world's ~94 copies of 1 MiB and more stayed in the
+///   PC's memory, read over the bus: the card's time 170-700 ms a frame
+///   against 60-110.
+/// - Copies from 64 KiB up go to the card ([`resolve_card_limits_with`]):
+///   the world's ~3,700 small copies (4 KiB mostly) were read over the
+///   bus, and four compute programs took 70-130 ms of the card's time a
+///   frame for it; on the card, 3 ms.
+///
+/// From PainDe0Mie/VIctory 162701b17 (GPL-3.0), where it is on by default
+/// (`=0` there turns it off): median world frame 390-434 to 213-232 ms
+/// (2.4 to 4.3-4.7 fps).
+pub(crate) fn card_reserve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RESERVE").is_some_and(|v| v == "1"))
+}
+
+/// The card's memory the texture queue leaves for copies of title buffers
+/// not made yet (`resource::room`, with [`card_reserve_on`]): what
+/// [`card_limits`] allows them less what they hold now, so little once the
+/// world's copies are made.
+pub(crate) fn card_reserve() -> u64 {
+    if !cards() || !card_reserve_on() {
+        return 0;
+    }
+    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
@@ -253,15 +313,18 @@ fn card_limits() -> (u64, u64) {
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (min_bytes, max_bytes) = resolve_card_limits(
+        let (min_bytes, max_bytes) = resolve_card_limits_with(
             vram_budget,
+            env_mb("VICTORY_CARD_BUFFERS_MIN_KB"),
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
+            card_reserve_on(),
         );
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
-            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
+            reserve = card_reserve_on(),
             "card buffer limits"
         );
         (min_bytes, max_bytes)
@@ -614,8 +677,11 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // With [`card_reserve_on`]: up to the share textures fill, which leave
+    // the copies their reserve ([`card_reserve`]), so a copy made after the
+    // textures came still finds its room.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && if card_reserve_on() { !crate::resource::copy_fits(budget, used, size) } else { used + size > budget / 10 * 8 }
     {
         return None;
     }
@@ -4015,11 +4081,20 @@ fn make_copy(start: u64, len: u64, size: u64) -> Option<Arc<Shadow>> {
         let (buffer, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", start));
-                tracing::info!(
-                    start = format_args!("{:#x}", start),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
+                // The thousands under 1 MiB (`card_reserve_on`) at debug level.
+                if len >= 1 << 20 {
+                    tracing::info!(
+                        start = format_args!("{:#x}", start),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                } else {
+                    tracing::debug!(
+                        start = format_args!("{:#x}", start),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                }
                 let card = Card {
                     staging: Some(buffer),
                     before: Mutex::default(),
@@ -4435,7 +4510,7 @@ mod subpage_tests {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        resolve_card_limits_with, tail_of, window_of,
     };
 
     #[test]
@@ -4463,6 +4538,23 @@ mod window_tests {
         assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
         assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
         assert_eq!(resolve_card_limits(None, None, None), (MIB, 1024 * MIB));
+    }
+
+    /// `VICTORY_CARD_RESERVE=1` (PainDe0Mie 162701b17): every copy from
+    /// 64 KiB up, and 1,280 MB where the default was 1,024; the KiB switch
+    /// wins over the MiB one; without the reserve, as before.
+    #[test]
+    fn small_copies_go_to_the_card_with_the_reserve() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        const KIB: u64 = 1 << 10;
+        assert_eq!(resolve_card_limits_with(Some(12 * GIB), None, None, None, true), (64 * KIB, 1280 * MIB));
+        assert_eq!(resolve_card_limits_with(Some(16 * GIB), None, None, None, true), (64 * KIB, 2048 * MIB));
+        assert_eq!(resolve_card_limits_with(Some(12 * GIB), Some(4), None, None, true), (64 * KIB, 1280 * MIB));
+        assert_eq!(resolve_card_limits_with(Some(12 * GIB), Some(256), Some(4), Some(900), true), (256 * KIB, 900 * MIB));
+        assert_eq!(resolve_card_limits_with(Some(12 * GIB), None, Some(2), None, true), (2 * MIB, 1280 * MIB));
+        assert_eq!(resolve_card_limits_with(Some(12 * GIB), None, None, None, false), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits_with(Some(12 * GIB), Some(128), None, None, false), (128 * KIB, 1024 * MIB));
     }
 
     /// An ask that may take any window takes the longest that holds all of
