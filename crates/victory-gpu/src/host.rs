@@ -2420,8 +2420,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it (retaining a COM ref).
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -2952,15 +2952,18 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
-/// air, if there are any, and is set when they are settled. Whether it
-/// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+/// air, if there are any, and is set when they are settled. Returns `Ok(())`
+/// if queued, or `Err(fence)` if the caller should set the fence now.
+pub(crate) fn late_signal(
+    fence: crate::fence::FenceRef,
+    value: u64,
+) -> Result<(), crate::fence::FenceRef> {
     if !late() {
-        return false;
+        return Err(fence);
     }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
-        return false;
+        return Err(fence);
     }
     line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
@@ -2969,7 +2972,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     // the helper thread for it.
     LINE_MOVED.notify_one();
     RELAY_MOVED.notify_one();
-    true
+    Ok(())
 }
 
 /// A queue stands at `wait`, which memory does not meet now ([`late`]):
@@ -4420,7 +4423,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
             }
         }
         if last > 0 {
@@ -4865,7 +4868,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
             if last > 0 {
