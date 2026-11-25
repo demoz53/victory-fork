@@ -564,6 +564,11 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// Serialises on-disk pipeline library staging and replacement so concurrent
+/// periodic saves and shutdown saves cannot race on the same staging file or
+/// target rename.
+static SAVE_IO: Mutex<()> = Mutex::new(());
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
@@ -577,11 +582,12 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    let _io = SAVE_IO.lock().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = unique_tmp(&dir.join(LIBRARY_FILE));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -660,6 +666,16 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
     std::fs::write(tmp, &bytes)
 }
 
+/// Unique staging path beside `path` so overlapping writes never share a
+/// temporary file name.
+fn unique_tmp(path: &std::path::Path) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    path.with_file_name(name)
+}
+
 /// Renames the written library `tmp` over the library's file in `dir`. This
 /// run may have that file mapped: Windows 11 replaces a mapped file, and
 /// the mapping goes on reading the old one for as long as a handle on it
@@ -667,15 +683,26 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let res = std::fs::rename(tmp, dir.join(LIBRARY_FILE))
+        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)));
+    if res.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    res
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// `path`: a reader never sees a part. Serialised so concurrent callers do
+/// not race on the target rename or leave orphaned temp files behind.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = unique_tmp(path);
+    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -837,5 +864,67 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn concurrent_write_atomically_never_fails_or_leaves_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(EARLY_FILE);
+        let threads: Vec<_> = (0..4u8)
+            .map(|t| {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let payload = vec![b'a' + t; 4096];
+                    for _ in 0..30 {
+                        write_atomically(&target, &payload).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 4096);
+        assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_save_io_and_replace_library_never_collide_or_leak_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(LIBRARY_FILE);
+        let threads: Vec<_> = (0..4u8)
+            .map(|t| {
+                let dir_path = dir.path().to_path_buf();
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let payload = vec![b'A' + t; 4096];
+                    for _ in 0..25 {
+                        let _io = SAVE_IO.lock().unwrap_or_else(|e| e.into_inner());
+                        let tmp = unique_tmp(&target);
+                        std::fs::write(&tmp, &payload).unwrap();
+                        replace_library(&dir_path, &tmp).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), 4096);
+        assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
     }
 }
