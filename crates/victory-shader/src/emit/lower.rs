@@ -1416,14 +1416,16 @@ pub fn lds_fit() -> bool {
 /// every mask taken per host wave (`with_local_waves_any`, the last resort for programs no
 /// other form takes), selects by a lane mask it does not follow (`v_cndmask_b32` on a mask
 /// built from scalars or loaded): each lane takes its bit of that mask, as the console's
-/// does. `VICTORY_LOCAL_ANY_MASKS=0`: refused ("a constant lane mask in a half-wave"), as
-/// before. The tile program `f133e35efed2a48a` (8x16 groups, among the material passes)
-/// translated in no form and was dropped every frame; it now translates in that one, the
-/// approximate form with each half-wave's wave operations its own. Part of the translation:
-/// the shader cache keys on it (`victory-gpu`'s does).
+/// does (`VICTORY_LOCAL_ANY_MASKS=1`). Off by default: refused ("a constant lane mask in a
+/// half-wave"), as before. The tile program `f133e35efed2a48a` (8x16 groups) translated in
+/// no form and was dropped every frame; with the switch it translates in that one, the
+/// approximate form with each half-wave's wave operations its own: its 64-lane minimum and
+/// maximum (`v_readlane_b32` of lanes 0 and 32 after the row reductions) become each half's,
+/// and all13l2-boat showed a large black region over the water at the shore with it, so it
+/// stays opt-in. Part of the translation: the shader cache keys on it (`victory-gpu`'s does).
 pub fn local_any_masks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_ANY_MASKS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_ANY_MASKS").is_some_and(|v| v == "1"))
 }
 
 /// Whether pixel shaders read their quads' other lanes with quad reads, helper
