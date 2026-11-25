@@ -262,6 +262,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// The same table dwords before the stride mask, with the format kind
+    /// bits ([`heap_half_bits`]).
+    slot_words: HashMap<(usize, Site, u8), V>,
     /// The heap map's handle ([`Lower::heap_remap`]), made once in the
     /// entry block.
     heap_map: Option<V>,
@@ -1480,6 +1483,23 @@ pub fn half_bits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a d16 typed buffer access through a view the program picks from the
+/// view heap at run time (no table place, so [`half_bits`] does not reach it)
+/// takes the view's format kind from the host's table by heap slot
+/// ([`super::shader::SLOT_INTEGER`], [`super::shader::SLOT_SIGNED`]): through a
+/// `UINT` or `SINT` view the 16-bit integers move as they are (a load keeps
+/// each channel's low 16 bits, a store zero- or sign-extends), through any
+/// other view as halves, as before. `VICTORY_HEAP_HALF_BITS=0`: always as
+/// halves, and the host's table holds strides only. Ported from upstream
+/// Marvisak/VIctory 4243a96a7 (Marvis), adapted: an integer view is read and
+/// written through an integer-typed handle (NVIDIA gives 0 for a float access
+/// through an integer view), the access picked by the kind. Part of the
+/// translation: the shader cache keys on it.
+pub fn heap_half_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_HALF_BITS").is_none_or(|v| v != "0"))
+}
+
 /// Whether `ds_swizzle_b32` offsets from 0xC000 are the ISA's rotate mode
 /// (0xC000-0xDFFF: lane i reads `(i & mask) | ((i + rot) & !mask)` in its
 /// group of 32, rot = offset[9:5], negated with offset[10], mask =
@@ -1920,6 +1940,7 @@ impl<'a> Lower<'a> {
             isolated_p10_rows: BTreeMap::new(),
             handles: HashMap::new(),
             strides: HashMap::new(),
+            slot_words: HashMap::new(),
             heap_map: None,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -7240,9 +7261,46 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
+        let mut v = self.as_int(f);
+        if heap_half_bits() {
+            // The top bits are the view's format kind.
+            let bits = self.s.m.i32(super::shader::SLOT_STRIDE_BITS);
+            self.slot_words.insert(key, v);
+            v = self.s.m.bin(c, Bin::And, v, bits);
+        }
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// The format kind of the typed buffer view `src` names, picked from the
+    /// view heap at an index the program computes, from the host's table by
+    /// heap slot ([`heap_half_bits`]): i1s in the current block, whether it is
+    /// an unsigned integer format, a signed one, or neither (`[uint, sint,
+    /// other]`, exactly one true); `None` for a view of a table or when the
+    /// switch is off.
+    fn slot_kind(&mut self, src: &Source) -> Result<Option<[V; 3]>, Why> {
+        if !heap_half_bits() || self.slot_stride(src)?.is_none() {
+            return Ok(None);
+        }
+        let Source::Loaded { load, first } = src else {
+            return Ok(None);
+        };
+        let Some(&word) = self.slot_words.get(&(self.cur, *load, *first)) else {
+            return Ok(None);
+        };
+        let c = self.cur;
+        let (int, signed) = (super::shader::SLOT_INTEGER, super::shader::SLOT_SIGNED);
+        let bits = self.s.m.i32(int | signed);
+        let kind = self.s.m.bin(c, Bin::And, word, bits);
+        let [uint, sint] = [int, int | signed].map(|k| {
+            let k = self.s.m.i32(k);
+            self.s.m.cmp(c, pred::EQ, kind, k)
+        });
+        let int = self.s.m.i32(int);
+        let x = self.s.m.bin(c, Bin::And, word, int);
+        let zero = self.s.m.i32(0);
+        let other = self.s.m.cmp(c, pred::EQ, x, zero);
+        Ok(Some([uint, sint, other]))
     }
 
     /// The heap index of a descriptor that may differ between lanes,

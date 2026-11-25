@@ -764,13 +764,35 @@ fn view_stride(view: &View) -> Option<u32> {
             (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
         }
     };
+    let kind = if stride == 0 && !raw && victory_shader::emit::heap_half_bits() {
+        integer_kind(format.0 as u32)
+    } else {
+        0
+    };
     Some(if stride > 0 {
         stride
     } else if raw {
         1
     } else {
-        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
+        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32) | kind
     })
+}
+
+/// The stride table's format-kind bits of a typed buffer view in DXGI format
+/// `format`: [`SLOT_INTEGER`] for a `UINT` format, with [`SLOT_SIGNED`] for a
+/// `SINT` one; 0 otherwise. Translated programs pass 16-bit typed data of
+/// such views as bits, not as halves (`victory_shader::emit::heap_half_bits`;
+/// from upstream Marvisak/VIctory 4243a96a7).
+///
+/// [`SLOT_INTEGER`]: victory_shader::emit::SLOT_INTEGER
+/// [`SLOT_SIGNED`]: victory_shader::emit::SLOT_SIGNED
+fn integer_kind(format: u32) -> u32 {
+    use victory_shader::emit::{SLOT_INTEGER, SLOT_SIGNED};
+    match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => SLOT_INTEGER,
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => SLOT_INTEGER | SLOT_SIGNED,
+        _ => 0,
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -2906,6 +2928,33 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typed buffer views of integer formats carry their kind in the stride
+    /// table; float, normalized, raw and structured ones none (upstream
+    /// 4243a96a7's test, on our table).
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_stride_table() {
+        use victory_shader::emit::{SLOT_INTEGER, SLOT_SIGNED};
+        if !victory_shader::emit::heap_half_bits() {
+            return;
+        }
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        assert_eq!(view_stride(&uav(12, 0, 0)), Some(8 | SLOT_INTEGER), "R16G16B16A16_UINT");
+        assert_eq!(view_stride(&uav(57, 0, 0)), Some(2 | SLOT_INTEGER), "R16_UINT");
+        assert_eq!(view_stride(&uav(59, 0, 0)), Some(2 | SLOT_INTEGER | SLOT_SIGNED), "R16_SINT");
+        assert_eq!(view_stride(&uav(64, 0, 0)), Some(1 | SLOT_INTEGER | SLOT_SIGNED), "R8_SINT");
+        assert_eq!(view_stride(&uav(10, 0, 0)), Some(8), "R16G16B16A16_FLOAT");
+        assert_eq!(view_stride(&uav(58, 0, 0)), Some(2), "R16_SNORM");
+        assert_eq!(view_stride(&uav(39, 0, 1)), Some(1), "raw");
+        assert_eq!(view_stride(&uav(0, 16, 0)), Some(16), "structured");
+        // Format, dimension, mapping, first element, count, stride, flags.
+        let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
+        assert_eq!(view_stride(&srv), Some(1 | SLOT_INTEGER), "R8_UINT");
+        for v in [uav(12, 0, 0), uav(59, 0, 0), srv] {
+            assert!(view_stride(&v).unwrap() & victory_shader::emit::SLOT_STRIDE_BITS <= 16);
+        }
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

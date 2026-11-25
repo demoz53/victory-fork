@@ -26,6 +26,16 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The bits of a [`SLOT_STRIDES`] dword holding the stride; with
+/// `VICTORY_HEAP_HALF_BITS` on (`lower::heap_half_bits`) the top two hold
+/// the view's format kind ([`SLOT_INTEGER`], [`SLOT_SIGNED`]).
+pub const SLOT_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
+/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+/// (Upstream Marvisak/VIctory 4243a96a7, `VIEW_INTEGER`.)
+pub const SLOT_INTEGER: u32 = 1 << 31;
+/// With [`SLOT_INTEGER`]: a signed (`SINT`) format.
+pub const SLOT_SIGNED: u32 = 1 << 30;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

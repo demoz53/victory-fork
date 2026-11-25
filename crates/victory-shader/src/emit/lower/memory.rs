@@ -1295,6 +1295,10 @@ impl<'a> Lower<'a> {
         if let Some(place) = place {
             self.half_views.insert(place);
         }
+        // Picked from the heap at run time: the host's table tells an
+        // integer view, whose 16-bit typed accesses pass bits (upstream
+        // 4243a96a7; [`super::heap_half_bits`]).
+        let heap_kind = if d16 && typed && !halves { self.slot_kind(src)? } else { None };
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -1582,6 +1586,42 @@ impl<'a> Lower<'a> {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+            if let Some([uint, sint, other]) = heap_kind {
+                // shortcut: typed stores are taken to write all four channels.
+                if count != 4 || *offen || *offset != 0 {
+                    return Err("a typed buffer store of some channels or at an offset");
+                }
+                let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xffff));
+                let f32t = self.s.t.f32;
+                let (mut zero_ext, mut sign_ext, mut floats) = (Vec::new(), Vec::new(), Vec::new());
+                for k in 0..count {
+                    let mut x = vals[(k / 2) as usize];
+                    if k % 2 == 1 {
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    zero_ext.push(self.s.m.bin(c, Bin::And, x, low));
+                    let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                    sign_ext.push(self.s.m.bin(c, Bin::AShr, up, k16));
+                    floats.push(self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]));
+                }
+                let index = index.unwrap_or(self.s.m.i32(0));
+                let mask = self.s.m.i8(0xF);
+                let void = self.s.t.void;
+                let at = self.begin_guarded(guard);
+                // Each kind through a handle of its own component type (U32,
+                // I32, F32): only the one that fits the view runs.
+                for (want, component, data) in [(uint, 0x405u32, zero_ext), (sint, 0x404, sign_ext), (other, 0x409, floats)] {
+                    let inner = self.begin_guarded(Some(want));
+                    let mut args = vec![self.handle(site, src, false, (10 | u, component))?, index, iu];
+                    args.extend(&data);
+                    args.push(mask);
+                    let name = if component == 0x409 { "bufferStore.f32" } else { "bufferStore.i32" };
+                    self.s.op(self.cur, name, Attr::NoUnwind, void, 69, &args);
+                    self.end_guarded(inner, &[]);
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             if d16 {
                 // Through a view of a table each half is stored as it is
                 // (`halves`). Reached another way:
@@ -1703,6 +1743,74 @@ impl<'a> Lower<'a> {
                 for (k, x) in vals.into_iter().enumerate() {
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
+            }
+            return Ok(());
+        }
+        if let (Some([uint, sint, other]), true) = (heap_kind, typed) {
+            if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
+                return Err("a typed buffer load at an offset");
+            }
+            if uav {
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let index = index.unwrap_or(self.s.m.i32(0));
+            let i32t = self.s.t.i32;
+            let ret_i32 = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+            let k16 = self.s.m.i32(16);
+            let regs = count.div_ceil(2);
+            // Each kind through a handle of its own component type; only the
+            // one that fits the view runs. Integer views keep each channel's
+            // low 16 bits, others narrow a float to a half.
+            let mut picked: Vec<V> = Vec::new();
+            for (want, component) in [(uint, 0x405u32), (sint, 0x404), (other, 0x409)] {
+                let at = self.begin_guarded(Some(want));
+                let h = self.handle(site, src, false, (10 | u, component))?;
+                let r = if component == 0x409 {
+                    let ret = self.s.t.res_ret;
+                    self.s.op(self.cur, "bufferLoad.f32", Attr::ReadOnly, ret, 68, &[h, index, iu])
+                } else {
+                    self.s.op(self.cur, "bufferLoad.i32", Attr::ReadOnly, ret_i32, 68, &[h, index, iu])
+                };
+                let mut packed = Vec::new();
+                for k in 0..regs {
+                    let mut x = None;
+                    for ch in (2 * k..(2 * k + 2).min(count)).rev() {
+                        let f = self.s.m.extract(self.cur, r, ch);
+                        let h = if component == 0x409 {
+                            self.f16_narrow(f)
+                        } else {
+                            let low = self.s.m.i32(0xffff);
+                            self.s.m.bin(self.cur, Bin::And, f, low)
+                        };
+                        x = Some(match x {
+                            Some(hi) => {
+                                let hi = self.s.m.bin(self.cur, Bin::Shl, hi, k16);
+                                self.s.m.bin(self.cur, Bin::Or, h, hi)
+                            }
+                            None => h,
+                        });
+                    }
+                    packed.push(x.expect("a channel"));
+                }
+                let undef = self.s.m.undef(i32t);
+                let pairs: Vec<(V, V)> = packed.iter().map(|&v| (v, undef)).collect();
+                let vals = self.end_guarded(at, &pairs);
+                if picked.is_empty() {
+                    picked = vals;
+                } else {
+                    let cur = self.cur;
+                    picked = picked
+                        .into_iter()
+                        .zip(vals)
+                        .map(|(was, now)| self.s.m.select(cur, want, now, was))
+                        .collect();
+                }
+            }
+            for (k, x) in picked.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }

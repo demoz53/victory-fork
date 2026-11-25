@@ -121,12 +121,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_uses_wave32, lane_loop_fix, set_host_max_wave, with_group_base};
+pub use lower::{heap_half_bits, host_uses_wave32, lane_loop_fix, set_host_max_wave, with_group_base};
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried, wave_wide_first};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_INTEGER,
+    SLOT_SIGNED, SLOT_STRIDE_BITS, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, set_view_heap_limit, set_view_heap_map, view_heap_limit, view_heap_map,
 };
 

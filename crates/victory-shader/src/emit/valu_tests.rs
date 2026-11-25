@@ -2218,6 +2218,12 @@ fn lower_store_cs(root: RootType, heap: (u32, Option<(u32, u32)>)) -> HostShader
         buffer_store_dword(0, 8, 0)[1],
         S_ENDPGM,
     ];
+    lower_heap_cs(root, heap, &words)
+}
+
+/// [`lower_store_cs`]'s program frame (the descriptor at a data index of
+/// the table or the resource heap in `s[8:11]`) around other `words`.
+fn lower_heap_cs(root: RootType, heap: (u32, Option<(u32, u32)>), words: &[u32]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -4583,4 +4589,39 @@ fn ds_swizzle_rotate_mode() {
             assert_eq!(got, want, "offset {offset:#06x}");
         }
     }
+}
+
+/// MUBUF `op vdata, v0, s[srsrc:srsrc+3], 0 idxen` (opcodes from 0x80 carry
+/// their bit 7 in dword 0's bit 25).
+const fn mubuf_idxen(op: u8, vdata: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32 >> 7 & 1) << 25 | (op as u32 & 0x7F) << 18 | 1 << 13,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// A d16 typed load and store through a view picked from the resource heap
+/// at run time (`buffer_load_format_d16_xyzw`, `buffer_store_format_d16_xyzw`,
+/// as the face network moves its tensors): with `VICTORY_HEAP_HALF_BITS` each
+/// access goes through one handle per format kind the host's table names
+/// (unsigned, signed, other), guarded by the kind, and the module validates.
+#[test]
+fn heap_picked_d16_typed_accesses_take_the_views_kind_from_the_table() {
+    let words = [
+        s_mov_b32(5, 0x80),     // s5 = 0
+        sop2(0x1E, 6, 0, 0x85), // s_lshl_b32 s6, s0, 5: the index from data
+        // s_load_dwordx4 s[8:11], s[4:5], s6
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, 0x80), // v_mov_b32 v0, 0: element 0
+        mubuf_idxen(0x83, 2, 8)[0],
+        mubuf_idxen(0x83, 2, 8)[1],
+        mubuf_idxen(0x87, 2, 8)[0],
+        mubuf_idxen(0x87, 2, 8)[1],
+        S_ENDPGM,
+    ];
+    // Lowers and validates (lower_heap_cs runs the validator when present).
+    let heap = lower_heap_cs(RootType::ResourceHeap, (999_999, None), &words);
+    assert!(heap.half_views.is_empty(), "no table place");
+    assert_eq!(heap.dxil, lower_heap_cs(RootType::ResourceHeap, (999_999, None), &words).dxil, "repeatable");
 }
