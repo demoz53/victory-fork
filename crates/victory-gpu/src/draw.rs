@@ -249,6 +249,14 @@ fn windows() -> bool {
     window_mode() > 0
 }
 
+/// Whether the pass over the heap's buffer views looks at a sixteenth of
+/// all their slots each pass instead of all of them every sixteenth pass
+/// (`VICTORY_BUFFER_PASS_SPREAD=0`: all of them every sixteenth, as before).
+fn spread_buffer_passes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_PASS_SPREAD").is_none_or(|v| v != "0"))
+}
+
 /// Whether the shaders of title pipeline `pipeline` may store to buffers
 /// (no host pipeline: nothing runs, nothing is stored).
 fn pipeline_stores(pipeline: usize) -> bool {
@@ -1464,7 +1472,20 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let slots = if spread_buffer_passes() {
+            // A sixteenth of all the slots each pass, in turn (and those
+            // written since the last): every slot is looked at again once
+            // in 16 passes, as before, without the pass of all of them that
+            // took 400-900 ms every sixteenth frame while the world loads
+            // (all5-cold: 23,000-67,000 slots at about 13 us each). The
+            // slice's kept ranges go first; those of its slots that still
+            // hold buffer views come back below.
+            let turn = (*passes % 16) as u32;
+            ranges.retain(|&index, _| index % 16 != turn);
+            let mut slots: Vec<u32> = host.buffer_slots().into_iter().filter(|index| index % 16 == turn).collect();
+            slots.extend(changed.into_iter().filter(|index| index % 16 != turn));
+            slots
+        } else if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
