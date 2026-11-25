@@ -1489,15 +1489,18 @@ pub fn half_bits() -> bool {
 /// ([`super::shader::SLOT_INTEGER`], [`super::shader::SLOT_SIGNED`]): through a
 /// `UINT` or `SINT` view the 16-bit integers move as they are (a load keeps
 /// each channel's low 16 bits, a store zero- or sign-extends), through any
-/// other view as halves, as before. `VICTORY_HEAP_HALF_BITS=0`: always as
-/// halves, and the host's table holds strides only. Ported from upstream
+/// other view as halves, as before. Opt-in (`VICTORY_HEAP_HALF_BITS=1`):
+/// the stride mask it needs changes every program that reads a heap-picked
+/// buffer by index (1,065 of the boat set), while none of that set's 24 d16
+/// programs picks its view from the heap. Off, the host's table holds
+/// strides only and the translation is as before. Ported from upstream
 /// Marvisak/VIctory 4243a96a7 (Marvis), adapted: an integer view is read and
 /// written through an integer-typed handle (NVIDIA gives 0 for a float access
 /// through an integer view), the access picked by the kind. Part of the
 /// translation: the shader cache keys on it.
 pub fn heap_half_bits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_HALF_BITS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_HALF_BITS").is_some_and(|v| v == "1"))
 }
 
 /// Whether `ds_swizzle_b32` offsets from 0xC000 are the ISA's rotate mode
