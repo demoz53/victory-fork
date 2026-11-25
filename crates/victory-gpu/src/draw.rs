@@ -440,7 +440,10 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// that the asking what of a texture's memory is mapped, and the making of
 /// views, host textures and uploads; then the slots of buffer views looked
 /// at, and the textures' slots looked at (since the last frame-rate line).
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Then, of the making: the slot's view and the texture's host copy
+/// (`mirror`, `placed_texture`, `host_resource`), and the upload recorded
+/// (`readable`), microseconds.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1792,9 +1795,12 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            let uploading = std::time::Instant::now();
+            HEAP_PASS_PARTS[6].fetch_add((uploading - making).as_micros() as u64, Ordering::Relaxed);
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
+            HEAP_PASS_PARTS[7].fetch_add(uploading.elapsed().as_micros() as u64, Ordering::Relaxed);
             HEAP_PASS_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
