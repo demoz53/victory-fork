@@ -1355,6 +1355,7 @@ mod tests {
         assert_eq!(query(at(3)).host.State, MEM_COMMIT);
         // SAFETY: the two outer pages are outside the unmapped range.
         assert_eq!(unsafe { at(0).cast::<u8>().read() }, 17);
+        // SAFETY: as above.
         assert_eq!(unsafe { at(4).cast::<u8>().read() }, 29);
 
         assert_eq!(XMemMapPhysicalPages(at(1), 1, &pages[1]), at(1));
@@ -1367,6 +1368,7 @@ mod tests {
         assert_eq!(query(at(3)).host.State, MEM_COMMIT);
         // SAFETY: the scatter mapped page 0 at slot 3 and left slot 4 alone.
         assert_eq!(unsafe { at(3).cast::<u8>().read() }, 17);
+        // SAFETY: as above.
         assert_eq!(unsafe { at(4).cast::<u8>().read() }, 29);
 
         assert_eq!(XMemMapPhysicalPages(base, 5, std::ptr::null()), base);

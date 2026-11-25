@@ -45,6 +45,7 @@ struct Allocation {
 
 // SAFETY: `Allocation` owns a heap allocation freed when the last `Arc` drops.
 unsafe impl Send for Allocation {}
+// SAFETY: as for `Send`; `Allocation` itself only holds the pointer and its layout.
 unsafe impl Sync for Allocation {}
 
 impl Drop for Allocation {

@@ -2381,11 +2381,15 @@ mod tests {
             drop(cloned);
             let unk: windows::core::IUnknown = r.cast().unwrap();
             let raw = unk.as_raw();
+            // SAFETY: `raw` is a live COM object (`unk` holds it); its first word is its vtable.
             let vtbl = unsafe { *(raw as *const *const *const ()) };
+            // SAFETY: slots 1 and 2 of every COM vtable are AddRef and Release, of this type.
             let add_ref: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
                 unsafe { std::mem::transmute(*vtbl.add(1)) };
+            // SAFETY: as above.
             let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
                 unsafe { std::mem::transmute(*vtbl.add(2)) };
+            // SAFETY: `raw` is alive; an AddRef then a Release leave its count as it was.
             unsafe {
                 add_ref(raw);
                 release(raw)

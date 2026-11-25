@@ -794,6 +794,7 @@ pub fn pending_with(
             // SAFETY: `state` is alive while registered; mark canceled so a
             // still-running worker does not complete a later reused block.
             OP_CANCEL => {
+                // SAFETY: `state` is alive while registered (above).
                 unsafe { &*state }
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -803,6 +804,7 @@ pub fn pending_with(
             // call's reference while any still-running worker holds its own
             // `Arc` clone.
             OP_CLEANUP => {
+                // SAFETY: the registration's own reference, given back here once (above).
                 let state = unsafe { Arc::from_raw(state) };
                 state.lock().unwrap_or_else(|e| e.into_inner()).2 = true;
                 drop(state);
@@ -1406,6 +1408,7 @@ mod tests {
             // SAFETY: context points to our stack `CleanupSync` for the test's lifetime.
             let data = unsafe { &*data };
             if op == OP_CLEANUP {
+                // SAFETY: as above: the test's `CleanupSync`, alive for the test.
                 let sync = unsafe { &*data.context.cast::<CleanupSync>() };
                 let _ = sync.in_cleanup.send(());
                 let _ = sync.resume.lock().unwrap().recv();
