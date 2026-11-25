@@ -1412,6 +1412,34 @@ pub fn lds_fit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_FIT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a cube sampled with explicit gradients (`image_sample_d*` on a cube, sampled at
+/// the level the longer gradient gives) takes that level as the console does: the log2 of
+/// the footprint in texels, and `_cl`'s minimum level (`VICTORY_CUBE_GRAD_LOD=0`: the log2
+/// scaled by log2(e) once more, a level 1.44 times too coarse, and no minimum, as before).
+/// From DexNom/VIctory 921d8d3b4. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn cube_grad_lod() -> bool {
+    if let Some(on) = CUBE_GRAD_LOD_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CUBE_GRAD_LOD").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// [`with_cube_grad_lod`]'s setting for translations on this thread.
+    static CUBE_GRAD_LOD_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`cube_grad_lod`] giving `on` on this thread (tests).
+#[cfg(test)]
+pub fn with_cube_grad_lod<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = CUBE_GRAD_LOD_HERE.replace(Some(on));
+    let r = f();
+    CUBE_GRAD_LOD_HERE.set(was);
+    r
+}
+
 /// Whether pixel shaders read their quads' other lanes with quad reads, helper
 /// lanes included, and a helper lane's `v_readfirstlane_b32` gives its own value
 /// (`Lower::helpers_read`, `Lower::helper_reads_own`; `VICTORY_PIXEL_HELPERS=0`:
