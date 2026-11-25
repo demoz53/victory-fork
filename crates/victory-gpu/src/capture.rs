@@ -545,10 +545,14 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    if matches!(format, 42 | 43) {
+        let word_at = |x, y| u32_at(px(x, y, 4), 0);
+        return Some(r32_integer_to_rgba(format, w, h, word_at));
+    }
+    let mut out = Vec::with_capacity(w * h * 4);
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
@@ -589,7 +593,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
@@ -601,7 +605,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
-    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
+    let grey = matches!(format, 19..=22 | 39..=41 | 44..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
     let (low, high) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
@@ -630,15 +634,60 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
         }
     }
-    // R32_UINT targets hold packed light (the title reads them back as
-    // R9G9B9E5): as floats their low, high and share above the lowest say
-    // nothing. How many texels hold any bit, and the highest channel value
-    // of the packed reading.
+    // Float colours (scene light) go through a cube root: scaled linearly,
+    // a night scene under one lamp of 50 units came out all black.
+    let curved = matches!(format, 1..=2 | 9..=10 | 26);
+    for v in values {
+        let c = v.map(|c| {
+            let t = ((c - low) / range).clamp(0.0, 1.0);
+            ((if curved { t.cbrt() } else { t }) * 255.0) as u8
+        });
+        out.extend([c[0], c[1], c[2], 255]);
+    }
+    Some(out)
+}
+
+fn r32_integer_to_rgba(
+    format: u32,
+    w: usize,
+    h: usize,
+    word_at: impl Fn(usize, usize) -> u32,
+) -> Vec<u8> {
+    let signed = format == 43;
+    let values = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let word = word_at(x, y);
+            if signed {
+                i64::from(word as i32)
+            } else {
+                i64::from(word)
+            }
+        });
+    let first = values.clone().next().unwrap_or(0);
+    let (low, high) = values.clone().fold((first, first), |(low, high), value| {
+        (low.min(value), high.max(value))
+    });
+
+    // Even the full 32-bit span multiplied by 255 fits in i64.
+    let range = (high - low).max(1);
+    let mut out = Vec::with_capacity(w * h * 4);
+    let mut above = 0;
+    for value in values {
+        above += usize::from(value > low);
+        let grey = ((value - low) * 255 / range) as u8;
+        out.extend([grey, grey, grey, 255]);
+    }
+    let nonzero_percent = above as f32 * 100.0 / (w * h).max(1) as f32;
+    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // R32_UINT targets can also carry R9G9B9E5 packed light. Report how
+    // many texels hold any bit and the highest channel value when decoded
+    // as packed light.
     if format == 42 {
         let (mut set, mut packed_high) = (0usize, 0f32);
         for y in 0..h {
             for x in 0..w {
-                let v = u32_at(px(x, y, 4), 0);
+                let v = word_at(x, y);
                 set += usize::from(v != 0);
                 let scale = 2f32.powi((v >> 27) as i32 - 24);
                 for k in 0..3 {
@@ -657,7 +706,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         let mut highest_below_ones = 0u32;
         for y in 0..h {
             for x in 0..w {
-                let v = u32_at(px(x, y, 4), 0);
+                let v = word_at(x, y);
                 classes[match v {
                     0 => 0,
                     1..=15 => 1,
@@ -685,17 +734,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             "target values as words"
         );
     }
-    // Float colours (scene light) go through a cube root: scaled linearly,
-    // a night scene under one lamp of 50 units came out all black.
-    let curved = matches!(format, 1..=2 | 9..=10 | 26);
-    for v in values {
-        let c = v.map(|c| {
-            let t = ((c - low) / range).clamp(0.0, 1.0);
-            ((if curved { t.cbrt() } else { t }) * 255.0) as u8
-        });
-        out.extend([c[0], c[1], c[2], 255]);
-    }
-    Some(out)
+    out
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -829,6 +868,26 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn r32_integer_captures_scale_numeric_values() {
+        let unsigned = [1u32, 2, 3].map(u32::to_le_bytes).concat();
+        let signed = [-2i32, -1, 0].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 3, 1, 12, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 3, 1, 12, &signed), expected);
+    }
+
+    #[test]
+    fn r32_integer_captures_keep_adjacent_contrast() {
+        let unsigned = [16_777_216u32, 16_777_217].map(u32::to_le_bytes).concat();
+        let signed = [-16_777_217i32, -16_777_216].map(i32::to_le_bytes).concat();
+        let expected = Some(vec![0, 0, 0, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(42, 2, 1, 8, &unsigned), expected);
+        assert_eq!(super::to_rgba(43, 2, 1, 8, &signed), expected);
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
