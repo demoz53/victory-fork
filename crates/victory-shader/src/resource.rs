@@ -1364,7 +1364,7 @@ impl<'a> Tracer<'a> {
                     Ok(source) if self.anywhere(&source) => Ok(source),
                     _ => Err(e),
                 },
-                None => match self.past_skip(block) {
+                None => match self.past_skip(block).filter(|_| past_skips()) {
                     Some(j) => match self.classify(&edge(j), joins, known) {
                         Ok(source) if self.anywhere(&source) => Ok(source),
                         _ => Err(e),
@@ -2403,6 +2403,16 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
         248 => Some(0x3E22_F983),
         _ => None,
     }
+}
+
+/// Whether a descriptor made in a region an `s_cbranch_execz` skips is the region's after
+/// the join where the lanes' paths cannot rule the skip out (Vaximous ab4736b; `Tracer::
+/// past_skip`). `VICTORY_SKIP_DESCRIPTORS=0`: not, as before (such a program then stops at
+/// "a descriptor neither loaded nor built" in every form, and keeps 64 lanes). Part of the
+/// translation: the shader cache keys on it (`victory-gpu`'s does).
+fn past_skips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_DESCRIPTORS").is_none_or(|v| v != "0"))
 }
 
 #[cfg(test)]
