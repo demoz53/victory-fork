@@ -500,6 +500,39 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Per host view heap (its address): the spans of the host copies that its
+/// unordered access buffer views show, as the last pass over the heap
+/// found them ([`State::heap_buffers`]).
+#[allow(clippy::type_complexity)]
+static HEAP_UNORDERED: std::sync::Mutex<
+    Option<std::collections::HashMap<usize, Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>>>,
+> = std::sync::Mutex::new(None);
+/// Lists that ran a shader that picks buffers by index and can store, and
+/// the bytes of the heap's unordered views they had (declared written with
+/// [`heap_writes`], only counted without), since the last frame-rate line.
+pub(crate) static HEAP_WRITE_LISTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether what shaders store through buffer views they pick from the view
+/// heap by a computed index (SM 6.6 dynamic resources) goes back into
+/// title memory (`VICTORY_HEAP_WRITES=1`; off by default until a run shows
+/// what it costs).
+///
+/// On the console the view names title memory itself, so the store is in
+/// the title's memory at once, for the CPU and for every other view of the
+/// same bytes. Here it lands in the host copy the view shows, and only
+/// ranges declared written ([`crate::shadow::Shadow::gpu_writes`]: table
+/// views, root views, raw addresses) are compared and copied back after
+/// the submission. A picked view was never declared: the title never saw
+/// such a store, another host copy of the same memory (a window, a texture)
+/// kept the old bytes, and the next refresh of a page the title wrote put
+/// the title's whole 64 KiB over the shader's results. With the switch, a
+/// list that runs a picking shader that can store declares the spans of
+/// the heap's unordered buffer views written.
+fn heap_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WRITES").is_some_and(|v| v == "1"))
+}
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], microseconds: the buffer views' part (their
 /// slots looked at and their copies refreshed), the textures' part, and of
@@ -1230,7 +1263,7 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
-                        match self.heap_buffers(list) {
+                        match self.heap_buffers(list, writes) {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
@@ -1529,11 +1562,73 @@ impl State {
     /// submitted. Tables tell us which views a draw reads; nothing tells
     /// us which of the heap's a computed index names, so all of them are
     /// made ready, once per list.
-    /// shortcut: the buffers are read, not written: what such a shader
-    /// writes through a picked unordered access view stays in the host
-    /// copy. A list refreshes them where it first runs such a shader;
+    /// What such a shader writes through a picked unordered access view
+    /// goes back to title memory only with [`heap_writes`] (see there).
+    /// A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
-    fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+    fn heap_buffers(&self, list: &HostList, writes: bool) -> Option<u64> {
+        let gpu = self.heap_buffers_ready(list)?;
+        if writes {
+            self.heap_buffer_writes(list);
+        }
+        Some(gpu)
+    }
+
+    /// A shader that picks buffers by index and can store ran in `list`:
+    /// the unordered access views of the heap (as the last pass found them,
+    /// [`HEAP_UNORDERED`]) are declared written by the list, once per list,
+    /// so that what its shaders stored goes back into title memory after it
+    /// ran ([`heap_writes`]). Without the switch they are only counted and
+    /// logged.
+    fn heap_buffer_writes(&self, list: &HostList) {
+        const ONCE: usize = usize::MAX - 0x5f;
+        if !list.first_use(ONCE) {
+            return;
+        }
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let spans = HEAP_UNORDERED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&(std::ptr::from_ref(host) as usize)).cloned())
+            .unwrap_or_default();
+        if spans.is_empty() {
+            return;
+        }
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
+        HEAP_WRITE_LISTS.fetch_add(1, Ordering::Relaxed);
+        HEAP_WRITE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        if !heap_writes() {
+            static ONCE_LOG: std::sync::Once = std::sync::Once::new();
+            ONCE_LOG.call_once(|| {
+                tracing::warn!(
+                    copies = spans.len(),
+                    mb = bytes >> 20,
+                    "a shader that picks buffers by index can store: what it writes through the heap's unordered views \
+                     stays in the host copies and never reaches title memory (VICTORY_HEAP_WRITES=1 copies it back)"
+                );
+            });
+            return;
+        }
+        for (shadow, from, to) in spans {
+            shadow.gpu_writes(list, from, to - from);
+        }
+    }
+
+    /// [`State::heap_buffers`]' pass: the table of strides, with the heap's
+    /// buffer views made ready.
+    fn heap_buffers_ready(&self, list: &HostList) -> Option<u64> {
         let heap = self
             .heaps
             .iter()
@@ -1568,7 +1663,7 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)>;
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1633,7 +1728,8 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let unordered = matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..));
+            ranges.insert(index, (shadow, address, address + len, unordered));
         }
         let views = ranges.len() as u32;
         let slots_done = std::time::Instant::now();
@@ -1641,12 +1737,28 @@ impl State {
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
+        // And of those views that are unordered access ones: what a shader
+        // that stores may write ([`State::heap_buffer_writes`]).
+        let mut unordered: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            std::collections::HashMap::new();
+        for (shadow, from, to, uav) in ranges.values() {
             let key = std::sync::Arc::as_ptr(shadow) as usize;
             let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
+            if *uav {
+                let span = unordered.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
         }
+        let uav_views = ranges.values().filter(|r| r.3).count();
+        let uav_bytes: u64 = unordered.values().map(|s| s.2 - s.1).sum();
+        HEAP_UNORDERED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(std::ptr::from_ref(host) as usize, unordered.into_values().collect());
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
@@ -1700,6 +1812,8 @@ impl State {
                 views,
                 copies = spans.len(),
                 mb = bytes >> 20,
+                uav_views,
+                uav_mb = uav_bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
             );
