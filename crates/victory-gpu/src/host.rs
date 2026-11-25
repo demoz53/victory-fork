@@ -5985,7 +5985,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16, 20, 24].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -6007,7 +6007,7 @@ impl HostList {
     }
 
     /// Before the list closes, if this recording charged the card's copy
-    /// of the budget: its notes on mesh records go to the mapped words
+    /// of the budget: its notes on mesh and compute records (words 1-6) go to the mapped words
     /// (read at the next submission), and it goes back to common.
     fn card_budget_out(&self) {
         if !self.deferred().budget_zeroed {
@@ -6026,7 +6026,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 24);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
