@@ -1513,6 +1513,24 @@ fn room_percent() -> u64 {
     })
 }
 
+/// Whether two half-open byte ranges share a byte: `[a_start, a_start +
+/// a_len)` and `[b_start, b_start + b_len)`. A range of no bytes shares
+/// none, and the ranges end at the last address there is.
+pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return false;
+    }
+    a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+/// Whether [`let_go_idle`] and [`evict_placed_in`] let host copies go at
+/// all: `VICTORY_TEXTURE_SWEEP=0` keeps every one.
+#[cfg(windows)]
+fn sweeping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1540,8 +1558,7 @@ fn room_percent() -> u64 {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
+    if !sweeping() {
         return;
     }
     let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
@@ -1593,6 +1610,83 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Lets go of the host copies of the placed textures the title fills that
+/// `[base, base + len)` covers, at once: the runtime unmapped or moved
+/// those pages of title memory (`crate::title_memory_remapped`), so what
+/// those host copies were filled from is gone and a copy of it is memory
+/// held for a texture the title has finished with. Where [`let_go_idle`]
+/// waits `IDLE_MS` and `IDLE_FRAMES` frames, this goes now: unmapping the
+/// memory is how the title says it is done with it (a streamed texture the
+/// title unmaps otherwise sat in the card for seconds more, and the run
+/// paged).
+///
+/// A host copy goes only when only the resource holds it, as in
+/// [`let_go_idle`]: a list not yet reset or a descriptor slot still names
+/// it, and it stays until they let it go (the next use makes it anew from
+/// title memory, which is what the title just mapped). Nothing here waits
+/// on a fence, so no submission is held up.
+/// Returns how many host copies went.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+#[cfg(windows)]
+pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !sweeping() || len == 0 {
+        return 0;
+    }
+    // For the trail (`crate::host::trail`): how many went, their bytes,
+    // and the first one.
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let size = footprint(&r.desc).map_or(0, |f| f.size);
+        if !ranges_overlap(r.data() as u64, size, base, len) {
+            continue;
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let only_here = made.as_ref().is_some_and(|(host, _)| {
+                std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+            });
+            if only_here {
+                // Under the lock: the next use must not find the staging
+                // state of the texture let go (it says "uploaded").
+                crate::texture::unstage(at as This);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, _)) = gone {
+            r.host.gone.store(true, Relaxed);
+            KINDS[2].fetch_add(1, Relaxed);
+            KINDS[3].fetch_add(host.bytes, Relaxed);
+            went += 1;
+            bytes += host.bytes;
+            if first.is_none() {
+                first = Some(at);
+            }
+            crate::host::retire(host);
+        }
+    }
+    if went > 0 {
+        crate::host::trail(|| {
+            format!(
+                "unmapped: {went} host copies of placed textures let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                bytes >> 10,
+                first.unwrap_or(0)
+            )
+        });
+    }
+    went
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -2473,6 +2567,33 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    fn ranges_overlap_handles_boundaries_zero_len_and_overflow() {
+        // Side by side, in both orders: nothing shared.
+        assert!(!ranges_overlap(0, KIB_64, KIB_64, KIB_64));
+        assert!(!ranges_overlap(KIB_64, KIB_64, 0, KIB_64));
+        // A byte of one inside the other: shared.
+        assert!(ranges_overlap(0, KIB_64, KIB_64 - 1, KIB_64));
+        assert!(ranges_overlap(KIB_64 - 1, KIB_64, 0, KIB_64));
+        // One wholly inside the other: shared, and either way round.
+        assert!(ranges_overlap(0, 4 * KIB_64, KIB_64, KIB_64));
+        assert!(ranges_overlap(KIB_64, KIB_64, 0, 4 * KIB_64));
+        // Nothing at all shares nothing, wherever it is.
+        assert!(!ranges_overlap(0, 0, 0, KIB_64));
+        assert!(!ranges_overlap(0, KIB_64, 0, 0));
+        assert!(!ranges_overlap(0, 0, 0, 0));
+        assert!(!ranges_overlap(u64::MAX, 0, u64::MAX, 0));
+        // A range running off the end of the address space does not wrap
+        // into a false `true`: `saturating_add` stops it at the last
+        // address, so what starts there ends there too. No title address
+        // comes near, and nothing panics.
+        assert!(!ranges_overlap(u64::MAX, u64::MAX, 0, 1));
+        assert!(!ranges_overlap(0, 1, u64::MAX, 1));
+        assert!(!ranges_overlap(u64::MAX, 1, u64::MAX, 1));
+        assert!(ranges_overlap(u64::MAX - 1, 1, u64::MAX - 1, 1));
+        assert!(ranges_overlap(u64::MAX - 1, u64::MAX, u64::MAX - 1, 1));
     }
 
     #[test]
