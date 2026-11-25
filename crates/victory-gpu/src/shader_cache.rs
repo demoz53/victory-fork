@@ -75,6 +75,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_SHADER_OPT_RANGE",
                     "VICTORY_SHADER_OPT_IN",
                     "VICTORY_SHADER_OPT_STAGE",
+                    "VICTORY_MESH_EDGE_FLAGS",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

@@ -414,6 +414,18 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     Some(regions)
 }
 
+/// The bits of a mesh primitive's corner that are its vertex index: 9 (`0x1FF`; the edge flag
+/// above it is no part of it, RecompLive 6ccbdc635 / upstream c0228d9).
+/// `VICTORY_MESH_EDGE_FLAGS=index`: 10 bits, the flag read as part of the index, as before
+/// (a corner with its flag set then lies past the vertices and the primitive is culled). Part
+/// of the translation: the shader cache keys on it (`victory-gpu`'s does).
+fn mesh_corner_mask() -> u32 {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        if std::env::var_os("VICTORY_MESH_EDGE_FLAGS").is_some_and(|v| v == "index") { 0x3FF } else { 0x1FF }
+    })
+}
+
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
@@ -11256,7 +11268,7 @@ impl<'a> Lower<'a> {
         for (k, slot) in indices.iter_mut().enumerate() {
             // Each corner is a 9-bit index with its edge flag above it
             // (bits 9, 19, 29); the flag is not part of the index.
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(mesh_corner_mask()));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
