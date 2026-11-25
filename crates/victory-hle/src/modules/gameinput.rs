@@ -1146,6 +1146,8 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            #[cfg(feature = "diagnostics")]
+            record(1 + slot, pad_names(&pad));
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1174,7 +1176,12 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
+                #[cfg(feature = "diagnostics")]
+                record(0, held.iter().filter_map(|&vk| key_name(vk)).collect());
                 down.extend(held);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                record(0, Vec::new());
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1251,16 +1258,23 @@ mod host {
     /// are already there when input starts are skipped, so one file serves
     /// several runs. The file is read at most every 100 ms; an unknown line is
     /// logged and skipped.
+    ///
+    /// `<key>+<key>... <ms>` holds the keys together (a walk while the camera
+    /// turns), and `wait <ms>` holds none; a line with its time is followed
+    /// by the next one at once, with no 0.2 s between, so a recording
+    /// (`VICTORY_INPUT_RECORD`) plays back as it was pressed.
     #[cfg(feature = "diagnostics")]
     fn filed() -> Vec<u8> {
         const HOLD: Duration = Duration::from_millis(200);
+        /// Keys held together, for how long, and whether 0.2 s of nothing follows.
+        type Entry = (Vec<u8>, Duration, bool);
         struct Filed {
             path: Option<std::path::PathBuf>,
             read: Option<u64>,
             partial: String,
             polled: Option<Instant>,
-            queue: VecDeque<(u8, Duration)>,
-            held: Option<(u8, Instant)>,
+            queue: VecDeque<Entry>,
+            held: Option<(Vec<u8>, Instant, bool)>,
             free_at: Instant,
         }
         static FILED: LazyLock<Mutex<Filed>> = LazyLock::new(|| {
@@ -1307,6 +1321,7 @@ mod host {
                             // minute). A frame can take longer than 200 ms, so a stick turn needs more.
                             let mut words = line.split_whitespace();
                             let key = words.next().unwrap_or_default();
+                            let timed = words.clone().next().is_some();
                             let hold = match words.next() {
                                 None => Some(HOLD),
                                 Some(ms) => ms
@@ -1315,10 +1330,16 @@ mod host {
                                     .filter(|&ms| ms <= 60_000)
                                     .map(Duration::from_millis),
                             };
-                            match (key_code(key), hold) {
-                                (Some(vk), Some(hold)) if words.next().is_none() => {
+                            // `wait` holds nothing; otherwise every key of `a+b+...` must be known.
+                            let keys: Option<Vec<u8>> = if key == "wait" && timed {
+                                Some(Vec::new())
+                            } else {
+                                key.split('+').map(key_code).collect()
+                            };
+                            match (keys, hold) {
+                                (Some(keys), Some(hold)) if words.next().is_none() => {
                                     tracing::info!(key = line, "scripted key from VICTORY_KEYS_FILE");
-                                    f.queue.push_back((vk, hold));
+                                    f.queue.push_back((keys, hold, !timed));
                                 }
                                 _ => tracing::warn!(line, "VICTORY_KEYS_FILE: unknown key, skipped"),
                             }
@@ -1330,19 +1351,114 @@ mod host {
                 Some(_) => {}
             }
         }
-        if let Some((_, until)) = f.held
+        if let Some((_, until, gap)) = f.held
             && now >= until
         {
             f.held = None;
-            f.free_at = until + HOLD;
+            f.free_at = if gap { until + HOLD } else { until };
         }
         if f.held.is_none()
             && now >= f.free_at
-            && let Some((vk, hold)) = f.queue.pop_front()
+            && let Some((keys, hold, gap)) = f.queue.pop_front()
         {
-            f.held = Some((vk, now + hold));
+            // Back to back: start where the last one ended when it ended moments ago, so a long
+            // recording does not drift by a poll each line.
+            let start = if now.duration_since(f.free_at) < Duration::from_millis(50) { f.free_at } else { now };
+            f.held = Some((keys, start + hold, gap));
         }
-        f.held.map(|(vk, _)| vk).into_iter().collect()
+        f.held.as_ref().map(|(keys, _, _)| keys.clone()).unwrap_or_default()
+    }
+
+    /// The name `VICTORY_KEYS_FILE` takes for a virtual key (the inverse of [`key_code`]).
+    #[cfg(feature = "diagnostics")]
+    fn key_name(vk: u8) -> Option<String> {
+        Some(match vk {
+            0x0D => "Enter".into(),
+            0x1B => "Esc".into(),
+            0x09 => "Tab".into(),
+            0x08 => "Back".into(),
+            0x26 => "Up".into(),
+            0x28 => "Down".into(),
+            0x25 => "Left".into(),
+            0x27 => "Right".into(),
+            b'0'..=b'9' | b'A'..=b'Z' => char::from(vk).to_string(),
+            _ => return None,
+        })
+    }
+
+    /// A pad's reading as the stand-in pad's keys: sticks past half way as
+    /// W/A/S/D (left) and I/J/K/L (right), triggers as Z/C, buttons by the
+    /// stand-in's table.
+    #[cfg(feature = "diagnostics")]
+    fn pad_names(pad: &PadState) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut on = |cond: bool, name: &str| {
+            if cond {
+                names.push(name.into());
+            }
+        };
+        on(pad.left_y > 0.5, "W");
+        on(pad.left_y < -0.5, "S");
+        on(pad.left_x < -0.5, "A");
+        on(pad.left_x > 0.5, "D");
+        on(pad.right_y > 0.5, "I");
+        on(pad.right_y < -0.5, "K");
+        on(pad.right_x < -0.5, "J");
+        on(pad.right_x > 0.5, "L");
+        on(pad.left_trigger > 0.5, "Z");
+        on(pad.right_trigger > 0.5, "C");
+        for &(vk, bit) in &super::FALLBACK_BUTTONS {
+            if pad.buttons & bit != 0
+                && let Some(name) = key_name(vk)
+            {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Debugging aid: `VICTORY_INPUT_RECORD=<file>`: what the player presses
+    /// (the keyboard while our window has focus, and the pads, as
+    /// [`pad_names`]) is appended as one line per change,
+    /// `<ms since the first input> <keys joined by +, or none>`, in the names
+    /// `VICTORY_KEYS_FILE` takes, so a walk can be played back. Each change is
+    /// also logged, to line it up with the frames.
+    #[cfg(feature = "diagnostics")]
+    fn record(source: usize, names: Vec<String>) {
+        use std::io::Write;
+        struct Recorder {
+            file: Option<std::fs::File>,
+            start: Option<Instant>,
+            by_source: [Vec<String>; PADS + 1],
+            last: Vec<String>,
+        }
+        static RECORDER: LazyLock<Mutex<Recorder>> = LazyLock::new(|| {
+            let file = std::env::var_os("VICTORY_INPUT_RECORD").and_then(|path| {
+                std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+            });
+            Mutex::new(Recorder { file, start: None, by_source: Default::default(), last: Vec::new() })
+        });
+        let mut r = RECORDER.lock().unwrap_or_else(PoisonError::into_inner);
+        if r.file.is_none() {
+            return;
+        }
+        r.by_source[source] = names;
+        let mut all: Vec<String> = r.by_source.iter().flatten().cloned().collect();
+        all.sort();
+        all.dedup();
+        if all == r.last {
+            return;
+        }
+        let now = Instant::now();
+        let start = *r.start.get_or_insert(now);
+        let ms = now.duration_since(start).as_millis();
+        let keys = if all.is_empty() { "none".to_string() } else { all.join("+") };
+        tracing::info!(ms, keys = %keys, "recorded input");
+        if let Some(file) = r.file.as_mut() {
+            let _ = writeln!(file, "{ms} {keys}");
+            let _ = file.flush();
+        }
+        r.last = all;
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
