@@ -92,6 +92,7 @@ mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
+mod per_program;
 mod rect;
 mod sampler;
 mod shader;
@@ -113,6 +114,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_uses_wave32, set_host_max_wave};
+pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -318,10 +320,24 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
+    let native = main_program(&c)?;
+    let p = crate::spill::build(&native)?;
+    // Structurisation first: tracing per-lane descriptors needs it (its
+    // failure is reported after the earlier stages').
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// The program of a container that [`translate`] translates: its vertex,
+/// pixel, compute or mesh program.
+fn main_program(c: &Container) -> Result<NativeProgram, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -332,15 +348,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    let p = crate::spill::build(&native)?;
-    // Structurisation first: tracing per-lane descriptors needs it (its
-    // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
-    let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+        })
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -397,11 +405,14 @@ fn emit_once(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && host_uses_wave32() {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        // (each line names the program by its hash, when the caller gave it: [`for_program`])
+        let program = per_program::current();
+        let hash = program.as_deref().unwrap_or("?");
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY #{hash} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY #{hash} {what}: {e}"),
                 }
             }
         };
@@ -419,7 +430,7 @@ fn emit_once(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!("WAVE64-RETRY #{hash} local waves: not the allocation idiom at {offset:#x}: {what}");
                 }
                 false
             }
@@ -461,8 +472,13 @@ fn emit_once(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off;
+                // `VICTORY_WAVE_DEEP_SKIPS_NOT` and `_ONLY` the first for some programs:
+                // [`deep_skips_allowed`].)
+                let deep_on = deep_skips_allowed(program.as_deref());
+                if why && !deep_on {
+                    eprintln!("WAVE64-RETRY #{hash} without skips, scalars followed: off for this program");
+                }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -540,7 +556,7 @@ fn emit_once(
         // that hung the card under `=1` (runs 121-124) have an earlier form and keep it.
         // shortcut: opt-in until a run shows the programs it takes leave the card alone.
         if wide_last() {
-            let deep = form(ir::without_skips(p, true));
+            let deep = if deep_skips_allowed(program.as_deref()) { form(ir::without_skips(p, true)) } else { None };
             let bases = [
                 deep.as_ref().map(|f| &f.0),
                 forms[1].1.as_ref().map(|f| &f.0),
