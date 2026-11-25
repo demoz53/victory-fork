@@ -1059,6 +1059,15 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         };
         if len <= 3 * WINDOW {
             take(0, len);
+        } else if dense_recheck() {
+            // 4 KiB of every 64 KiB, and the last 4 KiB: a piece the title's
+            // streaming fills later anywhere in the texture changes it.
+            const STEP: usize = 64 << 10;
+            const PIECE: usize = 4 << 10;
+            for from in (0..len).step_by(STEP) {
+                take(from, PIECE.min(len - from));
+            }
+            take(len - PIECE, PIECE);
         } else {
             take(0, WINDOW);
             take((len / 2) & !0xfff, WINDOW);
@@ -1069,6 +1078,17 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash.as_bytes()[..8]);
     u64::from_le_bytes(first) | 1
+}
+
+/// `VICTORY_HEAP_RECHECK=dense`: the looks at textures picked by index
+/// after their upload ([`fingerprint`]) read 4 KiB of every 64 KiB of the
+/// texture's memory, not 16 KiB at its start, middle and end, and go on for
+/// longer (`crate::draw`). The sparse look misses a texture whose other parts
+/// arrive later (its host copy keeps zeros there: a candidate for the white
+/// speckles on faces since the looks came in, all5).
+pub(crate) fn dense_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_some_and(|v| v == "dense"))
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its
