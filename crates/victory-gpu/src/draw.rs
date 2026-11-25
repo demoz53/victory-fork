@@ -443,7 +443,9 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Then, of the making: the slot's view and the texture's host copy
 /// (`mirror`, `placed_texture`, `host_resource`), and the upload recorded
 /// (`readable`), microseconds.
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Then the slots left for the next frame while the makers make their
+/// textures' host copies (`resource::texture_makers`).
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1773,6 +1775,19 @@ impl State {
                 if refused > 256 {
                     break;
                 }
+                continue;
+            }
+            // A texture placed in title memory whose host copy is not made
+            // yet: the makers make it (`resource::texture_makers`), and the
+            // slot is looked at again next frame.
+            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view)
+                && resource[0] != 1
+                && let Some(texture) = crate::resource::texture_at(u64::from(desc[10]) | u64::from(desc[11]) << 32, &resource)
+                && !crate::resource::has_host_copy(texture)
+                && crate::resource::make_host_copy_soon(texture)
+            {
+                HEAP_PASS_PARTS[8].fetch_add(1, Ordering::Relaxed);
+                host.texture_slot_later(index, write, frame, 1);
                 continue;
             }
             let making = std::time::Instant::now();

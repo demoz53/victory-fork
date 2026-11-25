@@ -1251,6 +1251,98 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// How many threads make host copies of textures ahead of their first use
+/// ([`make_host_copy_soon`]; `VICTORY_TEXTURE_MAKERS`, 4; 0: none, every
+/// host copy is made where it is first used, as before).
+///
+/// The pass over the heap's views uploads the textures the title's shaders
+/// pick by index, on a recording thread, within 250 ms a pass: at world
+/// load 26,000 slots were due, and 300-1,400 were made a pass at about 0.6
+/// ms each (a2-noguard: frames of 300-560 ms for 85 s, the pass 186-555 ms
+/// of them). Most of that is making the host copy of each texture (one
+/// host resource each). With makers, the pass hands a texture placed in
+/// title memory that has no host copy yet to them and looks at its slot
+/// again next frame; the makers make copies on threads of their own,
+/// several at a time, and the pass uploads what is made.
+#[cfg(windows)]
+pub(crate) fn texture_makers() -> usize {
+    static MAKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAKERS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAKERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).min(16)
+    })
+}
+
+/// The makers' queue ([`texture_makers`]): textures to make host copies of,
+/// and those queued or being made (so none is queued twice).
+#[cfg(windows)]
+struct Makers {
+    queue: std::collections::VecDeque<usize>,
+    queued: std::collections::BTreeSet<usize>,
+}
+
+#[cfg(windows)]
+static MAKERS: std::sync::Mutex<Makers> = std::sync::Mutex::new(Makers {
+    queue: std::collections::VecDeque::new(),
+    queued: std::collections::BTreeSet::new(),
+});
+
+#[cfg(windows)]
+static MAKERS_MORE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Since the start: host copies made by the makers, and textures handed to
+/// them ([`make_host_copy_soon`]).
+#[cfg(windows)]
+pub(crate) static MADE_AHEAD: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `this` (a texture) has its host copy now.
+#[cfg(windows)]
+pub(crate) fn has_host_copy(this: This) -> bool {
+    hosted(this, false).is_some()
+}
+
+/// Hands texture `this` to the makers ([`texture_makers`]) to make its host
+/// copy; true if it is with them now (handed now or before). Only for
+/// textures kept for the run ([`texture_at`]'s): a maker holds no
+/// reference. False without makers.
+#[cfg(windows)]
+pub(crate) fn make_host_copy_soon(this: This) -> bool {
+    let makers = texture_makers();
+    if makers == 0 {
+        return false;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        for n in 0..makers {
+            let _ = std::thread::Builder::new().name(format!("victory-texture-maker-{n}")).spawn(|| {
+                loop {
+                    let next = {
+                        let mut m = MAKERS.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(next) = m.queue.pop_front() {
+                                break next;
+                            }
+                            m = MAKERS_MORE.wait(m).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    // Not without room on the card: the pass makes it
+                    // itself once there is (or leaves the slot due).
+                    if room() && hosted(next as This, true).is_some() {
+                        MADE_AHEAD[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    MAKERS.lock().unwrap_or_else(|e| e.into_inner()).queued.remove(&next);
+                }
+            });
+        }
+    });
+    let mut m = MAKERS.lock().unwrap_or_else(|e| e.into_inner());
+    if m.queued.insert(this as usize) {
+        m.queue.push_back(this as usize);
+        MADE_AHEAD[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MAKERS_MORE.notify_one();
+    }
+    true
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.
@@ -2490,6 +2582,40 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    /// A texture placed at an address has no host copy until something
+    /// makes it; handed to the makers, one makes it on a thread of its own.
+    #[cfg(windows)]
+    #[test]
+    fn a_maker_makes_a_textures_host_copy_ahead_of_its_use() {
+        if crate::host::host().is_none() || texture_makers() == 0 || !lazy() {
+            return; // no host GPU, or no makers, or host copies made at once
+        }
+        let mut memory = vec![0u8; 4096];
+        let mut made = std::ptr::null();
+        let desc = texture(16, 4, 28, 1);
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                memory.as_mut_ptr() as u64,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut made
+            ),
+            S_OK
+        );
+        assert!(!has_host_copy(made), "made on first use, not before");
+        assert!(make_host_copy_soon(made));
+        assert!(make_host_copy_soon(made), "handed over again: still with the makers or made");
+        let since = std::time::Instant::now();
+        while !has_host_copy(made) {
+            assert!(since.elapsed() < std::time::Duration::from_secs(10), "no maker made it");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(memory);
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,

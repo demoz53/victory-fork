@@ -7225,7 +7225,9 @@ impl Meter {
                 .map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
             if picked > 0.0 {
                 tracing::info!(
-                    "the pass over the heap's views per frame (on a recording thread): {:.1} ms buffer views ({:.0} slots looked at),                      {:.1} ms textures ({:.0} slots looked at), of them {:.1} ms asking what of their memory is mapped and {:.1} ms                      making their views, host textures and uploads ({:.1} ms the views and host textures, {:.1} ms the uploads)",
+                    "the pass over the heap's views per frame (on a recording thread): {:.1} ms buffer views ({:.0} slots looked at),                      {:.1} ms textures ({:.0} slots looked at), of them {:.1} ms asking what of their memory is mapped and {:.1} ms                      making their views, host textures and uploads ({:.1} ms the views and host textures, {:.1} ms the uploads); \
+                     {:.0} slots left for the next frame while their host copies are made ahead ({} made ahead of {} handed over \
+                     since the start, VICTORY_TEXTURE_MAKERS)",
                     parts[0] / 1e3,
                     parts[4],
                     parts[1] / 1e3,
@@ -7234,6 +7236,9 @@ impl Meter {
                     parts[3] / 1e3,
                     parts[6] / 1e3,
                     parts[7] / 1e3,
+                    parts[8],
+                    crate::resource::MADE_AHEAD[0].load(Ordering::Relaxed),
+                    crate::resource::MADE_AHEAD[1].load(Ordering::Relaxed),
                 );
             }
         }
