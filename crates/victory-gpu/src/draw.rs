@@ -3469,7 +3469,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod rect_bounds_tests {
     use super::*;
 
     #[test]

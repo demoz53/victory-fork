@@ -668,7 +668,7 @@ fn emit_once(
             if native.stage == HwStage::Cs && what == lower::LANE_ELSEWHERE =>
         {
             let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-            let halves = native.wave64 && lower::host_max_wave() == 32;
+            let halves = native.wave64 && lower::host_uses_wave32();
             let again = if halves { None } else { Some(widen(c, native, p, why)) };
             if why {
                 match &again {

@@ -389,7 +389,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod clwb_tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,

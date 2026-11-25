@@ -2967,7 +2967,7 @@ fn image_store_partial_dmask_writes_expected_channels() {
 }
 
 #[test]
-fn float_compares_that_are_always_false_or_true() {
+fn float_compares_that_are_always_false_or_true_cmpx_and_f16() {
     let cmp_shader = |op: u16| {
         let cmp = vop3(op, 6, vgpr(1), vgpr(2), 0);
         let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
