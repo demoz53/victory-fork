@@ -7427,7 +7427,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Into title memory: through the kernel, which reports a destination
+    // page that is not there (the guarded copy only survives the source's).
+    let whole = if title_dst { read_kernel(src, dst, len) } else { read(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -7446,7 +7448,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, title_dst);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
@@ -7471,7 +7473,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            read_pieces(at, to, remaining, false);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -7481,13 +7483,15 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             unsafe { to.write_bytes(0, n) };
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            read_pieces(at, to, n, false);
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+/// `kernel`: into title memory, read through the kernel ([`read_kernel`]).
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, kernel: bool) {
+    let read = |src: *const u8, dst: *mut u8, len: usize| if kernel { read_kernel(src, dst, len) } else { read(src, dst, len) };
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
@@ -7514,7 +7518,19 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
+/// The destination must be host memory (`crate::guarded`).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if crate::guarded::on() {
+        // SAFETY: the destination is mapped writable host memory of `len`
+        // bytes; a source page that is not there stops the copy.
+        return unsafe { crate::guarded::copy(src, dst, len) };
+    }
+    read_kernel(src, dst, len)
+}
+
+/// [`read`] through the kernel (`ReadProcessMemory`), which also reports a
+/// destination page that is not there or not writable.
+fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
