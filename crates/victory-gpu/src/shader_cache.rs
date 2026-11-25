@@ -89,6 +89,8 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_VCC_LOOP_POLARITY",
                     "VICTORY_SKIP_DESCRIPTORS",
                     "VICTORY_DIV_FIXUP",
+                    "VICTORY_WAVE_EXACT",
+                    "VICTORY_WAVE_WIDE_LANE_RESOURCES",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

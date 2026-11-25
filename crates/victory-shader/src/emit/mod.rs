@@ -462,6 +462,8 @@ fn emit_once(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // (why the program as it is did not do: the first line of each program's retries)
+        report("as it is", &original);
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -509,7 +511,8 @@ fn emit_once(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         // (or for the programs `VICTORY_WAVE_WIDE_FIRST` lists: [`wave_wide_first`])
-        let wide_first = per_program::wave_wide_first(program.as_deref());
+        // (or, by default, for every program: [`wave_exact`])
+        let wide_first = per_program::wave_wide_first(program.as_deref()) || wave_exact();
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || wide_first;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
@@ -562,7 +565,8 @@ fn emit_once(
                         ] {
                             let Some(base) = base else { continue };
                             let again = widen(c, native, base, why);
-                            report(&format!("wave-wide branches (VICTORY_WAVE_WIDE_FIRST), {name}"), &again);
+                            let by = if per_program::wave_wide_first(program.as_deref()) { "VICTORY_WAVE_WIDE_FIRST" } else { "VICTORY_WAVE_EXACT" };
+                            report(&format!("wave-wide branches ({by}), {name}"), &again);
                             if done(&again) {
                                 return again.map(|(shader, _)| shader);
                             }
@@ -743,6 +747,8 @@ thread_local! {
     static TEST_WIDE_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// A test's `VICTORY_WAVE_LDS_REGIONS=approx`, for its thread only.
     static TEST_LDS_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's `VICTORY_WAVE_EXACT`, for its thread only.
+    pub(crate) static TEST_WAVE_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -778,7 +784,35 @@ fn widen(
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        let res = match resource::track(p, &native.layout, native.stage, Some(&st)) {
+            Ok(res) => res,
+            // Resources the wave-wide paths do not prove (a waterfall loop over a per-lane
+            // descriptor, the moves that fill such a descriptor, inside a branch now taken
+            // wave-wide): those proofs ask which lanes reach an access and what they ran on
+            // the way, and past a wave-wide branch a lane's path no longer says (EXEC is a
+            // guard there, a join of it stays opaque). What a lane accesses is the same either
+            // way: a lane the wave carries through with EXEC clear accesses nothing, the others
+            // run what they ran. So what the lanes' own paths proved is the program's here too
+            // ([`widen_lane_resources`]).
+            Err(e) if !wide.is_empty() && widen_lane_resources() => {
+                let lanes = structure::structure(p)?;
+                match resource::track(p, &native.layout, native.stage, Some(&lanes)) {
+                    Ok(res) => {
+                        if why {
+                            eprintln!("WAVE64-WIDE resources with {} branches wave-wide ({e}): the lanes' own paths' taken", wide.len());
+                        }
+                        res
+                    }
+                    Err(_) => return Err(e),
+                }
+            }
+            Err(e) => {
+                if why {
+                    eprintln!("WAVE64-WIDE resources not tracked with {} branches wave-wide: {e}", wide.len());
+                }
+                return Err(e);
+            }
+        };
         lower::take_needs();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
@@ -793,6 +827,13 @@ fn widen(
             }
             return r;
         }
+        if why {
+            let what = match &r {
+                Ok((_, wave)) => format!("wave {wave:?}"),
+                Err(e) => e.to_string(),
+            };
+            eprintln!("WAVE64-WIDE with {} branches wave-wide: {what}; blocks needing every lane {needs:?}", wide.len());
+        }
         let more: Vec<usize> = lower::branches_around(&st, &needs)
             .unwrap_or_default()
             .into_iter()
@@ -806,6 +847,38 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// Whether the wave-wide form is tried for every console wave64 compute program on a host of
+/// 32-lane waves as [`per_program::wave_wide_first`] tries it for the programs it lists: after
+/// the exact forms without barriers and the deep-skips form, on the program as it is first,
+/// and before the approximate forms, where each host wave is a wave of its own and a result
+/// the console makes over the whole wave (a tile of 8 by 8 pixels: its depth range, whether
+/// it holds glass, a count of its lanes) becomes two half-wave ones: the suspects for the
+/// 8-pixel staircase on the outlines over the window glass are such programs
+/// (`e4a9f58e3acfcf7b`, `c4183d3cbee28e8e`, `1f1fbd86759b3da2`, which read and write the
+/// G-buffer tile by tile). Of the 23 programs the census took approximately, 19 take it; the 4
+/// whose thread groups hold several console waves stay as they were (a barrier inside a
+/// wave-wide branch would wait for the other waves). `VICTORY_WAVE_EXACT=0`: the approximate
+/// forms first, as before. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn wave_exact() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WAVE_EXACT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_EXACT").is_none_or(|v| v != "0"))
+}
+
+/// Whether [`widen`] takes the resources the lanes' own paths proved where the wave-wide
+/// paths do not prove them again (a waterfall loop over a per-lane descriptor, or the moves
+/// that fill one, in a branch taken wave-wide): `VICTORY_WAVE_WIDE_LANE_RESOURCES=0` refuses the
+/// wave-wide form there, as before. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn widen_lane_resources() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_LANE_RESOURCES").is_none_or(|v| v != "0"))
 }
 
 /// The translated program, and the wave size it requires of the host.

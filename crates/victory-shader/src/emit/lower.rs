@@ -6641,18 +6641,24 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props);
-                if let Some(&h) = self.handles.get(&key) {
-                    return Ok(h);
-                }
-                let index = self.heap_index(*load, *first, sampler)?;
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
+                // (one handle per block and descriptor, but not where it is the lane's own in
+                // a wave-wide form: there it depends on the access's guard)
+                let shared = !per_lane || self.x.st.wide.is_empty();
+                let key = (self.cur, *load, *first, sampler, props);
+                if shared && let Some(&h) = self.handles.get(&key) {
+                    return Ok(h);
+                }
+                let index = self.heap_index(*load, *first, sampler)?;
+                let index = if per_lane { self.wide_lane_index(site, index)? } else { index };
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
-                self.handles.insert(key, h);
+                if shared {
+                    self.handles.insert(key, h);
+                }
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
@@ -6746,9 +6752,29 @@ impl<'a> Lower<'a> {
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
+                let index = self.wide_lane_index(site, index)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// A lane's own heap index for the access at `site`, as the wave-wide form of a program
+    /// ([`crate::structure::structure_wide`]) must give it: there the wave carries lanes
+    /// through with EXEC clear, and such a lane's descriptor dwords are whatever it held
+    /// (the moves and loads that would fill them did not run for it), so its index could
+    /// name no slot of the heap. The access is guarded and its result for that lane thrown
+    /// away, but a handle made from such an index may still be read on the host: such a
+    /// lane takes slot 0 (made null like every slot never written). Without a branch taken
+    /// wave-wide, or unguarded, `index` as it is.
+    fn wide_lane_index(&mut self, site: Site, index: V) -> Result<V, Why> {
+        if self.x.st.wide.is_empty() {
+            return Ok(index);
+        }
+        let Some(g) = self.effect_guard(site.0, site.1)? else {
+            return Ok(index);
+        };
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.select(self.cur, g, index, zero))
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its

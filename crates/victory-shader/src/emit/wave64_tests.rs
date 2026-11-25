@@ -763,6 +763,94 @@ fn the_wave_wide_form_last_of_all_keeps_the_forms_taken_before() {
     }
 }
 
+/// A lane loop that takes the number of its first lane (`s_ff1` of EXEC) in every round, as
+/// the tile programs over the window glass do (`e4a9f58e3acfcf7b`, `c4183d3cbee28e8e`: "a
+/// wave's first-lane number used as data", "a lane mask exchanged where not every lane
+/// runs"): lane t runs t rounds, and round k adds the first lane still in the loop (lane k)
+/// to the lane's sum, so the console's lane t ends with 1 + 2 + ... + t. Every lane stores
+/// its sum at its own dword.
+const FIRST_LANE_ROUNDS: [u32; 14] = [
+    0x7E02_0280, // v_mov_b32 v1, 0 (the sum)
+    0x7E04_0300, // v_mov_b32 v2, v0 (rounds left)
+    0xBE8C_047E, // s_mov_b64 s[12:13], exec
+    0x7D8A_0480, // loop: v_cmp_ne_u32 vcc, 0, v2
+    0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+    0xBF88_0004, // s_cbranch_execz done
+    0xBE87_147E, // s_ff1_i32_b64 s7, exec
+    0x4A02_0207, // v_add_nc_u32 v1, s7, v1
+    0x4E04_0481, // v_subrev_nc_u32 v2, 1, v2
+    0xBF82_FFF9, // s_branch loop
+    0xBEFE_040C, // done: s_mov_b64 exec, s[12:13]
+    0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+    0x38 << 26 | 0x1C << 18 | 1 << 12,
+    0x80 << 24 | 2 << 16 | 1 << 8 | 3, // buffer_store_dword v1, v3, s[8:11], 0 offen
+];
+
+/// `VICTORY_WAVE_EXACT` (on by default): a console wave64 program that takes its first lane's
+/// number inside a lane loop ([`FIRST_LANE_ROUNDS`]) has no exact form without barriers (no
+/// skip to leave out: the loop's exit is the only branch), and the approximate one runs each
+/// host wave as a wave of its own, whose first lane in the upper half is lane 32 at the
+/// earliest. It now takes the wave-wide form before that: the loop taken by the whole wave,
+/// the mask exchanged between the halves. Under the whole `emit` on a 32-lane host, and on a
+/// card of 32-lane waves, every lane ends with the console's sum; the approximate form, still
+/// taken with the switch off, gives the upper half's lanes another.
+#[test]
+fn a_first_lane_number_in_a_lane_loop_takes_the_exact_wave_wide_form() {
+    let native = native(&FIRST_LANE_ROUNDS);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let io = io::raise(&p, &native).expect("io");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+    let empty_bytes = crate::dxbc::build(&[]);
+    let empty = crate::Container::parse(&empty_bytes).unwrap();
+    let run = |exact: bool| {
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let was_exact = super::TEST_WAVE_EXACT.replace(Some(exact));
+        let r = super::emit(&empty, &native, &p, &st, &io, &res);
+        super::TEST_WAVE_EXACT.set(was_exact);
+        lower::TEST_HOST_WAVE.set(was);
+        r.expect("translates")
+    };
+    let (approximate, exact) = (run(false), run(true));
+    assert_ne!(psv0_wave(&exact), (64, 64), "the exact form runs on 32-lane waves");
+    assert_ne!(approximate.dxil, exact.dxil, "the two orders take different forms");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for shader in [&approximate, &exact] {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let console: Vec<u32> = (0..64).map(|t| t * (t + 1) / 2).collect();
+    let mut sums = Vec::new();
+    for shader in [&exact, &approximate] {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            eprintln!("the hardware device does not take this program (waves of 32?); not run");
+            return;
+        };
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch the rounds");
+        sums.push(out[0][..64].to_vec());
+    }
+    assert_eq!(sums[0], console, "the exact form: every lane the console's sum");
+    assert_ne!(sums[1][32..], console[32..], "the approximate form: the upper half its own");
+    eprintln!("ran on the hardware device: the exact form gave every lane the console's sum");
+}
+
 /// `with_group_base`: the second part of a dispatch over 65,535 groups in x reads its
 /// group id x past the first part's. A 32-lane console program with the group id x in s5
 /// (TGID_X_EN) stores it; translated with a base of 65,535 and run as one group, it
