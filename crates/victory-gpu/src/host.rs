@@ -1470,6 +1470,70 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
+/// An upload buffer of a texture's staging that nothing holds any more,
+/// kept for the next staging of its size class ([`Host::staging_buffer`]):
+/// the buffer and its mapping.
+struct KeptUpload(ID3D12Resource, usize);
+
+// SAFETY: a D3D12 buffer (free-threaded) and the address of its mapping,
+// which only the next staging that takes it writes.
+unsafe impl Send for KeptUpload {}
+
+/// Staging buffers no texture and no list holds, by size class.
+static SPARE_STAGING: Mutex<Spare<KeptUpload>> = Mutex::new(Spare::new());
+
+/// Since the start: stagings that took a kept buffer, and those that made
+/// one ([`Host::staging_buffer`]).
+pub(crate) static STAGING_TAKEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The most bytes of staging buffers kept for reuse
+/// (`VICTORY_STAGING_SPARE_MB`, 256; 0 keeps none, as before).
+///
+/// Textures the title's shaders pick by index (`crate::draw`'s pass over
+/// the heap) are staged, uploaded once and let go: "textures picked by
+/// index: 76,823 uploaded so far (33,755 MB)" in the reference run, beside
+/// "made so far: 83,298 upload buffers 36,825 MB", some 80 buffers and 37
+/// MB a frame. Each was a committed upload buffer made for it (a kernel
+/// allocation and mapping) and released after its list ran, and its pages
+/// were zeroed by the system as the detile first wrote them (the 15,000-
+/// 19,000 page faults a frame). A staging whose texture is let go now
+/// gives its buffer back here once no list holds it (the lists that copy
+/// from it hold the staging until they are reset, after the card ran
+/// them), and the next staging of the same size class (a power of two of
+/// at least 64 KiB) takes it.
+fn staging_spare_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            << 20
+    })
+}
+
+/// The size class of a staging buffer of `size` bytes ([`staging_spare_most`]).
+fn staging_class(size: u64) -> u64 {
+    if staging_spare_most() == 0 {
+        return size;
+    }
+    size.max(64 << 10).checked_next_power_of_two().unwrap_or(size)
+}
+
+/// A staging's buffer nothing holds any more ([`Host::staging_buffer`]): kept
+/// for the next staging of its size class while the kept bytes stay under
+/// [`staging_spare_most`], else released.
+pub(crate) fn spare_staging(buffer: ID3D12Resource, data: *mut u8, bytes: u64) {
+    if staging_spare_most() == 0 || bytes != staging_class(bytes) {
+        return;
+    }
+    let kept = KeptUpload(buffer, data as usize);
+    let _released = SPARE_STAGING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .give(kept, bytes, staging_spare_most());
+}
+
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -6490,6 +6554,22 @@ impl Host {
         }
     }
 
+    /// An upload buffer for a texture's staging of at least `size` bytes,
+    /// its mapping and its bytes, and whether it was kept from an earlier
+    /// staging (then it holds what that one left: the caller clears it).
+    pub(crate) fn staging_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, u64, bool)> {
+        let class = staging_class(size);
+        if staging_spare_most() > 0
+            && let Some(KeptUpload(buffer, data)) = SPARE_STAGING.lock().unwrap_or_else(|e| e.into_inner()).take(class)
+        {
+            STAGING_TAKEN[0].fetch_add(1, Ordering::Relaxed);
+            return Some((buffer, data as *mut u8, class, true));
+        }
+        STAGING_TAKEN[1].fetch_add(1, Ordering::Relaxed);
+        let (buffer, data) = self.upload_buffer(class)?;
+        Some((buffer, data, class, false))
+    }
+
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
@@ -7350,6 +7430,34 @@ mod trail {
 #[cfg(test)]
 mod spare {
     use super::Spare;
+
+    /// A staging buffer given back is taken by the next staging of its
+    /// size class, mapping and all; one of another class is not.
+    #[test]
+    fn staging_buffers_come_back_by_size_class() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if super::staging_spare_most() == 0 {
+            return; // VICTORY_STAGING_SPARE_MB=0: none kept
+        }
+        // A class no other test stages in (5 MiB and a bit: 8 MiB).
+        let size = (5 << 20) + 4096;
+        let (buffer, data, class, _) = host.staging_buffer(size).unwrap();
+        assert_eq!(class, 8 << 20);
+        // SAFETY: the mapping holds `class` bytes.
+        unsafe { std::ptr::write_bytes(data, 0x5a, class as usize) };
+        super::spare_staging(buffer.clone(), data, class);
+        drop(buffer);
+        let (again, again_data, again_class, kept) = host.staging_buffer(size + 4096).unwrap();
+        assert!(kept, "the buffer given back is taken again");
+        assert_eq!((again_data, again_class), (data, class));
+        // SAFETY: as above; what the last staging left is still there.
+        assert_eq!(unsafe { data.read() }, 0x5a);
+        let (_, _, small, small_kept) = host.staging_buffer(4096).unwrap();
+        assert_eq!(small, 64 << 10);
+        let _ = (again, small_kept);
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.

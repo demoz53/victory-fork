@@ -418,6 +418,9 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // No list holds it (each that copies from it holds it until it is
+        // reset, after the card ran it): the buffer serves another staging.
+        crate::host::spare_staging(self.buffer.clone(), self.data, self.bytes);
     }
 }
 
@@ -1125,7 +1128,15 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, bytes, kept) = host.staging_buffer(total)?;
+    if kept {
+        // What the texture before it left: a texture whose memory reads
+        // as zeros, or is not read at its first check, is uploaded with
+        // the buffer as it is (a new buffer is zeros).
+        // SAFETY: the mapping holds `bytes >= total` bytes, and nothing
+        // else holds the buffer.
+        unsafe { std::ptr::write_bytes(data, 0, total as usize) };
+    }
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1134,7 +1145,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1144,7 +1155,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
-        bytes: total,
+        bytes,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
