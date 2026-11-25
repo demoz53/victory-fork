@@ -2326,10 +2326,107 @@ fn late_stage() -> u8 {
             Ok("3") => 3,
             // The relay alone: on top of stage 3.
             Err(_) if crate::shadow::relay() => 3,
+            // One flight at a time ([`one_flight`]) without the relay:
+            // stage 1, the present waited for as before.
+            Err(_) if one_flight() > 0 => 1,
             _ => 0,
         }
     })
 }
+
+/// `VICTORY_ONE_FLIGHT`: 0 (off, the default), 1 or 2. After ka1qux's
+/// BRVIctory-ka1qux `8519549` and `c465fe2` (GPL-3.0), themselves after
+/// Belobug's VIctory port; mapped onto the relay here, which ka1qux turns
+/// off.
+///
+/// At 1 every submission sent ahead first waits until nothing is in the
+/// air (with the relay, until its thread has landed everything; without
+/// it, a settle), so whatever it reads of title memory it reads after
+/// everything the one before wrote is back, as with every submission
+/// waited for. At 2 it waits only when two flights are in the air (with
+/// the relay, until fewer are); with one in the air it is prepared and
+/// sent when preparing it reads nothing that flight may write
+/// ([`late_blocked`], strictly: a buffer copy from or into, a fill, a
+/// texture, a refresh of another copy over the same bytes, a read-back's or
+/// a bottom-of-pipe write's range, a step of ours), and waits for it
+/// otherwise, as every submission sent ahead does.
+///
+/// Before either wait the submission's refreshes that nothing in the air
+/// can change are made once ([`prewarm`]), while the card still runs, and
+/// again after it as always, finding little left
+/// (`VICTORY_ONE_FLIGHT_PREWARM=0`: not).
+///
+/// Without [`late`] (`VICTORY_RELAY=0` and no `VICTORY_LATE_WAIT`) it
+/// turns it on at stage 1. With the relay at 2 it is stricter than the
+/// relay alone, which lets [`late_most`] lists fly: an A/B of whether the
+/// flights running ahead are what costs the waits.
+fn one_flight() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_ONE_FLIGHT").as_deref() {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => 0,
+        };
+        if mode > 0 {
+            tracing::info!(
+                mode,
+                relay = crate::shadow::relay(),
+                prewarm = one_flight_prewarm(),
+                "a submission sent ahead waits for the flights before it: at 1 for all of them, at 2 only with two in the \
+                 air or when it reads what one may write (VICTORY_ONE_FLIGHT)"
+            );
+        }
+        mode
+    })
+}
+
+/// With [`one_flight`]: whether its waits make [`prewarm`] first
+/// (`VICTORY_ONE_FLIGHT_PREWARM=0`: not).
+fn one_flight_prewarm() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ONE_FLIGHT_PREWARM").is_none_or(|v| v != "0"))
+}
+
+/// Whether a submission that waits for flights because it reads what they
+/// may write (the settles "title memory read" and "a step of ours", and the
+/// wait for a texture's staging buffer) makes [`prewarm`] first
+/// (`VICTORY_SETTLE_PREWARM=1`; off by default). The relay's own waits,
+/// with or without [`one_flight`].
+///
+/// Why: a settle stands the submitting thread still until the card has run
+/// the flights and they have landed, and only then does it prepare, with
+/// the card idle behind it: title CPU, preparing and settles all one after
+/// the other. The refreshes nothing in the air can change come out the same
+/// made before the wait as after it.
+fn settle_prewarm() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_PREWARM").is_some_and(|v| v == "1"))
+}
+
+/// With [`one_flight`] at `mode`: whether a submission waits before it is
+/// prepared, with `in_air` flights in the line and `landing` whether the
+/// relay's thread is landing some (it has taken them out of the line).
+fn one_flight_waits(mode: u8, in_air: usize, landing: bool) -> bool {
+    match mode {
+        1 => in_air > 0 || landing,
+        2 => in_air + usize::from(landing) >= 2,
+        _ => false,
+    }
+}
+
+/// Flights in `line` (not those being landed).
+fn flights_in(line: &Line) -> usize {
+    line.line.iter().filter(|l| matches!(l, Late::Run(_))).count()
+}
+
+/// With [`one_flight`], since the last frame line: submissions that waited
+/// for the flights before them; of those, the ones whose flights the card
+/// had already run; with `VICTORY_ONE_FLIGHT=2`, submissions sent with a
+/// flight still in the air. Then, of [`prewarm`] (either switch): prewarms,
+/// their microseconds, refreshes made in them, refreshes left for after the
+/// wait.
+static ONE_FLIGHT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// Stage 2 of [`late`] (`VICTORY_LATE_WAIT=2`): point 3 of its list is no
 /// longer a point. Where the title wrote a page that lies in a range a
@@ -2596,6 +2693,82 @@ mod relay_tests {
         assert_eq!(super::refresh_blocked(&written, &by_copy, &immed, b, 0x9000, 0xa000), None);
     }
 
+    /// The read/write check a submission sent with a flight in the air
+    /// passes (`VICTORY_ONE_FLIGHT=2`, and the relay): a title buffer copy
+    /// waits when it reads or writes what the flight may write, a fill when
+    /// it reads it, a bottom-of-pipe write's range counts as written, and
+    /// what lies beside the ranges (touching an end only) goes.
+    #[test]
+    fn a_submission_reading_what_a_flight_writes_waits() {
+        let written = [(0x2000usize, 0x3000usize)];
+        let immed = [(0x8000usize, 0x8004usize)];
+        let check = |steps: &[Step]| blocked_by_steps(&written, &[], &immed, steps).map(|(why, _)| why);
+        // Copies: from the flight's range, into it, and beside it.
+        assert_eq!(check(&[Step::Copy(0x5000, 0x2ff0, 0x20)]), Some(WHY_READ));
+        assert_eq!(check(&[Step::Copy(0x2800, 0x5000, 0x10)]), Some(WHY_READ));
+        assert_eq!(check(&[Step::Copy(0x3000, 0x1000, 0x1000)]), None);
+        // Fills read title memory: only the source counts.
+        assert_eq!(check(&[Step::Fill(0x2000, 0x1000, 0x1000)]), None);
+        assert_eq!(check(&[Step::Fill(0x0, 0x2fff, 1)]), Some(WHY_READ));
+        // A bottom-of-pipe write's range, read by a fill or a copy.
+        assert_eq!(check(&[Step::Fill(0x0, 0x8002, 4)]), Some(WHY_READ));
+        assert_eq!(check(&[Step::Copy(0x8000, 0x6000, 4)]), Some(WHY_READ));
+        assert_eq!(check(&[Step::Fill(0x0, 0x8004, 4)]), None);
+        // Nothing in the air: nothing waits, a step of ours neither.
+        assert_eq!(blocked_by_steps(&[], &[], &[], &[Step::Copy(0x2000, 0x2000, 8), Step::Run(Box::new(|| {}))]), None);
+        // With something in the air a step of ours always waits.
+        assert_eq!(check(&[Step::Run(Box::new(|| {}))]), Some(WHY_RUN));
+        // Work on host memory alone reads nothing of the title's.
+        assert_eq!(check(&[Step::Host(Box::new(|| {}))]), None);
+    }
+
+    /// A refresh made before the wait ([`super::prewarm`]) touches nothing
+    /// in the air: not another copy's range, not its own, not a read-back's
+    /// or a bottom-of-pipe write's, and its copy holds no pending shader
+    /// writes; where the relay's own check lets a copy refresh over its own
+    /// shaders' range, this one does not.
+    #[test]
+    fn a_prewarmed_refresh_touches_nothing_in_the_air() {
+        let a = 0xaaaa_0000usize;
+        let written = [(0x1000usize, 0x2000usize), (0x4000, 0x4100)];
+        let by_copy = [(0usize, 0x4000usize, 0x4100usize), (a, 0x1000, 0x2000)];
+        let immed = [(0x8000usize, 0x8004usize)];
+        let safe = |from, to, held| super::prewarm_safe(&written, &immed, from, to, held);
+        // Beside everything, touching ends only: made ahead.
+        assert!(safe(0x2000, 0x4000, false));
+        assert!(safe(0x0, 0x1000, false));
+        assert!(safe(0x8004, 0x9000, false));
+        // Over its own shaders' range: the relay lets it refresh, not ahead.
+        assert_eq!(super::refresh_blocked(&written, &by_copy, &immed, a, 0x1800, 0x1900), None);
+        assert!(!safe(0x1800, 0x1900, false));
+        // A read-back's range, a bottom-of-pipe write's.
+        assert!(!safe(0x40f0, 0x4200, false));
+        assert!(!safe(0x7000, 0x8001, false));
+        // A copy with shader writes pending, in the card's memory or not
+        // watched, anywhere.
+        assert!(!safe(0x2000, 0x4000, true));
+        // Empty.
+        assert!(!safe(0x3000, 0x3000, false));
+    }
+
+    /// `VICTORY_ONE_FLIGHT`: at 1 every flight in the air, or being landed,
+    /// is waited for; at 2 one may stay, two may not (one being landed
+    /// counts); off, nothing.
+    #[test]
+    fn one_flight_waits_for_what_its_mode_allows() {
+        use super::one_flight_waits as waits;
+        assert!(!waits(1, 0, false));
+        assert!(waits(1, 1, false));
+        assert!(waits(1, 0, true));
+        assert!(!waits(2, 0, false));
+        assert!(!waits(2, 1, false));
+        assert!(!waits(2, 0, true));
+        assert!(waits(2, 1, true));
+        assert!(waits(2, 2, false));
+        assert!(waits(2, 5, true));
+        assert!(!waits(0, 9, true));
+    }
+
     #[test]
     fn blocked_by_steps_checks_host_read_and_prioritizes_run() {
         let written = [(0x2000usize, 0x3000usize)];
@@ -2756,6 +2929,13 @@ const WHY_RUN: usize = 7;
 const WHY_MOST: usize = 8;
 const WHY_WRITES: usize = 9;
 const WHY_FENCE: usize = 10;
+/// [`one_flight`]: the next submission sent ahead.
+const WHY_NEXT: usize = 22;
+
+/// The place in [`LATE_WAITED`] of a settle for `why`.
+fn waited_at(why: usize) -> usize {
+    if why == WHY_NEXT { 11 } else { why.min(10) }
+}
 
 /// Since the last frame-rate line: submissions sent without a wait;
 /// settles; settles by reason ([`WHY_SYNC`]..); flights settled;
@@ -2765,11 +2945,12 @@ const WHY_FENCE: usize = 10;
 /// copy, a fill of upload memory, a texture, another host copy).
 /// Then, of the last (another host copy): over the writes of another copy's
 /// shaders, over a range a read-back writes, over a bottom-of-pipe write.
-static LATE_STATS: [std::sync::atomic::AtomicU64; 22] = [const { std::sync::atomic::AtomicU64::new(0) }; 22];
+/// Then the settles for [`WHY_NEXT`].
+static LATE_STATS: [std::sync::atomic::AtomicU64; 23] = [const { std::sync::atomic::AtomicU64::new(0) }; 23];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
-/// card, by why they settled (the `WHY_` places).
-static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+/// card, by why they settled (the `WHY_` places, [`waited_at`]).
+static LATE_WAITED: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 /// Whether title memory `[from, to)` lies in what flights in the air may
 /// write (with [`late`]).
@@ -3234,6 +3415,58 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
+/// For [`prewarm`]: whether a refresh of `[from, to)` may be made before
+/// the wait for the flights in the air, because nothing they do can change
+/// what it finds: it touches no range their shaders or read-backs may write
+/// (`written`, of any copy, its own too) nor a bottom-of-pipe write
+/// (`immed`), and its copy (`held`) has no shader writes pending, is not in
+/// the card's memory and is write-watched (a copy that is not is taken
+/// whole again after the wait). Stricter than [`refresh_blocked`], which
+/// lets a copy refresh over its own shaders' ranges.
+fn prewarm_safe(written: &[(usize, usize)], immed: &[(usize, usize)], from: usize, to: usize, held: bool) -> bool {
+    !held && from < to && !touches(written, from, to) && !touches(immed, from, to)
+}
+
+/// Before a wait for the flights in the air ([`one_flight_prewarm`],
+/// [`settle_prewarm`]): the refreshes of `runs` that [`prewarm_safe`]
+/// allows are made now, while the card still runs, and again after the
+/// wait as always (the write watch says what the title changed meanwhile).
+/// Only those ahead of the first step that writes title memory (a buffer
+/// copy of the title's, work of ours): a refresh behind one must see it.
+/// Called with the submission lock held, so no flight joins the line
+/// meanwhile; the relay's thread only takes flights out of it.
+fn prewarm(runs: &[&HostList]) {
+    let warming = std::time::Instant::now();
+    let (written, immed) = {
+        let line = line();
+        (line.written.clone(), line.immed_writes())
+    };
+    let mut batch = Batch::default();
+    let (mut made, mut left) = (0u64, 0u64);
+    'lists: for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Copy(..) | Step::Run(_) => break 'lists,
+                Step::Refresh(shadow, address, len) => {
+                    let held = shadow.writes_pending() || shadow.carded() || shadow.unwatched();
+                    if prewarm_safe(&written, &immed, *address, address.saturating_add(*len), held) {
+                        batch.add(shadow, *address, *len);
+                        made += 1;
+                    } else {
+                        left += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    batch.flush();
+    ONE_FLIGHT[3].fetch_add(1, Ordering::Relaxed);
+    ONE_FLIGHT[4].fetch_add(warming.elapsed().as_micros() as u64, Ordering::Relaxed);
+    ONE_FLIGHT[5].fetch_add(made, Ordering::Relaxed);
+    ONE_FLIGHT[6].fetch_add(left, Ordering::Relaxed);
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Returns `Ok(())`
 /// if queued, or `Err(fence)` if the caller should set the fence now.
@@ -3434,7 +3667,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
-    LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+    LATE_WAITED[waited_at(why)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
@@ -3582,8 +3815,9 @@ fn late_line(frames: f64) {
          title memory changed under shader writes {:.1}, title memory read {:.1} (by a buffer copy {:.1}, a fill of upload memory {:.1}, \
          a texture {:.1}, another copy {:.1} (over another copy's shader writes {:.1}, a read-back {:.1}, a bottom-of-pipe \
          write {:.1})), a step of ours {:.1}, {} lists in the air {:.1}, \
-         bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}; \
-         {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence signals set behind flights",
+         bottom-of-pipe writes (VICTORY_LATE_WAIT_WRITES=0) {:.1}, a blocking fence wait {:.1}, the next submission \
+         (VICTORY_ONE_FLIGHT) {:.1}; {:.1} waits for memory values met by a flight's bottom-of-pipe write, {:.1} fence \
+         signals set behind flights",
         s[0],
         s[1],
         if s[1] > 0.0 { s[11] / s[1] } else { 0.0 },
@@ -3605,6 +3839,7 @@ fn late_line(frames: f64) {
         s[WHY_MOST],
         s[WHY_WRITES],
         s[WHY_FENCE],
+        s[WHY_NEXT],
         s[13],
         s[14],
     );
@@ -3613,7 +3848,8 @@ fn late_line(frames: f64) {
         tracing::info!(
             "of the waiting for the card in settles, per frame, by what settled: a synchronous submission or present {:.1} ms, \
              the card had run them {:.1}, a wait for a memory value {:.1}, title memory changed under shader writes {:.1}, \
-             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}",
+             title memory read {:.1}, a step of ours {:.1}, lists in the air {:.1}, bottom-of-pipe writes {:.1}, a blocking fence wait {:.1}, \
+             the next submission (VICTORY_ONE_FLIGHT) {:.1}",
             w[WHY_SYNC],
             w[WHY_CARD_DONE],
             w[WHY_VALUE],
@@ -3623,6 +3859,25 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+            w[waited_at(WHY_NEXT)],
+        );
+    }
+    if one_flight() > 0 || settle_prewarm() {
+        let o: Vec<f64> = ONE_FLIGHT.iter().map(|o| o.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "one flight at a time per frame (VICTORY_ONE_FLIGHT={}): {:.1} submissions waited for the flights before them, \
+             {:.1} of those found the card done with them, {:.1} sent with one in the air (at 2); prewarms before waits \
+             (VICTORY_ONE_FLIGHT_PREWARM, VICTORY_SETTLE_PREWARM={}): {:.1}, {:.1} ms, {:.1} refreshes made ahead, {:.1} left \
+             for after the wait",
+            one_flight(),
+            o[0],
+            o[1],
+            o[2],
+            u8::from(settle_prewarm()),
+            o[3],
+            o[4] / 1000.0,
+            o[5],
+            o[6],
         );
     }
     if alias_copy() {
@@ -5290,7 +5545,7 @@ impl Host {
                 }
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                LATE_WAITED[waited_at(why)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
@@ -5497,9 +5752,37 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write or would overwrite an in-flight texture staging
         // buffer.
+        // At most one [`prewarm`] a submission, before its first wait.
+        let mut warmed = false;
+        let mut warm = |asked: bool| {
+            if asked && !warmed {
+                warmed = true;
+                prewarm(runs);
+            }
+        };
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else {
+            let mode = one_flight();
+            let waits = |line: &Line| one_flight_waits(mode, flights_in(line), line.settling);
+            if mode > 0 && waits(&line()) {
+                // One flight at a time ([`one_flight`]): waited for before
+                // anything of this one is prepared, after the refreshes
+                // nothing in the air can change are made.
+                warm(one_flight_prewarm());
+                ONE_FLIGHT[0].fetch_add(1, Ordering::Relaxed);
+                // SAFETY: a plain fence query.
+                if unsafe { self.fence.GetCompletedValue() } >= line().target {
+                    ONE_FLIGHT[1].fetch_add(1, Ordering::Relaxed);
+                }
+                if relay() {
+                    relay_wait(WHY_NEXT, |line| !waits(line));
+                } else {
+                    self.settle(&mut submitted, WHY_NEXT);
+                }
+            }
+        }
+        if late && let Some(why) = late_blocked(runs) {
             let plan = if relay_exact() && why == WHY_READ && alias_copy() { alias_plan(runs) } else { None };
             // The title's bytes go into the writers' copies first; where
             // that cannot be done, the wait after all.
@@ -5520,6 +5803,7 @@ impl Host {
                 }
                 alias = plan;
             } else if relay_exact() && why == WHY_READ {
+                warm(settle_prewarm() || (one_flight() > 0 && one_flight_prewarm()));
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
@@ -5527,10 +5811,12 @@ impl Host {
                     blocked_by(&line.written, &line.by_copy, &immed, runs, false).is_none()
                 });
             } else {
+                warm(settle_prewarm() || (one_flight() > 0 && one_flight_prewarm()));
                 self.settle(&mut submitted, why);
             }
         }
         if late && staging_wait_whole() && staging_in_flight(runs) {
+            warm(settle_prewarm());
             if relay_exact() {
                 relay_wait(WHY_READ, |_| !staging_in_flight(runs));
             } else {
@@ -5554,6 +5840,10 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        if behind && one_flight() == 2 {
+            // Prepared while the card runs the one in the air.
+            ONE_FLIGHT[2].fetch_add(1, Ordering::Relaxed);
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
