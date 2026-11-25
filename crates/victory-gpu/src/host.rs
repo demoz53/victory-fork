@@ -8499,6 +8499,155 @@ impl Host {
         }
     }
 
+    /// Shows `planes` (two or more, each [`crate::compose::composable`] and
+    /// in its `state`, where it stays) as frame `frame`, composed
+    /// ([`crate::compose`]): the window as large as the largest plane, in
+    /// the first plane's format. `None` if nothing was shown; else, in
+    /// diagnostics builds, whether the frame was black. One plane goes
+    /// through [`Host::present`], which this leaves as it was.
+    ///
+    /// Ported (GPL-3.0) from Geckomacabre/vx-layer's `present_planes`.
+    pub(crate) fn present_planes(
+        &self,
+        planes: &[crate::compose::ShownPlane<'_>],
+        frame: u64,
+    ) -> Option<bool> {
+        let first = planes.first()?;
+        // SAFETY: a live resource.
+        let first_format = unsafe { first.texture.GetDesc() }.Format;
+        let Some(format) = swap_format(first_format) else {
+            tracing::warn!(format = first_format.0, "cannot present this format");
+            return None;
+        };
+        let (mut width, mut height) = (0, 0);
+        for p in planes {
+            // SAFETY: a live resource.
+            let d = unsafe { p.texture.GetDesc() };
+            (width, height) = (width.max(d.Width as u32), height.max(d.Height));
+        }
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        if presenter.is_none() {
+            *presenter = match self.presenter(width, height, format) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no swap chain");
+                    return None;
+                }
+            };
+        }
+        let p = presenter.as_mut()?;
+        if (p.width, p.height, p.format) != (width, height, format) {
+            // Presents sent ahead hold back buffers until they have run.
+            settle_now(WHY_SYNC);
+            // SAFETY: no back buffer is held; every submission was waited for.
+            let resized = unsafe {
+                p.swap_chain
+                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            };
+            match resized {
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (width, height, format);
+                    tracing::info!(
+                        width,
+                        height,
+                        format = format.0,
+                        frame,
+                        planes = planes.len(),
+                        "the swap chain's buffers were made again for another size or format (composed planes)"
+                    );
+                    self.log_video_memory("right after the swap chain's buffers were made again");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    return None;
+                }
+            }
+        }
+        let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        // SAFETY: our swap chain and list, and live planes.
+        unsafe {
+            let index = p.swap_chain.GetCurrentBackBufferIndex();
+            let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
+                return None;
+            };
+            // Sent ahead as [`Host::present`] does.
+            #[cfg(feature = "diagnostics")]
+            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            #[cfg(not(feature = "diagnostics"))]
+            let read_now = false;
+            let slot = if late_free_present() && !read_now {
+                let finished = FINISHED.load(Ordering::Acquire);
+                p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                    let list = self.new_list().ok()?;
+                    list.close();
+                    p.ahead.push((list, 0));
+                    Some(p.ahead.len() - 1)
+                })
+            } else {
+                None
+            };
+            let copy = match slot {
+                Some(i) => &p.ahead[i].0,
+                None => &p.copy,
+            };
+            copy.reset();
+            let list = &copy.list;
+            let mut enter = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)];
+            let mut leave = Vec::new();
+            for plane in planes {
+                let state = D3D12_RESOURCE_STATES(plane.state as i32);
+                if state != read {
+                    enter.push(transition(plane.texture, state, read));
+                    leave.push(transition(plane.texture, read, state));
+                }
+            }
+            list.ResourceBarrier(&enter);
+            if !crate::compose::record(self, list, &back, format, (width, height), planes) {
+                // No pass: black rather than the buffer's last frame.
+                let view = self.rtv(Some(&back), None);
+                list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], None);
+            }
+            // Diagnostics read the composed frame back, through the copy
+            // source state.
+            #[cfg(feature = "diagnostics")]
+            let (capture, probe) = {
+                let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                list.ResourceBarrier(&[transition(&back, target, source)]);
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, &back))
+                    .flatten();
+                let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, &back) };
+                leave.push(transition(&back, source, D3D12_RESOURCE_STATE_PRESENT));
+                (capture, probe)
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            leave.push(transition(&back, target, D3D12_RESOURCE_STATE_PRESENT));
+            list.ResourceBarrier(&leave);
+            copy.close();
+            match slot {
+                Some(i) => {
+                    let flown = self.execute_own(copy);
+                    p.ahead[i].1 = flown;
+                }
+                None => self.execute(&[copy]),
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some((buffer, footprint)) = capture {
+                crate::capture::finish_frame(frame, buffer, footprint);
+            }
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            p.meter.frame(p.hwnd);
+            #[cfg(feature = "diagnostics")]
+            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            #[cfg(not(feature = "diagnostics"))]
+            Some(false)
+        }
+    }
+
     fn presenter(
         &self,
         width: u32,

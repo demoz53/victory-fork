@@ -613,12 +613,234 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane's description (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`),
+/// [`PLANE_STRIDE`] bytes, in the field order of the public GDK binding:
+/// frame token, the plane's resources, their source rectangles, the
+/// destination placement, colour space, scale filter, extended
+/// descriptions and flags. The title presents an array of them; one plane
+/// reads only the first three fields, as before. The 72-byte stride is
+/// ZSlayerHQ's runtime #10 (Cleverdee, found against the second plane's
+/// token); the layout as vx-layer and Kamiloj9 (1b4e37cc) have it.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    /// `D3D12_RECT`s (`[left, top, right, bottom]`), one per resource, or
+    /// null.
+    src_rects: *const [i32; 4],
+    /// Where the plane goes in the output (`[left, top, right, bottom]`,
+    /// fractions of it), or null.
+    dest: *const [f32; 4],
+    color_space: u32,
+    scale_filter: u32,
+    extended_count: u32,
+    /// The extended descriptions themselves: not read.
+    _extended: *const u8,
+    flags: u32,
+}
+
+/// Bytes from one plane's description to the next.
+const PLANE_STRIDE: usize = 72;
+const _: () = assert!(std::mem::size_of::<Plane>() == PLANE_STRIDE);
+const _: () = assert!(std::mem::offset_of!(Plane, count) == 8);
+const _: () = assert!(std::mem::offset_of!(Plane, resources) == 16);
+const _: () = assert!(std::mem::offset_of!(Plane, src_rects) == 24);
+const _: () = assert!(std::mem::offset_of!(Plane, dest) == 32);
+const _: () = assert!(std::mem::offset_of!(Plane, color_space) == 40);
+const _: () = assert!(std::mem::offset_of!(Plane, scale_filter) == 44);
+const _: () = assert!(std::mem::offset_of!(Plane, _extended) == 56);
+const _: () = assert!(std::mem::offset_of!(Plane, flags) == 64);
+
+/// Planes composed at most (the first four).
+#[cfg(windows)]
+const MAX_PLANES: usize = 4;
+
+/// A present's plane as the title describes it: its first resource and
+/// what the composition reads or logs of it.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Described {
+    resource: This,
+    /// Whether its token is the first plane's (a check of the stride).
+    same_token: bool,
+    src: Option<[i32; 4]>,
+    dest: Option<[f32; 4]>,
+    color_space: u32,
+    scale_filter: u32,
+    extended: u32,
+    flags: u32,
+}
+
+/// The first [`MAX_PLANES`] planes of a present that name a resource, each
+/// resource once (a repeat is not drawn over itself).
+///
+/// # Safety
+/// `parameters` is null or points at `planes` plane descriptions, each
+/// listing `count` resources at `resources` and, when `src_rects` or
+/// `dest` is set, as many rectangles there.
+#[cfg(windows)]
+unsafe fn described(planes: u32, parameters: *const Plane) -> Vec<Described> {
+    let mut found: Vec<Described> = Vec::new();
+    if parameters.is_null() || planes == 0 {
+        return found;
+    }
+    // SAFETY: the caller's: at least one description.
+    let token = unsafe { (*parameters).token };
+    for i in 0..(planes as usize).min(MAX_PLANES) {
+        // SAFETY: the caller's: description `i` of `planes`.
+        let plane = unsafe { &*parameters.add(i) };
+        if plane.count == 0 || plane.resources.is_null() {
+            continue;
+        }
+        // SAFETY: the caller's: the plane lists `count` resources.
+        let resource = unsafe { plane.resources.read_unaligned() };
+        if resource.is_null() || found.iter().any(|d| d.resource == resource) {
+            continue;
+        }
+        // SAFETY: the caller's: a rectangle per resource when set.
+        let src = (!plane.src_rects.is_null()).then(|| unsafe { plane.src_rects.read_unaligned() });
+        // SAFETY: as above, for the placement.
+        let dest = (!plane.dest.is_null()).then(|| unsafe { plane.dest.read_unaligned() });
+        found.push(Described {
+            resource,
+            same_token: plane.token == token,
+            src,
+            dest,
+            color_space: plane.color_space,
+            scale_filter: plane.scale_filter,
+            extended: plane.extended_count,
+            flags: plane.flags,
+        });
+    }
+    found
+}
+
+/// `VICTORY_COMPOSE_PLANES` (`var`): `None` when presents show their first
+/// plane alone (`0`, as before); else the blending forced on every plane
+/// after the first (`premul`, `straight`; unset or anything else: by each
+/// plane's flags). On by default: a present of one plane takes the plain
+/// copy whatever this says, so only presents of several planes (Series S)
+/// change.
+#[cfg(windows)]
+fn compose_switch(var: Option<&str>) -> Option<Option<crate::compose::Alpha>> {
+    use crate::compose::Alpha;
+    match var {
+        Some("0") => None,
+        Some("premul") => Some(Some(Alpha::Premultiplied)),
+        Some("straight") => Some(Some(Alpha::Straight)),
+        _ => Some(None),
+    }
+}
+
+/// [`compose_switch`] as this run has it.
+#[cfg(windows)]
+fn compose_planes() -> Option<Option<crate::compose::Alpha>> {
+    static SWITCH: std::sync::OnceLock<Option<Option<crate::compose::Alpha>>> =
+        std::sync::OnceLock::new();
+    *SWITCH.get_or_init(|| {
+        let switch = compose_switch(std::env::var("VICTORY_COMPOSE_PLANES").ok().as_deref());
+        tracing::info!(?switch, "present planes: composed unless None (VICTORY_COMPOSE_PLANES=0)");
+        switch
+    })
+}
+
+/// Shows a present of several planes composed ([`crate::compose`]); false
+/// if it is not one (fewer than two planes with a host texture, or a plane
+/// the composition cannot read), for the plain copy of the first plane.
+///
+/// # Safety
+/// As [`described`].
+#[cfg(windows)]
+unsafe fn present_composed(
+    host: &crate::host::Host,
+    planes: u32,
+    parameters: *const Plane,
+    alpha: Option<crate::compose::Alpha>,
+    frame: u64,
+) -> bool {
+    use crate::compose::{Alpha, ShownPlane, composable};
+    // SAFETY: the caller's.
+    let found = unsafe { described(planes, parameters) };
+    if found.len() < 2 {
+        return false;
+    }
+    let textures: Vec<_> = found
+        .iter()
+        .filter_map(|d| Some((d, crate::resource::host_resource(d.resource)?)))
+        .collect();
+    log_planes(planes, &textures);
+    if textures.len() < 2 {
+        return false;
+    }
+    if !textures.iter().all(|(_, t)| composable(t)) {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            tracing::warn!("present planes the composition cannot read: the first is shown alone");
+        }
+        return false;
+    }
+    // Each plane goes to the pixel-shader-readable state for the
+    // composition and back ([`crate::host::Host::present_planes`]).
+    const READABLE: u32 = 0x80;
+    let shown: Vec<ShownPlane<'_>> = textures
+        .iter()
+        .map(|(d, texture)| ShownPlane {
+            texture,
+            state: crate::resource::host_transition(d.resource, READABLE)
+                .map_or(READABLE, |(_, before)| before),
+            src: d.src,
+            dest: d.dest,
+            alpha: Alpha::of(d.flags, alpha),
+        })
+        .collect();
+    let shown_now = host.present_planes(&shown, frame);
+    for ((d, _), plane) in textures.iter().zip(&shown) {
+        crate::resource::host_transition(d.resource, plane.state);
+    }
+    #[cfg(feature = "diagnostics")]
+    blinks(frame, textures[0].0.resource, shown[0].state, shown_now);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shown_now;
+    true
+}
+
+/// Logs a present's planes whenever what they are changes: how many the
+/// title gave, then for each one shown its size, format, source rectangle,
+/// placement, flags, colour space, scale filter, whether it has extended
+/// descriptions, and whether its token is the first plane's.
+#[cfg(windows)]
+fn log_planes(
+    planes: u32,
+    textures: &[(
+        &Described,
+        &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    )],
+) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let mut text = format!("{planes} planes, stride {PLANE_STRIDE}:");
+    for (d, texture) in textures {
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        text += &format!(
+            " [{}x{} format {} src {:?} dest {:?} flags {:#x} colour space {} filter {} extended {} same token {}]",
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            d.src,
+            d.dest,
+            d.flags,
+            d.color_space,
+            d.scale_filter,
+            d.extended,
+            d.same_token
+        );
+    }
+    let mut last = lock(&LAST);
+    if *last != text {
+        tracing::info!(planes = %text, "present planes changed");
+        *last = text;
+    }
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -780,10 +1002,13 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the planes in our window. One plane (or
+/// `VICTORY_COMPOSE_PLANES=0`): its first resource, copied as it is.
+/// Several (Series S: the game image under the interface): composed, each
+/// plane's source rectangle stretched over its placement
+/// ([`present_composed`]).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: one plane is copied with no scaling or placement.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -845,6 +1070,15 @@ extern "system" fn present(
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }
+    }
+    #[cfg(windows)]
+    if planes > 1
+        && let Some(alpha) = compose_planes()
+        && let Some(host) = crate::host::host()
+        // SAFETY: the title passes `planes` plane descriptions.
+        && unsafe { present_composed(host, planes, plane_parameters, alpha, frame) }
+    {
+        return S_OK;
     }
     #[cfg(windows)]
     if planes > 0
@@ -1036,6 +1270,55 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Two planes at the console's 72-byte stride: both read, with their
+    /// rectangles, placements and flags; a repeated resource and an empty
+    /// plane are left out.
+    #[cfg(windows)]
+    #[test]
+    fn present_planes_are_read_at_the_console_stride() {
+        let (game, ui): (This, This) = (std::ptr::without_provenance_mut(0x10), std::ptr::without_provenance_mut(0x20));
+        let half = [0, 0, 960, 540];
+        let whole = [0.0f32, 0.0, 1.0, 1.0];
+        let plane = |resources: *const This, count, src: *const [i32; 4], dest: *const [f32; 4], flags| Plane {
+            token: 7,
+            count,
+            resources,
+            src_rects: src,
+            dest,
+            color_space: 0,
+            scale_filter: 0,
+            extended_count: 0,
+            _extended: std::ptr::null(),
+            flags,
+        };
+        let planes = [
+            plane(&game, 1, &half, &whole, 0),
+            plane(&ui, 1, std::ptr::null(), std::ptr::null(), 0x2),
+            plane(&game, 1, std::ptr::null(), std::ptr::null(), 0),
+            plane(std::ptr::null(), 0, std::ptr::null(), std::ptr::null(), 0),
+        ];
+        // SAFETY: four descriptions whose pointers name live locals.
+        let found = unsafe { described(4, planes.as_ptr()) };
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].resource, found[0].src, found[0].dest), (game, Some(half), Some(whole)));
+        assert_eq!((found[1].resource, found[1].src, found[1].dest), (ui, None, None));
+        assert!(found.iter().all(|d| d.same_token));
+        assert_eq!(found[1].flags, 0x2);
+        // SAFETY: a null array is allowed.
+        assert!(unsafe { described(2, std::ptr::null()) }.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn planes_are_composed_unless_switched_off() {
+        use crate::compose::Alpha;
+        assert_eq!(compose_switch(None), Some(None));
+        assert_eq!(compose_switch(Some("1")), Some(None));
+        assert_eq!(compose_switch(Some("0")), None);
+        assert_eq!(compose_switch(Some("premul")), Some(Some(Alpha::Premultiplied)));
+        assert_eq!(compose_switch(Some("straight")), Some(Some(Alpha::Straight)));
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's
