@@ -1609,6 +1609,10 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        // The slots' views first; then the host copies they read, found (and
+        // made where there is none yet) on several threads
+        // (`shadow::buffer_makers`).
+        let mut views: Vec<(u32, crate::descriptor::View)> = Vec::with_capacity(slots.len());
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1632,9 +1636,36 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            views.push((index, view));
+        }
+        // The copy each slot shows (`buffer_copy`), not the one the view's
+        // range alone would find.
+        let copies: Vec<Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>> =
+            if crate::shadow::buffer_makers() && views.len() >= 256 {
+                let found = std::sync::Arc::new(std::sync::Mutex::new(vec![None; views.len()]));
+                let chunk = views.len().div_ceil(8);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = views
+                    .chunks(chunk)
+                    .enumerate()
+                    .map(|(c, part)| {
+                        let part: Vec<crate::descriptor::View> = part.iter().map(|(_, v)| v.clone()).collect();
+                        let found = found.clone();
+                        Box::new(move || {
+                            let copies: Vec<_> = part.iter().map(crate::descriptor::host::buffer_copy).collect();
+                            let mut found = found.lock().unwrap_or_else(|e| e.into_inner());
+                            for (i, copy) in copies.into_iter().enumerate() {
+                                found[c * chunk + i] = copy;
+                            }
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+                std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                views.iter().map(|(_, view)| crate::descriptor::host::buffer_copy(view)).collect()
+            };
+        for ((index, _view), copy) in views.into_iter().zip(copies) {
+            let Some((shadow, address, len)) = copy else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]

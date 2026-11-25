@@ -3849,15 +3849,55 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        if !buffer_makers() {
+            entry.shadow = Some(make_copy(key.0, len, size)?);
+            return entry.shadow.clone();
+        }
+        // Made with the table let go ([`buffer_makers`]); another thread
+        // may have made one meanwhile, and its copy is the one kept.
+        drop(map);
+        let made = make_copy(key.0, len, size);
+        let mut map = buffers();
+        let Some(entry) = map.get_mut(&key) else {
+            return made;
+        };
+        if entry.shadow.is_none() {
+            entry.shadow = made;
+        }
+        return entry.shadow.clone();
+    }
+    entry.shadow.clone()
+}
+
+/// Whether a buffer's host copy is made with the table of title buffers let
+/// go, and the pass over the heap's buffer views finds its views' copies on
+/// several threads (`VICTORY_BUFFER_MAKERS=0`: one at a time, each made
+/// under the table's lock, as before).
+///
+/// In the first minute after the world loads (all9-base) the pass's buffer
+/// view slots took 120-260 ms a pass, 30-60 us a slot against 2 us later:
+/// each new title buffer's host copy (a committed buffer, mapped) was made
+/// where the pass first found a view of it, on the recording thread, and
+/// under the lock every other thread's look for a copy takes too.
+pub(crate) fn buffer_makers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_MAKERS").is_none_or(|v| v != "0"))
+}
+
+/// A title buffer's host copy, of `len` bytes at `start` (its buffer
+/// `size` bytes): in the PC's memory, or in the card's with that as its
+/// CPU side ([`card_for`]).
+fn make_copy(start: u64, len: u64, size: u64) -> Option<Arc<Shadow>> {
+    {
         let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", start));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match card_for(size) {
             Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", start));
                 tracing::info!(
-                    start = format_args!("{:#x}", key.0),
+                    start = format_args!("{:#x}", start),
                     len,
                     "a buffer's host copy is in the card's memory"
                 );
@@ -3877,26 +3917,25 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
             tracing::info!(
-                start = format_args!("{:#x}", key.0),
+                start = format_args!("{:#x}", start),
                 len,
                 "large buffer copied to the host"
             );
         } else {
             tracing::debug!(
-                start = format_args!("{:#x}", key.0),
+                start = format_args!("{:#x}", start),
                 len,
                 "buffer copied to the host"
             );
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
-        entry.shadow = Some(shadow);
+        Some(shadow)
     }
-    entry.shadow.clone()
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -4181,6 +4220,36 @@ mod skip_tests {
             // next allocation's at this address.
             crate::watch::forget_pages(start, start + LEN);
         }
+    }
+}
+
+#[cfg(test)]
+mod maker_tests {
+    use std::sync::Arc;
+
+    /// Threads that look for the host copy of one new title buffer at once
+    /// all get the same copy, made with the table let go
+    /// (`buffer_makers`).
+    #[test]
+    fn copies_made_at_once_by_several_threads_are_one() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let memory = vec![7u8; 3 << 16];
+        let start = memory.as_ptr() as u64;
+        let resource = 0x5eed_0001usize;
+        super::register(resource, start, memory.len() as u64);
+        let found: Vec<Arc<super::Shadow>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(move || super::find(start + 100, 64).expect("a copy")))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(found.iter().all(|s| Arc::ptr_eq(s, &found[0])), "one copy for all");
+        assert!(Arc::ptr_eq(&super::find(start, 16).unwrap(), &found[0]), "and the table holds it");
+        drop(found);
+        super::unregister(resource, start);
+        drop(memory);
     }
 }
 
