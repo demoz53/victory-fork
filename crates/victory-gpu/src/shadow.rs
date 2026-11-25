@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -87,6 +87,9 @@ pub(crate) struct Shadow {
     /// ([`Shadow::note_declared`]); the last few frames only.
     #[cfg(feature = "diagnostics")]
     declared: Mutex<Vec<(u64, usize, usize)>>,
+    /// Whether shaders were ever given a range of the copy to write
+    /// ([`Shadow::gpu_writes`]).
+    shaders_wrote: AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2572,7 +2575,15 @@ impl Shadow {
             place: None,
             #[cfg(feature = "diagnostics")]
             declared: Mutex::default(),
+            shaders_wrote: AtomicBool::new(false),
         }
+    }
+
+    /// Whether shaders were ever given a range of the copy to write: a
+    /// constant buffer view of it may read what a flight in the air writes
+    /// by the time its list is submitted (`crate::host::fill_on_card`).
+    pub(crate) fn shaders_wrote(&self) -> bool {
+        self.shaders_wrote.load(Ordering::Relaxed)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2600,6 +2611,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.shaders_wrote.store(true, Ordering::Relaxed);
         // A lean window has no CPU side to compare with ([`lean_windows`]):
         // the write is counted, not declared.
         if self.lean() {

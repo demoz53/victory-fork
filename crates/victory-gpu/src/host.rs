@@ -2753,8 +2753,36 @@ pub(crate) fn flights_write(from: usize, to: usize) -> bool {
 /// instead of in upload memory at submission, which waits for them to land
 /// (`VICTORY_FILL_ON_CARD=0` fills it as before).
 pub(crate) fn fill_on_card() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_ON_CARD").is_none_or(|v| v != "0"))
+    fill_on_card_mode() > 0
+}
+
+/// `VICTORY_FILL_ON_CARD`: 0 (fills as before), 1 (the default: a constant
+/// buffer view over what flights write when it is recorded is copied on the
+/// card, [`fill_on_card`]), 2 (and one over a host copy shaders have ever
+/// been given to write, [`fill_written_on_card`]).
+fn fill_on_card_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_ON_CARD").as_deref() {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    })
+}
+
+/// Whether a constant buffer view over a host copy that shaders have ever
+/// been given to write is copied on the card too, though no flight in the
+/// air writes it when the view is recorded (`VICTORY_FILL_ON_CARD=2`).
+///
+/// all9-base still settled the flights for "a fill of upload memory" once a
+/// frame (~20 ms of the submitting thread waiting for the card), while the
+/// fills over what flights wrote, counted where they were recorded, were 0
+/// a frame: the list was recorded before the submissions whose shaders
+/// write those bytes were sent, and by its own submission they were in the
+/// air. A copy shaders write in one frame is written in the next too.
+/// Each such view costs a copy on the card and a wait for its earlier
+/// shader writes in the list ([`HostList::card_constants`]).
+pub(crate) fn fill_written_on_card() -> bool {
+    fill_on_card_mode() > 1
 }
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
@@ -7730,13 +7758,15 @@ impl Meter {
             let f = crate::draw::FILL_FLIGHTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
             if f.iter().any(|&n| n > 0.0) {
                 tracing::info!(
-                    "fills of upload memory over what flights write, per frame (each settles the flights at its                      submission unless copied on the card, VICTORY_FILL_ON_CARD): {:.1} of root constant views ({:.1} copied                      on the card), {:.1} of table constant views ({:.1} copied on the card, {:.1} with no host copy to copy                      from), {:.1} of texture copies' sources",
+                    "fills of upload memory over what flights write, per frame (each settles the flights at its                      submission unless copied on the card, VICTORY_FILL_ON_CARD): {:.1} of root constant views ({:.1} copied                      on the card), {:.1} of table constant views ({:.1} copied on the card, {:.1} with no host copy to copy                      from), {:.1} of texture copies' sources; {:.1} constant views taken for a copy on the card as shaders wrote their host \
+                     copy before (VICTORY_FILL_ON_CARD=2)",
                     f[0],
                     f[1],
                     f[2],
                     f[3],
                     f[4],
                     f[5],
+                    f[6],
                 );
             }
         }
@@ -7833,6 +7863,21 @@ impl Meter {
                     parts[9] / 1e3,
                     parts[10] / 1e3,
                     parts[11],
+                );
+            }
+        }
+        {
+            let u = crate::texture::UPLOAD_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            if u[3] > 0.0 {
+                tracing::info!(
+                    "texture uploads recorded per frame: {:.0} with {:.0} subresource copies; {:.1} ms making or taking their \
+                     staging buffers, {:.1} ms recording their copies; {:.1} ms looking for and recording copies through a \
+                     texture of another format (all threads)",
+                    u[3],
+                    u[2],
+                    u[0] / 1e3,
+                    u[1] / 1e3,
+                    u[4] / 1e3,
                 );
             }
         }
