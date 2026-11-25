@@ -6426,7 +6426,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.copy_written(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -6695,13 +6695,52 @@ impl Batch {
         // the copies' asking of the write watch.
         self.refresh_textures();
         self.index.clear();
+        let refreshes = std::mem::take(&mut self.refreshes);
+        Self::run(refreshes);
+    }
+
+    /// Before the title's buffer copy into `[at, at + len)`, done on the
+    /// CPU at submission: the pending refreshes over those bytes are done
+    /// first, so the copy does not reach them, and the others stay pending
+    /// for the next flush; the due textures are refreshed and are checked
+    /// again after it, as with [`Batch::title_written`]
+    /// (`VICTORY_COPY_FLUSH_ALL=1`: every pending refresh first, as
+    /// before).
+    ///
+    /// Every such copy flushed all the refreshes recorded before it, and
+    /// each flush asked the kernel again: 7,500-13,600 title copies a frame
+    /// (some 500 bytes each) and 2,000-2,600 write-watch askings, 22-33 ms
+    /// a frame of preparing (a2-noguard, gpu-cold). A refresh whose bytes
+    /// the copy does not touch finds the same bytes before or after it.
+    fn copy_written(&mut self, at: usize, len: usize) {
+        if copy_flush_all() {
+            return self.title_written();
+        }
+        self.refresh_textures();
+        let end = at.saturating_add(len);
+        let (now, later): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.refreshes).into_iter().partition(|r| r.1 < end && r.2 > at);
+        self.refreshes = later;
+        if !now.is_empty() {
+            self.index.clear();
+            for (k, r) in self.refreshes.iter().enumerate() {
+                self.index.insert(std::sync::Arc::as_ptr(&r.0) as usize, k);
+            }
+            Self::run(now);
+        }
+        self.textures.clear();
+    }
+
+    /// Brings `refreshes` up to date: one write-watch asking for those
+    /// that lie close together, then each copy, on several threads if
+    /// there are enough.
+    fn run(mut refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
+            let ranges: Vec<(usize, usize)> = refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
                 .map(|r| (r.1, r.2))
@@ -6709,14 +6748,13 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = refreshes
                 .drain(..)
                 .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
                 .collect();
@@ -6724,7 +6762,7 @@ impl Batch {
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
+            for (shadow, from, to) in refreshes.drain(..) {
                 Self::update(&shadow, from, to);
             }
         }
@@ -6732,6 +6770,14 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Whether a title buffer copy done at submission flushes every pending
+/// refresh (`VICTORY_COPY_FLUSH_ALL=1`), not only those over its
+/// destination ([`Batch::copy_written`]).
+fn copy_flush_all() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_FLUSH_ALL").is_some_and(|v| v == "1"))
 }
 
 /// Copies title memory at submission. The ranges were checked against their
