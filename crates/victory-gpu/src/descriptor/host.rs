@@ -1418,13 +1418,18 @@ impl HostHeap {
         // texture is held by no slot, may have been let go, and would be
         // made anew here, with the card full. `made` first, then `kept`,
         // as `mirror` takes them.
+        // (With a heap map, a title slot is made in its host slot: its own
+        // below the window, its pool slot past it.)
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
+        let Some(host) = made.host(index) else {
+            return false;
+        };
+        made.keys.get(host as usize).is_some_and(|&made| made != 0 && made == key)
             && self
                 .kept
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
+                .get(host as usize)
                 .is_some_and(Option::is_some)
     }
 
