@@ -1456,6 +1456,18 @@ pub fn local_any_masks() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_ANY_MASKS").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_NAN_GUARD` ([`Lower::nan_guard`]): unset or `0`, off (as before); `1`, pixel
+/// programs' float colour exports; `stores`, typed stores as well. Opt-in. Part of the
+/// translation: the shader cache keys on it (`victory-gpu`'s does).
+pub fn nan_guard_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_NAN_GUARD").as_deref() {
+        Ok("1") => 1,
+        Ok("stores") => 2,
+        _ => 0,
+    })
+}
+
 /// Whether pixel shaders read their quads' other lanes with quad reads, helper
 /// lanes included, and a helper lane's `v_readfirstlane_b32` gives its own value
 /// (`Lower::helpers_read`, `Lower::helper_reads_own`; `VICTORY_PIXEL_HELPERS=0`:
@@ -3858,6 +3870,41 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, m, k32);
         self.s.flags |= flags::INT64;
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+    }
+
+    /// [`nan_guard_mode`]: a float a pixel program exports to a colour target (`strict`) and,
+    /// with `stores`, a value a typed store writes (not `strict`), with NaN made 0 and an
+    /// infinity ±65504, so one bad pixel does not stay in a history the title blends into each
+    /// frame. Not `strict`: only the NaN the GPU makes (0x7FC00000, either sign) and
+    /// infinities, since typed stores go out as `.f32` whatever the view's format (integer
+    /// words 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000 change too). From
+    /// fxceless/victory-fork PR #837 (PastiiJay).
+    // shortcut: raw buffer stores are left as they are (no type to go by).
+    pub(super) fn nan_guard(&mut self, f: V, strict: bool) -> V {
+        let mode = nan_guard_mode();
+        if mode == 0 || (!strict && mode < 2) {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let nan = if strict {
+            self.s.m.cmp(c, pred::IUGT, abs, inf_bits)
+        } else {
+            let quiet = self.s.m.i32(0x7FC0_0000);
+            self.s.m.cmp(c, pred::EQ, abs, quiet)
+        };
+        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        let sign_bit = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
+        let big = self.s.m.i32(65504f32.to_bits());
+        let big = self.s.m.bin(c, Bin::Or, sign, big);
+        let zero = self.s.m.i32(0);
+        let r = self.s.m.select(c, inf, big, bits);
+        let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
     }
 
     /// `0 × anything = 0`, as in D3D9.
@@ -10773,6 +10820,12 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            // A pixel program's float colour target ([`nan_guard_mode`]).
+            let x = if !mesh && self.s.pixel && kind == 16 && comp == 9 {
+                self.nan_guard(x, true)
+            } else {
+                x
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),

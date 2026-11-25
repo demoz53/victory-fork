@@ -95,6 +95,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_PIXEL_HELPERS",
                     "VICTORY_LDS_FIT",
                     "VICTORY_HALF_BITS",
+                    "VICTORY_NAN_GUARD",
                     "VICTORY_CUBE_GRAD_LOD",
                     "VICTORY_LOCAL_ANY_MASKS",
                 ] {
