@@ -2569,6 +2569,141 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, &by_copy, &immed, runs, true)
 }
 
+/// A range of a host copy (`reader`) whose refresh would wait for shader
+/// writes of another copy (`writer`) in the air, carried over on the card
+/// instead ([`alias_copy`]): title memory `[from, to)`.
+struct AliasCopy {
+    writer: std::sync::Arc<crate::shadow::Shadow>,
+    reader: std::sync::Arc<crate::shadow::Shadow>,
+    from: usize,
+    to: usize,
+}
+
+/// Since the last frame-rate line ([`alias_copy`]): submissions that went
+/// on without a wait, the ranges carried over, their bytes, and the plans
+/// given up (a merge of the title's bytes that could not be made).
+static ALIAS_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether a refresh that waits only for another host copy's shader writes
+/// in the air has the card carry those bytes over instead
+/// (`VICTORY_ALIAS_COPY=1`; off by default).
+///
+/// The "another copy" settles: 2.6-2.9 of the 4.6-4.9 a frame in a2-noguard,
+/// 57-61 ms a frame of the submitting thread waiting for the card and the
+/// card idle behind it after each. Nearly all are one case: a root view
+/// in title memory that no buffer holds refreshes its window (4 MiB) from
+/// its address to the window's end, over a small title buffer (2-8 KB)
+/// whose copy compute shaders write in a flight still in the air. The
+/// refresh would put title memory, which has not got those writes yet,
+/// over them; without the wait, skinned meshes read that way came out
+/// wrong (fxceless #89, #191).
+///
+/// With the switch, when every wait of a submission is of that kind (the
+/// writers' copies and the window not in the card's memory nor in place,
+/// the window declaring no shader writes there): the writer's copy takes
+/// the title's own bytes written there since its flight was prepared
+/// (`Shadow::merge_under_writes`, as a refresh under shader writes does),
+/// the window's refresh leaves the range alone, and a list ahead of the
+/// submission's copies the range from the writer's copy into the window's
+/// on the card, behind the flight in the queue. After the flight lands its
+/// bytes are in title memory, and the window's next refresh finds the
+/// pages written.
+fn alias_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_some_and(|v| v == "1"))
+}
+
+/// The plan for [`alias_copy`] if every step of `runs` that waits for
+/// flights is a refresh over another copy's shader writes that the card
+/// can carry over; `None` if any cannot be.
+fn alias_plan(runs: &[&HostList]) -> Option<Vec<AliasCopy>> {
+    use std::sync::Arc;
+    const MOST_BYTES: usize = 16 << 20;
+    let line = line();
+    let immed = line.immed_writes();
+    let writer_of = |owner: usize| {
+        line.line.iter().find_map(|item| match item {
+            Late::Run(flight) => flight
+                .back
+                .iter()
+                .find(|(s, _)| Arc::as_ptr(s) as usize == owner)
+                .map(|(s, _)| s.clone()),
+            _ => None,
+        })
+    };
+    let mut plan: Vec<AliasCopy> = Vec::new();
+    for list in runs {
+        let deferred = list.deferred();
+        for step in &deferred.copies {
+            let Step::Refresh(reader, address, len) = step else {
+                if blocked_by_steps(&line.written, &line.by_copy, &immed, std::iter::once(step)).is_some() {
+                    return None;
+                }
+                continue;
+            };
+            let (from, to) = (*address, *address + *len);
+            let copy = Arc::as_ptr(reader) as usize;
+            match refresh_blocked(&line.written, &line.by_copy, &immed, copy, from, to) {
+                None => continue,
+                Some(19) => {}
+                Some(_) => return None,
+            }
+            if reader.carded() || reader.in_place() {
+                return None;
+            }
+            for &(owner, a, e) in line.by_copy.iter().filter(|&&(o, a, e)| o != copy && a < to && e > from) {
+                let writer = if owner == 0 { None } else { writer_of(owner) }?;
+                if writer.carded() || writer.in_place() {
+                    return None;
+                }
+                let (lo, hi) = (a.max(from), e.min(to));
+                if reader.pending_over(lo, hi) {
+                    return None;
+                }
+                plan.push(AliasCopy { writer, reader: reader.clone(), from: lo, to: hi });
+            }
+        }
+        // The reader's own shader writes over a carried range: its
+        // compare would take the carried bytes for its shaders'.
+        for step in &deferred.copies {
+            if let Step::GpuWrite(shadow, address, len) = step
+                && plan.iter().any(|p| Arc::ptr_eq(&p.reader, shadow) && p.from < address + len && p.to > *address)
+            {
+                return None;
+            }
+        }
+    }
+    // One writer for each byte, no copy both read and written, and not
+    // too much to copy.
+    for (i, p) in plan.iter().enumerate() {
+        for q in &plan[i + 1..] {
+            let same_bytes = Arc::ptr_eq(&p.reader, &q.reader) && p.from < q.to && q.from < p.to;
+            if same_bytes && !Arc::ptr_eq(&p.writer, &q.writer) {
+                return None;
+            }
+            if Arc::ptr_eq(&p.reader, &q.writer) || Arc::ptr_eq(&p.writer, &q.reader) || Arc::ptr_eq(&p.writer, &p.reader) {
+                return None;
+            }
+        }
+    }
+    if plan.iter().map(|p| p.to - p.from).sum::<usize>() > MOST_BYTES {
+        return None;
+    }
+    plan.sort_by_key(|p| (Arc::as_ptr(&p.reader) as usize, p.from));
+    plan.dedup_by(|a, b| Arc::ptr_eq(&a.reader, &b.reader) && Arc::ptr_eq(&a.writer, &b.writer) && a.from == b.from && a.to == b.to);
+    Some(plan)
+}
+
+/// Lists of ours that carried ranges over for [`alias_copy`], and the
+/// value of the host's fence after which each may be recorded again.
+struct AliasList(Prelude, u64);
+
+// SAFETY: D3D12 objects (free-threaded), recorded only under the
+// submission lock.
+unsafe impl Send for AliasList {}
+
+static ALIAS_LISTS: Mutex<Vec<AliasList>> = Mutex::new(Vec::new());
+
 /// For [`blocked_by_steps`]: whether a refresh of `[from, to)` of host copy
 /// `copy` waits for flights, and for what ([`LATE_STATS`]' places 19-21,
 /// all counted under 18 too): the writes of another copy's shaders, a
@@ -3158,6 +3293,17 @@ fn late_line(frames: f64) {
             w[WHY_MOST],
             w[WHY_WRITES],
             w[WHY_FENCE],
+        );
+    }
+    if alias_copy() {
+        let a: Vec<f64> = ALIAS_STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refreshes over another copy's shader writes carried on the card per frame (VICTORY_ALIAS_COPY=1): {:.1} \
+             submissions went on without a wait, {:.1} ranges {:.2} MB carried over, {:.1} plans given up",
+            a[0],
+            a[1],
+            a[2] / (1 << 20) as f64,
+            a[3],
         );
     }
     if relay() {
@@ -4676,6 +4822,68 @@ impl Host {
         (unsafe { self.fence.GetCompletedValue() }) >= target
     }
 
+    /// A list of ours that copies the ranges of `alias` from the writers'
+    /// copies into the readers' ([`alias_copy`]), closed; one whose last
+    /// run is done is recorded again.
+    fn alias_list(&self, alias: &[AliasCopy]) -> Option<AliasList> {
+        // SAFETY: a plain query of our fence.
+        let done = unsafe { self.fence.GetCompletedValue() };
+        let kept = {
+            let mut lists = ALIAS_LISTS.lock().unwrap_or_else(|e| e.into_inner());
+            lists.iter().position(|l| l.1 <= done).map(|at| lists.swap_remove(at))
+        };
+        let (allocator, list) = match kept {
+            Some(AliasList(prelude, _)) => prelude,
+            None => self.make_prelude()?,
+        };
+        let mut sources: Vec<&ID3D12Resource> = Vec::new();
+        let mut targets: Vec<&ID3D12Resource> = Vec::new();
+        for p in alias {
+            if !sources.iter().any(|b| b.as_raw() == p.writer.buffer.as_raw()) {
+                sources.push(&p.writer.buffer);
+            }
+            if !targets.iter().any(|b| b.as_raw() == p.reader.buffer.as_raw()) {
+                targets.push(&p.reader.buffer);
+            }
+        }
+        let states = |to: bool| -> Vec<D3D12_RESOURCE_BARRIER> {
+            let (read, write) = if to {
+                ((D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE), (D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST))
+            } else {
+                ((D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON), (D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON))
+            };
+            sources
+                .iter()
+                .map(|b| transition(b, read.0, read.1))
+                .chain(targets.iter().map(|b| transition(b, write.0, write.1)))
+                .collect()
+        };
+        // SAFETY: the list's last run finished (its fence value is reached,
+        // or it is new); live buffers, and the ranges lie in them.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(&allocator, None)?;
+                list.ResourceBarrier(&states(true));
+                for p in alias {
+                    list.CopyBufferRegion(
+                        &p.reader.buffer,
+                        p.reader.offset(p.from as u64),
+                        &p.writer.buffer,
+                        p.writer.offset(p.from as u64),
+                        (p.to - p.from) as u64,
+                    );
+                }
+                list.ResourceBarrier(&states(false));
+                list.Close()
+            })()
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("the list that carries ranges between host copies could not be recorded ({e})"));
+        }
+        Some(AliasList((allocator, list), 0))
+    }
+
     /// A CPU detile must wait for the last GPU read of its staging buffer.
     /// Called with the submission lock held, so no newer upload can race it.
     pub(crate) fn wait_for_staging(&self, target: u64) {
@@ -4720,6 +4928,8 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // Ranges the card carries over between copies ([`alias_copy`]).
+        let mut alias: Vec<AliasCopy> = Vec::new();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write or would overwrite an in-flight texture staging
@@ -4727,7 +4937,26 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
+            let plan = if relay_exact() && why == WHY_READ && alias_copy() { alias_plan(runs) } else { None };
+            // The title's bytes go into the writers' copies first; where
+            // that cannot be done, the wait after all.
+            let plan = plan.filter(|plan| {
+                let mut runs_left = 512;
+                let merged = !plan.iter().any(|p| p.writer.merge_under_writes(p.from, p.to - p.from, &mut runs_left));
+                if !merged {
+                    ALIAS_STATS[3].fetch_add(1, Ordering::Relaxed);
+                }
+                merged
+            });
+            if let Some(plan) = plan {
+                ALIAS_STATS[0].fetch_add(1, Ordering::Relaxed);
+                ALIAS_STATS[1].fetch_add(plan.len() as u64, Ordering::Relaxed);
+                ALIAS_STATS[2].fetch_add(plan.iter().map(|p| (p.to - p.from) as u64).sum(), Ordering::Relaxed);
+                for p in &plan {
+                    p.reader.skip_refresh(p.from, p.to);
+                }
+                alias = plan;
+            } else if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
@@ -4824,6 +5053,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        for p in &alias {
+            p.reader.skip_done();
+        }
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -4847,6 +5079,16 @@ impl Host {
         let card = self.card_before(runs, flown);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+        }
+        // The carried ranges ahead of everything else of the submission,
+        // behind the flights that wrote them ([`alias_copy`]).
+        // The readers' refreshes left the ranges alone: the list is due.
+        let alias_list = (!alias.is_empty()).then(|| {
+            self.alias_list(&alias)
+                .unwrap_or_else(|| fail(format_args!("no list to carry ranges between host copies")))
+        });
+        if let Some(AliasList((_, list), _)) = &alias_list {
+            lists.insert(0, list.cast().ok());
         }
         let prepared = std::time::Instant::now();
         // Waits for staging buffers a flight still copies from, inside this
@@ -4873,6 +5115,9 @@ impl Host {
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
+            }
+            if let Some(AliasList(list, _)) = alias_list {
+                ALIAS_LISTS.lock().unwrap_or_else(|e| e.into_inner()).push(AliasList(list, *submitted));
             }
             for list in runs {
                 for step in &list.deferred().copies {

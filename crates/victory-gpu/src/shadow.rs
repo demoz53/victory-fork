@@ -40,6 +40,11 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Ranges this submission's refreshes leave alone: another copy's
+    /// shaders in the air write them, and the card carries those bytes
+    /// over into this copy (`crate::host`'s alias copies). Set and cleared
+    /// by the submitting thread around a submission's preparing.
+    skip: Mutex<Vec<(usize, usize)>>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -1883,6 +1888,27 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// Whether the copy is title memory in place (nothing is copied).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
+    /// Whether shaders of a submission not copied back yet may write any
+    /// of `[from, to)`.
+    pub(crate) fn pending_over(&self, from: usize, to: usize) -> bool {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+    }
+
+    /// This submission's refreshes leave `[from, to)` alone (see `skip`).
+    pub(crate) fn skip_refresh(&self, from: usize, to: usize) {
+        self.skip.lock().unwrap_or_else(|e| e.into_inner()).push((from, to));
+    }
+
+    /// The submission's refreshes are done: the next ones copy all again.
+    pub(crate) fn skip_done(&self) {
+        self.skip.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     /// The offset of a title address in the copy, if it lies in it.
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
@@ -1946,6 +1972,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            skip: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -2574,6 +2601,14 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        busy.extend(
+            self.skip
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from),
+        );
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -3256,6 +3291,52 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::{PAGE, Shadow};
+
+    /// A range a submission's refreshes leave alone (`skip_refresh`, for
+    /// bytes the card carries over from another copy) keeps what the copy
+    /// held, beside bytes the same refresh brings up to date; once the
+    /// skip is done the next refresh takes the title's bytes there too.
+    #[test]
+    fn a_skipped_range_is_left_alone_until_the_skip_is_done() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 2 * PAGE;
+        // SAFETY: a private write-watched region of the test's own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }
+            as *mut u8;
+        assert!(!title.is_null());
+        let start = title as usize;
+        let (buffer, data) = host.shared_buffer(LEN as u64).unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, start as u64, LEN as u64);
+        let at = |i: usize| (start + i) as *mut u8;
+        // SAFETY: the region and the copy's mapping hold LEN bytes.
+        unsafe {
+            std::ptr::write_bytes(title, 1, LEN);
+            copy.update(start, LEN);
+            assert_eq!(*data.add(100), 1);
+            // The title writes beside and inside the range to skip.
+            at(100).write(2);
+            at(PAGE + 10).write(3);
+            copy.skip_refresh(start + PAGE, start + PAGE + 64);
+            copy.update(start, LEN);
+            assert_eq!(*data.add(100), 2, "beside the skipped range: the title's byte");
+            assert_eq!(*data.add(PAGE + 10), 1, "in it: what the copy held");
+            copy.skip_done();
+            copy.update(start, LEN);
+            assert_eq!(*data.add(PAGE + 10), 3, "after the skip: the title's byte");
+            assert_ne!(VirtualFree(title.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 #[cfg(test)]
