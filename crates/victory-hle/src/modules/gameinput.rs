@@ -1015,6 +1015,20 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
         Value::Pad(state) if !out.is_null() => {
+            // Whether the title ever reads a trigger held (the aim with the
+            // left trigger did nothing, 2026-11-25): the first such reading
+            // of each trigger is logged.
+            static HELD: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+            for (i, (name, value)) in [("left", state.left_trigger), ("right", state.right_trigger)].into_iter().enumerate() {
+                if value > 0.5 && HELD[i].swap(1, Ordering::Relaxed) == 0 {
+                    tracing::info!(
+                        trigger = name,
+                        value,
+                        device = ?reading(this).device,
+                        "the title read a gamepad state with this trigger held"
+                    );
+                }
+            }
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
             true
@@ -1022,8 +1036,18 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
         _ => false,
     }
 }
-/// Kinds our devices do not have: no count, no state.
-extern "system" fn nothing(_: *const c_void) -> usize {
+/// Kinds our devices do not have: no count, no state. The first call of
+/// each slot is logged with the reading's kind, to see which a title asks
+/// for (the aim with the left trigger, 2026-11-25, did nothing).
+extern "system" fn nothing_at<const SLOT: usize>(this: *const Reading) -> usize {
+    static SEEN: [AtomicU32; 25] = [const { AtomicU32::new(0) }; 25];
+    if SEEN[SLOT / 8].swap(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        tracing::info!(
+            slot = format_args!("{SLOT:#x}"),
+            kind = format_args!("{:#x}", reading(this).kind()),
+            "the title asked a reading for something our devices do not have"
+        );
+    }
     0
 }
 
@@ -1035,24 +1059,24 @@ static READING: Table<25> = Table([
     sequence_number as *const (),   // 0x20
     reading_timestamp as *const (), // 0x28
     reading_device as *const (),    // 0x30
-    nothing as *const (),           // 0x38 raw report
-    nothing as *const (),           // 0x40 controller axes, buttons, switches
-    nothing as *const (),           // 0x48
-    nothing as *const (),           // 0x50
-    nothing as *const (),           // 0x58
-    nothing as *const (),           // 0x60
-    nothing as *const (),           // 0x68
+    nothing_at::<0x38> as *const (), // 0x38 raw report
+    nothing_at::<0x40> as *const (), // 0x40 controller axes, buttons, switches
+    nothing_at::<0x48> as *const (), // 0x48
+    nothing_at::<0x50> as *const (), // 0x50
+    nothing_at::<0x58> as *const (), // 0x58
+    nothing_at::<0x60> as *const (), // 0x60
+    nothing_at::<0x68> as *const (), // 0x68
     key_count as *const (),         // 0x70
     key_state as *const (),         // 0x78
-    nothing as *const (),           // 0x80 mouse
-    nothing as *const (),           // 0x88 touch
-    nothing as *const (),           // 0x90
-    nothing as *const (),           // 0x98 motion
-    nothing as *const (),           // 0xa0 arcade stick
-    nothing as *const (),           // 0xa8 flight stick
+    nothing_at::<0x80> as *const (), // 0x80 mouse
+    nothing_at::<0x88> as *const (), // 0x88 touch
+    nothing_at::<0x90> as *const (), // 0x90
+    nothing_at::<0x98> as *const (), // 0x98 motion
+    nothing_at::<0xa0> as *const (), // 0xa0 arcade stick
+    nothing_at::<0xa8> as *const (), // 0xa8 flight stick
     gamepad_state as *const (),     // 0xb0
-    nothing as *const (),           // 0xb8 racing wheel
-    nothing as *const (),           // 0xc0 UI navigation
+    nothing_at::<0xb8> as *const (), // 0xb8 racing wheel
+    nothing_at::<0xc0> as *const (), // 0xc0 UI navigation
 ]);
 
 pub(crate) fn module() -> HleModule {
