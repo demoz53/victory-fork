@@ -151,6 +151,10 @@ pub(crate) enum C {
     GuardProtects,
     GuardProtectUs,
     GuardLockUs,
+    /// Questions to Windows whether blocks noted unmapped still are
+    /// (`watch::uncommitted_end`), and their microseconds.
+    GuardAbsentQueries,
+    GuardAbsentUs,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1121,13 +1125,15 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "guards per frame: {:.1} ms in all; {:.0} questions whether a range is view memory {:.1} ms, {:.0} calls making \
-         blocks read-only {:.1} ms, {:.1} ms waiting for the guards' lock",
+         blocks read-only {:.1} ms, {:.1} ms waiting for the guards' lock, {:.0} questions whether blocks noted          unmapped still are {:.1} ms (VICTORY_GUARD_BITS)",
         ms(c[C::GuardUs as usize]),
         c[C::GuardQueries as usize],
         ms(c[C::GuardQueryUs as usize]),
         c[C::GuardProtects as usize],
         ms(c[C::GuardProtectUs as usize]),
         ms(c[C::GuardLockUs as usize]),
+        c[C::GuardAbsentQueries as usize],
+        ms(c[C::GuardAbsentUs as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
