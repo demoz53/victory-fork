@@ -9509,6 +9509,11 @@ impl<'a> Lower<'a> {
                     self.lane(inst, Some(op == "tru"));
                     return Ok(());
                 }
+                // WARP can remove its device on `fcmp false` or `fcmp true`.
+                if matches!(op, "f" | "tru") {
+                    self.lane(inst, Some(op == "tru"));
+                    return Ok(());
+                }
                 let (a, b) = if ty == "f16" {
                     (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
                 } else {
