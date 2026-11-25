@@ -618,7 +618,29 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
+    asked("current", kind, hub.index(device), found.is_some());
     hand(out, found)
+}
+
+/// Logs the first request of each kind of reading, per call and device,
+/// and whether we had one: a kind our devices never have (a controller's
+/// axes, UI navigation) is answered "not found" before any reading slot is
+/// asked, so the slot diagnostics cannot see it (the aim with the left
+/// trigger did nothing, 2026-11-25).
+fn asked(call: &'static str, kind: u32, device: Option<usize>, found: bool) {
+    static SEEN: Mutex<Vec<(&'static str, u32, Option<usize>, bool)>> = Mutex::new(Vec::new());
+    let key = (call, kind, device, found);
+    let mut seen = lock(&SEEN);
+    if !seen.contains(&key) {
+        seen.push(key);
+        tracing::info!(
+            call,
+            kind = format_args!("{kind:#x}"),
+            ?device,
+            found,
+            "the title asked for a reading of this kind"
+        );
+    }
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
@@ -666,6 +688,7 @@ fn relative(
             .filter(|r| r.sequence < reference.sequence)
             .find(wanted)
     };
+    asked(if forward { "next" } else { "previous" }, kind, Some(index), found.is_some());
     hand(out, found)
 }
 extern "system" fn next_reading(

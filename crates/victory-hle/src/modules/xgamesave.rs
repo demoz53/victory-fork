@@ -475,6 +475,10 @@ impl Update {
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
+        // Which container a title writes, and when: whether a play session
+        // reached a point the title saves (the robbery, 2026-11-25, wrote
+        // only the profile and settings; mid-mission checkpoints stay in memory).
+        tracing::info!(container = %self.name, version = number, bytes = written, "game save written");
         // The old version is garbage now; a crash here leaves it for later.
         if let Some(old) = &current {
             let _ = std::fs::remove_dir_all(&old.dir);
