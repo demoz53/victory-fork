@@ -557,6 +557,16 @@ impl Xma {
     }
 }
 
+
+/// `VICTORY_XMA_RING_WRAP` (default on; `0` = old way): the title's read and
+/// write blocks are taken modulo the output ring (fxceless PR #959: 1ff9486a5
+/// and 9f974a2d5, by AnoHunted). A read block at or past the ring's end was
+/// never met, so a looping stream kept its voice (and lock) filling forever;
+/// a write block past it wrote past the ring.
+fn ring_wrap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_XMA_RING_WRAP").map_or(true, |v| v.trim() != "0"))
+}
 fn pump(context: Context, voice: &mut Voice) {
     let size = context.field(0, 22, 5);
     if size == 0 {
@@ -583,7 +593,8 @@ fn pump(context: Context, voice: &mut Voice) {
         }
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
-        let write = context.field(0, 27, 5) % size;
+        let write = context.field(0, 27, 5);
+        let write = if ring_wrap() { write % size } else { write };
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
         let Some(mut out) = heap_bytes(address as u32, BLOCK_BYTES) else {
             return;
@@ -600,7 +611,8 @@ fn pump(context: Context, voice: &mut Voice) {
         // write block and `advance_read`'s. Compared as it is, one at or
         // past the end would never be met, and a stream that loops would
         // keep this voice (and its lock) filling forever.
-        if write == context.field(9, 0, 5) % size {
+        let read = context.field(9, 0, 5);
+        if write == if ring_wrap() { read % size } else { read } {
             // Full: nothing more until the title advances its read block.
             context.set_field(1, 31, 1, 0);
         }

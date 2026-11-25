@@ -573,6 +573,16 @@ pub struct Decoder {
     parsed_all_subframes: bool,
 }
 
+/// `VICTORY_XMA_FRAME_END` (default on; `0` = old way): a frame's decode
+/// ends at its data, not at the caller's bit count (upstream Marvisak/VIctory
+/// PR #183, fxceless PR #959 fcbb3cbc6, by AnoHunted). Past the data the
+/// reader gives zeros, and a stereo tile header of zeros takes no subframe,
+/// so a count beyond the data looped forever.
+fn frame_end_at_data() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_XMA_FRAME_END").map_or(true, |v| v.trim() != "0"))
+}
+
 /// What the decoder needs from the stream format: the channel count and
 /// the sample rate, which sets the scale factor band layout.
 impl Decoder {
@@ -656,7 +666,11 @@ impl Decoder {
             // Past the data there are only zeros to read. A count beyond it
             // would never let a stereo tile header overread, and its loop
             // takes no subframe on zero bits, so it would spin for good.
-            end: bits.min(data.len().saturating_mul(8)),
+            end: if frame_end_at_data() {
+                bits.min(data.len().saturating_mul(8))
+            } else {
+                bits
+            },
         };
         let len = b.read(LENGTH_BITS) as usize;
         let result = self.frame(&mut b, len);
