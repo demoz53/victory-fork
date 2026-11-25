@@ -23,6 +23,9 @@ use windows_sys::Win32::System::Memory::{
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
+
+/// `winnt.h` `MEM_COALESCE_PLACEHOLDERS` (not exported by `windows-sys`).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
@@ -153,6 +156,22 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if placeholder && !at.is_null() {
+        let alloc_base = at as usize;
+        let alloc_len = size.next_multiple_of(PAGE);
+        let mut p = physical();
+        // Drop any stale placeholder entries if the OS reused freed VA space.
+        let stale: Vec<usize> = p
+            .placeholders
+            .range(..alloc_base + alloc_len)
+            .filter(|&(&start, &len)| start + len > alloc_base)
+            .map(|(&start, _)| start)
+            .collect();
+        for start in stale {
+            p.placeholders.remove(&start);
+        }
+        p.placeholders.insert(alloc_base, alloc_len);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -370,6 +389,8 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Unmapped placeholder intervals by start address: their exact kernel length.
+    placeholders: BTreeMap<usize, usize>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -753,46 +774,153 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    // Snapshot the source slices before unmapping `to` so overlapping aliases
+    // keep their source pages and a missing source page leaves `to` intact.
+    let sources: Vec<Slice> = if from == 0 {
+        Vec::new()
+    } else {
+        let mut out = Vec::with_capacity(len / PAGE);
+        for k in (0..len).step_by(PAGE) {
+            let at = from + k;
+            let Some(slice) = physical
+                .views
+                .range(..=at)
+                .next_back()
+                .filter(|(base, (size, _))| at < *base + size)
+                .map(|(base, (_, s))| Slice {
+                    index: s.index + (at - base) / PAGE,
+                    section: s.section.clone(),
+                })
+            else {
+                return false;
+            };
+            out.push(slice);
+        }
+        out
+    };
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let (start, end) = reach(&physical, to, len);
     let _changing = victory_gpu::title_memory_remapping(start, end - start);
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
-            return false;
-        };
-        if !map(&mut physical, to + k, PAGE, slice) {
+    for (i, slice) in sources.into_iter().enumerate() {
+        if !map(&mut physical, to + i * PAGE, PAGE, slice) {
             return false;
         }
     }
     true
 }
 
-/// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
-fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
+/// Ensures `[base, base + len)` is a single exact placeholder: splits any
+/// larger tracked placeholder straddling `base` or `base + len`, then
+/// coalesces fragmented placeholders inside `[base, base + len)`.
+fn prepare_placeholder(physical: &mut Physical, base: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    let first = physical
+        .placeholders
+        .range(..=base)
+        .next_back()
+        .filter(|&(&start, &size)| start + size > base)
+        .map(|(&start, &size)| (start, size));
+    let mut covered: Vec<(usize, usize)> = first
+        .into_iter()
+        .chain(
+            physical
+                .placeholders
+                .range(base + 1..end)
+                .map(|(&start, &size)| (start, size)),
+        )
+        .collect();
+    let contiguous = !covered.is_empty()
+        && covered[0].0 <= base
+        && covered.last().is_some_and(|&(s, n)| s + n >= end)
+        && covered.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0);
+    if !contiguous {
+        // Fallback for placeholders created outside `XMemVirtualAlloc`.
+        // SAFETY: splits a single enclosing placeholder if needed.
+        unsafe {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+        }
+        return;
+    }
+    if covered.len() == 1 {
+        let (p0, s0) = covered[0];
+        if p0 < base || p0 + s0 > end {
+            // SAFETY: splits the single enclosing placeholder at `base` and/or `end`.
+            unsafe {
+                VirtualFree(
+                    base as *mut c_void,
+                    len,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                );
+            }
+            physical.placeholders.remove(&p0);
+            if p0 < base {
+                physical.placeholders.insert(p0, base - p0);
+            }
+            physical.placeholders.insert(base, len);
+            if p0 + s0 > end {
+                physical.placeholders.insert(end, p0 + s0 - end);
+            }
+        }
+        return;
+    }
+    let (p0, s0) = covered[0];
+    if p0 < base {
+        // SAFETY: splits `[p0, p0 + s0)` into `[p0, base)` and `[base, p0 + s0)`.
+        unsafe {
+            VirtualFree(
+                p0 as *mut c_void,
+                base - p0,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+        }
+        physical.placeholders.insert(p0, base - p0);
+        physical.placeholders.insert(base, p0 + s0 - base);
+        covered[0] = (base, p0 + s0 - base);
+    }
+    let last_idx = covered.len() - 1;
+    let (pk, sk) = covered[last_idx];
+    if pk + sk > end {
+        // SAFETY: splits `[pk, pk + sk)` into `[pk, end)` and `[end, pk + sk)`.
+        unsafe {
+            VirtualFree(
+                pk as *mut c_void,
+                end - pk,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+        }
+        physical.placeholders.insert(pk, end - pk);
+        physical.placeholders.insert(end, pk + sk - end);
+        covered[last_idx] = (pk, end - pk);
+    }
+    // SAFETY: all tracked placeholders covering `[base, end)` now match exact boundaries.
+    unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
         );
+    }
+    for (p, _) in covered {
+        physical.placeholders.remove(&p);
+    }
+    physical.placeholders.insert(base, len);
+}
+
+/// Maps `slice` and the slices after it over `[base, base + len)`, which
+/// must lie in placeholder memory (splitting/coalescing placeholders as needed).
+fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    prepare_placeholder(physical, base, len);
+    // SAFETY: `[base, base + len)` is now a single exact placeholder (if valid
+    // placeholder memory); `MapViewOfFile3` replaces it with the section view.
+    let mut view = unsafe {
         MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
@@ -805,6 +933,31 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             0,
         )
     };
+    if view.Value as usize != base {
+        // If an external split left exact placeholders covering `[base, base + len)`,
+        // try coalescing them once before giving up.
+        // SAFETY: acts only on placeholders matching `[base, base + len)`.
+        unsafe {
+            if VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+            ) != 0
+            {
+                view = MapViewOfFile3(
+                    slice.section.0,
+                    GetCurrentProcess(),
+                    base as *const c_void,
+                    (slice.index * PAGE) as u64,
+                    len,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+            }
+        }
+    }
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -823,6 +976,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.placeholders.remove(&base);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -935,6 +1089,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        physical.placeholders.insert(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1499,5 +1654,96 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn remapping_contiguous_run_over_fragmented_placeholders_succeeds() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+
+        // Map page 0 alone, splitting the 3-page placeholder into [a, a+PAGE) and [a+PAGE, a+3*PAGE).
+        assert_eq!(XMemMapPhysicalPages(a, 1, &pages[0]), a);
+        // Now remap 2 contiguous pages at `a`: unmapping page 0 leaves two separate
+        // placeholders [a, a+PAGE) and [a+PAGE, a+3*PAGE) that must be split at
+        // a+2*PAGE and coalesced across [a, a+2*PAGE) before MapViewOfFile3.
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+
+        // SAFETY: both pages are mapped read-write.
+        unsafe {
+            a.cast::<u8>().write(0x11);
+            a.wrapping_byte_add(PAGE).cast::<u8>().write(0x22);
+            assert_eq!(a.cast::<u8>().read(), 0x11);
+            assert_eq!(a.wrapping_byte_add(PAGE).cast::<u8>().read(), 0x22);
+        }
+
+        // The trailing placeholder at a + 2*PAGE must still be mappable.
+        let third = a.wrapping_byte_add(2 * PAGE);
+        assert_eq!(XMemMapPhysicalPages(third, 1, &pages[2]), third);
+        // SAFETY: third page is mapped read-write.
+        unsafe {
+            third.cast::<u8>().write(0x33);
+            assert_eq!(third.cast::<u8>().read(), 0x33);
+        }
+
+        // Remapping all 3 contiguous pages over the two views [a, a+2*PAGE) + [third, a+3*PAGE)
+        // must coalesce across both unmapped placeholders too.
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        // SAFETY: all 3 pages are mapped read-write.
+        unsafe {
+            assert_eq!(a.cast::<u8>().read(), 0x11);
+            assert_eq!(a.wrapping_byte_add(PAGE).cast::<u8>().read(), 0x22);
+            assert_eq!(third.cast::<u8>().read(), 0x33);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn map_alias_handles_overlapping_ranges_and_missing_sources() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: pages 0 and 1 are mapped read-write.
+        unsafe {
+            a.cast::<u8>().write(0xA1);
+            a.wrapping_byte_add(PAGE).cast::<u8>().write(0xB2);
+        }
+
+        // Overlapping shift [a, a+2*PAGE) -> [a+PAGE, a+3*PAGE): page 1 overlaps
+        // between source and destination, so snapshotting before unmap preserves it.
+        let second = a.wrapping_byte_add(PAGE);
+        let third = a.wrapping_byte_add(2 * PAGE);
+        assert!(map_alias(second as u64, a as u64, (2 * PAGE) as u64));
+        // SAFETY: all three pages are now mapped (page0, page0, page1).
+        unsafe {
+            assert_eq!(a.cast::<u8>().read(), 0xA1);
+            assert_eq!(second.cast::<u8>().read(), 0xA1);
+            assert_eq!(third.cast::<u8>().read(), 0xB2);
+        }
+
+        // Missing source page must fail without unmapping destination `a`.
+        assert!(!map_alias(a as u64, 0x10000, PAGE as u64));
+        // SAFETY: `a` was not unmapped on failed alias.
+        unsafe {
+            assert_eq!(a.cast::<u8>().read(), 0xA1);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }
