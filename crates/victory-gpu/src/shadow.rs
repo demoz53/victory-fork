@@ -82,6 +82,11 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Diagnostics (`VICTORY_CARD_VERIFY`): the ranges shaders were declared
+    /// to write, by the number of frames presented when they were declared
+    /// ([`Shadow::note_declared`]); the last few frames only.
+    #[cfg(feature = "diagnostics")]
+    declared: Mutex<Vec<(u64, usize, usize)>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -282,6 +287,259 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
+}
+
+/// The live copies in the card's memory (diagnostics: `VICTORY_CARD_VERIFY`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()).collect()
+}
+
+/// What `VICTORY_CARD_VERIFY` reads of a copy in the card's memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct CardVerifyView {
+    /// The card's side.
+    pub(crate) buffer: ID3D12Resource,
+    /// The CPU's side: the mapping, `len` bytes of it are the copy.
+    pub(crate) cpu: usize,
+    /// Where the title buffer (or window) starts in title memory.
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+    pub(crate) window: bool,
+    /// Shaders of a submission not yet copied back may be writing it.
+    pub(crate) in_flight: bool,
+    /// Offsets of the CPU's side not yet sent to the card's side, sorted.
+    pub(crate) dirty: Vec<(usize, usize)>,
+    /// Title addresses shaders were declared to write in the last frames
+    /// ([`DECLARED_STAMPS`]), joined, in order.
+    pub(crate) declared: Vec<(usize, usize)>,
+}
+
+/// Frames back from the present that declared ranges are kept for
+/// ([`Shadow::note_declared`]).
+#[cfg(feature = "diagnostics")]
+const DECLARED_STAMPS: u64 = 2;
+
+/// The result of comparing stretches of a copy's card side with its CPU
+/// side, by 64 KiB piece ([`verify_compare`]).
+#[cfg(feature = "diagnostics")]
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct VerifyReport {
+    /// Pieces looked at (a piece with every byte left out is not counted).
+    pub(crate) pieces: u64,
+    /// Pieces with at least one differing byte, and the bytes that differ.
+    pub(crate) bad_pieces: u64,
+    pub(crate) bad_bytes: u64,
+    /// Bytes left out of the comparison: the CPU's side holds them not yet
+    /// sent to the card.
+    pub(crate) excluded: u64,
+    /// Of the first mismatching pieces (at most [`VERIFY_FIRST`]): the title
+    /// address of the first differing byte in it and how many bytes of the
+    /// piece differ.
+    pub(crate) first: Vec<(usize, u64)>,
+}
+
+/// How many mismatching pieces a [`VerifyReport`] names.
+#[cfg(feature = "diagnostics")]
+pub(crate) const VERIFY_FIRST: usize = 8;
+
+/// Compares `card` (the card side's bytes at offsets `[at, at + card.len())`
+/// of a copy of title memory from `start` on) with `cpu` (the CPU side's
+/// bytes there), piece by piece (pieces are cut at multiples of 64 KiB of
+/// title memory, as the card compare cuts them). The offsets of `dirty`
+/// (sorted or not) are left out and counted in `excluded`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn verify_compare(start: usize, at: usize, card: &[u8], cpu: &[u8], dirty: &[(usize, usize)], report: &mut VerifyReport) {
+    debug_assert_eq!(card.len(), cpu.len());
+    let end = at + card.len();
+    let mut lo = at;
+    while lo < end {
+        let hi = (((start + lo) / PIECE + 1) * PIECE - start).min(end);
+        let skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+        let parts = outside(lo, hi, skip);
+        let looked: usize = parts.iter().map(|&(a, b)| b - a).sum();
+        report.excluded += (hi - lo - looked) as u64;
+        if looked > 0 {
+            report.pieces += 1;
+            let mut bad = 0u64;
+            let mut first_at = None;
+            for (a, b) in parts {
+                let (x, y) = (&card[a - at..b - at], &cpu[a - at..b - at]);
+                if x != y {
+                    bad += x.iter().zip(y).filter(|(p, q)| p != q).count() as u64;
+                    first_at.get_or_insert(a + first_difference(x, y).unwrap_or(0));
+                }
+            }
+            if let Some(first_at) = first_at {
+                report.bad_pieces += 1;
+                report.bad_bytes += bad;
+                if report.first.len() < VERIFY_FIRST {
+                    report.first.push((start + first_at, bad));
+                }
+            }
+        }
+        lo = hi;
+    }
+}
+
+/// How many pieces of a class a [`ClassReport`] names.
+#[cfg(feature = "diagnostics")]
+pub(crate) const CLASS_FIRST: usize = 4;
+
+/// The pieces [`verify_compare`] found differing, told apart by who holds
+/// the card's bytes: the title's memory, read live, against the card's side
+/// and the CPU's side. By byte that differs between the two sides, the
+/// title's byte equals the CPU's (class 0, "A": the card's is newer: shaders
+/// wrote it and it did not come back), equals the card's (1, "B": the CPU's
+/// side is stale: a merge missed it) or neither (2, "C": the title wrote it
+/// and neither side has it). A piece with bytes of one class is of it;
+/// of several, class 3 ("D", mixed).
+#[cfg(feature = "diagnostics")]
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct ClassReport {
+    /// Pieces by class.
+    pub(crate) pieces: [u64; 4],
+    /// Of them, pieces with a differing byte inside a range declared as
+    /// written in the last frames.
+    pub(crate) declared: [u64; 4],
+    /// Differing bytes by class 0..=2, and those inside declared ranges.
+    pub(crate) bytes: [u64; 3],
+    pub(crate) bytes_declared: u64,
+    /// Pieces whose title memory could not be read.
+    pub(crate) unread: u64,
+    /// Per class, the first pieces' first differing byte: its offset in the
+    /// copy and whether a declared range holds it.
+    pub(crate) first: [Vec<(usize, bool)>; 4],
+}
+
+/// [`verify_compare`]'s pieces, classified ([`ClassReport`]). `title(address,
+/// len)` reads live title memory; it is asked only for pieces that differ.
+/// `declared` is sorted and joined (title addresses).
+#[cfg(feature = "diagnostics")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_classify(
+    start: usize,
+    at: usize,
+    card: &[u8],
+    cpu: &[u8],
+    dirty: &[(usize, usize)],
+    declared: &[(usize, usize)],
+    title: &mut dyn FnMut(usize, usize) -> Option<Vec<u8>>,
+    report: &mut ClassReport,
+) {
+    let end = at + card.len();
+    let mut lo = at;
+    while lo < end {
+        let hi = (((start + lo) / PIECE + 1) * PIECE - start).min(end);
+        let skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+        let parts = outside(lo, hi, skip);
+        if parts.iter().any(|&(a, b)| card[a - at..b - at] != cpu[a - at..b - at]) {
+            match title(start + lo, hi - lo) {
+                None => report.unread += 1,
+                Some(live) => {
+                    let (mut mask, mut inside, mut first) = (0u8, false, None);
+                    for (a, b) in parts {
+                        for i in a..b {
+                            let (c, p) = (card[i - at], cpu[i - at]);
+                            if c == p {
+                                continue;
+                            }
+                            let t = live[i - lo];
+                            let class = if t == p { 0 } else if t == c { 1 } else { 2 };
+                            mask |= 1 << class;
+                            report.bytes[class] += 1;
+                            let held = declared.get(declared.partition_point(|r| r.1 <= start + i)).is_some_and(|r| r.0 <= start + i);
+                            if held {
+                                inside = true;
+                                report.bytes_declared += 1;
+                            }
+                            first.get_or_insert((i, held));
+                        }
+                    }
+                    let class = if mask.count_ones() == 1 { mask.trailing_zeros() as usize } else { 3 };
+                    report.pieces[class] += 1;
+                    report.declared[class] += u64::from(inside);
+                    if let Some(first) = first
+                        && report.first[class].len() < CLASS_FIRST
+                    {
+                        report.first[class].push(first);
+                    }
+                }
+            }
+        }
+        lo = hi;
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod classify_tests {
+    use super::{ClassReport, PIECE, verify_classify};
+
+    /// Each differing byte is classed by the title's byte, a piece by its
+    /// bytes' classes, and declared ranges are told apart.
+    #[test]
+    fn pieces_are_classed_by_who_holds_the_card_bytes() {
+        let cpu: Vec<u8> = (0..4 * PIECE).map(|i| (i % 251) as u8).collect();
+        let (mut card, mut title) = (cpu.clone(), cpu.clone());
+        let mut change = |at: usize, class: u8| {
+            card[at] = cpu[at] ^ 1;
+            match class {
+                0 => {}
+                1 => title[at] = card[at],
+                _ => title[at] = card[at] ^ 2,
+            }
+        };
+        change(5, 0);
+        change(PIECE + 5, 1);
+        change(2 * PIECE + 5, 2);
+        change(3 * PIECE + 7, 0);
+        change(3 * PIECE + 9, 1);
+        let mut report = ClassReport::default();
+        let live = title.clone();
+        verify_classify(0, 0, &card, &cpu, &[], &[(5, 6)], &mut |a, n| Some(live[a..a + n].to_vec()), &mut report);
+        assert_eq!(report.pieces, [1, 1, 1, 1]);
+        assert_eq!(report.declared, [1, 0, 0, 0]);
+        assert_eq!((report.bytes, report.bytes_declared, report.unread), ([2, 2, 1], 1, 0));
+        assert_eq!(report.first[0], vec![(5, true)]);
+        assert_eq!(report.first[3], vec![(3 * PIECE + 7, false)]);
+        // Every difference left out as unsent: nothing to class. Title
+        // memory that cannot be read: the pieces are counted apart.
+        let mut unread = ClassReport::default();
+        verify_classify(0, 0, &card, &cpu, &[(0, 4 * PIECE)], &[], &mut |_, _| None, &mut unread);
+        assert_eq!(unread, ClassReport::default());
+        verify_classify(0, 0, &card, &cpu, &[], &[], &mut |_, _| None, &mut unread);
+        assert_eq!((unread.unread, unread.pieces), (4, [0; 4]));
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod verify_tests {
+    use super::{PIECE, VerifyReport, verify_compare};
+
+    /// Differences are found per piece with the title address of the first
+    /// differing byte, and offsets in `dirty` are left out.
+    #[test]
+    fn differences_are_counted_per_piece_and_dirty_offsets_are_left_out() {
+        let start = PIECE - 100;
+        let len = 2 * PIECE + 500;
+        let cpu: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut card = cpu.clone();
+        // Piece 0 holds offsets [0, 100), piece 1 [100, 100 + PIECE), piece 2
+        // [100 + PIECE, 100 + 2 * PIECE), piece 3 the rest (400 bytes).
+        card[10] ^= 1;
+        card[200] ^= 1;
+        card[201] ^= 1;
+        card[PIECE + 300] ^= 1;
+        let mut report = VerifyReport::default();
+        verify_compare(start, 0, &card, &cpu, &[(PIECE + 250, PIECE + 400), (0, 5)], &mut report);
+        assert_eq!(report.pieces, 4);
+        assert_eq!(report.excluded, 5 + 150);
+        assert_eq!((report.bad_pieces, report.bad_bytes), (2, 3));
+        assert_eq!(report.first, vec![(start + 10, 1), (start + 200, 2)]);
+        let mut clean = VerifyReport::default();
+        verify_compare(start, 0, &cpu, &cpu, &[], &mut clean);
+        assert_eq!((clean.pieces, clean.bad_pieces, clean.bad_bytes, clean.excluded), (4, 0, 0, 0));
+    }
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
@@ -2201,6 +2459,8 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            #[cfg(feature = "diagnostics")]
+            declared: Mutex::default(),
         }
     }
 
@@ -2297,6 +2557,8 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        #[cfg(feature = "diagnostics")]
+        self.note_declared(range);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -3121,6 +3383,57 @@ impl Shadow {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
         }
         before.is_some()
+    }
+
+    /// Diagnostics: a range shaders may write is declared now. Kept for the
+    /// last [`DECLARED_STAMPS`] frames, once per frame and range, and only
+    /// with `VICTORY_CARD_VERIFY` set.
+    #[cfg(feature = "diagnostics")]
+    fn note_declared(&self, range: (usize, usize)) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VICTORY_CARD_VERIFY").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) > 0) {
+            return;
+        }
+        let now = crate::queue::presented();
+        let mut log = self.declared.lock().unwrap_or_else(|e| e.into_inner());
+        if log.last().is_some_and(|e| e.0 == now && (e.1, e.2) == range) {
+            return;
+        }
+        log.retain(|e| e.0 + DECLARED_STAMPS >= now);
+        if !log.iter().any(|e| e.0 == now && (e.1, e.2) == range) {
+            log.push((now, range.0, range.1));
+        }
+    }
+
+    /// Diagnostics (`VICTORY_CARD_VERIFY`): what the card-vs-CPU check needs
+    /// of a copy in the card's memory, or `None` for any other copy.
+    ///
+    /// `dirty` is taken under the lock that `card_changed` holds: those are
+    /// the offsets whose CPU-side bytes the card's side has not received
+    /// yet, so a difference there is not a fault of the card path.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn card_verify_view(&self) -> Option<CardVerifyView> {
+        let card = self.card.as_ref()?;
+        let mut dirty: Vec<(usize, usize)> = card.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        dirty.sort_unstable();
+        Some(CardVerifyView {
+            buffer: self.buffer.clone(),
+            cpu: self.data as usize,
+            start: self.start as usize,
+            len: self.len as usize,
+            window: self.window,
+            in_flight: self.writes_pending(),
+            dirty,
+            declared: joined(
+                self.declared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|e| e.0 + DECLARED_STAMPS >= crate::queue::presented())
+                    .map(|e| (e.1, e.2))
+                    .collect(),
+            ),
+        })
     }
 
     /// The declared range `[address, end)` as the compare on the card

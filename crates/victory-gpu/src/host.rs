@@ -18,6 +18,10 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+/// `VICTORY_CARD_VERIFY`: copies in the card's memory against their CPU side.
+#[cfg(feature = "diagnostics")]
+mod card_verify;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -7847,6 +7851,9 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        // Diagnostics: every N-th frame, the card's copies against their CPU side.
+        #[cfg(feature = "diagnostics")]
+        card_verify::frame(self, frame);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
