@@ -1926,13 +1926,59 @@ pub(crate) fn let_go_idle() {
 /// title memory, which is what the title just mapped). Nothing here waits
 /// on a fence, so no submission is held up.
 /// Returns how many host copies went.
-/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go. With `VICTORY_EVICT_LATER=1`
+/// the range is only noted here, and the host copies go before the next
+/// submission starts ([`evict_noted`]): nothing of this then runs under the
+/// runtime's change of mapping.
 #[cfg(windows)]
 pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
-    use std::sync::atomic::Ordering::Relaxed;
     if !sweeping() || len == 0 {
         return 0;
     }
+    if evict_later() {
+        /// Ranges kept until a submission takes them; past it, the
+        /// once-a-second sweep lets those host copies go.
+        const MOST: usize = 1 << 15;
+        let mut noted = EVICT_NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        let room = noted.len() < MOST;
+        match noted.last_mut() {
+            // Pages are mapped one after the other.
+            Some(last) if last.0.saturating_add(last.1) == base => last.1 = last.1.saturating_add(len),
+            _ if room => noted.push((base, len)),
+            _ => {}
+        }
+        return 0;
+    }
+    evict_placed_in_ranges(&[(base, len)])
+}
+
+/// Whether [`evict_placed_in`] only notes its range for the next
+/// submission (`VICTORY_EVICT_LATER=1`); off by default.
+#[cfg(windows)]
+fn evict_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_LATER").is_some_and(|v| v == "1"))
+}
+
+/// The ranges [`evict_placed_in`] noted with `VICTORY_EVICT_LATER=1`.
+#[cfg(windows)]
+static EVICT_NOTED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Before a submission starts: [`evict_placed_in`] for the ranges noted
+/// since the last one (`VICTORY_EVICT_LATER=1`).
+#[cfg(windows)]
+pub(crate) fn evict_noted() -> u64 {
+    let ranges = std::mem::take(&mut *EVICT_NOTED.lock().unwrap_or_else(|e| e.into_inner()));
+    if ranges.is_empty() {
+        return 0;
+    }
+    evict_placed_in_ranges(&ranges)
+}
+
+/// [`evict_placed_in`] for every range of `ranges` at once.
+#[cfg(windows)]
+fn evict_placed_in_ranges(ranges: &[(u64, u64)]) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1942,7 +1988,11 @@ pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
     let candidates: Vec<usize> = if evict_walk() {
         all.iter().copied().collect()
     } else {
-        TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner()).overlapping(base, len)
+        let index = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut found: Vec<usize> = ranges.iter().flat_map(|&(base, len)| index.overlapping(base, len)).collect();
+        found.sort_unstable();
+        found.dedup();
+        found
     };
     for at in candidates {
         // SAFETY: in the table, whose lock is held (see above).
@@ -1951,7 +2001,8 @@ pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
             continue;
         }
         let size = footprint(&r.desc).map_or(0, |f| f.size);
-        if !ranges_overlap(r.data() as u64, size, base, len) {
+        let start = r.data() as u64;
+        if !ranges.iter().any(|&(base, len)| ranges_overlap(start, size, base, len)) {
             continue;
         }
         let gone = {
@@ -3060,10 +3111,18 @@ mod tests {
             assert!(hosted(texture, true).is_some());
             assert!(has_host_copy(texture));
         }
-        assert_eq!(evict_placed_in(at + 0x4000 + 0x100, 0x100), 1);
+        // By the ranges directly: `evict_placed_in` only notes them with
+        // `VICTORY_EVICT_LATER=1`.
+        assert_eq!(evict_placed_in_ranges(&[(at + 0x4000 + 0x100, 0x100)]), 1);
         assert!(has_host_copy(made[0]) && !has_host_copy(made[1]) && has_host_copy(made[2]));
-        assert_eq!(evict_placed_in(at + 0x3000, 0x2000), 1, "the first only, 1 is gone");
+        assert_eq!(evict_placed_in_ranges(&[(at + 0x3000, 0x2000)]), 1, "the first only, 1 is gone");
         assert!(!has_host_copy(made[0]) && has_host_copy(made[2]));
+        // Several ranges at once (`VICTORY_EVICT_LATER=1` takes those noted
+        // since the last submission): each texture is looked at once.
+        assert!(hosted(made[0], true).is_some() && hosted(made[1], true).is_some());
+        let ranges = [(at + 0x100, 0x100), (at + 0x200, 0x100), (at + 0x8000, 0x10)];
+        assert_eq!(evict_placed_in_ranges(&ranges), 2);
+        assert!(has_host_copy(made[1]) && !has_host_copy(made[0]) && !has_host_copy(made[2]));
         drop(memory);
     }
 

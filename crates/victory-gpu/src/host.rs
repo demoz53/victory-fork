@@ -193,6 +193,9 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // Host copies of placed textures in memory the runtime remapped since
+    // the last submission (`VICTORY_EVICT_LATER=1`).
+    crate::resource::evict_noted();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
