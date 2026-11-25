@@ -555,6 +555,43 @@ pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 12] = [const { AtomicU64::new(0) 
 /// still waiting.
 pub(crate) static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// A texture picked by index was uploaded whole, its memory at `at` (`len`
+/// bytes) with fingerprint `print`: counted, and counted again as sent
+/// unchanged when its memory had the same fingerprint at its last whole
+/// upload. A slot written again gets its record of the last upload wiped
+/// (`TextureQueue::written`), so the texture it shows is uploaded again
+/// even when nothing in it changed: another tree measured 166,794 uploads
+/// in 7.5 minutes from that with descriptor mirroring on (2026-11-25). An
+/// info line every 5 s says how many of ours are such re-sends.
+fn resent(at: u64, len: u64, print: u64, bytes: u64) {
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = std::sync::Mutex::new(None);
+    // Whole uploads, of them unchanged, and the bytes of each.
+    static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let same = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        last.get_or_insert_with(std::collections::HashMap::new).insert((at, len), print) == Some(print)
+    };
+    COUNTS[0].fetch_add(1, Ordering::Relaxed);
+    COUNTS[2].fetch_add(bytes, Ordering::Relaxed);
+    if same {
+        COUNTS[1].fetch_add(1, Ordering::Relaxed);
+        COUNTS[3].fetch_add(bytes, Ordering::Relaxed);
+    }
+    let now = crate::host::now_ms();
+    let said = SAID.load(Ordering::Relaxed);
+    if now.saturating_sub(said) >= 5000 && SAID.compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let [whole, unchanged, all_bytes, unchanged_bytes] = COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        tracing::info!(
+            whole,
+            unchanged,
+            mb = all_bytes >> 20,
+            unchanged_mb = unchanged_bytes >> 20,
+            "textures picked by index uploaded whole in the last 5 s, and of them sent again with nothing changed since their last whole upload"
+        );
+    }
+}
 pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
@@ -2370,6 +2407,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
+                    resent(at, len, print, bytes);
                     host.texture_slot_recheck(index, write, frame + recheck_frames()[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
