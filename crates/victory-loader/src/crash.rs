@@ -613,6 +613,16 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
         } else {
+            // Only where everything the step reads lies in `low..high`: a
+            // frame register with garbage in it mid-function (a title's
+            // hand-written code, a thread sampled at any instruction) sent
+            // the unwinder to 0xffffffffffffffff and took the process down
+            // (all12b-wcbackb, all11j-a, all11i-warm).
+            // SAFETY: `entry` is the table entry `RtlLookupFunctionEntry`
+            // gave for `Rip` in `image`.
+            if !unsafe { step_reads_fit(image, entry, context, low, high) } {
+                break;
+            }
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
             unsafe {
@@ -633,6 +643,162 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         }
         frames.push(context.Rip);
     }
+}
+
+/// Whether one `RtlVirtualUnwind` step of `context` reads only stack in
+/// `low..high`, as the unwind information of its function says (with the
+/// chained ones): the pushed and saved registers, the allocation and the
+/// return address (or a machine frame) from where the step starts, which
+/// is `Rsp`, and past the instruction that sets a frame register, that
+/// register less its offset (its value, whatever it holds). An unwind code
+/// it does not know, or more than 32 chained entries: false. Allocation-free
+/// (the crash handler uses it).
+///
+/// # Safety
+/// `entry` is a function table entry of `image` (`RtlLookupFunctionEntry`).
+pub(crate) unsafe fn step_reads_fit(
+    image: u64,
+    entry: *const windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY,
+    context: &CONTEXT,
+    low: usize,
+    high: usize,
+) -> bool {
+    const PUSH_NONVOL: u8 = 0;
+    const ALLOC_LARGE: u8 = 1;
+    const ALLOC_SMALL: u8 = 2;
+    const SET_FPREG: u8 = 3;
+    const SAVE_NONVOL: u8 = 4;
+    const SAVE_NONVOL_FAR: u8 = 5;
+    const EPILOG: u8 = 6;
+    const SAVE_XMM128: u8 = 8;
+    const SAVE_XMM128_FAR: u8 = 9;
+    const PUSH_MACHFRAME: u8 = 10;
+    const CHAININFO: u8 = 4;
+    // SAFETY: the caller's entry.
+    let (begin, mut info_rva) = unsafe { ((*entry).BeginAddress, (*entry).Anonymous.UnwindData) };
+    let offset = context.Rip.wrapping_sub(image + u64::from(begin));
+    // The bytes from the step's base that it reads: pushes, allocations and
+    // saved registers, then the return address (or a machine frame).
+    let (mut size, mut saved, mut machine) = (0u64, 0u64, 0u64);
+    // The frame register and its offset, if one is set before `offset`.
+    let mut frame: Option<(u8, u64)> = None;
+    let mut first = true;
+    for _ in 0..32 {
+        let info = (image + u64::from(info_rva)) as *const u8;
+        // SAFETY: unwind information inside the loaded image: four bytes,
+        // then two per code, then a chained entry when flagged.
+        let (flags, codes, register) = unsafe { (info.read() >> 3, info.add(2).read(), info.add(3).read()) };
+        // SAFETY: as above.
+        let codes_at = unsafe { info.add(4) };
+        let mut i = 0usize;
+        while i < usize::from(codes) {
+            // SAFETY: inside the codes the header counts.
+            let (code_offset, op) = unsafe { (codes_at.add(2 * i).read(), codes_at.add(2 * i + 1).read()) };
+            let (kind, op_info) = (op & 0xf, op >> 4);
+            let slot = |k: usize| -> u64 {
+                if i + k >= usize::from(codes) {
+                    return u64::MAX >> 8;
+                }
+                // SAFETY: a code's own slots, inside the codes counted.
+                u64::from(unsafe { (codes_at.add(2 * (i + k)) as *const u16).read_unaligned() })
+            };
+            // Codes past `offset` in the function's own prolog have not
+            // run yet; chained entries' codes all have.
+            let done = !first || u64::from(code_offset) <= offset;
+            let slots = match kind {
+                PUSH_NONVOL => {
+                    if done {
+                        size += 8;
+                    }
+                    1
+                }
+                ALLOC_LARGE if op_info == 0 => {
+                    if done {
+                        size += slot(1) * 8;
+                    }
+                    2
+                }
+                ALLOC_LARGE if op_info == 1 => {
+                    if done {
+                        size += slot(1) | slot(2) << 16;
+                    }
+                    3
+                }
+                ALLOC_SMALL => {
+                    if done {
+                        size += u64::from(op_info) * 8 + 8;
+                    }
+                    1
+                }
+                SET_FPREG => {
+                    if done && register & 0xf != 0 {
+                        frame = Some((register & 0xf, u64::from(register >> 4) * 16));
+                    }
+                    1
+                }
+                SAVE_NONVOL => {
+                    saved = saved.max(slot(1) * 8 + 8);
+                    2
+                }
+                SAVE_NONVOL_FAR => {
+                    saved = saved.max((slot(1) | slot(2) << 16) + 8);
+                    3
+                }
+                EPILOG => 2,
+                SAVE_XMM128 => {
+                    saved = saved.max(slot(1) * 16 + 16);
+                    2
+                }
+                SAVE_XMM128_FAR => {
+                    saved = saved.max((slot(1) | slot(2) << 16) + 16);
+                    3
+                }
+                PUSH_MACHFRAME => {
+                    machine = if op_info == 0 { 40 } else { 48 };
+                    1
+                }
+                _ => return false,
+            };
+            i += slots;
+        }
+        if flags & CHAININFO == 0 {
+            break;
+        }
+        // The chained entry, after the codes (an even count of slots).
+        // SAFETY: a RUNTIME_FUNCTION after the codes of a chained entry.
+        info_rva = unsafe {
+            let chained = codes_at.add(2 * (usize::from(codes) + usize::from(codes) % 2));
+            (chained as *const u32).add(2).read_unaligned()
+        };
+        first = false;
+    }
+    // From where the step starts: the frame register less its offset once
+    // it is set, else the stack pointer; the pushes, the allocation and the
+    // saved registers above it, then the return address or a machine frame.
+    let reads = size.max(saved).saturating_add(if machine > 0 { machine } else { 8 });
+    let fits = |base: u64| base >= low as u64 && base.checked_add(reads).is_some_and(|end| end <= high as u64);
+    let register = |r: u8| -> u64 {
+        match r {
+            0 => context.Rax,
+            1 => context.Rcx,
+            2 => context.Rdx,
+            3 => context.Rbx,
+            4 => context.Rsp,
+            5 => context.Rbp,
+            6 => context.Rsi,
+            7 => context.Rdi,
+            8 => context.R8,
+            9 => context.R9,
+            10 => context.R10,
+            11 => context.R11,
+            12 => context.R12,
+            13 => context.R13,
+            14 => context.R14,
+            _ => context.R15,
+        }
+    };
+    // An epilog reads from the stack pointer, the body from the frame.
+    fits(context.Rsp) && frame.is_none_or(|(r, frame_offset)| fits(register(r).wrapping_sub(frame_offset)))
 }
 
 /// `module+rva`, or the bare address.

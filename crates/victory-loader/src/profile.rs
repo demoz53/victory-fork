@@ -762,4 +762,107 @@ mod tests {
         assert!(text.contains("\"busy one\""), "{text}");
         assert!(text.contains("STALL"), "{text}");
     }
+
+    /// A stack aligned past 16 bytes: the function keeps a frame register.
+    #[repr(C, align(64))]
+    struct Aligned64([u8; 64]);
+
+    /// Spins with garbage in `rbp` (all ones, then zero) in the middle of a
+    /// function whose unwind information keeps its frame in `rbp` (its
+    /// 64-byte aligned local), restoring it between spins; until `stop`.
+    #[inline(never)]
+    fn spin_with_garbage_frame(stop: &std::sync::atomic::AtomicBool) -> u8 {
+        let local = Aligned64([1; 64]);
+        let local = std::hint::black_box(&local);
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: `rbp` is saved and restored around the spin, and
+            // nothing in between reads the stack or calls anything.
+            unsafe {
+                std::arch::asm!(
+                    "push rbp",
+                    "mov rbp, -1",
+                    "mov {n}, 20000",
+                    "2:",
+                    "dec {n}",
+                    "jnz 2b",
+                    "xor ebp, ebp",
+                    "mov {n}, 20000",
+                    "3:",
+                    "dec {n}",
+                    "jnz 3b",
+                    "pop rbp",
+                    n = out(reg) _,
+                );
+            }
+        }
+        local.0[0]
+    }
+
+    /// The profiler samples a thread caught with garbage in its frame
+    /// register mid-function, again and again, and comes back each time
+    /// with the frames it could read: the unwinder never follows the
+    /// garbage (`crate::crash::step_reads_fit`).
+    #[test]
+    fn a_thread_with_garbage_in_its_frame_register_is_sampled_safely() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spinner = std::thread::spawn(move || {
+            // SAFETY: plain query.
+            tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+            spin_with_garbage_frame(&s)
+        });
+        let id = rx.recv().unwrap();
+        // SAFETY: a thread of this process, opened for sampling.
+        let thread = unsafe { OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, 0, id) };
+        assert!(!thread.is_null());
+        let mut frames = Vec::with_capacity(MAX_FRAMES);
+        let mut sampled = 0;
+        for _ in 0..3000 {
+            if stack_of(thread, &mut frames) {
+                sampled += 1;
+                assert!(frames.len() <= MAX_FRAMES);
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        spinner.join().unwrap();
+        // SAFETY: our handle.
+        unsafe { CloseHandle(thread) };
+        assert!(sampled > 2900, "{sampled} of 3000 samples");
+    }
+
+    /// The unwind of a context with garbage in every register but `Rip`
+    /// and `Rsp`, from many places in this thread's stack, stops where a
+    /// step would read outside it.
+    #[test]
+    fn garbage_registers_stop_the_unwind_inside_the_stack() {
+        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureContext;
+        let mut context = Aligned(unsafe {
+            // SAFETY: zeroed is a valid CONTEXT.
+            std::mem::zeroed::<CONTEXT>()
+        });
+        // SAFETY: fills our aligned context with this thread's registers.
+        unsafe { RtlCaptureContext(&mut context.0) };
+        let (low, high) = committed_around(context.0.Rsp as usize).expect("this thread's stack");
+        let mut frames = Vec::with_capacity(MAX_FRAMES);
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for k in 0..20_000u64 {
+            let mut c = context.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let garbage = [u64::MAX, 0, 8, x, x | 0xffff_0000_0000_0000][k as usize % 5];
+            (c.Rbp, c.Rbx, c.Rsi, c.Rdi, c.R12, c.R13, c.R14, c.R15) =
+                (garbage, garbage, garbage, garbage, garbage, garbage, garbage, garbage);
+            // Rsp anywhere in the stack (8-aligned), and sometimes at its ends.
+            c.Rsp = match k % 3 {
+                0 => (low as u64 + (x % (high - low) as u64)) & !7,
+                1 => high as u64 - 8,
+                _ => low as u64,
+            };
+            frames.clear();
+            crate::crash::unwind_into(c, low, high, &mut frames);
+            assert!(!frames.is_empty() && frames.len() <= MAX_FRAMES);
+        }
+    }
 }
