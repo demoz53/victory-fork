@@ -687,3 +687,37 @@ fn the_wave_wide_form_last_of_all_keeps_the_forms_taken_before() {
         assert_eq!(before.dxil, after.dxil, "and the switch keeps that form");
     }
 }
+
+/// `with_group_base`: the second part of a dispatch over 65,535 groups in x reads its
+/// group id x past the first part's. A 32-lane console program with the group id x in s5
+/// (TGID_X_EN) stores it; translated with a base of 65,535 and run as one group, it
+/// stores 65,535, and as it is, 0.
+#[test]
+fn a_group_base_is_added_to_the_group_id_x() {
+    let mut native = native_of(&[], false, 32);
+    let words = [
+        0x7E02_0205, // v_mov_b32 v1, s5 (the group id x)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+        125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 1 << 8, // buffer_store_dword v1, off, s[8:11], 0
+        S_ENDPGM,
+    ];
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 7; // TGID_X_EN: the group id x after the user SGPRs
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let plain = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let based = lower::with_group_base(65_535, || lowered(&native, &p, &HashSet::new())).expect("lower");
+    assert_ne!(plain.dxil, based.dxil, "the base is in the translation");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut based.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(got) = on_the_card(&based, [0, 0]) else { return };
+    assert_eq!(got, 65_535, "group 0 of the second part is group 65,535");
+    assert_eq!(on_the_card(&plain, [0, 0]), Some(0));
+    eprintln!("ran on the hardware device: the second part's group ids start at the base");
+}

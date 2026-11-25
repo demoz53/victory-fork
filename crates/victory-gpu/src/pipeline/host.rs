@@ -902,6 +902,68 @@ fn root_signature(
     }
 }
 
+/// The pipeline of the second parts of a compute pipeline's indirect
+/// dispatches over 65,535 groups in x (`VICTORY_INDIRECT_SPLIT`,
+/// `crate::indirect::with_remainder`): its program translated with a group
+/// base of 65,535 (`victory_shader::emit::with_group_base`), on `p`'s root
+/// signature, which the base leaves as it is. Made at the first need, then
+/// kept with `p`'s; `None` if it does not translate or the host refuses it.
+pub(crate) fn split_part(p: &HostPipeline) -> Option<ID3D12PipelineState> {
+    type Made = Vec<(ID3D12PipelineState, Option<ID3D12PipelineState>)>;
+    static MADE: std::sync::Mutex<Made> = std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, part)) = made.iter().find(|(whole, _)| whole == &p.pso) {
+        return part.clone();
+    }
+    let part = (|| {
+        if !p.compute {
+            return None;
+        }
+        let shader = &p.stages.first()?.shader;
+        let host_shader = match shader.translated_from_group(65_535) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, shader = ?shader, "VICTORY_INDIRECT_SPLIT: the second part does not translate");
+                return None;
+            }
+        };
+        // The base changes the code only: what the root signature declares
+        // for it (user data, samplers, root views) must be the same.
+        let whole = &shader.translated()?.host;
+        let layout = |s: &victory_shader::emit::HostShader| victory_shader::emit::HostShader {
+            dxil: Vec::new(),
+            ..s.clone()
+        };
+        if layout(&host_shader) != layout(whole) || host_shader.dxil == whole.dxil {
+            tracing::warn!(shader = ?shader, "VICTORY_INDIRECT_SPLIT: the second part binds otherwise, or reads no group id; not split");
+            return None;
+        }
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&p.root) },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: host_shader.dxil.as_ptr().cast(),
+                BytecodeLength: host_shader.dxil.len(),
+            },
+            ..Default::default()
+        };
+        // SAFETY: the description points at live data.
+        match unsafe { host()?.device.CreateComputePipelineState::<ID3D12PipelineState>(&desc) } {
+            Ok(pso) => {
+                tracing::info!(shader = ?shader, "VICTORY_INDIRECT_SPLIT: the second part's pipeline (group base 65535)");
+                crate::host::name(&pso, || format!("{shader:?} from group 65535"));
+                Some(pso)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, shader = ?shader, "VICTORY_INDIRECT_SPLIT: the host refused the second part's pipeline");
+                None
+            }
+        }
+    })();
+    made.push((p.pso.clone(), part.clone()));
+    part
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

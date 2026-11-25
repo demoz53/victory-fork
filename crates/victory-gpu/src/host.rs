@@ -7196,6 +7196,9 @@ impl Meter {
         if let Some((asked, label)) = COMPUTE_CUT.lock().unwrap_or_else(|e| e.into_inner()).take() {
             tracing::info!(asked, pipeline = %label, "indirect compute dispatches: the record cut down most (first dimension asked for, at most 262143 noted) was of this pipeline");
         }
+        if std::env::var_os("VICTORY_INDIRECT_SPLIT").is_some() {
+            tracing::info!("indirect dispatches run in two parts (VICTORY_INDIRECT_SPLIT) so far: {}", crate::draw::split_parts());
+        }
         late_line(frames);
         {
             let [events, us, longest] = [0, 1, 2].map(|i| crate::fence::EVENT_WAITS[i].swap(0, Ordering::Relaxed));

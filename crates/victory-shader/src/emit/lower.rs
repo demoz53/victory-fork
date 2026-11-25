@@ -1023,6 +1023,22 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+thread_local! {
+    /// What [`with_group_base`] adds to the group id x on this thread.
+    static GROUP_BASE_X: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` (a translation) with `base` added to the thread group's id x: the
+/// second part of an indirect dispatch over the host's 65,535 groups in x,
+/// which runs the groups from `base` on (`victory-gpu`'s
+/// `VICTORY_INDIRECT_SPLIT`). Only compute programs read the group id.
+pub fn with_group_base<R>(base: u32, f: impl FnOnce() -> R) -> R {
+    let was = GROUP_BASE_X.replace(base);
+    let r = f();
+    GROUP_BASE_X.set(was);
+    r
+}
+
 /// Runs `f` with console wave64 programs on 32-lane hosts lowered with each
 /// host wave as a wave of its own ("local"): no exchange between the two
 /// halves of a console wave, so no barriers and no need for every lane to
@@ -2400,7 +2416,18 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                let id = self.compute_id("groupId.i32", 94, c);
+                // A dispatch over 65,535 groups run in two parts (`with_group_base`).
+                let base = GROUP_BASE_X.get();
+                return match id {
+                    Val::I32(g) if c == 0 && base != 0 => {
+                        let k = self.s.m.i32(base);
+                        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, k))
+                    }
+                    other => other,
+                };
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {

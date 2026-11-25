@@ -173,6 +173,18 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The translation with `base` added to the thread group's id x (the
+    /// second parts of indirect dispatches over 65,535 groups,
+    /// `VICTORY_INDIRECT_SPLIT`), with the clean-up passes of the
+    /// translation without it. Not kept here: the caller keeps its pipeline.
+    pub(crate) fn translated_from_group(&self, base: u32) -> Result<victory_shader::emit::HostShader, String> {
+        let translate = || crate::shader_cache::host_shader_from_group(&self.container, base);
+        match opt_in_range(&self.hash, self.stage) {
+            Some(passes) => victory_shader::emit::with_shader_opt(passes, translate),
+            None => translate(),
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
