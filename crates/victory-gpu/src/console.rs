@@ -26,12 +26,41 @@ impl Console {
         }
     }
 
+    /// The GPU's pipe configuration, which the addresses of the XOR swizzle
+    /// modes follow (textures the title's CPU reads or writes in one).
+    /// `VICTORY_XOR_SWIZZLE=0`: one no XOR mode has a pattern for, so those
+    /// modes are not addressed, as before (the other modes' patterns hold
+    /// for every configuration).
+    pub fn pipes(self) -> victory_formats::texture::Pipes {
+        if !xor_swizzle() {
+            return victory_formats::texture::Pipes {
+                pipes_log2: 0,
+                packers_log2: 0,
+            };
+        }
+        match self {
+            Console::SeriesX => victory_formats::texture::Pipes::SERIES_X,
+            Console::SeriesS => victory_formats::texture::Pipes::SERIES_S,
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Console::SeriesX => "Xbox Series X",
             Console::SeriesS => "Xbox Series S",
         }
     }
+}
+
+/// Whether textures in the pipe and bank XOR swizzle modes are addressed
+/// (`VICTORY_XOR_SWIZZLE=0`: not, as before): the ocean height map the
+/// title's CPU reads is in one, and a copy back of what the wave passes wrote
+/// into it failed to tile ("a texture copied back could not be tiled
+/// e=Unsupported"). From PastiiJay/klbf-lab ee7081b7, after MiamiGame/XTP
+/// 00c60fb and 188d895 (patterns from Mesa's addrlib, MIT).
+pub fn xor_swizzle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XOR_SWIZZLE").is_none_or(|v| v != "0"))
 }
 
 static SERIES_S: AtomicBool = AtomicBool::new(false);
