@@ -119,7 +119,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_uses_wave32, set_host_max_wave, with_group_base};
+pub use lower::{host_uses_wave32, lane_loop_fix, set_host_max_wave, with_group_base};
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 pub use rect::rect_list_gs;
 pub use shader::{

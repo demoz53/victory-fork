@@ -403,6 +403,13 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
+            // The branch's own block, reached again without passing a block every way out of
+            // it passes: a lane loop, which only the lanes still in it run again (it
+            // post-dominates itself all the same). Its successors are on the stack already.
+            if b == d && lane_loop_fix() {
+                seen[d] = true;
+                continue;
+            }
             if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
@@ -424,6 +431,27 @@ fn mesh_corner_mask() -> u32 {
     *MASK.get_or_init(|| {
         if std::env::var_os("VICTORY_MESH_EDGE_FLAGS").is_some_and(|v| v == "index") { 0x3FF } else { 0x1FF }
     })
+}
+
+/// Whether a lane loop's own branch block counts as in its branch's region, not as a block
+/// every lane runs ([`lane_regions`]): after the first round only the lanes still in the loop
+/// run it, so two host waves cannot meet there (a group barrier, an exchange), nor are values
+/// written there the same in every lane holding them. `VICTORY_LANE_LOOP_FIX=0`: counted as
+/// every lane's, as before. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn lane_loop_fix() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LANE_LOOP_FIX.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_LOOP_FIX").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's setting of [`lane_loop_fix`] for this thread.
+    static TEST_LANE_LOOP_FIX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -12426,6 +12454,34 @@ mod tests {
             .expect("meetings when approximate");
         assert!(meet.iter().any(|m| m.0 || m.1), "the host waves meet around the region");
         assert!(super::lds_meetings(&p, &st, &all).is_none(), "and refused again after it");
+    }
+
+    /// A lane loop (one block, left per lane on `s_cbranch_execnz`): after the first round only
+    /// the lanes still in it run its block, so it is not a block every lane runs, though it
+    /// post-dominates its own branch.
+    #[test]
+    fn a_lane_loop_is_not_a_block_every_lane_runs() {
+        let words: [u32; 9] = [
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0x4A00_0081, // 4: v_add_nc_u32 v0, 1, v0
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFB, // s_cbranch_execnz -> 4
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 8).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let all = super::all_lane_blocks(&st).expect("all-lane blocks");
+        assert!(matches!(st.exits[1], structure::LaneExit::Branch { taken: 1, not_taken: 2, .. }), "{:?}", st.exits);
+        assert_eq!(all, [true, false, true], "the entry, the loop, after the loop");
+        let was = super::TEST_LANE_LOOP_FIX.replace(Some(false));
+        let before = super::all_lane_blocks(&st).expect("all-lane blocks");
+        super::TEST_LANE_LOOP_FIX.set(was);
+        assert_eq!(before, [true, true, true], "VICTORY_LANE_LOOP_FIX=0: as before");
     }
 
     #[test]

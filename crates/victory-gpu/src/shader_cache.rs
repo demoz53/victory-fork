@@ -84,6 +84,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_MESH_OUTPUT_STRICT",
                     "VICTORY_WAVE_LOCAL",
                     "VICTORY_FIRST_HALF",
+                    "VICTORY_LANE_LOOP_FIX",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
