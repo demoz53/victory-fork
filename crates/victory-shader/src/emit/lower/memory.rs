@@ -1281,9 +1281,12 @@ impl<'a> Lower<'a> {
         let used = self.used_kind(src);
         // Sixteen bits a channel through a view of a table: the bits go as
         // they are, as unsigned integers ([`super::half_bits`]).
-        let halves = d16 && typed && super::half_bits() && used.is_some_and(|u| u.root == RootType::Table);
-        if halves && let Some(u) = used {
-            self.half_views.insert((u.slot, u.table_offset_dwords));
+        // (The descriptor's own place in the table, not its range's start:
+        // fxceless #927, befaf3b.)
+        let place = (d16 && typed && super::half_bits()).then(|| self.table_place(src)).flatten();
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
         }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {

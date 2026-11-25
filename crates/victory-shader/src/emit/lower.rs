@@ -6245,7 +6245,7 @@ impl<'a> Lower<'a> {
                     // (Unsigned integers where the access moves halves: [`half_bits`].)
                     let halves = half_bits()
                         && un.contains("_format_d16_")
-                        && used.is_some_and(|u| u.root == RootType::Table);
+                        && self.table_place(&Source::Loaded { load: site, first }).is_some();
                     (10 | u, if halves { 0x405 } else { 0x409 })
                 } else {
                     (11 | u, 0)
@@ -6699,6 +6699,21 @@ impl<'a> Lower<'a> {
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow. (fxceless #927, befaf3b.)
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none()).then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
+    }
+
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
             src

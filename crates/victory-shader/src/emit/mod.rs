@@ -339,8 +339,9 @@ pub struct HostShader {
     /// through a 16-bit float view and through a 16-bit integer one alike (the
     /// title keeps half floats, and indices beside them, in `R16G16B16A16_UINT`
     /// and `R16_UINT` buffers); the DXIL moves them as unsigned integers, which
-    /// an unsigned 16-bit view carries unchanged. (fxceless #927 by
-    /// tippythetaidum.)
+    /// an unsigned 16-bit view carries unchanged. A descriptor picked at run
+    /// time keeps the float path (its slot, and so its format, is known only
+    /// then). (fxceless #927 by tippythetaidum.)
     pub half_views: Vec<(u8, u32)>,
 }
 
