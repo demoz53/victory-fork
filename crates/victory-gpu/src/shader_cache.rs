@@ -156,11 +156,25 @@ pub(crate) fn host_shader_from_group(container: &[u8], base: u32) -> Result<Host
             // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
             // any, gets there)
             let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-            let key = group_key(&program_key(build(), off), base);
+            let wide_first = emit::wave_wide_first(Some(&hash)) && emit::wave64_retried(container);
+            let key = group_key(&wide_first_key(&program_key(build(), off), wide_first), base);
             cached(cache, &key, emit::host_uses_wave32(), container, translate)
         }
         None => translate(container),
     }
+}
+
+/// `key` mixed with the per-program decision of `VICTORY_WAVE_WIDE_FIRST`
+/// (`victory_shader::emit::wave_wide_first`) when the program is listed; as
+/// it is otherwise, so the list is in no key.
+fn wide_first_key(key: &[u8; 32], listed: bool) -> [u8; 32] {
+    if !listed {
+        return *key;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(key);
+    h.update(b"VICTORY_WAVE_WIDE_FIRST lists this program");
+    *h.finalize().as_bytes()
 }
 
 /// `key` mixed with a group base other than 0 ([`host_shader_from_group`]);
@@ -551,6 +565,16 @@ mod tests {
             cached(&cache, &program_key(&build, false), false, c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_program_listed_for_the_wave_wide_form_first_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        assert_eq!(wide_first_key(&build, false), build);
+        let listed = wide_first_key(&build, true);
+        assert_ne!(listed, build);
+        assert_ne!(listed, program_key(&build, true), "not the deep-skips decision's key");
+        assert_eq!(wide_first_key(&build, true), listed);
     }
 
     /// `VICTORY_INDIRECT_SPLIT`: the program translated with a group base

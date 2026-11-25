@@ -83,6 +83,21 @@ pub fn wave64_retried(container: &[u8]) -> bool {
             .is_some_and(|p| p.stage == HwStage::Cs && p.wave64)
 }
 
+/// `VICTORY_WAVE_WIDE_FIRST=<hash>,...`: whether the wave-wide form (the per-lane branches
+/// around the places two host waves must meet taken by the whole wave, at group barriers) is
+/// tried for the program `hash` where `VICTORY_WAVE_WIDE=1` tries it for every program: after
+/// the exact forms without barriers and the deep-skips form, before the approximate
+/// per-half-wave ones. For the programs that otherwise run APPROXIMATE (each host wave its
+/// own wave: a wave-wide sum becomes two half sums), such as the irradiance probes' shading.
+/// The global switch stays off: the light-atlas particle programs lost the card in it (runs
+/// 121-124). A program's decision is part of its shader cache key, not the list.
+pub fn wave_wide_first(hash: Option<&str>) -> bool {
+    static LIST: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    LIST.get_or_init(|| std::env::var("VICTORY_WAVE_WIDE_FIRST").ok().map(|v| parse_hash_list(&v)))
+        .as_deref()
+        .is_some_and(|l| listed(l, hash))
+}
+
 /// The hashes of a `_NOT` or `_ONLY` list: separated by commas, semicolons
 /// or white space, each with or without the `#` the offline listing puts
 /// before it, in lower case and cut to the 16 digits a hash has. Pure, for
