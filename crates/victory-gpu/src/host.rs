@@ -1339,6 +1339,11 @@ fn card_budget() -> bool {
 /// groups run in all (before the list's budget), and the records cut down.
 static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Since the last frame line: the largest first dimension a cut-down
+/// compute record asked for, and the pipeline it came from (word 6 of the
+/// lists' budget buffers: `indirect::with_dispatch`).
+static COMPUTE_CUT: Mutex<Option<(u32, std::sync::Arc<str>)>> = Mutex::new(None);
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -5937,7 +5942,16 @@ impl HostList {
                 COMPUTE_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 COMPUTE_GROUPS[1].fetch_add(u64::from(run), Ordering::Relaxed);
                 COMPUTE_GROUPS[2].fetch_add(u64::from(cut), Ordering::Relaxed);
-                for k in 0..6 {
+                let worst = words.add(6).read_volatile();
+                if worst != 0 {
+                    let (asked, n) = (worst >> 14, worst & 0x3fff);
+                    let label = crate::indirect::dispatch_label(n).unwrap_or_else(|| "an execution no longer noted".into());
+                    let mut cut = COMPUTE_CUT.lock().unwrap_or_else(|e| e.into_inner());
+                    if cut.as_ref().is_none_or(|(x, _)| asked > *x) {
+                        *cut = Some((asked, label));
+                    }
+                }
+                for k in 0..7 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6884,6 +6898,9 @@ impl Meter {
         tracing::info!(
             "indirect compute dispatches: the largest first dimension asked for {compute_largest} (run: at most 65535), {compute_groups:.0} groups run per frame, {compute_cut:.1} records a frame cut down"
         );
+        if let Some((asked, label)) = COMPUTE_CUT.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            tracing::info!(asked, pipeline = %label, "indirect compute dispatches: the record cut down most (first dimension asked for, at most 262143 noted) was of this pipeline");
+        }
         late_line(frames);
         crate::draw::window_line(frames);
         card_clock_line(frames, ms);

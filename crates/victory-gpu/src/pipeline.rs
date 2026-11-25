@@ -493,6 +493,17 @@ pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
 
+/// The shaders of the title's pipeline `this` as the log names them
+/// (`compute 0123456789abcdef`, stages joined by `+`).
+pub(crate) fn shaders_label(this: This) -> String {
+    if this.is_null() {
+        return "no pipeline".to_owned();
+    }
+    let p = pipeline(this);
+    let names: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    names.join(" + ")
+}
+
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

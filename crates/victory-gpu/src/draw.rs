@@ -2692,10 +2692,19 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead_at(list, (&args.buffer, offset), (kind, step, records), place)
+                let bound = || {
+                    if windowed && records > 1 {
+                        crate::indirect::bound_ahead_at(list, (&args.buffer, offset), (kind, step, records), place)
+                    } else {
+                        crate::indirect::bound_at(list, (&args.buffer, offset), count_arg, (kind, step, records), place)
+                    }
+                };
+                // (a dispatch's clamp notes its pipeline with a record it cuts down)
+                let bounded = if kind == DISPATCH {
+                    let this = self.pipeline as This;
+                    crate::indirect::with_dispatch(|| crate::pipeline::shaders_label(this), bound)
                 } else {
-                    crate::indirect::bound_at(list, (&args.buffer, offset), count_arg, (kind, step, records), place)
+                    bound()
                 };
                 let Some(bounded) = bounded else {
                     self.windows.clear();

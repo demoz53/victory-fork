@@ -37,7 +37,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -48,6 +48,8 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    // The execution (`note_dispatch`), noted with a record it cuts down.
+    uint execution;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -113,6 +115,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         budget.InterlockedMax(12, asked.x, was);
         if (huge || any(asked > g)) {
             budget.InterlockedAdd(20, 1u, was);
+            // word 6: the largest first dimension a cut record asked for (18
+            // bits), and the execution it came from (14 bits)
+            budget.InterlockedMax(24, (min(asked.x, 0x3ffffu) << 14) | (execution & 0x3fffu), was);
         }
         if (huge) {
             g = uint3(0, 0, 0);
@@ -319,6 +324,43 @@ fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
+/// Executions of indirect dispatches by number (14 bits, a ring): what the
+/// clamp of a dispatch's records notes with the largest record it cut down
+/// (word 6 of the list's budget), so the frame line can name the pipeline
+/// whose record asked for the most groups.
+static DISPATCHES: std::sync::Mutex<Vec<Option<std::sync::Arc<str>>>> = std::sync::Mutex::new(Vec::new());
+static NEXT_DISPATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const DISPATCH_RING: u32 = 1 << 14;
+
+thread_local! {
+    /// The execution the next clamp on this thread is recorded for ([`with_dispatch`]).
+    static EXECUTION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` (the clamp of an indirect dispatch's records) with a new execution
+/// number noted as `label` (the pipeline's shaders), which [`dispatch_label`]
+/// gives back for the number the clamp wrote.
+pub(crate) fn with_dispatch<R>(label: impl FnOnce() -> String, f: impl FnOnce() -> R) -> R {
+    let n = NEXT_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % DISPATCH_RING;
+    {
+        let mut ring = DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
+        if ring.is_empty() {
+            ring.resize(DISPATCH_RING as usize, None);
+        }
+        ring[n as usize] = Some(label().into());
+    }
+    let was = EXECUTION.replace(n);
+    let r = f();
+    EXECUTION.set(was);
+    r
+}
+
+/// What [`with_dispatch`] noted for execution `n`, if the ring still holds it.
+pub(crate) fn dispatch_label(n: u32) -> Option<std::sync::Arc<str>> {
+    let ring = DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
+    ring.get((n % DISPATCH_RING) as usize).cloned().flatten()
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
@@ -489,7 +531,8 @@ fn record_clamp_at(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let execution = EXECUTION.with(std::cell::Cell::get);
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset, execution];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -523,7 +566,7 @@ fn record_clamp_at(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
