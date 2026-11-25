@@ -97,6 +97,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_HALF_BITS",
                     "VICTORY_HEAP_HALF_BITS",
                     "VICTORY_SWIZZLE_MODES",
+                    "VICTORY_NORM_EXACT",
                     "VICTORY_CUBE_GRAD_LOD",
                     "VICTORY_LOCAL_ANY_MASKS",
                 ] {
