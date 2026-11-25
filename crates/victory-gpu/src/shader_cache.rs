@@ -91,6 +91,8 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_DIV_FIXUP",
                     "VICTORY_WAVE_EXACT",
                     "VICTORY_WAVE_WIDE_LANE_RESOURCES",
+                    "VICTORY_EARLY_DEPTH",
+                    "VICTORY_PIXEL_HELPERS",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

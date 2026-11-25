@@ -1268,6 +1268,79 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// A pixel program the console tests depth for before it runs
+    /// (`DB_SHADER_CONTROL` 0x1050: DEPTH_BEFORE_SHADER, early Z, kill, as
+    /// the title's glass prepass has it) declares ForceEarlyDepthStencil:
+    /// the module differs from the same program without the bit, and the
+    /// validator, where there is one, accepts it. With a depth output the bit
+    /// is not declared (the host cannot test before a shader that writes the
+    /// depth). (fxceless #907 by SpaghettiMaster545.)
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let el = |name: &str, kind, cols| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let emitted = |words: &[u32], out: SigElement, db: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: db,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let osg1 = container::signature(&[out], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
+        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut early.clone()).unwrap();
+        }
+        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
+        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
+        assert_eq!(late, early, "early depth declared for a depth export");
+        // The rule alone: the bit, and no export of depth, stencil or coverage.
+        let ps = |db| StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] };
+        assert!(lower::early_depth(&ps(0x1450), &[]));
+        assert!(lower::early_depth(&ps(0x1010), &[]));
+        assert!(!lower::early_depth(&ps(0x0450), &[]));
+        assert!(!lower::early_depth(&ps(0x1012), &[]));
+        assert!(!lower::early_depth(&ps(0x1150), &[]));
+        assert!(!lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
+        assert!(!lower::early_depth(&StageIo::None, &[]));
+    }
+
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask was
     /// opaque and keyed by the unchanged low dword, so building its lane bit
@@ -3085,5 +3158,162 @@ mod barycentric_tests {
         ) {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
+    }
+
+    fn lower_ps(words: &[u32]) -> lower::Lowered {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: PERSP_CENTER,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), false, 8).unwrap();
+        let res = resource::track(&p, &[], HwStage::Ps, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
+
+    /// `VICTORY_PIXEL_HELPERS` (on by default): a pixel shader's
+    /// `v_readfirstlane_b32` gives a helper lane its own value
+    /// (`isHelperLane`), a compute shader's does not. (fxceless #895, after
+    /// Marvisak/VIctory #1733 by Vax.)
+    #[test]
+    fn pixel_readfirstlane_uses_is_helper_lane_and_compute_does_not() {
+        let [e0, e1] = exp_mrt0(3);
+        let ps_words = [
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0x7E06_0202, // v_mov_b32 v3, s2
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&ps_words, PERSP_CENTER).unwrap();
+        validate(&shader);
+        let lowered = lower_ps(&ps_words);
+        assert!(
+            lowered.funcs.iter().any(|n| n == "dx.op.isHelperLane.i1"),
+            "pixel shader must guard v_readfirstlane with isHelperLane: {:?}",
+            lowered.funcs
+        );
+        use crate::native::{ComputeIo, ResourceType, RootParam, RootType, UsedResource};
+        let cs_words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0x7E02_0202, // v_mov_b32 v1, s2
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16 | 1 << 8, // buffer_store_dword v1, off, s[8:11], 0
+            S_ENDPGM,
+        ];
+        let cs_native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: cs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&cs_native.patched_code(), false, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &cs_native.layout, HwStage::Cs, Some(&st)).unwrap();
+        let io = io::raise(&p, &cs_native).unwrap();
+        let lowered = lower::lower(&lower::Parts {
+            native: &cs_native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert!(
+            !lowered.funcs.iter().any(|n| n == "dx.op.isHelperLane.i1"),
+            "compute shader must not emit isHelperLane"
+        );
+    }
+
+    /// `VICTORY_PIXEL_HELPERS` (on by default): a pixel shader's quad swizzle
+    /// reads its quad with `quadReadLaneAt`, helper lanes included, not with
+    /// `waveReadLaneAt`. (fxceless #895, after Belobug/VIctory-Belobug-AMD
+    /// 03629f3f.)
+    #[test]
+    fn pixel_quad_swizzle_without_discards_uses_quad_read_lane_at() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xD8D4_80E4,
+            0x0300_0000, // ds_swizzle_b32 v3, v0 offset:0x80E4
+            v_add_f32(2, 3, 1),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+        let lowered = lower_ps(&words);
+        assert!(lowered.funcs.iter().any(|n| n == "dx.op.quadReadLaneAt.i32"));
+        assert!(!lowered.funcs.iter().any(|n| n == "dx.op.waveReadLaneAt.i32"));
     }
 }

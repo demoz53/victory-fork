@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Functions declared in the emitted DXIL module.
+    #[cfg(test)]
+    pub funcs: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1360,6 +1363,48 @@ fn packed_half(
     })
 }
 
+/// Whether a pixel program runs its depth and stencil tests before the
+/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
+/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
+/// a program that writes unordered views writes them for pixels the depth
+/// test then rejects: the title's glass prepass (`PS_AlphaPrepass`) wrote its
+/// depth and motion for every pixel of a window pane, the character standing
+/// in front of it too, and a later pass (`PS_AlphaVelocityDepthResolve`)
+/// copied those over the character's. Not for a program that exports depth,
+/// stencil or coverage (bits 0-2 and 8, or such an output), which cannot test
+/// before it runs. (fxceless #907 by SpaghettiMaster545.)
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
+    // SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
+/// Whether pixel shaders read their quads' other lanes with quad reads, helper
+/// lanes included, and a helper lane's `v_readfirstlane_b32` gives its own value
+/// (`Lower::helpers_read`, `Lower::helper_reads_own`; `VICTORY_PIXEL_HELPERS=0`:
+/// wave reads, as before). Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn pixel_helpers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIXEL_HELPERS").is_none_or(|v| v != "0"))
+}
+
+/// Whether [`early_depth`] is declared (`VICTORY_EARLY_DEPTH=0`: never, the
+/// host testing after every shader, as before). Part of the translation: the
+/// shader cache keys on it (`victory-gpu`'s does).
+pub fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1465,6 +1510,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let masks = mask_values(p, x.st);
         let writes_uavs = insts().any(|i| {
@@ -2533,6 +2581,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            funcs: self.s.m.func_names(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4596,6 +4646,37 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Whether a read of another lane of this lane's quad must reach helper
+    /// lanes: in a pixel shader, always ([`pixel_helpers`]). At a triangle's
+    /// edge the quad's other pixels are helpers (and so are discarded ones),
+    /// which only quad reads see: wave reads leave helper lanes out, so a
+    /// derivative taken by hand at a triangle's edge can misread or read zero
+    /// there (lines along triangle edges on glass, car paint and skin).
+    /// (Belobug/VIctory-Belobug-AMD 03629f3f, by way of fxceless #895.)
+    fn helpers_read(&self, quad: bool) -> bool {
+        quad && self.s.pixel && pixel_helpers()
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader: a
+    /// helper lane takes its own value instead ([`pixel_helpers`]).
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop serves helper lanes too. On the host, wave operations
+    /// leave helper lanes out: once only helper lanes are left in such a
+    /// loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the loop
+    /// runs to its limit. With its own value a helper lane matches in the
+    /// first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped. (Marvisak/VIctory #1733 by
+    /// Vax, by way of fxceless #895.)
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel || !pixel_helpers() {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
@@ -4742,7 +4823,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -7342,7 +7423,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -8372,7 +8453,8 @@ impl<'a> Lower<'a> {
                         // scalars this way, inside a loop whose exit is per console wave).
                         static OWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         if *OWN.get_or_init(|| std::env::var_os("VICTORY_FIRSTLANE_OWN").is_some_and(|v| v == "1")) {
-                            return int(self, mine);
+                            let r = self.helper_reads_own(a, mine);
+                            return int(self, r);
                         }
                         need(self.cur_ir);
                         return Err("a first-lane read where not every lane runs");
@@ -8401,6 +8483,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
