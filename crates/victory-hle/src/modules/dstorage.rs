@@ -367,6 +367,8 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    /// `VICTORY_IO_STATS`: this second's reads.
+    io: IoStats,
 }
 
 /// A queue's requests in the scheduler.
@@ -424,6 +426,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    io: IoStats::default(),
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -516,6 +519,87 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     );
 }
 
+/// `VICTORY_IO_STATS=1`: an info line every second of what the title
+/// streamed: reads done, megabytes, how long they waited in their queue
+/// before a worker took them (the title asked late, or we were behind?) and
+/// how long the read itself took, reads still queued, the times the title
+/// waited for room in a full queue, reads per priority class, and the files
+/// read most.
+fn io_stats() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_IO_STATS").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[derive(Default)]
+struct IoStats {
+    since: Option<std::time::Instant>,
+    /// Microseconds: waited in the queue, and reading.
+    waited: Vec<u32>,
+    read: Vec<u32>,
+    bytes: u64,
+    classes: [u32; 3],
+    /// Bytes by file object (named when reported).
+    files: HashMap<usize, u64>,
+    blocked: u32,
+    blocked_time: std::time::Duration,
+}
+
+impl IoStats {
+    fn add(&mut self, read: &QueuedRead, class: usize, started: std::time::Instant) {
+        self.since.get_or_insert(read.queued.min(started));
+        let us = |d: std::time::Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
+        self.waited.push(us(started.saturating_duration_since(read.queued)));
+        self.read.push(us(started.elapsed()));
+        let size = u64::from(read.request.destination_size);
+        self.bytes += size;
+        self.classes[class.min(2)] += 1;
+        if read.request.options & MEMORY_SOURCE == 0 {
+            *self.files.entry(read.request.source as usize).or_default() += size;
+        }
+    }
+
+    fn report(&mut self, waiting: usize) {
+        let Some(since) = self.since else { return };
+        let elapsed = since.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let ms = |v: &mut Vec<u32>, q: f64| {
+            v.sort_unstable();
+            let i = ((v.len() as f64 - 1.0) * q).round() as usize;
+            v.get(i).map_or(0.0, |&u| f64::from(u) / 1000.0)
+        };
+        let (w50, w95, wmax) = (ms(&mut self.waited, 0.5), ms(&mut self.waited, 0.95), ms(&mut self.waited, 1.0));
+        let (r50, rmax) = (ms(&mut self.read, 0.5), ms(&mut self.read, 1.0));
+        let mut files: Vec<(usize, u64)> = self.files.drain().collect();
+        files.sort_by_key(|f| std::cmp::Reverse(f.1));
+        let names = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let top: Vec<String> = files
+            .iter()
+            .take(3)
+            .map(|&(source, bytes)| {
+                let name = names.iter().rev().find(|f| f.0 == source).map_or("?", |f| f.1.as_str());
+                let short = name.rsplit(['\\', '/']).next().unwrap_or(name);
+                format!("{short} {:.1} MB", bytes as f64 / 1e6)
+            })
+            .collect();
+        drop(names);
+        tracing::info!(
+            reads = self.read.len(),
+            mb = format_args!("{:.1}", self.bytes as f64 / 1e6),
+            waited_ms = format_args!("p50 {w50:.1} p95 {w95:.1} max {wmax:.1}"),
+            read_ms = format_args!("p50 {r50:.1} max {rmax:.1}"),
+            still_queued = waiting,
+            title_waited_for_room = format_args!("{} times, {} ms", self.blocked, self.blocked_time.as_millis()),
+            classes = format_args!("low {} normal {} high {}", self.classes[0], self.classes[1], self.classes[2]),
+            most_read = %top.join(", "),
+            "streaming: the last {:.1} s",
+            elapsed.as_secs_f64()
+        );
+        *self = IoStats::default();
+    }
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
@@ -545,6 +629,12 @@ fn work(scheduler: &'static Scheduler) {
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
+        if io_stats() {
+            let class = self.lanes.get(&job.lane).map_or(1, |l| l.class);
+            self.io.add(&job.read, class, started);
+            let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
+            self.io.report(waiting);
+        }
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.read.request.destination_size);
@@ -776,6 +866,8 @@ struct QueuedRead {
     request: Request,
     file: Option<*mut Instance<File>>,
     name: String,
+    /// When the title enqueued it (`VICTORY_IO_STATS`: how long it waited).
+    queued: std::time::Instant,
 }
 
 impl QueuedRead {
@@ -793,6 +885,7 @@ impl QueuedRead {
             request,
             file,
             name,
+            queued: std::time::Instant::now(),
         }
     }
 
@@ -868,10 +961,13 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        let blocked = std::time::Instant::now();
         lanes = scheduler
             .finished
             .wait(lanes)
             .unwrap_or_else(|e| e.into_inner());
+        lanes.io.blocked += 1;
+        lanes.io.blocked_time += blocked.elapsed();
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
@@ -1505,7 +1601,23 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            io: IoStats::default(),
         }
+    }
+
+    #[test]
+    fn io_stats_sum_up_a_second_and_start_over() {
+        let mut io = IoStats::default();
+        let r = QueuedRead::new(request(0, std::ptr::null_mut(), 0, std::ptr::null(), 0, 4096));
+        let started = r.queued + std::time::Duration::from_millis(3);
+        io.add(&r, 2, started);
+        io.add(&r, 1, started);
+        assert_eq!((io.waited.len(), io.classes), (2, [0, 1, 1]));
+        io.report(0); // under a second: kept
+        assert_eq!(io.read.len(), 2);
+        io.since = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        io.report(5);
+        assert!(io.read.is_empty() && io.since.is_none());
     }
 
     fn read(lanes: &mut Lanes, id: u64, options: u64, size: u32) {

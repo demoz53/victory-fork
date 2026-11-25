@@ -79,8 +79,9 @@ pub(crate) extern "system" fn schedule(
     S_OK
 }
 
-/// Frames begun so far (frame waits that ended).
-pub(crate) fn current() -> u64 {
+/// Frames begun so far (frame waits that ended). Public for the profiler's
+/// stall check (`VICTORY_PROFILE`).
+pub fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 

@@ -136,6 +136,9 @@ pub fn run(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    // `VICTORY_PROFILE=<file>`: where each thread's time goes, and every
+    // thread's stack when frames stop.
+    victory_loader::profile(victory_gpu::frame::current);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those

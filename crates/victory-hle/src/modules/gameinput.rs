@@ -1052,12 +1052,67 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
                     );
                 }
             }
+            trace_read(reading(this), state);
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
             true
         }
         _ => false,
     }
+}
+
+/// `VICTORY_INPUT_TRACE=1`: a line whenever what the title reads from a pad
+/// changes (buttons, a trigger past half, a stick past half a direction),
+/// with the time it held the last state: what the game saw, as against what
+/// was pressed (the aim at the robbery, 2026-11-25).
+fn trace_read(reading: &Reading, state: &PadState) {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("VICTORY_INPUT_TRACE").is_ok_and(|v| v.trim() == "1"));
+    static LAST: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+    if !*ON {
+        return;
+    }
+    let dir = |v: f32, minus: &'static str, plus: &'static str| {
+        if v > 0.5 {
+            plus
+        } else if v < -0.5 {
+            minus
+        } else {
+            ""
+        }
+    };
+    let mut held: Vec<&str> = [
+        dir(state.left_x, "left-stick-left", "left-stick-right"),
+        dir(state.left_y, "left-stick-down", "left-stick-up"),
+        dir(state.right_x, "right-stick-left", "right-stick-right"),
+        dir(state.right_y, "right-stick-down", "right-stick-up"),
+        if state.left_trigger > 0.5 { "LT" } else { "" },
+        if state.right_trigger > 0.5 { "RT" } else { "" },
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect();
+    let buttons = format!("buttons={:#x}", state.buttons);
+    if state.buttons != 0 {
+        held.push(&buttons);
+    }
+    let now = if held.is_empty() { "nothing".to_string() } else { held.join("+") };
+    let mut last = lock(&LAST);
+    if last.as_ref().is_some_and(|(was, _)| *was == now) {
+        return;
+    }
+    let for_ms = last.as_ref().map_or(0, |(_, since)| since.elapsed().as_millis() as u64);
+    // SAFETY: a reading's device is one of the hub's, never freed.
+    let device = unsafe { &*reading.device }.index;
+    tracing::info!(
+        device,
+        sequence = reading.sequence,
+        lt = state.left_trigger,
+        rt = state.right_trigger,
+        previous_held_ms = for_ms,
+        "the title read: {now}"
+    );
+    *last = Some((now, Instant::now()));
 }
 /// Kinds our devices do not have: no count, no state. The first call of
 /// each slot is logged with the reading's kind, to see which a title asks
