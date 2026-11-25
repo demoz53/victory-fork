@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -82,6 +82,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Whether shaders were ever given a range of the copy to write
+    /// ([`Shadow::gpu_writes`]).
+    shaders_wrote: AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2100,7 +2103,15 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            shaders_wrote: AtomicBool::new(false),
         }
+    }
+
+    /// Whether shaders were ever given a range of the copy to write: a
+    /// constant buffer view of it may read what a flight in the air writes
+    /// by the time its list is submitted (`crate::host::fill_on_card`).
+    pub(crate) fn shaders_wrote(&self) -> bool {
+        self.shaders_wrote.load(Ordering::Relaxed)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2128,6 +2139,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.shaders_wrote.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
