@@ -1598,7 +1598,9 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match memory {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        // With `VICTORY_CARD_RESERVE=1` the copies of title buffers not made
+        // yet keep their room (`shadow::card_reserve`; 0 without it).
+        Some([budget, used, ..]) => used.saturating_add(crate::shadow::card_reserve()) < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1630,6 +1632,17 @@ pub(crate) fn room_for_bake() -> bool {
         Some([budget, used, ..]) => used < budget / 100 * percent,
         None => false,
     }
+}
+
+/// Whether a copy of a title buffer of `size` bytes may go to the card's
+/// memory, which has `used` bytes of the `budget` in use
+/// (`VICTORY_CARD_RESERVE=1`): up to the share textures fill
+/// ([`room_percent`]). The textures leave the copies their own reserve
+/// (`shadow::card_reserve`), so a copy made after the textures came still
+/// finds its room. From PainDe0Mie/VIctory 162701b17.
+#[cfg(windows)]
+pub(crate) fn copy_fits(budget: u64, used: u64, size: u64) -> bool {
+    used.saturating_add(size) <= budget / 100 * room_percent()
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
