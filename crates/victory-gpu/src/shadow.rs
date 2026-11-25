@@ -959,51 +959,54 @@ fn give_back(v: Vec<u8>) {
 
 const NOT_WATCHED: u8 = 2;
 
-/// Where `a` and `b` (of one length) first differ, compared eight bytes at
-/// a time.
+// Fixed-size equality compiles to two SIMD comparisons on Windows x64.
+// Only the first or last unequal chunk needs a byte-wise search.
+const DIFF_CHUNK: usize = 32;
+
+/// Where `a` and `b` first differ within their common length.
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    let from = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .position(|(x, y)| x != y)
-        .map_or(whole, |word| word * 8);
-    a[from..].iter().zip(&b[from..]).position(|(x, y)| x != y).map(|i| from + i)
+    let len = a.len().min(b.len());
+    let (a_chunks, a_tail) = a[..len].as_chunks::<DIFF_CHUNK>();
+    let (b_chunks, b_tail) = b[..len].as_chunks::<DIFF_CHUNK>();
+    let (offset, a, b) = match a_chunks.iter().zip(b_chunks).position(|(x, y)| x != y) {
+        Some(i) => (i * DIFF_CHUNK, &a_chunks[i][..], &b_chunks[i][..]),
+        None => (len - a_tail.len(), a_tail, b_tail),
+    };
+    a.iter().zip(b).position(|(x, y)| x != y).map(|i| offset + i)
 }
 
-/// Where `a` and `b` (of one length) last differ.
+/// Where `a` and `b` last differ within their common length.
 fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
-        return Some(whole + i);
+    let len = a.len().min(b.len());
+    let (a_chunks, a_tail) = a[..len].as_chunks::<DIFF_CHUNK>();
+    let (b_chunks, b_tail) = b[..len].as_chunks::<DIFF_CHUNK>();
+    if let Some(i) = a_tail.iter().zip(b_tail).rposition(|(x, y)| x != y) {
+        return Some(len - a_tail.len() + i);
     }
-    let word = a[..whole]
-        .as_chunks::<8>().0.iter()
-        .zip(b[..whole].chunks_exact(8))
-        .rposition(|(x, y)| x != y)?
-        * 8;
-    a[word..word + 8]
+    let chunk = a_chunks.iter().zip(b_chunks).rposition(|(x, y)| x != y)?;
+    a_chunks[chunk]
         .iter()
-        .zip(&b[word..word + 8])
+        .zip(&b_chunks[chunk])
         .rposition(|(x, y)| x != y)
-        .map(|i| word + i)
+        .map(|i| chunk * DIFF_CHUNK + i)
 }
 
 #[cfg(test)]
 mod difference_tests {
     use super::{first_difference, last_difference};
 
-    /// The word-wise searches agree with the byte-wise ones they replace.
+    /// The chunk searches agree with a byte-wise scan across chunk boundaries.
     #[test]
     fn differences_are_found_as_byte_by_byte() {
-        let base: Vec<u8> = (0..61u32).map(|i| (i * 7 + 3) as u8).collect();
-        let same = base.clone();
-        assert_eq!(first_difference(&base, &same), None);
-        assert_eq!(last_difference(&base, &same), None);
-        for len in [0usize, 1, 7, 8, 9, 16, 23, 61] {
+        let base: Vec<u8> = (0..98u32).map(|i| (i * 7 + 3) as u8).collect();
+        for len in [0, 1, 31, 32, 33, 63, 64, 65, 97] {
+            let a = &base[1..1 + len];
+            let same = a.to_vec();
+            assert_eq!(first_difference(&same, a), None);
+            assert_eq!(last_difference(&same, a), None);
             for at in 0..len {
                 for other in at..len {
-                    let (a, mut b) = (&base[..len], base[..len].to_vec());
+                    let mut b = a.to_vec();
                     b[at] ^= 0x80;
                     b[other] ^= 0x01;
                     let first = a.iter().zip(&b).position(|(x, y)| x != y);
@@ -1013,6 +1016,19 @@ mod difference_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn differences_ignore_bytes_past_the_shorter_slice() {
+        let a = [0; 65];
+        let mut b = [0; 67];
+        b[65] = 1;
+        assert_eq!(first_difference(&a, &b), None);
+        assert_eq!(last_difference(&b, &a), None);
+        b[32] = 1;
+        b[64] = 1;
+        assert_eq!(first_difference(&b, &a), Some(32));
+        assert_eq!(last_difference(&a, &b), Some(64));
     }
 }
 
@@ -1442,6 +1458,44 @@ mod wide_tests {
     }
 }
 
+/// What [`Shadow::copy_back`] does with a piece that differs from the
+/// snapshot: `host` is the copy's bytes there, `old` the snapshot's. From
+/// the first byte that differs to the last, title memory is read into
+/// `title` (scratch, sized to that stretch) by `read` (the stretch's offset
+/// in the piece, where to), the GPU's bytes are put in and `host` takes the
+/// result. The stretch's offset in the piece and its length if that changed
+/// title memory (the bytes to write are `title`'s); none if nothing differs
+/// or title memory is not there.
+fn back_piece(host: &mut [u8], old: &[u8], title: &mut Vec<u8>, read: impl FnOnce(usize, &mut [u8]) -> bool) -> Option<(usize, usize)> {
+    // From the first byte that differs to the last: title memory is read
+    // and written there only (a shader that sets a few words of a piece
+    // cost a read, a walk and a write of all 64 KiB of it).
+    let first = first_difference(host, old)?;
+    let last = last_difference(host, old).unwrap_or(first);
+    let n = last + 1 - first;
+    let (host, old) = (&mut host[first..=last], &old[first..=last]);
+    title.clear();
+    title.resize(n, 0);
+    if !read(first, title) {
+        return None;
+    }
+    // Title memory with the GPU's bytes put in; the copy takes the title's
+    // bytes in turn.
+    // Without a branch, so the loop runs many bytes at a time: the GPU's
+    // byte where the copy's byte is not what it was before the submission,
+    // else the title's. (With the two searches above this was 44 ms a frame
+    // for 970 pieces.)
+    let mut differs = 0u8;
+    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+        let gpu = if *h != *o { 0xffu8 } else { 0 };
+        let merged = (*t & !gpu) | (*h & gpu);
+        differs |= merged ^ *t;
+        *t = merged;
+        *h = merged;
+    }
+    (differs != 0).then_some((first, n))
+}
+
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -1480,7 +1534,65 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{PIECE, back_piece, changed_runs};
+
+    /// A piece put back takes the GPU's bytes where the copy changed and
+    /// the title's everywhere else, reads and writes title memory only from
+    /// the first change to the last, and its scratch holds that stretch and
+    /// no more: not the 64 KiB per range it once was.
+    #[test]
+    fn a_piece_put_back_reads_only_its_stretch() {
+        let old: Vec<u8> = (0..PIECE).map(|i| (i * 7 + i / 251) as u8).collect();
+        // The title wrote 7 and 40,000 since the snapshot; the GPU wrote 5,
+        // 9 and 40,000 (the GPU's byte wins where both wrote).
+        let mut title_memory = old.clone();
+        title_memory[7] ^= 0x11;
+        title_memory[40_000] ^= 0x22;
+        let mut host = old.clone();
+        for at in [5, 9] {
+            host[at] ^= 0x33;
+        }
+        let gpu = host.clone();
+        let mut scratch = Vec::new();
+        let mut asked = None;
+        let read = |first: usize, into: &mut [u8]| {
+            asked = Some((first, into.len()));
+            into.copy_from_slice(&title_memory[first..first + into.len()]);
+            true
+        };
+        assert_eq!(back_piece(&mut host, &old, &mut scratch, read), Some((5, 5)));
+        assert_eq!(asked, Some((5, 5)));
+        let mut wanted = title_memory[5..10].to_vec();
+        wanted[0] = gpu[5];
+        wanted[4] = gpu[9];
+        assert_eq!(scratch, wanted);
+        assert_eq!(host[5..10], wanted);
+        // The copy outside the stretch is left as it was.
+        assert!(host[..5] == gpu[..5] && host[10..] == gpu[10..]);
+        assert!(scratch.capacity() < PIECE / 2, "scratch of {} bytes for a stretch of 5", scratch.capacity());
+
+        // Nothing differs: title memory is not read.
+        let mut same = old.clone();
+        assert_eq!(back_piece(&mut same, &old, &mut scratch, |_, _| unreachable!()), None);
+        // Title memory not there: nothing to write, the copy unchanged.
+        let mut host = gpu.clone();
+        assert_eq!(back_piece(&mut host, &old, &mut scratch, |_, _| false), None);
+        assert!(host == gpu);
+        // The GPU wrote what the title holds already: nothing to write.
+        let mut title_memory = old.clone();
+        title_memory[5] = gpu[5];
+        title_memory[9] = gpu[9];
+        let mut host = gpu.clone();
+        let read = |first: usize, into: &mut [u8]| {
+            into.copy_from_slice(&title_memory[first..first + into.len()]);
+            true
+        };
+        assert_eq!(back_piece(&mut host, &old, &mut scratch, read), None);
+        // A whole piece changed: the scratch grows to it.
+        let mut host: Vec<u8> = old.iter().map(|b| !b).collect();
+        assert_eq!(back_piece(&mut host, &old, &mut scratch, |_, into| into.len() == PIECE), Some((0, PIECE)));
+        assert_eq!(scratch.len(), PIECE);
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -2044,45 +2156,23 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
+            // range, most of whose ranges differ nowhere, was most of the
+            // work for small ranges.
+            let mut title = Vec::new();
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                // From the first byte that differs to the last: title
-                // memory is read and written there only (a shader that sets
-                // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
-                let Some(first) = first_difference(host, old) else {
+                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
+                let Some((first, n)) = back_piece(host, old, &mut title, read) else {
                     continue;
                 };
-                let last = last_difference(host, old).unwrap_or(first);
-                let (at, n) = (at + first, last + 1 - first);
-                let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
-                    continue;
-                }
-                // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
-                }
+                let at = at + first;
+                crate::watch::writing(start + at, n);
+                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                written += n;
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
