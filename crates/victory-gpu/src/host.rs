@@ -7500,6 +7500,21 @@ impl Meter {
                 );
             }
         }
+        {
+            let u = crate::texture::UPLOAD_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            if u[3] > 0.0 {
+                tracing::info!(
+                    "texture uploads recorded per frame: {:.0} with {:.0} subresource copies; {:.1} ms making or taking their \
+                     staging buffers, {:.1} ms recording their copies; {:.1} ms looking for and recording copies through a \
+                     texture of another format (all threads)",
+                    u[3],
+                    u[2],
+                    u[0] / 1e3,
+                    u[1] / 1e3,
+                    u[4] / 1e3,
+                );
+            }
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

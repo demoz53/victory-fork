@@ -538,6 +538,14 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
+/// Since the last frame line, of the uploads recorded ([`upload`]):
+/// microseconds making or taking their staging buffers, microseconds
+/// recording their copies (with the state change), the subresource copies,
+/// the uploads; and microseconds of copies through a texture of another
+/// format ([`alias`]).
+pub(crate) static UPLOAD_PARTS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     let host_written = HOST_WRITTEN
         .lock()
@@ -549,7 +557,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if host_written || !list.first_use(resource as usize) {
         return;
     }
-    let Some(staging) = staging(resource, texture) else {
+    let staging_began = std::time::Instant::now();
+    let staging = staging(resource, texture);
+    UPLOAD_PARTS[0].fetch_add(staging_began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let Some(staging) = staging else {
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
@@ -566,6 +577,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    let copies_began = std::time::Instant::now();
+    UPLOAD_PARTS[2].fetch_add(staging.footprints.len() as u64, Relaxed);
+    UPLOAD_PARTS[3].fetch_add(1, Relaxed);
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -617,6 +631,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    UPLOAD_PARTS[1].fetch_add(copies_began.elapsed().as_micros() as u64, Relaxed);
     list.defer_texture(staging, true);
 }
 

@@ -3080,8 +3080,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
+            let aliasing = std::time::Instant::now();
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            crate::texture::UPLOAD_PARTS[4].fetch_add(aliasing.elapsed().as_micros() as u64, Ordering::Relaxed);
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
