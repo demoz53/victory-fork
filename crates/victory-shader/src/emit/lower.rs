@@ -482,20 +482,29 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                     v.src.iter().all(|op| match *op {
                         Operand::Vector { reg, dwords } => {
                             // every dword of the operand the instruction reads (not the old value
-                            // of a higher-numbered destination register that IR keeps for guards)
-                            let end = reg.saturating_add(dwords);
+                            // of a higher-numbered destination register that IR keeps for guards;
+                            // widen to u16 so operands ending at v255 are not truncated)
+                            let start = u16::from(reg);
+                            let end = start + u16::from(dwords);
                             let read: Vec<Value> = inst
                                 .reads
                                 .iter()
-                                .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && x < end))
+                                .filter(|r| {
+                                    matches!(r.0, Reg::V(x) if (start..end).contains(&u16::from(x)))
+                                })
                                 .map(|r| r.1)
                                 .collect();
                             !read.is_empty() && read.iter().all(|x| same.contains(x))
                         }
                         // a scalar is one value; a lane mask is not, unless a compare of such values made it
                         Operand::Scalar { code, dwords } if code != NULL => {
-                            (code..code.saturating_add(dwords)).all(|c| {
-                                inst.read(Reg::S(c)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                            let start = u16::from(code);
+                            let end = start + u16::from(dwords);
+                            (start..end).all(|c| {
+                                u8::try_from(c)
+                                    .ok()
+                                    .and_then(|c| inst.read(Reg::S(c)))
+                                    .is_none_or(|x| !is_mask(x) || same.contains(&x))
                             })
                         }
                         _ => true,
@@ -12373,5 +12382,90 @@ mod tests {
             .expect("meetings when approximate");
         assert!(meet.iter().any(|m| m.0 || m.1), "the host waves meet around the region");
         assert!(super::lds_meetings(&p, &st, &all).is_none(), "and refused again after it");
+    }
+
+    #[test]
+    fn lane_uniform_handles_v255_and_high_pair_operands() {
+        // Regression test for operands ending at v255 (exclusive end 256):
+        // 1. A single-word uniform v255 must still be recognised as wave-uniform.
+        // 2. A 64-bit pair v[254:255] with uniform v254 and per-lane v255 shifted
+        //    right by 32 copies v255 into v8 and must NOT be classified as uniform.
+        let run = |body: &[u32]| {
+            let mut words = vec![
+                0xBE90_0380, // s_mov_b32 s16, 0
+                0xBE91_0380, // s_mov_b32 s17, 0
+                0xD760_0004, // v_readlane_b32 s4, v0, 0 (triggers wave64 exchange)
+                0x0001_0100,
+                0x7D88_0081, // v_cmp_gt_u32_e32 vcc, 1, v0
+                0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+                0xBF88_0000 | (body.len() as u32 + 1), // s_cbranch_execz -> restore exec
+            ];
+            words.extend_from_slice(body);
+            words.extend_from_slice(&[
+                0x7E22_0508, // v_readfirstlane_b32 s17, v8
+                0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+                0x8011_0411, // s_add_u32 s17, s17, s4
+                0x7E06_0211, // v_mov_b32 v3, s17
+                0xD834_0000, // ds_write_b32 v0, v3
+                0x0000_0300,
+                S_ENDPGM,
+            ]);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15,
+                    threads: [128, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, true, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let prev = super::TEST_HOST_WAVE.replace(Some(32));
+            let out = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            });
+            super::TEST_HOST_WAVE.set(prev);
+            out
+        };
+
+        // Uniform v255 -> uniform v8 -> v_readfirstlane_b32 lowers on wave32.
+        let uniform_v255 = [
+            0x7FFE_0210, // v_mov_b32 v255, s16
+            0x4A11_FE11, // v_add_nc_u32 v8, s17, v255
+        ];
+        if let Err(e) = run(&uniform_v255) {
+            panic!("uniform v255 read must be recognised as wave-uniform, got: {e}");
+        }
+
+        // Uniform v254 + per-lane v255 -> v_lshrrev_b64 v[8:9], 32, v[254:255] -> per-lane v8.
+        let varying_high = [
+            0x7FFC_0210, // v_mov_b32 v254, s16
+            0x7FFE_0300, // v_mov_b32 v255, v0
+            0xD700_0008, // v_lshrrev_b64 v[8:9], 32, v[254:255]
+            0x0003_FCA0,
+        ];
+        let err = run(&varying_high)
+            .err()
+            .expect("varying v255 high word must not be classified as uniform")
+            .to_string();
+        assert!(
+            err.contains("a first-lane read where not every lane runs"),
+            "varying v255 high word must require all lanes, got: {err}"
+        );
     }
 }

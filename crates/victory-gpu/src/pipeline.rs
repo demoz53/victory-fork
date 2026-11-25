@@ -118,6 +118,49 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// `VICTORY_SHADER_OPT_RANGE=<lo>-<hi>` (hexadecimal, the leading digits of the
+/// shader hash the log names: `0-8` is the first half, `8-` the second): the
+/// shaders whose hash lies in `[lo, hi)` get the clean-up passes
+/// `VICTORY_SHADER_OPT_IN` (every pass when unset), the others the run's
+/// `VICTORY_SHADER_OPT`; `VICTORY_SHADER_OPT_STAGE=pixel` (or `vertex`,
+/// `compute`, `mesh`, ...) takes only that stage's into the range. A way to
+/// find which shader a clean-up fault is in, halving the range from run to
+/// run. The shader cache keys on all three.
+#[cfg(windows)]
+fn opt_in_range(hash: &str, stage: &str) -> Option<u32> {
+    static RANGE: OnceLock<Option<(String, Option<String>, u32)>> = OnceLock::new();
+    let (range, only, passes) = RANGE
+        .get_or_init(|| {
+            let range = std::env::var("VICTORY_SHADER_OPT_RANGE").ok()?;
+            // (checked once, with a hash at the bottom of every range)
+            if victory_shader::emit::in_opt_range(&range, "0000000000000000").is_none() {
+                tracing::warn!(range, "VICTORY_SHADER_OPT_RANGE is not <lo>-<hi> in hexadecimal; ignored");
+                return None;
+            }
+            let only = std::env::var("VICTORY_SHADER_OPT_STAGE").ok();
+            let passes = std::env::var("VICTORY_SHADER_OPT_IN")
+                .ok()
+                .and_then(|v| match v.trim().strip_prefix("0x") {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => v.trim().parse().ok(),
+                })
+                .unwrap_or(u32::MAX);
+            tracing::warn!(
+                range,
+                stage = only.as_deref().unwrap_or("any"),
+                passes_in = passes,
+                passes_out = victory_shader::emit::run_shader_opt(),
+                "VICTORY_SHADER_OPT_RANGE: the shaders in the range get other clean-up passes"
+            );
+            Some((range, only, passes))
+        })
+        .as_ref()?;
+    if only.as_deref().is_some_and(|s| s != stage) {
+        return None;
+    }
+    victory_shader::emit::in_opt_range(range, hash)?.then_some(*passes)
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -135,7 +178,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = match opt_in_range(&self.hash, self.stage) {
+                    Some(passes) => victory_shader::emit::with_shader_opt(passes, || translate(&self.container)),
+                    None => translate(&self.container),
+                };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

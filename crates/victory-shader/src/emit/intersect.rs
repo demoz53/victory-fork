@@ -116,6 +116,17 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        if crate::emit::rt_miss() {
+            // `VICTORY_RT_MISS`: no node read, no child hit; the program's
+            // traversal ends as a miss. The checks above still refuse
+            // what they refuse, so the programs that translate are the
+            // same with and without it.
+            let none = self.s.m.i32(bvh::NONE);
+            for k in 0..4u8 {
+                self.write(inst, Reg::V(dst + k), none, guard);
+            }
+            return Ok(());
+        }
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;

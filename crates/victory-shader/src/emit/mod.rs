@@ -98,6 +98,7 @@ mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
+mod per_program;
 mod rect;
 mod sampler;
 mod shader;
@@ -119,6 +120,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_uses_wave32, set_host_max_wave};
+pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -192,8 +194,52 @@ pub fn group_sync() -> u8 {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    if let Some(passes) = OPT_FOR.get() {
+        return passes;
+    }
+    run_shader_opt()
+}
+
+/// The run's clean-up passes (`VICTORY_SHADER_OPT`), whatever
+/// [`with_shader_opt`] gives the program being translated.
+pub fn run_shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+thread_local! {
+    /// The passes [`with_shader_opt`] gives the translation on this thread.
+    static OPT_FOR: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (a translation) with the clean-up passes `passes` instead of the
+/// run's: for telling which program a clean-up fault is in
+/// (`victory-gpu`'s `VICTORY_SHADER_OPT_RANGE`).
+pub fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    let was = OPT_FOR.replace(Some(passes & bitcode::opt::ALL));
+    let r = f();
+    OPT_FOR.set(was);
+    r
+}
+
+/// `VICTORY_SHADER_OPT_RANGE`'s bounds (`lo-hi`, hexadecimal, read as the
+/// leading digits of a 64-bit hash: `0-8` is the first half, `8-` the
+/// second): whether the 16-digit `hash` lies in `[lo, hi)`. None if the
+/// value is not of that form. Pure, for testing.
+pub fn in_opt_range(range: &str, hash: &str) -> Option<bool> {
+    let bound = |s: &str| -> Option<u64> {
+        let s = s.trim();
+        if s.is_empty() || s.len() > 16 {
+            return None;
+        }
+        let v = u64::from_str_radix(s, 16).ok()?;
+        Some(v << (4 * (16 - s.len())))
+    };
+    let (lo, hi) = range.split_once('-')?;
+    let lo = bound(lo)?;
+    let hi = if hi.trim().is_empty() { None } else { Some(bound(hi)?) };
+    let h = u64::from_str_radix(hash.get(..16)?, 16).ok()?;
+    Some(h >= lo && hi.is_none_or(|hi| h < hi))
 }
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
@@ -206,6 +252,45 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             None => v.parse().ok(),
         });
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+}
+
+/// `VICTORY_RT_MISS=1`: every ray-tracing node test
+/// (`image_bvh_intersect_ray`, `image_bvh64_intersect_ray`) returns "no
+/// node hit" (`0xffffffff` in its four results) without reading the node,
+/// so every traversal ends at once as a miss: each ray sees the sky.
+///
+/// A fallback for runs without the title's structure builder (off unless
+/// `VICTORY_BVH_BUILDER=1`): the trace programs run anyway and otherwise
+/// walk structures nothing built. So it is ignored when the builder is
+/// asked for. Off by default.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn rt_miss() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RT_MISS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_rt_miss(
+            std::env::var("VICTORY_RT_MISS").ok().as_deref(),
+            std::env::var("VICTORY_BVH_BUILDER").ok().as_deref(),
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The tests' setting of [`rt_miss`] for this thread (the card tests
+    /// run in parallel; the switch is read once per process otherwise).
+    pub(crate) static TEST_RT_MISS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_RT_MISS` and `VICTORY_BVH_BUILDER`'s values: on only for
+/// `VICTORY_RT_MISS=1` without `VICTORY_BVH_BUILDER=1`. Pure, for testing.
+fn parse_rt_miss(rt_miss: Option<&str>, builder: Option<&str>) -> bool {
+    rt_miss.map(str::trim) == Some("1") && builder.map(str::trim) != Some("1")
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -280,10 +365,24 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
+    let native = main_program(&c)?;
+    let p = crate::spill::build(&native)?;
+    // Structurisation first: tracing per-lane descriptors needs it (its
+    // failure is reported after the earlier stages').
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// The program of a container that [`translate`] translates: its vertex,
+/// pixel, compute or mesh program.
+fn main_program(c: &Container) -> Result<NativeProgram, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -294,15 +393,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    let p = crate::spill::build(&native)?;
-    // Structurisation first: tracing per-lane descriptors needs it (its
-    // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
-    let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+        })
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -359,11 +450,14 @@ fn emit_once(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && host_uses_wave32() {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        // (each line names the program by its hash, when the caller gave it: [`for_program`])
+        let program = per_program::current();
+        let hash = program.as_deref().unwrap_or("?");
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY #{hash} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY #{hash} {what}: {e}"),
                 }
             }
         };
@@ -381,7 +475,7 @@ fn emit_once(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!("WAVE64-RETRY #{hash} local waves: not the allocation idiom at {offset:#x}: {what}");
                 }
                 false
             }
@@ -423,8 +517,13 @@ fn emit_once(
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
-                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
-                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off;
+                // `VICTORY_WAVE_DEEP_SKIPS_NOT` and `_ONLY` the first for some programs:
+                // [`deep_skips_allowed`].)
+                let deep_on = deep_skips_allowed(program.as_deref());
+                if why && !deep_on {
+                    eprintln!("WAVE64-RETRY #{hash} without skips, scalars followed: off for this program");
+                }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
@@ -502,7 +601,7 @@ fn emit_once(
         // that hung the card under `=1` (runs 121-124) have an earlier form and keep it.
         // shortcut: opt-in until a run shows the programs it takes leave the card alone.
         if wide_last() {
-            let deep = form(ir::without_skips(p, true));
+            let deep = if deep_skips_allowed(program.as_deref()) { form(ir::without_skips(p, true)) } else { None };
             let bases = [
                 deep.as_ref().map(|f| &f.0),
                 forms[1].1.as_ref().map(|f| &f.0),
@@ -866,6 +965,38 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+    }
+
+    #[test]
+    fn a_clean_up_range_takes_the_hashes_between_its_bounds() {
+        use super::in_opt_range;
+        let (low, mid, high) = ("0123456789abcdef", "8000000000000000", "ffffffffffffffff");
+        assert_eq!(in_opt_range("0-8", low), Some(true));
+        assert_eq!(in_opt_range("0-8", mid), Some(false));
+        assert_eq!(in_opt_range("8-", mid), Some(true));
+        assert_eq!(in_opt_range("8-", high), Some(true));
+        assert_eq!(in_opt_range("8-", low), Some(false));
+        assert_eq!(in_opt_range("01-02", low), Some(true));
+        assert_eq!(in_opt_range("0123456789abcdef-0123456789abcdf0", low), Some(true));
+        assert_eq!(in_opt_range("0-", low), Some(true));
+        for bad in ["", "8", "x-9", "-", "0-12345678901234567"] {
+            assert_eq!(in_opt_range(bad, low), None, "{bad:?}");
+        }
+        // the passes one translation is given, and the run's again after it
+        let run = super::run_shader_opt();
+        assert_eq!(super::with_shader_opt(0, super::shader_opt), 0);
+        assert_eq!(super::with_shader_opt(59, super::shader_opt), 59);
+        assert_eq!(super::shader_opt(), run);
+    }
+
+    #[test]
+    fn rt_miss_is_on_only_for_1_and_never_with_the_builder() {
+        assert!(!super::parse_rt_miss(None, None));
+        assert!(super::parse_rt_miss(Some("1"), None));
+        assert!(super::parse_rt_miss(Some(" 1 "), Some("0")));
+        assert!(!super::parse_rt_miss(Some("0"), None));
+        assert!(!super::parse_rt_miss(Some("yes"), None));
+        assert!(!super::parse_rt_miss(Some("1"), Some("1")));
     }
 
     #[test]
