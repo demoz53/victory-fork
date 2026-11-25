@@ -7896,10 +7896,10 @@ impl Host {
 
 /// Whether the tables translated shaders read on every draw go to the
 /// card's own memory where it has memory the CPU writes
-/// (`VICTORY_TABLES_ON_CARD=1`; off by default): [`Host::table_buffer`].
+/// (`VICTORY_TABLES_ON_CARD=0` turns it off; on by default from test/all12: all11k-tables A/B, the card about 10-20% less busy): [`Host::table_buffer`].
 pub(crate) fn tables_on_card() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_ON_CARD").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_ON_CARD").is_none_or(|v| v != "0"))
 }
 
 /// The swap chain formats a presented texture can be copied into: its own

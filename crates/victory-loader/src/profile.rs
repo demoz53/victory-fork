@@ -484,11 +484,39 @@ fn stack_of(thread: HANDLE, frames: &mut Vec<u64>) -> bool {
             return false;
         }
         if GetThreadContext(thread, &mut context.0) != 0 {
-            unwind_into(context.0, low, high, frames);
+            // Only the committed, readable memory around the stack pointer:
+            // the TEB's limits are not enough (all11i-warm, 2026-11-25: the
+            // unwinder read a reserved, never committed page and the
+            // profiler took the process down). A stack pointer outside such
+            // memory gives the leaf alone.
+            match committed_around(context.0.Rsp as usize) {
+                Some((start, end)) => {
+                    unwind_into(context.0, low.max(start), high.min(end), frames);
+                }
+                None => frames.push(context.0.Rip),
+            }
         }
         ResumeThread(thread);
     }
     !frames.is_empty()
+}
+
+/// The committed, readable run of pages holding `at` (one region as
+/// `VirtualQuery` sees it), or `None`.
+fn committed_around(at: usize) -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: zeroed is a valid MEMORY_BASIC_INFORMATION.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: VirtualQuery writes `info` (its size is passed) and reads
+    // nothing at `at`.
+    let got = unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+    let readable = info.State == MEM_COMMIT && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 && info.Protect != 0;
+    (got != 0 && readable).then(|| {
+        let start = info.BaseAddress as usize;
+        (start, start + info.RegionSize)
+    })
 }
 
 /// The start of the function holding `pc`, or `pc` itself where no unwind
