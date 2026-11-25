@@ -5323,7 +5323,7 @@ impl<'a> Lower<'a> {
                 l.s.m.cmp(c, pred::NE, o, z)
             };
             return match name {
-                "s_bcnt1_i32_b64" => {
+                "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let i32t = self.s.t.i32;
                     let na = self
@@ -5332,7 +5332,13 @@ impl<'a> Lower<'a> {
                     let nb = self
                         .s
                         .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
-                    let r = self.s.m.bin(c, Bin::Add, na, nb);
+                    let ones = self.s.m.bin(c, Bin::Add, na, nb);
+                    let r = if name == "s_bcnt0_i32_b64" {
+                        let width = self.s.m.i32(64);
+                        self.s.m.bin(c, Bin::Sub, width, ones)
+                    } else {
+                        ones
+                    };
                     self.set(lo, Val::I32(r));
                     let z = self.s.m.i32(0);
                     let s = self.s.m.cmp(c, pred::NE, r, z);
@@ -5559,6 +5565,14 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
+            }
+            "s_bcnt0_i32_b32" => {
+                let a = src32(self, 0)?;
+                let ones = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
+                let width = self.s.m.i32(32);
+                (self.s.m.bin(c, Bin::Sub, width, ones), None)
             }
             "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.

@@ -2842,3 +2842,27 @@ fn f16_nearest_switch_rounds_every_narrowing() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn scalar_zero_counts_set_scc_for_nonzero_results() {
+    let cases = [
+        [0, 0, 0, 0],
+        [u32::MAX, u32::MAX, 0, 0],
+        [u32::MAX, 0, 0, 0],
+        [0, u32::MAX, 0, 0],
+        [0x8000_0001, 0xaaaa_5555, 0, 0],
+    ];
+    for (opcode, wide) in [(0x0d, false), (0x0e, true)] {
+        // Count zero bits in s0 or s[0:1] into s6. Complement the count on SCC=0.
+        let shader = build_valu_cs(&[
+            0xbe86_0000 | opcode << 8,
+            sop2(0x0a, 7, 128, 193),
+            sop2(0x12, 7, 6, 7),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        run_cases(&shader, &cases, |backend, _, inputs, got| {
+            let count = inputs[0].count_zeros() + if wide { inputs[1].count_zeros() } else { 0 };
+            assert_eq!(got, if count == 0 { u32::MAX } else { count }, "{backend}");
+        });
+    }
+}
