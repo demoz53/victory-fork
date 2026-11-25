@@ -620,11 +620,11 @@ fn emit_once(
                 }
             }
         }
-        // `VICTORY_WAVE_WIDE=last`: the wave-wide form only for a program that no other form
+        // [`wide_last`] (on unless `VICTORY_WAVE_WIDE=off`): the wave-wide form only for a program that no other form
         // takes, which would otherwise keep 64 lanes (`WaveSize(64)`, refused by a 32-lane
         // host) or stay untranslated, so its dispatches are dropped either way. The programs
         // that hung the card under `=1` (runs 121-124) have an earlier form and keep it.
-        // shortcut: opt-in until a run shows the programs it takes leave the card alone.
+        // (Opt-in until all10-pipes showed the programs it takes leaving the card alone.)
         if wide_last() {
             let deep = if deep_skips_allowed(program.as_deref()) { form(ir::without_skips(p, true)) } else { None };
             let bases = [
@@ -641,7 +641,7 @@ fn emit_once(
                 }
             }
         }
-        // `VICTORY_WAVE_LDS_REGIONS=approx`: after that, an LDS write and read in one
+        // [`lds_last`] (on unless `VICTORY_WAVE_LDS_REGIONS=off`): after that, an LDS write and read in one
         // lane-branch region taken as two host waves all the same
         // ([`lower::with_lds_regions_approx`]), the program and its forms as above, then each
         // host wave on its own with every mask and lane read.
@@ -712,24 +712,29 @@ fn emit_once(
     original.map(|(shader, _)| shader)
 }
 
-/// `VICTORY_WAVE_WIDE=last` ([`emit_once`]): the wave-wide form for 64-lane programs that
-/// no other form takes.
+/// The wave-wide form for 64-lane programs that no other form takes ([`emit_once`]): on
+/// by default since all10-pipes (CS_Tiling_Generate_Opaque, CS_Visibility and the
+/// transmission volumetrics ran for the first time, and the room came out lit as in the
+/// real game, with no device loss); `VICTORY_WAVE_WIDE=off` (or `0`) turns it off, as
+/// before, and `=1` tries the form before the approximate ones for every program.
 fn wide_last() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_WIDE_LAST.get() {
         return on;
     }
-    std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last")
+    std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "off" && v != "0")
 }
 
-/// `VICTORY_WAVE_LDS_REGIONS=approx` ([`emit_once`]): approximate LDS order for 64-lane
-/// programs that no other form takes.
+/// Approximate LDS order for 64-lane programs that no other form takes ([`emit_once`]):
+/// on by default since all10-pipes; `VICTORY_WAVE_LDS_REGIONS=off` turns it off, as
+/// before. (Of the saved programs only CS_DefragHeap_ComputeRelocations 02384a60fda6f2d0
+/// takes it: CS_AlphTransmissionPrefilterMip has an exact form since Vaximous ab4736b.)
 fn lds_last() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_LDS_LAST.get() {
         return on;
     }
-    std::env::var_os("VICTORY_WAVE_LDS_REGIONS").is_some_and(|v| v == "approx")
+    std::env::var_os("VICTORY_WAVE_LDS_REGIONS").is_none_or(|v| v != "off" && v != "0")
 }
 
 #[cfg(test)]
