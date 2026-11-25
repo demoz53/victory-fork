@@ -696,6 +696,19 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`guards`] for a guard's check, the wait for the lock counted.
+fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+    #[cfg(feature = "diagnostics")]
+    {
+        let waiting = std::time::Instant::now();
+        let g = guards();
+        crate::copystat::add(crate::copystat::C::GuardLockUs, waiting.elapsed().as_micros() as u64);
+        g
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    guards()
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -709,15 +722,26 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
+        let g = guards_timed();
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
-    if !known && !is_view(start, end) {
-        return None;
+    if !known {
+        #[cfg(feature = "diagnostics")]
+        let asking = std::time::Instant::now();
+        let view = is_view(start, end);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::GuardQueries, 1);
+            add(C::GuardQueryUs, asking.elapsed().as_micros() as u64);
+        }
+        if !view {
+            return None;
+        }
     }
     install();
-    let mut g = guards();
+    let mut g = guards_timed();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -914,15 +938,24 @@ fn protect_runs(g: &mut Guards, from: usize, to: usize, clean: bool) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let protecting = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        let done = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::GuardProtects, 1);
+            add(C::GuardProtectUs, protecting.elapsed().as_micros() as u64);
         }
+        done
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
