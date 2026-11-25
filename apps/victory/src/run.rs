@@ -20,18 +20,19 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let mut prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     let build = victory_game::identify(&hash);
     match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
-    apply_title_patches(&mut prepared, build, console);
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // In memory, before any of the title's code runs: no file is written.
+    apply_title_patches(&image, build, console);
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -356,44 +357,84 @@ fn hex_str(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The known build's code patches: the title's upscaler choice made the one
-/// a Series X makes (fxceless/victory-fork PR #798 by KyleS98, as in
-/// Geckomacabre/vx-layer 7bdd8c621). On a Series S the title picks FSR 4,
-/// whose output never reaches the screen here (every world frame black, 20
-/// of its compute shaders without a DXIL part); its own upscaler, the one a
-/// Series X runs, works. Applied with `--console series-s`;
-/// `VICTORY_TITLE_PATCHES=1` applies them on any console (a Series X already
-/// chooses that upscaler), `=0` never. Every expected byte is checked
-/// before anything is written: if one is not there (another build), nothing
-/// is patched and that is said. Each patch applied is said once.
+/// The known build's code patches, made in the mapped image's memory
+/// before any of its code runs (no file on disk is written or changed:
+/// the copy the loader maps from stays as it was), each group all or
+/// none ([`victory_loader::patch::patch_mapped`]):
+///
+/// - the title's upscaler choice made the one a Series X makes
+///   (fxceless/victory-fork PR #798 by KyleS98, as in Geckomacabre/vx-layer
+///   7bdd8c621). On a Series S the title picks FSR 4, whose output never
+///   reaches the screen here (every world frame black, 20 of its compute
+///   shaders without a DXIL part); its own upscaler, the one a Series X
+///   runs, works. With `--console series-s`; `VICTORY_TITLE_PATCHES=1` on
+///   any console (a Series X already chooses it).
+/// - `VICTORY_RENDER_SCALE=<0.2..1>`: its own upscaler's render scale fixed
+///   at that fraction of the output size (vitutu1/victory-perf, from
+///   ZigZagBoi1/ScarlettPort), on any console. Off unless set.
+///
+/// `VICTORY_TITLE_PATCHES=0`: none. If a group's bytes are not there
+/// (another build), nothing of it is written and that is said; each patch
+/// made is said once.
 #[cfg(windows)]
 fn apply_title_patches(
-    prepared: &mut victory_loader::PreparedImage,
+    image: &victory_loader::LoadedImage,
     build: Option<&victory_game::KnownBuild>,
     console: Console,
 ) {
-    let wanted = match std::env::var("VICTORY_TITLE_PATCHES").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => matches!(console, Console::SeriesS),
-    };
-    if !wanted {
+    use victory_loader::patch::MemoryPatch;
+    let switch = std::env::var("VICTORY_TITLE_PATCHES");
+    if switch.as_deref() == Ok("0") {
         return;
     }
-    let Some(build) = build.filter(|b| !b.patches.is_empty()) else {
-        println!("title patch    none: no patches for this build (it runs unpatched; a Series S may show black world frames)");
+    let upscaler = switch.as_deref() == Ok("1") || matches!(console, Console::SeriesS);
+    let scale = std::env::var("VICTORY_RENDER_SCALE").ok();
+    if !upscaler && scale.is_none() {
+        return;
+    }
+    let Some(build) = build else {
+        println!("title patch    none: not a known build (it runs unpatched)");
         return;
     };
-    let patches: Vec<(u32, Vec<u8>, Vec<u8>)> =
-        build.patches.iter().map(|p| (p.rva, p.expect.to_vec(), p.write.to_vec())).collect();
-    match prepared.patch(&patches) {
-        Ok(()) => {
-            for p in build.patches {
-                println!("title patch    +{:#x} {}: {} -> {}", p.rva, p.name, hex_str(p.expect), hex_str(p.write));
-            }
+    let mut groups: Vec<(&str, Vec<victory_game::OwnedPatch>)> = Vec::new();
+    if upscaler {
+        let choice = build
+            .patches
+            .iter()
+            .map(|p| victory_game::OwnedPatch { name: p.name, rva: p.rva, expect: p.expect.to_vec(), write: p.write.to_vec() })
+            .collect();
+        groups.push(("upscaler choice", choice));
+    }
+    if let Some(text) = scale {
+        match victory_game::parse_render_scale(&text) {
+            Some(scale) => groups.push(("render scale", victory_game::render_scale_patches(build, scale))),
+            None => println!("title patch    none for VICTORY_RENDER_SCALE={text}: it wants a number from 0.2 to 1"),
         }
-        Err(e) => {
-            println!("title patch    none applied ({e}): the title runs unpatched");
+    }
+    let size = image.info().size_of_image as usize;
+    for (group, patches) in groups {
+        if patches.is_empty() {
+            println!("title patch    none for the {group}: this build has no places for it");
+            continue;
+        }
+        let memory: Vec<MemoryPatch<'_>> = patches
+            .iter()
+            .map(|p| MemoryPatch { name: p.name, rva: p.rva, expect: &p.expect, write: &p.write })
+            .collect();
+        // SAFETY: the title's image, mapped and not yet run.
+        match unsafe { victory_loader::patch::patch_mapped(image.base(), size, &memory) } {
+            Ok(()) => {
+                for p in &patches {
+                    println!(
+                        "title patch    +{:#x} {} (in memory): {} -> {}",
+                        p.rva,
+                        p.name,
+                        hex_str(&p.expect),
+                        hex_str(&p.write)
+                    );
+                }
+            }
+            Err(e) => println!("title patch    none for the {group} ({e}): the title runs without it"),
         }
     }
 }
