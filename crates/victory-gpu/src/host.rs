@@ -2391,8 +2391,9 @@ fn one_flight_prewarm() -> bool {
 /// Whether a submission that waits for flights because it reads what they
 /// may write (the settles "title memory read" and "a step of ours", and the
 /// wait for a texture's staging buffer) makes [`prewarm`] first
-/// (`VICTORY_SETTLE_PREWARM=1`; off by default). The relay's own waits,
-/// with or without [`one_flight`].
+/// (`VICTORY_SETTLE_PREWARM=0`: not). The relay's own waits, with or
+/// without [`one_flight`]. On by default since all13q's runs: 149 and 153
+/// ms a frame against 179 and 209 without it, the picture clean.
 ///
 /// Why: a settle stands the submitting thread still until the card has run
 /// the flights and they have landed, and only then does it prepare, with
@@ -2401,7 +2402,7 @@ fn one_flight_prewarm() -> bool {
 /// made before the wait as after it.
 fn settle_prewarm() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_PREWARM").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_PREWARM").is_none_or(|v| v != "0"))
 }
 
 /// With [`one_flight`] at `mode`: whether a submission waits before it is
