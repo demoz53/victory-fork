@@ -482,15 +482,23 @@ fn process_memory() -> (u64, u64) {
     (c.WorkingSetSize as u64, c.PagefileUsage as u64)
 }
 
-/// The PC's memory in bytes: physical memory free, and what is left to
-/// commit.
+/// Available physical memory and the process's available commit, in bytes.
 fn system_memory() -> (u64, u64) {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
-    unsafe { GlobalMemoryStatusEx(&mut m) };
+    let sampled = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    if sampled && m.ullAvailPageFile < 2 << 30 {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                available_commit_mib = m.ullAvailPageFile >> 20,
+                "Windows commit headroom is low"
+            );
+        });
+    }
     (m.ullAvailPhys, m.ullAvailPageFile)
 }
 
@@ -764,8 +772,8 @@ fn log_memory() {
         mb(windows[2]),
     );
     tracing::info!(
-        "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
-         left to commit); host copies of title memory: {} alive {:.0} MB, of them {} windows \
+        "memory: {:.0} MB private ({:.0} MB of it in memory; {:.0} MB physical memory available, \
+         {:.0} MB left to commit for this process); host copies of title memory: {} alive {:.0} MB, of them {} windows \
          outside buffers {:.0} MB; snapshot buffers kept: {} reserving {:.0} MB; staging of \
          textures: {} alive {:.0} MB, {} kept by their texture, {} buffers taken again and {} made \
          (VICTORY_STAGING_SPARE_MB); host textures: {} alive {:.0} MB, \
