@@ -1152,13 +1152,24 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
+            // Its sticks and triggers too (W/A/S/D, I/J/K/L, Z/C as the
+            // stand-in reads them), over the real ones while a scripted key
+            // holds them: with a pad connected a scripted walk stood still.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
+                let keys: Vec<KeyState> = scripted()
+                    .into_iter()
+                    .map(|vk| KeyState { virtual_key: vk, ..Default::default() })
+                    .collect();
+                let s = super::fallback(&keys);
+                let over = |real: f32, scripted: f32| if scripted != 0.0 { scripted } else { real };
+                pad.buttons |= s.buttons;
+                pad.left_trigger = over(pad.left_trigger, s.left_trigger);
+                pad.right_trigger = over(pad.right_trigger, s.right_trigger);
+                pad.left_x = over(pad.left_x, s.left_x);
+                pad.left_y = over(pad.left_y, s.left_y);
+                pad.right_x = over(pad.right_x, s.right_x);
+                pad.right_y = over(pad.right_y, s.right_y);
             }
             Some(pad)
         }
