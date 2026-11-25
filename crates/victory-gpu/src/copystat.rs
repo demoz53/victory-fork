@@ -132,6 +132,10 @@ pub(crate) enum C {
     /// Of `ResetNs`: letting go of what the lists held (their steps, upload
     /// buffers and objects), where the reset was called.
     ResetDropNs,
+    /// Other views of guarded pages made read-only with them, and guarded
+    /// pages shown at too many addresses for that (`watch::guard_aliases`).
+    GuardAliasProtects,
+    GuardAliasMany,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1067,7 +1071,8 @@ pub(crate) fn log(frames: f64) {
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.1} fallbacks; {:.0} guard faults ({:.0} other views of guarded pages made read-only with \
+         them, {:.0} pages shown at too many places for that, VICTORY_GUARD_ALIASES); textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed, {:.1} changes the guard did not see",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -1089,6 +1094,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
         c[C::GuardFaults as usize],
+        c[C::GuardAliasProtects as usize],
+        c[C::GuardAliasMany as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
