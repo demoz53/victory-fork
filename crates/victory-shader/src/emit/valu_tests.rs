@@ -4444,3 +4444,143 @@ fn half_places_are_the_descriptors_the_program_loads() {
     runtime.push(S_ENDPGM);
     assert_eq!(lowered(&runtime).half_views, [(1, 16)]);
 }
+
+/// DS `ds_swizzle_b32 vdst, vsrc offset:offset`.
+const fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
+    [0x36 << 26 | 0x35 << 18 | offset as u32, (vdst as u32) << 24 | vsrc as u32]
+}
+
+/// MUBUF `buffer_store_dword vdata, voff, s[srsrc:srsrc+3], 0 offen offset:128`.
+const fn buffer_store_dword_offen_128(vdata: u8, voff: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | 128,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | voff as u32,
+    ]
+}
+
+/// One wave of 32 lanes holding 1..=32 (the input of the ISA's examples)
+/// through `ds_swizzle_b32` with `offset`: what each lane reads, per device
+/// that runs 32-lane waves. (Upstream Marvisak/VIctory PR #606 by upipibi.)
+fn swizzle_32(offset: u16) -> Vec<Vec<u32>> {
+    let vop2 = |op: u32, vdst: u32, src0: u32, vsrc1: u32| op << 25 | vdst << 17 | vsrc1 << 9 | src0;
+    let mut body = vec![vop2(0x25, 5, 129, 0)]; // v_add_nc_u32 v5, 1, v0
+    body.extend_from_slice(&ds_swizzle_b32(6, 5, offset));
+    body.push(vop2(0x1A, 7, 130, 0)); // v_lshlrev_b32 v7, 2, v0
+    body.extend_from_slice(&buffer_store_dword_offen_128(6, 7, 8));
+    let shader = build_cs(&body, 32, 0);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(p) => p,
+            Err(e) if !host.runs_waves_of(32) => {
+                eprintln!("{label}: no 32-lane waves ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let uavs = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push(uavs[0][32..64].to_vec());
+    }
+    out
+}
+
+/// The basic modes: a quad permutation and a 32-lane and/or/xor mapping.
+#[test]
+fn ds_swizzle_basic_modes() {
+    let reversed: Vec<u32> = (0..32).map(|i| (i ^ 3) + 1).collect();
+    let swapped: Vec<u32> = (0..32).map(|i| (i ^ 16) + 1).collect();
+    for (offset, want) in [(0x801B, reversed), (0x401F, swapped)] {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+}
+
+/// Offsets from 0xE000: the FFT orders, as the ISA lists them for inputs
+/// 1..=0x20 (RDNA2 ISA, 12.13.1).
+#[test]
+fn ds_swizzle_fft_mode() {
+    if !super::lower::swizzle_modes() {
+        return;
+    }
+    let cases: [(u16, [u32; 32]); 3] = [
+        (
+            0xE000,
+            [
+                0x01, 0x11, 0x09, 0x19, 0x05, 0x15, 0x0d, 0x1d, 0x03, 0x13, 0x0b, 0x1b, 0x07, 0x17, 0x0f, 0x1f, 0x02,
+                0x12, 0x0a, 0x1a, 0x06, 0x16, 0x0e, 0x1e, 0x04, 0x14, 0x0c, 0x1c, 0x08, 0x18, 0x10, 0x20,
+            ],
+        ),
+        (
+            0xE010,
+            [
+                0x01, 0x09, 0x05, 0x0d, 0x03, 0x0b, 0x07, 0x0f, 0x02, 0x0a, 0x06, 0x0e, 0x04, 0x0c, 0x08, 0x10, 0x11,
+                0x19, 0x15, 0x1d, 0x13, 0x1b, 0x17, 0x1f, 0x12, 0x1a, 0x16, 0x1e, 0x14, 0x1c, 0x18, 0x20,
+            ],
+        ),
+        (0xE01F, std::array::from_fn(|i| i as u32 + 1)),
+    ];
+    for (offset, want) in cases {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+    for got in swizzle_32(0xFFF0) {
+        assert_eq!(got, cases[1].1, "offset 0xfff0");
+    }
+}
+
+/// Offsets from 0xC000 to 0xDFFF: the 32 lanes rotate left by offset[9:5],
+/// or right with offset[10]; with a mask its bits of the lane index stay
+/// (the ISA's pseudocode, which RDNA2 hardware follows: Lyrnc's measurement
+/// in Marvisak/VIctory#606).
+#[test]
+fn ds_swizzle_rotate_mode() {
+    if !super::lower::swizzle_modes() {
+        return;
+    }
+    let rotated = |by: u32| -> Vec<u32> { (0..32).map(|i| (i + by) % 32 + 1).collect() };
+    for (offset, by) in [
+        (0xC000 | 1 << 5, 1),
+        (0xC000 | 1 << 10 | 1 << 5, 31),
+        (0xC000, 0),
+        (0xC000 | 5 << 5, 5),
+        (0xC000 | 1 << 10 | 5 << 5, 27),
+        (0xD800 | 31 << 5, 31),
+    ] {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, rotated(by), "offset {offset:#06x}");
+        }
+    }
+    let masked = |offset: u32, i: u32| -> u32 {
+        let (mask, n) = (offset & 0x1F, offset >> 5 & 0x1F);
+        let n = if offset & 0x400 != 0 { n.wrapping_neg() } else { n };
+        ((i & mask) | (i.wrapping_add(n) & !mask & 0x1F)) + 1
+    };
+    // Measured on RDNA2: 0xC021 gives lanes 0, 3, 2, 5, ...; 0xC421 30, 1, 0, 3, ...
+    assert_eq!((0..4).map(|i| masked(0xC021, i) - 1).collect::<Vec<_>>(), [0, 3, 2, 5]);
+    assert_eq!((0..4).map(|i| masked(0xC421, i) - 1).collect::<Vec<_>>(), [30, 1, 0, 3]);
+    for offset in [0xC021u16, 0xC421, 0xC023, 0xD821] {
+        let want: Vec<u32> = (0..32).map(|i| masked(u32::from(offset), i)).collect();
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+}
