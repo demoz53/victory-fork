@@ -210,6 +210,16 @@ pub(crate) fn ask_once_end() {
     }
 }
 
+/// Tests: the journal forgets the pages of `[start, end)`, memory a test
+/// frees (the next allocation there is another test's, and the journal is
+/// one for the process).
+#[cfg(test)]
+pub(crate) fn forget_pages(start: usize, end: usize) {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    j.written.retain(|&page, _| !(first..last).contains(&page));
+}
+
 /// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.

@@ -3338,6 +3338,9 @@ mod skip_tests {
             copy.update(start, LEN);
             assert_eq!(*data.add(PAGE + 10), 3, "after the skip: the title's byte");
             assert_ne!(VirtualFree(title.cast(), 0, MEM_RELEASE), 0);
+            // The journal is the process's: what it learnt here is not the
+            // next allocation's at this address.
+            crate::watch::forget_pages(start, start + LEN);
         }
     }
 }
