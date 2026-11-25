@@ -1092,7 +1092,12 @@ fn block_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
 
 /// How many addresses a guarded page may be shown at for its other views
 /// to be guarded with it ([`protect`], [`open`], [`views_mapped`];
-/// `VICTORY_GUARD_ALIASES`, 8; 0: none, as before fxceless #115).
+/// `VICTORY_GUARD_ALIASES`, 64 from test/all13; 0: none, as before fxceless #115).
+///
+/// 64 (2026-11-25, all12w): with every run at 0 the prologue room lost its walls
+/// and ceiling in 16 and 9 of 16 shots, 21,372 64 KiB blocks of title-memory
+/// copies frozen stale; at 64 views a page, 2 and 0 of 16, none stale, the
+/// same frame time (fxceless #866: the same with their view guard).
 ///
 /// fxceless #115 guards every view of the guarded pages. Its run had
 /// preparing at about 1.7 s a frame: every protect, open and new view went
@@ -1105,7 +1110,7 @@ fn block_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
 fn guard_aliases() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_GUARD_ALIASES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
+        std::env::var("VICTORY_GUARD_ALIASES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64)
     })
 }
 
