@@ -2218,6 +2218,12 @@ fn lower_store_cs(root: RootType, heap: (u32, Option<(u32, u32)>)) -> HostShader
         buffer_store_dword(0, 8, 0)[1],
         S_ENDPGM,
     ];
+    lower_heap_cs(root, heap, &words)
+}
+
+/// [`lower_store_cs`]'s program frame (the descriptor at a data index of
+/// the table or the resource heap in `s[8:11]`) around other `words`.
+fn lower_heap_cs(root: RootType, heap: (u32, Option<(u32, u32)>), words: &[u32]) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -4443,4 +4449,280 @@ fn half_places_are_the_descriptors_the_program_loads() {
     runtime.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
     runtime.push(S_ENDPGM);
     assert_eq!(lowered(&runtime).half_views, [(1, 16)]);
+}
+
+/// DS `ds_swizzle_b32 vdst, vsrc offset:offset`.
+const fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
+    [0x36 << 26 | 0x35 << 18 | offset as u32, (vdst as u32) << 24 | vsrc as u32]
+}
+
+/// MUBUF `buffer_store_dword vdata, voff, s[srsrc:srsrc+3], 0 offen offset:128`.
+const fn buffer_store_dword_offen_128(vdata: u8, voff: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | 128,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | voff as u32,
+    ]
+}
+
+/// One wave of 32 lanes holding 1..=32 (the input of the ISA's examples)
+/// through `ds_swizzle_b32` with `offset`: what each lane reads, per device
+/// that runs 32-lane waves. (Upstream Marvisak/VIctory PR #606 by upipibi.)
+fn swizzle_32(offset: u16) -> Vec<Vec<u32>> {
+    let vop2 = |op: u32, vdst: u32, src0: u32, vsrc1: u32| op << 25 | vdst << 17 | vsrc1 << 9 | src0;
+    let mut body = vec![vop2(0x25, 5, 129, 0)]; // v_add_nc_u32 v5, 1, v0
+    body.extend_from_slice(&ds_swizzle_b32(6, 5, offset));
+    body.push(vop2(0x1A, 7, 130, 0)); // v_lshlrev_b32 v7, 2, v0
+    body.extend_from_slice(&buffer_store_dword_offen_128(6, 7, 8));
+    let shader = build_cs(&body, 32, 0);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(p) => p,
+            Err(e) if !host.runs_waves_of(32) => {
+                eprintln!("{label}: no 32-lane waves ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let uavs = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push(uavs[0][32..64].to_vec());
+    }
+    out
+}
+
+/// The basic modes: a quad permutation and a 32-lane and/or/xor mapping.
+#[test]
+fn ds_swizzle_basic_modes() {
+    let reversed: Vec<u32> = (0..32).map(|i| (i ^ 3) + 1).collect();
+    let swapped: Vec<u32> = (0..32).map(|i| (i ^ 16) + 1).collect();
+    for (offset, want) in [(0x801B, reversed), (0x401F, swapped)] {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+}
+
+/// Offsets from 0xE000: the FFT orders, as the ISA lists them for inputs
+/// 1..=0x20 (RDNA2 ISA, 12.13.1).
+#[test]
+fn ds_swizzle_fft_mode() {
+    if !super::lower::swizzle_modes() {
+        return;
+    }
+    let cases: [(u16, [u32; 32]); 3] = [
+        (
+            0xE000,
+            [
+                0x01, 0x11, 0x09, 0x19, 0x05, 0x15, 0x0d, 0x1d, 0x03, 0x13, 0x0b, 0x1b, 0x07, 0x17, 0x0f, 0x1f, 0x02,
+                0x12, 0x0a, 0x1a, 0x06, 0x16, 0x0e, 0x1e, 0x04, 0x14, 0x0c, 0x1c, 0x08, 0x18, 0x10, 0x20,
+            ],
+        ),
+        (
+            0xE010,
+            [
+                0x01, 0x09, 0x05, 0x0d, 0x03, 0x0b, 0x07, 0x0f, 0x02, 0x0a, 0x06, 0x0e, 0x04, 0x0c, 0x08, 0x10, 0x11,
+                0x19, 0x15, 0x1d, 0x13, 0x1b, 0x17, 0x1f, 0x12, 0x1a, 0x16, 0x1e, 0x14, 0x1c, 0x18, 0x20,
+            ],
+        ),
+        (0xE01F, std::array::from_fn(|i| i as u32 + 1)),
+    ];
+    for (offset, want) in cases {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+    for got in swizzle_32(0xFFF0) {
+        assert_eq!(got, cases[1].1, "offset 0xfff0");
+    }
+}
+
+/// Offsets from 0xC000 to 0xDFFF: the 32 lanes rotate left by offset[9:5],
+/// or right with offset[10]; with a mask its bits of the lane index stay
+/// (the ISA's pseudocode, which RDNA2 hardware follows: Lyrnc's measurement
+/// in Marvisak/VIctory#606).
+#[test]
+fn ds_swizzle_rotate_mode() {
+    if !super::lower::swizzle_modes() {
+        return;
+    }
+    let rotated = |by: u32| -> Vec<u32> { (0..32).map(|i| (i + by) % 32 + 1).collect() };
+    for (offset, by) in [
+        (0xC000 | 1 << 5, 1),
+        (0xC000 | 1 << 10 | 1 << 5, 31),
+        (0xC000, 0),
+        (0xC000 | 5 << 5, 5),
+        (0xC000 | 1 << 10 | 5 << 5, 27),
+        (0xD800 | 31 << 5, 31),
+    ] {
+        for got in swizzle_32(offset) {
+            assert_eq!(got, rotated(by), "offset {offset:#06x}");
+        }
+    }
+    let masked = |offset: u32, i: u32| -> u32 {
+        let (mask, n) = (offset & 0x1F, offset >> 5 & 0x1F);
+        let n = if offset & 0x400 != 0 { n.wrapping_neg() } else { n };
+        ((i & mask) | (i.wrapping_add(n) & !mask & 0x1F)) + 1
+    };
+    // Measured on RDNA2: 0xC021 gives lanes 0, 3, 2, 5, ...; 0xC421 30, 1, 0, 3, ...
+    assert_eq!((0..4).map(|i| masked(0xC021, i) - 1).collect::<Vec<_>>(), [0, 3, 2, 5]);
+    assert_eq!((0..4).map(|i| masked(0xC421, i) - 1).collect::<Vec<_>>(), [30, 1, 0, 3]);
+    for offset in [0xC021u16, 0xC421, 0xC023, 0xD821] {
+        let want: Vec<u32> = (0..32).map(|i| masked(u32::from(offset), i)).collect();
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+}
+
+/// MUBUF `op vdata, v0, s[srsrc:srsrc+3], 0 idxen` (opcodes from 0x80 carry
+/// their bit 7 in dword 0's bit 25).
+const fn mubuf_idxen(op: u8, vdata: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32 >> 7 & 1) << 25 | (op as u32 & 0x7F) << 18 | 1 << 13,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// A d16 typed load and store through a view picked from the resource heap
+/// at run time (`buffer_load_format_d16_xyzw`, `buffer_store_format_d16_xyzw`,
+/// as the face network moves its tensors): with `VICTORY_HEAP_HALF_BITS` each
+/// access goes through one handle per format kind the host's table names
+/// (unsigned, signed, other), guarded by the kind, and the module validates.
+#[test]
+fn heap_picked_d16_typed_accesses_take_the_views_kind_from_the_table() {
+    let words = [
+        s_mov_b32(5, 0x80),     // s5 = 0
+        sop2(0x1E, 6, 0, 0x85), // s_lshl_b32 s6, s0, 5: the index from data
+        // s_load_dwordx4 s[8:11], s[4:5], s6
+        s_load_dwordx4(8, 4)[0],
+        6 << 25,
+        vop1(0x001, 0, 0x80), // v_mov_b32 v0, 0: element 0
+        mubuf_idxen(0x83, 2, 8)[0],
+        mubuf_idxen(0x83, 2, 8)[1],
+        mubuf_idxen(0x87, 2, 8)[0],
+        mubuf_idxen(0x87, 2, 8)[1],
+        S_ENDPGM,
+    ];
+    // Lowers and validates (lower_heap_cs runs the validator when present).
+    let heap = lower_heap_cs(RootType::ResourceHeap, (999_999, None), &words);
+    assert!(heap.half_views.is_empty(), "no table place");
+    assert_eq!(heap.dxil, lower_heap_cs(RootType::ResourceHeap, (999_999, None), &words).dxil, "repeatable");
+}
+
+/// Stores `v1` to the buffer, then reads it back into `v0` with the tbuffer
+/// load `op` in buffer format `format`.
+fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
+    let mut body = buffer_store_dword(1, 8, 0).to_vec();
+    body.extend(mtbuf(op, format, 0, 0, 8, 0));
+    build_valu_cs(&body)
+}
+
+/// A normalized format's ends load as exactly 1.0 and -1.0 (upstream
+/// Marvisak/VIctory 645391bcc by Duff).
+#[test]
+fn normalized_buffer_formats_load_their_ends_exactly() {
+    if !super::lower::norm_exact() {
+        return;
+    }
+    // tbuffer_load_format_x.
+    let x = 0;
+    // (format, dword stored, value loaded)
+    let cases: &[(u8, u32, f32)] = &[
+        (1, 0xFF, 1.0),   // 8_UNORM
+        (7, 0xFFFF, 1.0), // 16_UNORM
+        (2, 0x7F, 1.0),   // 8_SNORM: the top, the one above the lowest, the lowest
+        (2, 0x81, -1.0),
+        (2, 0x80, -1.0),
+        (8, 0x7FFF, 1.0), // 16_SNORM
+        (8, 0x8001, -1.0),
+        (8, 0x8000, -1.0),
+    ];
+    for &(format, stored, want) in cases {
+        let shader = tbuffer_load_of_v1(x, format);
+        run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want.to_bits(), "{backend}: format {format} of {stored:#x} = {got:#010x}, want {want}");
+        });
+    }
+}
+
+/// Codes of the normalized formats sampled below: every 8- and 10-bit code;
+/// for 16 bits a stride, the RX 6700 XT's division misses (257, 261, ...)
+/// and the ends.
+fn normalized_codes(bits: u32) -> Vec<u32> {
+    if bits <= 10 {
+        return (0..1 << bits).collect();
+    }
+    let edges = [1, 2, 3, 255, 256, 257, 261, 265, 269, 511, 512, 1000, 0x7FFF, 0x8000, 0x8001, 0xFFFE];
+    (0..=0xFFFF).step_by(257).chain(edges).collect()
+}
+
+/// Every normalized code loads as the float nearest its exact quotient, as
+/// the console's buffer unit converts it, not as the host divides: unsigned
+/// and signed, 8, 10 (the x channel of 2_10_10_10) and 16 bits, the signed
+/// formats' two lowest codes -1.0 (upstream Marvisak/VIctory da82e444e).
+#[test]
+fn normalized_buffer_formats_load_correctly_rounded_quotients() {
+    if !super::lower::norm_exact() {
+        return;
+    }
+    let x = 0;
+    // (format, bits, signed): 8_UNORM, 16_UNORM, 8_SNORM, 16_SNORM,
+    // 2_10_10_10_UNORM and _SNORM.
+    for (format, bits, signed) in [(1u8, 8u32, false), (7, 16, false), (2, 8, true), (8, 16, true), (50, 10, false), (51, 10, true)] {
+        let shader = tbuffer_load_of_v1(x, format);
+        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        run_cases(&shader, &cases, |backend, _, [a, ..], got| {
+            let want = if signed {
+                let top = (1i32 << (bits - 1)) - 1;
+                let s = ((a << (32 - bits)) as i32) >> (32 - bits);
+                (s.max(-top) as f32 / top as f32).to_bits()
+            } else {
+                (a as f32 / ((1u32 << bits) - 1) as f32).to_bits()
+            };
+            let sign = if signed { "signed" } else { "unsigned" };
+            assert_eq!(got, want, "{backend}: {bits}-bit {sign} normalized {a:#x} loads as {got:#010x}, want {want:#010x}");
+        });
+    }
+}
+
+/// A title truncates `x * (2^n - 1)` back to the code it stored (the
+/// material index a mesh program reads from a vertex colour's alpha, as
+/// `v_mul_legacy_f32` by 255.0 then `v_cvt_u32_f32`): every code comes back
+/// as itself (upstream Marvisak/VIctory da82e444e).
+#[test]
+fn normalized_codes_truncate_back_to_themselves() {
+    if !super::lower::norm_exact() {
+        return;
+    }
+    let x = 0;
+    for (format, bits) in [(1u8, 8u32), (7, 16)] {
+        let scale = (((1u32 << bits) - 1) as f32).to_bits();
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mtbuf(x, format, 0, 0, 8, 0));
+        // v_mul_legacy_f32 v0, literal, v0; v_cvt_u32_f32 v0, v0.
+        body.extend([0x07 << 25 | 0xFF, scale]);
+        body.push(vop1(0x07, 0, vgpr(0)));
+        let shader = build_valu_cs(&body);
+        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        run_cases(&shader, &cases, |backend, _, [a, ..], got| {
+            assert_eq!(got, a, "{backend}: {bits}-bit code {a} comes back as {got}");
+        });
+    }
 }

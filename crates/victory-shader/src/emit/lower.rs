@@ -262,6 +262,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// The same table dwords before the stride mask, with the format kind
+    /// bits ([`heap_half_bits`]).
+    slot_words: HashMap<(usize, Site, u8), V>,
     /// The heap map's handle ([`Lower::heap_remap`]), made once in the
     /// entry block.
     heap_map: Option<V>,
@@ -1480,6 +1483,54 @@ pub fn half_bits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a d16 typed buffer access through a view the program picks from the
+/// view heap at run time (no table place, so [`half_bits`] does not reach it)
+/// takes the view's format kind from the host's table by heap slot
+/// ([`super::shader::SLOT_INTEGER`], [`super::shader::SLOT_SIGNED`]): through a
+/// `UINT` or `SINT` view the 16-bit integers move as they are (a load keeps
+/// each channel's low 16 bits, a store zero- or sign-extends), through any
+/// other view as halves, as before. Opt-in (`VICTORY_HEAP_HALF_BITS=1`):
+/// the stride mask it needs changes every program that reads a heap-picked
+/// buffer by index (1,065 of the boat set), while none of that set's 24 d16
+/// programs picks its view from the heap. Off, the host's table holds
+/// strides only and the translation is as before. Ported from upstream
+/// Marvisak/VIctory 4243a96a7 (Marvis), adapted: an integer view is read and
+/// written through an integer-typed handle (NVIDIA gives 0 for a float access
+/// through an integer view), the access picked by the kind. Part of the
+/// translation: the shader cache keys on it.
+pub fn heap_half_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_HALF_BITS").is_some_and(|v| v == "1"))
+}
+
+/// Whether `ds_swizzle_b32` offsets from 0xC000 are the ISA's rotate mode
+/// (0xC000-0xDFFF: lane i reads `(i & mask) | ((i + rot) & !mask)` in its
+/// group of 32, rot = offset[9:5], negated with offset[10], mask =
+/// offset[4:0]) and FFT mode (0xE000 up: `(reverse5(i) >> popcount(mask)) |
+/// (i & mask)`), as RDNA2 ISA 12.13.1 gives them, instead of a quad
+/// permutation of offset[7:0] (`VICTORY_SWIZZLE_MODES=0`). Ported from
+/// upstream Marvisak/VIctory PR #606 by upipibi (3ad06fb, da1a1f7; masked
+/// rotations as measured on RDNA2 by Lyrnc). Part of the translation: the
+/// shader cache keys on it.
+pub fn swizzle_modes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWIZZLE_MODES").is_none_or(|v| v != "0"))
+}
+
+/// Whether buffer format loads (`tbuffer_load_format_*`, and buffer loads
+/// lowered through the format) of UNORM and SNORM fields up to 16 bits
+/// convert a code to the float nearest its exact quotient, worked out in
+/// integers, and give exactly 1.0 and -1.0 at the ends, as the console's
+/// buffer unit does (`VICTORY_NORM_EXACT=0`: the host's division, which is
+/// one ulp off for some codes on some cards; a title that truncates `x *
+/// 255` back to a material index then picks another material). Ported from
+/// upstream Marvisak/VIctory da82e444e (Marvis) and 645391bcc (Duff). Part
+/// of the translation: the shader cache keys on it.
+pub fn norm_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NORM_EXACT").is_none_or(|v| v != "0"))
+}
+
 /// Whether [`early_depth`] is declared (`VICTORY_EARLY_DEPTH=0`: never, the
 /// host testing after every shader, as before). Part of the translation: the
 /// shader cache keys on it (`victory-gpu`'s does).
@@ -1906,6 +1957,7 @@ impl<'a> Lower<'a> {
             isolated_p10_rows: BTreeMap::new(),
             handles: HashMap::new(),
             strides: HashMap::new(),
+            slot_words: HashMap::new(),
             heap_map: None,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -4904,10 +4956,14 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         if name == "ds_swizzle_b32" {
-            // Bit 15 set: each lane of a quad picks a lane of it; else lanes
-            // of each group of 32 combine their index with and/or/xor masks.
-            let quad = offset & 0x8000 != 0
-                || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
+            // From 0xE000: an FFT order; from 0xC000: a rotation ([`swizzle_modes`]).
+            // Below, bit 15 set: each lane of a quad picks a lane of it; else
+            // lanes of each group of 32 combine their index with and/or/xor masks.
+            let modes = swizzle_modes();
+            let (fft, rotate) = (modes && offset >= 0xE000, modes && (0xC000..0xE000).contains(&offset));
+            let quad = !(fft || rotate)
+                && (offset & 0x8000 != 0
+                    || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4);
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
@@ -4918,7 +4974,37 @@ impl<'a> Lower<'a> {
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
             let lane = self.lane_index();
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-            let src = if offset & 0x8000 != 0 {
+            let src = if fft || rotate {
+                // Both stay within the lane's group of 32.
+                let (low, high) = (k(self, 0x1F), k(self, !0x1F));
+                let mask = offset & 0x1F;
+                let i = self.s.m.bin(c, Bin::And, lane, low);
+                let j = if fft {
+                    // The 5 index bits reversed, shifted down by the number
+                    // of mask bits; the mask's bits stay the lane's own.
+                    let (top, m, i32t) = (k(self, 27), k(self, mask), self.s.t.i32);
+                    let down = k(self, mask.count_ones());
+                    let j = self.s.op(c, "unary.i32", Attr::ReadNone, i32t, 30, &[i]);
+                    let j = self.s.m.bin(c, Bin::LShr, j, top);
+                    let j = self.s.m.bin(c, Bin::LShr, j, down);
+                    let own = self.s.m.bin(c, Bin::And, i, m);
+                    self.s.m.bin(c, Bin::Or, j, own)
+                } else {
+                    // Left by bits 5-9 lanes (bit 10: right); the mask's
+                    // bits stay the lane's own. This is the ISA's
+                    // pseudocode, which RDNA2 hardware follows; its
+                    // examples for mask 1 list other lanes.
+                    let n = offset >> 5 & 0x1F;
+                    let n = if offset & 0x400 != 0 { n.wrapping_neg() } else { n };
+                    let (n, m, rest) = (k(self, n), k(self, mask), k(self, !mask & 0x1F));
+                    let j = self.s.m.bin(c, Bin::Add, i, n);
+                    let j = self.s.m.bin(c, Bin::And, j, rest);
+                    let own = self.s.m.bin(c, Bin::And, i, m);
+                    self.s.m.bin(c, Bin::Or, j, own)
+                };
+                let group = self.s.m.bin(c, Bin::And, lane, high);
+                self.s.m.bin(c, Bin::Or, group, j)
+            } else if offset & 0x8000 != 0 {
                 let (three, one) = (k(self, 3), k(self, 1));
                 let sel = self.s.m.bin(c, Bin::And, lane, three);
                 let sh = self.s.m.bin(c, Bin::Shl, sel, one);
@@ -6626,10 +6712,9 @@ impl<'a> Lower<'a> {
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    // bytes or more as dword-aligned. Without `VICTORY_NORM_EXACT` norm
+    // formats divide, which the AMD driver does 1 ULP off the hardware's
+    // correctly rounded conversion for some values.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -6688,6 +6773,55 @@ impl<'a> Lower<'a> {
             };
             let f32t = self.s.t.f32;
             let x = match numeric {
+                // With `VICTORY_NORM_EXACT` ([`norm_exact`]): a code converts
+                // to the float nearest its exact quotient, and the ends are
+                // exactly 1.0 and -1.0 (a host may divide through a
+                // reciprocal and land just below 1.0: RDNA 4 loaded
+                // 16_16_UNORM's 65535 as the half 0x3BFF, not 0x3C00).
+                Numeric::Unorm if norm_exact() => {
+                    let top = (1u64 << w) - 1;
+                    let q = if w <= 16 {
+                        let q = self.norm_quotient(field, w);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
+                    let (high, one) = (self.s.m.i32(top as u32), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::EQ, field, high);
+                    let q = self.s.m.select(c, at_top, one, q);
+                    float(self, q)
+                }
+                Numeric::Snorm if norm_exact() => {
+                    let s = signed(self);
+                    let top = (1u32 << (w - 1)) - 1;
+                    let q = if w <= 17 {
+                        // The magnitude's quotient, signed (codes at and
+                        // below -top are -1.0 below).
+                        let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
+                        let neg = self.s.m.cmp(c, pred::SLT, s, zero);
+                        let minus = self.s.m.bin(c, Bin::Sub, zero, s);
+                        let m = self.s.m.select(c, neg, minus, s);
+                        let q = self.norm_quotient(m, w - 1);
+                        let sign = self.s.m.select(c, neg, sign, zero);
+                        let q = self.s.m.bin(c, Bin::Or, q, sign);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
+                    // The lowest value is -1.0 too, as is the one above it.
+                    let (high, one) = (self.s.m.i32(top), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::SGE, s, high);
+                    let q = self.s.m.select(c, at_top, one, q);
+                    let low = self.s.m.i32(top.wrapping_neg());
+                    let minus_one = self.s.m.f32((-1.0f32).to_bits());
+                    let at_bottom = self.s.m.cmp(c, pred::SLE, s, low);
+                    let q = self.s.m.select(c, at_bottom, minus_one, q);
+                    float(self, q)
+                }
                 Numeric::Unorm => {
                     let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
                     let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
@@ -6740,6 +6874,144 @@ impl<'a> Lower<'a> {
         }
         out.truncate(channels as usize);
         Ok(out)
+    }
+
+    /// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for codes
+    /// `0 <= a < d` and `w <= 16`: what the console's buffer unit gives for
+    /// a normalized code. The host's division is not exact (the RX 6700 XT
+    /// returns 8-bit codes one ulp high and some 16-bit codes one ulp low),
+    /// and titles truncate `x * d` back to the code (a material index in a
+    /// vertex colour's alpha), which a quotient one ulp low turns into the
+    /// code below.
+    ///
+    /// `Q = floor(a * 2^32 / d) = a * K + floor(a * r / d)` with `K =
+    /// floor(2^32 / d)` and `r = 2^32 mod d` (no division when `r` is 1:
+    /// widths dividing 32). `a / d` is never exact for `0 < a < d` (`d`
+    /// odd, `r` coprime to it), so `Q` rounds to 24 bits up exactly when
+    /// its highest dropped bit is set, and the result is that integer (at
+    /// most 2^24, so its conversion is exact on any host) scaled by a power
+    /// of two; `Q` itself when it fits, the quotient's further bits then
+    /// lying below half an ulp. That holds for every code of every width but
+    /// 11 and 12 (checked for all codes of widths 2 to 16), which take
+    /// [`Self::exact_norm`]. The host's conversion of a larger integer is
+    /// not relied on: WARP rounds those above 2^31 otherwise.
+    fn norm_quotient(&mut self, a: V, w: u32) -> V {
+        if matches!(w, 11 | 12) {
+            return self.exact_norm(a, w);
+        }
+        let c = self.cur;
+        let d = (1u64 << w) - 1;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
+        let (one, kv) = (k(self, 1), k(self, kk));
+        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
+        if r != 1 {
+            let (rv, dv) = (k(self, r), k(self, d));
+            let t = self.s.m.bin(c, Bin::Mul, a, rv);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            q = self.s.m.bin(c, Bin::Add, q, more);
+        }
+        // The bits to drop (1 to 8) from the exponent of `q >> 8`, which
+        // converts exactly (fewer than 25 bits); none when `q` fits.
+        let k8 = k(self, 8);
+        let top = self.s.m.bin(c, Bin::LShr, q, k8);
+        let top = self.s.m.cast(c, Cast::UiToFp, top, self.s.t.f32);
+        let top = self.as_int(top);
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::LShr, top, k23);
+        let bias = k(self, 127 + 15);
+        let shift = self.s.m.bin(c, Bin::Sub, e, bias);
+        let (zero, b24) = (k(self, 0), k(self, 1 << 24));
+        let fits = self.s.m.cmp(c, pred::IULT, q, b24);
+        let shift = self.s.m.select(c, fits, zero, shift);
+        // Rounded up when the highest dropped bit is set: `a / d` is never
+        // exact, so a dropped half is more than half, never a tie.
+        let up = self.s.m.bin(c, Bin::Shl, q, one);
+        let up = self.s.m.bin(c, Bin::LShr, up, shift);
+        let up = self.s.m.bin(c, Bin::And, up, one);
+        let m = self.s.m.bin(c, Bin::LShr, q, shift);
+        let m = self.s.m.bin(c, Bin::Add, m, up);
+        // At most 2^24: exact as a float, and so its scale by 2^(shift - 32).
+        let f = self.s.m.cast(c, Cast::UiToFp, m, self.s.t.f32);
+        let b95 = k(self, 127 - 32);
+        let scale = self.s.m.bin(c, Bin::Add, shift, b95);
+        let scale = self.s.m.bin(c, Bin::Shl, scale, k23);
+        let scale = self.as_float(scale);
+        let f = self.s.m.bin(c, Bin::Mul, f, scale);
+        self.as_int(f)
+    }
+
+    /// [`Self::norm_quotient`] in integers only, for any width up to 16: `Q`
+    /// as there, 8 more bits when that leaves fewer than 25 (codes of wide
+    /// formats near 0), then rounded to 24 bits to nearest even with the
+    /// remainder as sticky bit, and assembled as float bits.
+    fn exact_norm(&mut self, a: V, w: u32) -> V {
+        let c = self.cur;
+        let d = (1u64 << w) - 1;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
+        let (one, zero, dv, k8) = (k(self, 1), k(self, 0), k(self, d), k(self, 8));
+        let kv = k(self, kk);
+        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
+        let mut rem = a;
+        if r != 1 {
+            let rv = k(self, r);
+            let t = self.s.m.bin(c, Bin::Mul, a, rv);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            q = self.s.m.bin(c, Bin::Add, q, more);
+            rem = self.s.m.bin(c, Bin::URem, t, dv);
+        }
+        // The exponent's bias less the 32 (or 40) fraction bits of `q`; the
+        // shift below is added.
+        let mut bias = k(self, 127 + 23 - 32);
+        if kk < 1 << 24 {
+            // Fewer than 25 bits for the smallest codes: 8 more.
+            let t = self.s.m.bin(c, Bin::Shl, rem, k8);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            let rest = self.s.m.bin(c, Bin::URem, t, dv);
+            let wide = self.s.m.bin(c, Bin::Shl, q, k8);
+            let wide = self.s.m.bin(c, Bin::Or, wide, more);
+            let limit = k(self, 1 << 24);
+            let small = self.s.m.cmp(c, pred::IULT, q, limit);
+            q = self.s.m.select(c, small, wide, q);
+            rem = self.s.m.select(c, small, rest, rem);
+            let b40 = k(self, 127 + 23 - 40);
+            bias = self.s.m.select(c, small, b40, bias);
+        }
+        // Bits to drop: the bit length less 24, 1 to 8.
+        let mut shift = one;
+        for bit in 25..32 {
+            let at = k(self, 1 << bit);
+            let ge = self.s.m.cmp(c, pred::IUGE, q, at);
+            let add = self.s.m.select(c, ge, one, zero);
+            shift = self.s.m.bin(c, Bin::Add, shift, add);
+        }
+        let mant = self.s.m.bin(c, Bin::LShr, q, shift);
+        let below = self.s.m.bin(c, Bin::Sub, shift, one);
+        let half = self.s.m.bin(c, Bin::LShr, q, below);
+        let half = self.s.m.bin(c, Bin::And, half, one);
+        let low = self.s.m.bin(c, Bin::Shl, one, below);
+        let low = self.s.m.bin(c, Bin::Sub, low, one);
+        let low = self.s.m.bin(c, Bin::And, q, low);
+        let rest = self.s.m.bin(c, Bin::Or, low, rem);
+        let sticky = self.s.m.cmp(c, pred::NE, rest, zero);
+        let odd = self.s.m.bin(c, Bin::And, mant, one);
+        let tie = self.s.m.select(c, sticky, one, odd);
+        let up = self.s.m.bin(c, Bin::And, half, tie);
+        let mant = self.s.m.bin(c, Bin::Add, mant, up);
+        // Rounding up to 2^24 moves to the next exponent.
+        let k24 = k(self, 24);
+        let carry = self.s.m.bin(c, Bin::LShr, mant, k24);
+        let mant = self.s.m.bin(c, Bin::LShr, mant, carry);
+        let e = self.s.m.bin(c, Bin::Add, bias, shift);
+        let e = self.s.m.bin(c, Bin::Add, e, carry);
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::Shl, e, k23);
+        let fraction = k(self, 0x7F_FFFF);
+        let m = self.s.m.bin(c, Bin::And, mant, fraction);
+        let bits = self.s.m.bin(c, Bin::Or, e, m);
+        let is_zero = self.s.m.cmp(c, pred::EQ, a, zero);
+        self.s.m.select(c, is_zero, zero, bits)
     }
 
     /// The byte offset a buffer descriptor built around a root descriptor adds
@@ -7192,9 +7464,46 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
+        let mut v = self.as_int(f);
+        if heap_half_bits() {
+            // The top bits are the view's format kind.
+            let bits = self.s.m.i32(super::shader::SLOT_STRIDE_BITS);
+            self.slot_words.insert(key, v);
+            v = self.s.m.bin(c, Bin::And, v, bits);
+        }
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// The format kind of the typed buffer view `src` names, picked from the
+    /// view heap at an index the program computes, from the host's table by
+    /// heap slot ([`heap_half_bits`]): i1s in the current block, whether it is
+    /// an unsigned integer format, a signed one, or neither (`[uint, sint,
+    /// other]`, exactly one true); `None` for a view of a table or when the
+    /// switch is off.
+    fn slot_kind(&mut self, src: &Source) -> Result<Option<[V; 3]>, Why> {
+        if !heap_half_bits() || self.slot_stride(src)?.is_none() {
+            return Ok(None);
+        }
+        let Source::Loaded { load, first } = src else {
+            return Ok(None);
+        };
+        let Some(&word) = self.slot_words.get(&(self.cur, *load, *first)) else {
+            return Ok(None);
+        };
+        let c = self.cur;
+        let (int, signed) = (super::shader::SLOT_INTEGER, super::shader::SLOT_SIGNED);
+        let bits = self.s.m.i32(int | signed);
+        let kind = self.s.m.bin(c, Bin::And, word, bits);
+        let [uint, sint] = [int, int | signed].map(|k| {
+            let k = self.s.m.i32(k);
+            self.s.m.cmp(c, pred::EQ, kind, k)
+        });
+        let int = self.s.m.i32(int);
+        let x = self.s.m.bin(c, Bin::And, word, int);
+        let zero = self.s.m.i32(0);
+        let other = self.s.m.cmp(c, pred::EQ, x, zero);
+        Ok(Some([uint, sint, other]))
     }
 
     /// The heap index of a descriptor that may differ between lanes,

@@ -1,9 +1,10 @@
 //! Console primitive types the host lacks. A rectangle list gives three
-//! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (the title's
-//! full-screen rectangles come as top left, bottom left, bottom right); on
+//! corners per rectangle and the hardware adds the fourth opposite the
+//! right angle, wherever it is (the title's full-screen rectangles come as
+//! top left, bottom left, bottom right, the right angle at v1; its tiled
+//! lighting as top left, bottom left, top right, the right angle at v0); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! made from the other three on the CPU ([`right_angle_rule`]).
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
@@ -18,20 +19,69 @@
 //! direct, indexed and indirect draws alike. This expansion is what is
 //! left for a pipeline that could not get that stage.
 
+/// Whether the CPU expansion finds each rectangle's right angle (the
+/// corner opposite the longest side, from the first float element of two or
+/// more components; ties and NaN keep v1) and completes the rectangle
+/// opposite it, `va + vb - vc` (`VICTORY_RECT_RIGHT_ANGLE=0`: the right angle
+/// is always v1, `v0 + v2 - v1`, as before). The geometry stage
+/// (`victory_shader::emit::rect_list_gs`) already finds the corner; this is
+/// the fallback for a pipeline without it. Ported from upstream
+/// Marvisak/VIctory 8ff791351 (Marvis).
+pub(crate) fn right_angle_rule() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECT_RIGHT_ANGLE").is_none_or(|v| v != "0"))
+}
+
+/// Which of three points is a rectangle's right angle: the one opposite the
+/// longest side; ties and NaN give 1 (upstream 8ff791351's
+/// `emit::right_angle`).
+fn right_angle(xy: [[f32; 2]; 3]) -> usize {
+    let side = |i: usize, j: usize| {
+        let (dx, dy) = (xy[i][0] - xy[j][0], xy[i][1] - xy[j][1]);
+        dx * dx + dy * dy
+    };
+    let (d12, d20, d01) = (side(1, 2), side(2, 0), side(0, 1));
+    if d12 > d20 && d12 > d01 {
+        0
+    } else if d01 > d12 && d01 > d20 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
-/// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
-/// triangles turn the same way. `elements` are (byte offset, format).
+/// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, the right
+/// angle `vc` and `va`, `vb` the corners after it (`(v0, v2, v3)` for a
+/// right angle at v1), so both triangles turn the same way. `elements` are
+/// (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    let rule = right_angle_rule();
     for (rect, out) in src
         .chunks_exact(3 * stride)
         .zip(dst.chunks_exact_mut(6 * stride))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
+        let right = if rule {
+            elements
+                .iter()
+                .find_map(|&(offset, format)| {
+                    let at = offset as usize;
+                    let (n, kind) = components(format)?;
+                    let float = matches!(kind, Kind::F32 | Kind::F16);
+                    (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2)
+                        .then(|| right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k)))))
+                })
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let (a, b) = ((right + 2) % 3, (right + 1) % 3);
+        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
         }
         let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(0));
+        fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -42,7 +92,7 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             let inside = stride.saturating_sub(at) / kind.bytes();
             for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
-                let value = get(0) + get(2) - get(1);
+                let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
             }
         }
@@ -156,6 +206,36 @@ fn f32_to_half(v: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The right angle at v0 (the tiled lighting's top left, bottom left,
+    /// top right): the fourth corner is opposite it, the second triangle
+    /// (v2, v1, v3); and three points in any order give two triangles that
+    /// turn the same way (upstream 8ff791351's test).
+    #[test]
+    fn rectangles_complete_opposite_their_right_angle() {
+        if !right_angle_rule() {
+            return;
+        }
+        let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
+        let mut dst = vec![0u8; 6 * 8];
+        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        assert_eq!(dst[24..], [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]);
+        let read = |d: &[u8], i: usize| {
+            let f = |k: usize| f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap());
+            [f(0), f(1)]
+        };
+        let turn = |d: &[u8], i: usize| {
+            let [a, b, c] = [i, i + 1, i + 2].map(|k| read(d, k));
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        };
+        let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
+        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
+        assert_eq!(right_angle([[0.0, 0.0], [0.0, 1.0], [1.0, 1.0]]), 1);
+        assert_eq!(right_angle([[1.0, 1.0], [0.0, 0.0], [0.0, 1.0]]), 2);
+        assert_eq!(right_angle([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]), 1);
+    }
 
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the
