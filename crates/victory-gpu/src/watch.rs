@@ -523,19 +523,37 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::GuardAliasMany, many as u64);
     let _ = many;
-    for alias in aliases {
-        let alias = alias / BLOCK;
-        // Read-only already (its own guard's, or another fan-out's): no
-        // call. Made read-only here, it is not clean: its own guard, if
-        // any, has not taken its bytes, and its next check copies them
-        // (as for a block written through the runtime: read-only, not
-        // clean).
-        if !g.protected.contains(&alias) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardAliasProtects, 1);
-            protect_here(g, alias, alias + 1, false);
+    // Read-only already (its own guard's, or another fan-out's): no call.
+    // Made read-only here, a block is not clean: its own guard, if any, has
+    // not taken its bytes, and its next check copies them (as for a block
+    // written through the runtime: read-only, not clean).
+    let mut blocks: Vec<usize> = aliases
+        .into_iter()
+        .map(|alias| alias / BLOCK)
+        .filter(|block| !(from..to).contains(block) && !g.protected.contains(block))
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardAliasProtects, blocks.len() as u64);
+    // A run of blocks in one call (each texture's other view is as
+    // contiguous as the texture): 3,400-4,400 calls a frame, one a block,
+    // were 15 ms of "guards" in run a2-base.
+    for (first, end) in block_runs(&blocks) {
+        protect_here(g, first, end, false);
+    }
+}
+
+/// `blocks` (in order, distinct) as runs of consecutive blocks: first, end.
+fn block_runs(blocks: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &block in blocks {
+        match runs.last_mut() {
+            Some(run) if run.1 == block => run.1 += 1,
+            _ => runs.push((block, block + 1)),
         }
     }
+    runs
 }
 
 /// How many addresses a guarded page may be shown at for its other views
@@ -620,8 +638,11 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     if start < end && most > 0 {
         let first = start / BLOCK * BLOCK;
         let (aliases, _) = crate::inplace::aliases_between(first, end.div_ceil(BLOCK).saturating_mul(BLOCK), most);
-        for alias in aliases {
-            any |= open_here(g, alias, alias.saturating_add(BLOCK));
+        let mut blocks: Vec<usize> = aliases.into_iter().map(|alias| alias / BLOCK).collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        for (first, end) in block_runs(&blocks) {
+            any |= open_here(g, first * BLOCK, end * BLOCK);
         }
     }
     any
@@ -638,9 +659,20 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    let set = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) != 0 }
+    };
+    // A run in one call; block by block where it spans views.
+    for (first, end) in block_runs(&blocks) {
+        if end - first > 1 && set(first, end) {
+            continue;
+        }
+        for block in first..end {
+            set(block, block + 1);
+        }
     }
     !blocks.is_empty()
 }
@@ -1403,6 +1435,14 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// Blocks in order make runs of consecutive ones.
+    #[test]
+    fn blocks_make_runs() {
+        assert_eq!(super::block_runs(&[]), Vec::new());
+        assert_eq!(super::block_runs(&[3]), vec![(3, 4)]);
+        assert_eq!(super::block_runs(&[3, 4, 5, 9, 10, 12]), vec![(3, 6), (9, 11), (12, 13)]);
     }
 
     /// A view made read-only because another view of its pages was guarded
