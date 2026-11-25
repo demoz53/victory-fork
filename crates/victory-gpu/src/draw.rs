@@ -3011,6 +3011,7 @@ impl State {
                 // (a dispatch's clamp notes its pipeline with a record it cuts down)
                 let bounded = if kind == DISPATCH {
                     let this = self.pipeline as This;
+                    crate::indirect::note_watched(|| crate::pipeline::shaders_label(this), arguments, count);
                     crate::indirect::with_dispatch(|| crate::pipeline::shaders_label(this), bound)
                 } else {
                     bound()

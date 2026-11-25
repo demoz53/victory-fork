@@ -119,8 +119,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_uses_wave32, set_host_max_wave, with_group_base};
-pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
+pub use lower::{host_uses_wave32, lane_loop_fix, set_host_max_wave, with_group_base};
+pub use per_program::{deep_skips_allowed, for_program, wave64_retried, wave_wide_first};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -508,7 +508,9 @@ fn emit_once(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // (or for the programs `VICTORY_WAVE_WIDE_FIRST` lists: [`wave_wide_first`])
+        let wide_first = per_program::wave_wide_first(program.as_deref());
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || wide_first;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -542,7 +544,30 @@ fn emit_once(
                         forms[0].1.as_ref().map(|f| &f.0),
                         Some(p),
                     ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
+                    if wide_first {
+                        // A program `VICTORY_WAVE_WIDE_FIRST` lists: on the program as it is
+                        // first, its skips kept and taken by the whole wave, as the console
+                        // takes them, so a console wave with no lane left skips their regions
+                        // as there. In a form without them it walks them with EXEC clear, and
+                        // a loop there that ends on a scalar compare of what a first-lane read
+                        // found (no lane: lane 0's stale value) may run to the iteration
+                        // limit, at two group barriers a round (the light-atlas programs
+                        // that lost the card under `VICTORY_WAVE_WIDE=1`, runs 121-124, have
+                        // such loops). Then the forms without them, in turn.
+                        for (name, base) in [
+                            ("as it is", Some(p)),
+                            ("without early-outs", forms[0].1.as_ref().map(|f| &f.0)),
+                            ("without skips", forms[1].1.as_ref().map(|f| &f.0)),
+                            ("without skips, scalars followed", deep.as_ref().map(|f| &f.0)),
+                        ] {
+                            let Some(base) = base else { continue };
+                            let again = widen(c, native, base, why);
+                            report(&format!("wave-wide branches (VICTORY_WAVE_WIDE_FIRST), {name}"), &again);
+                            if done(&again) {
+                                return again.map(|(shader, _)| shader);
+                            }
+                        }
+                    } else if let Some(base) = bases.into_iter().flatten().next() {
                         let again = widen(c, native, base, why);
                         report("wave-wide branches", &again);
                         if done(&again) {

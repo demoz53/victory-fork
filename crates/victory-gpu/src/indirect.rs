@@ -131,6 +131,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             g = uint3(0, 0, 0);
         }
         budget.InterlockedAdd(16, g.x * g.y * g.z, was);
+        // word 7: the groups run by the watched pipelines (`VICTORY_INDIRECT_WATCH`,
+        // bit 31 of the execution)
+        if ((execution & 0x80000000u) != 0) {
+            budget.InterlockedAdd(28, g.x * g.y * g.z, was);
+            // words 8-10: the watched records as asked (first parts only): how
+            // many, how many ask for no group, the largest first dimension
+            if (!rest) {
+                budget.InterlockedAdd(32, 1u, was);
+                if (asked.x == 0u || asked.y == 0u || asked.z == 0u) {
+                    budget.InterlockedAdd(36, 1u, was);
+                }
+                budget.InterlockedMax(40, asked.x, was);
+            }
+        }
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else if (active) {
@@ -353,14 +367,17 @@ thread_local! {
 /// gives back for the number the clamp wrote.
 pub(crate) fn with_dispatch<R>(label: impl FnOnce() -> String, f: impl FnOnce() -> R) -> R {
     let n = NEXT_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % DISPATCH_RING;
+    let watched;
     {
         let mut ring = DISPATCHES.lock().unwrap_or_else(|e| e.into_inner());
         if ring.is_empty() {
             ring.resize(DISPATCH_RING as usize, None);
         }
-        ring[n as usize] = Some(label().into());
+        let label: std::sync::Arc<str> = label().into();
+        watched = watching(&label);
+        ring[n as usize] = Some(label);
     }
-    let was = EXECUTION.replace(n);
+    let was = EXECUTION.replace(n | if watched { 1 << 31 } else { 0 });
     let r = f();
     EXECUTION.set(was);
     r
@@ -404,6 +421,52 @@ pub(crate) fn splits(label: impl FnOnce() -> String) -> bool {
     }
     let label = label();
     list.iter().any(|h| label.contains(h.as_str()))
+}
+
+/// `VICTORY_INDIRECT_WATCH=<hash>,...`: whether the pipeline `label` names
+/// (`compute 0123456789abcdef`) is one whose indirect dispatches' groups the
+/// frame line counts (word 7 of the lists' budgets).
+fn watching(label: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_INDIRECT_WATCH")
+            .map(|v| {
+                v.split([',', ';', ' '])
+                    .map(|h| h.trim().trim_start_matches('#').to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    !list.is_empty() && list.iter().any(|h| label.contains(h.as_str()))
+}
+
+/// `VICTORY_INDIRECT_WATCH`, on the CPU, since the last frame line: the
+/// watched pipelines' indirect dispatches recorded, those with a count buffer,
+/// the largest first dimension of their first record in title memory when
+/// recorded (`u32::MAX`: unreadable), and the largest count in title memory
+/// ([`note_watched`]).
+pub(crate) static WATCHED_CPU: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Notes an indirect dispatch of a watched pipeline (`VICTORY_INDIRECT_WATCH`)
+/// as the title's memory holds it when it is recorded: its first record at
+/// `arguments`, its count at `count`. On the card the record may be another:
+/// a dispatch earlier in the submission writes it (the frame line has both).
+pub(crate) fn note_watched(label: impl FnOnce() -> String, arguments: u64, count: Option<u64>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if std::env::var_os("VICTORY_INDIRECT_WATCH").is_none() || !watching(&label()) {
+        return;
+    }
+    WATCHED_CPU[0].fetch_add(1, Relaxed);
+    let mut first = [0u8; 4];
+    let x = if crate::host::read_into(arguments as *const u8, &mut first) { u32::from_le_bytes(first) } else { u32::MAX };
+    WATCHED_CPU[2].fetch_max(u64::from(x), Relaxed);
+    if let Some(at) = count {
+        WATCHED_CPU[1].fetch_add(1, Relaxed);
+        let mut n = [0u8; 4];
+        let n = if crate::host::read_into(at as *const u8, &mut n) { u32::from_le_bytes(n) } else { u32::MAX };
+        WATCHED_CPU[3].fetch_max(u64::from(n), Relaxed);
+    }
 }
 
 /// What [`with_dispatch`] noted for execution `n`, if the ring still holds it.

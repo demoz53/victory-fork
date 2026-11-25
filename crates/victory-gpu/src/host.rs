@@ -1349,6 +1349,15 @@ static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::a
 /// lists' budget buffers: `indirect::with_dispatch`).
 static COMPUTE_CUT: Mutex<Option<(u32, std::sync::Arc<str>)>> = Mutex::new(None);
 
+/// Since the last frame line: the groups the pipelines `VICTORY_INDIRECT_WATCH`
+/// names ran through indirect dispatches (word 7 of the lists' budgets).
+static WATCHED_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line: the watched pipelines' records as the clamp
+/// read them on the card (words 8-10 of the lists' budgets): how many, how
+/// many asked for no group, the largest first dimension asked for.
+static WATCHED_RECORDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -6381,7 +6390,11 @@ impl HostList {
                         *cut = Some((asked, label));
                     }
                 }
-                for k in 0..7 {
+                WATCHED_GROUPS.fetch_add(u64::from(words.add(7).read_volatile()), Ordering::Relaxed);
+                WATCHED_RECORDS[0].fetch_add(u64::from(words.add(8).read_volatile()), Ordering::Relaxed);
+                WATCHED_RECORDS[1].fetch_add(u64::from(words.add(9).read_volatile()), Ordering::Relaxed);
+                WATCHED_RECORDS[2].fetch_max(u64::from(words.add(10).read_volatile()), Ordering::Relaxed);
+                for k in 0..11 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -6415,7 +6428,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8, 12, 16, 20, 24].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -6456,7 +6469,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 24);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 40);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -7394,6 +7407,23 @@ impl Meter {
         }
         if std::env::var_os("VICTORY_INDIRECT_SPLIT").is_some() {
             tracing::info!("indirect dispatches run in two parts (VICTORY_INDIRECT_SPLIT) so far: {}", crate::draw::split_parts());
+        }
+        if std::env::var_os("VICTORY_INDIRECT_WATCH").is_some() {
+            let watched = WATCHED_GROUPS.swap(0, Ordering::Relaxed) as f64 / frames;
+            tracing::info!("indirect compute dispatches of VICTORY_INDIRECT_WATCH's pipelines: {watched:.1} groups run per frame");
+            let cpu = crate::indirect::WATCHED_CPU.each_ref().map(|w| w.swap(0, Ordering::Relaxed));
+            let card = WATCHED_RECORDS.each_ref().map(|w| w.swap(0, Ordering::Relaxed));
+            let max = |v: u64| if v == u64::from(u32::MAX) { "unreadable".to_owned() } else { v.to_string() };
+            tracing::info!(
+                "VICTORY_INDIRECT_WATCH per frame: {:.1} dispatches recorded ({:.1} with a count buffer); in title memory when recorded: first record's x at most {}, count at most {}; on the card: {:.1} records, {:.1} of them asking for no group, x at most {}",
+                cpu[0] as f64 / frames,
+                cpu[1] as f64 / frames,
+                max(cpu[2]),
+                max(cpu[3]),
+                card[0] as f64 / frames,
+                card[1] as f64 / frames,
+                card[2],
+            );
         }
         late_line(frames);
         {

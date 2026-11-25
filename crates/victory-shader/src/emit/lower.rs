@@ -403,6 +403,13 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
         let mut seen = vec![false; n];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
+            // The branch's own block, reached again without passing a block every way out of
+            // it passes: a lane loop, which only the lanes still in it run again (it
+            // post-dominates itself all the same). Its successors are on the stack already.
+            if b == d && lane_loop_fix() {
+                seen[d] = true;
+                continue;
+            }
             if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
                 continue;
             }
@@ -424,6 +431,37 @@ fn mesh_corner_mask() -> u32 {
     *MASK.get_or_init(|| {
         if std::env::var_os("VICTORY_MESH_EDGE_FLAGS").is_some_and(|v| v == "index") { 0x3FF } else { 0x1FF }
     })
+}
+
+/// `VICTORY_VCC_LOOP_POLARITY=old`: a loop branch on VCC votes "leave when some lane leaves"
+/// whatever its polarity ([`Lower::wave_loop_exit`], as fxceless #196 / 64ed759 had it), not
+/// by the console's own test (VCCNZ: taken when some lane's bit is set; VCCZ: when none is;
+/// ryotdev 178b1a7). Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+fn vcc_loop_polarity_old() -> bool {
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OLD.get_or_init(|| std::env::var_os("VICTORY_VCC_LOOP_POLARITY").is_some_and(|v| v == "old"))
+}
+
+/// Whether a lane loop's own branch block counts as in its branch's region, not as a block
+/// every lane runs ([`lane_regions`]): after the first round only the lanes still in the loop
+/// run it, so two host waves cannot meet there (a group barrier, an exchange), nor are values
+/// written there the same in every lane holding them. `VICTORY_LANE_LOOP_FIX=0`: counted as
+/// every lane's, as before. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn lane_loop_fix() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LANE_LOOP_FIX.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_LOOP_FIX").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's setting of [`lane_loop_fix`] for this thread.
+    static TEST_LANE_LOOP_FIX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
@@ -11314,20 +11352,12 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A loop's back edge decided by `s_cbranch_vccz`/`vccnz` on a compare
-    /// that differs between lanes: the console leaves the loop with the
-    /// whole wave as soon as one lane meets the exit (VCC is tested
-    /// wave-wide), so a lane whose own test never holds leaves with the
-    /// others. The lane's own bit (the structurisation's rule for mask
-    /// tests) keeps such a lane looping, up to the iteration limit in every
-    /// pass: a clustered-light loop that runs while the first lane's word
-    /// index differs from each lane's end runs about 2^20 times in a lane of
-    /// another cluster, which made world draws take seconds on an RTX 5070.
-    /// Here the host wave leaves when one of its lanes does (`waveAnyTrue`
-    /// of the exit). A lane also still leaves on its own exit, so a wave of
-    /// helper lanes only, which wave votes leave out, keeps the lane rule.
-    /// Other branches keep the lane rule: they skip work, or test a value
-    /// the same in every lane.
+    /// A loop's back edge decided by a VCC compare that differs between lanes. In the
+    /// clustered-light loop, the console leaves as soon as one lane's word index matches
+    /// its end. The lane rule alone can leave other lanes looping up to the iteration limit.
+    /// VCCNZ takes its branch when any lane's bit is set and VCCZ when none is set,
+    /// regardless of whether that branch goes back or leaves the loop. The lane's own
+    /// answer also covers helper-only pixel waves, which do not participate in votes.
     fn wave_loop_exit(&mut self, b: usize, when: Bool, cond: V, taken: usize, not_taken: usize) -> V {
         // A branch the wave already takes together ([`Structured::wide`]) has its
         // console-wide answer in `cond`.
@@ -11373,15 +11403,23 @@ impl<'a> Lower<'a> {
         let i1 = self.s.t.i1;
         let (t, f) = (self.s.m.bool(true), self.s.m.bool(false));
         self.s.flags |= flags::WAVE_OPS;
-        if back_taken {
-            // `cond` continues the loop: leave when some lane leaves.
-            let leave = self.s.m.select(c, cond, f, t);
-            let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[leave]);
-            self.s.m.select(c, any, f, cond)
+        let LaneExit::Branch { taken: guest_taken, .. } = self.x.st.exits[b] else { return cond };
+        // wave_any describes the original branch predicate. exit() may have inverted it
+        // and swapped the successors: any(bit) then becomes all(!bit), and vice versa.
+        // (`VICTORY_VCC_LOOP_POLARITY=old`: by where the branch goes instead, as fxceless #196
+        // had it: leave when some lane leaves, right only for a VCCZ back edge and a VCCNZ exit.)
+        let any_takes = if vcc_loop_polarity_old() {
+            !back_taken
         } else {
-            // `cond` leaves the loop.
+            self.x.st.wave_any[b] == Some(taken == guest_taken)
+        };
+        if any_takes {
             let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[cond]);
             self.s.m.bin(c, Bin::Or, cond, any)
+        } else {
+            let opposite = self.s.m.select(c, cond, f, t);
+            let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[opposite]);
+            self.s.m.select(c, any, f, cond)
         }
     }
 
@@ -12426,6 +12464,34 @@ mod tests {
             .expect("meetings when approximate");
         assert!(meet.iter().any(|m| m.0 || m.1), "the host waves meet around the region");
         assert!(super::lds_meetings(&p, &st, &all).is_none(), "and refused again after it");
+    }
+
+    /// A lane loop (one block, left per lane on `s_cbranch_execnz`): after the first round only
+    /// the lanes still in it run its block, so it is not a block every lane runs, though it
+    /// post-dominates its own branch.
+    #[test]
+    fn a_lane_loop_is_not_a_block_every_lane_runs() {
+        let words: [u32; 9] = [
+            0xBE82_0480, // s_mov_b64 s[2:3], 0
+            0x4A00_0081, // 4: v_add_nc_u32 v0, 1, v0
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+            0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+            0xBF89_FFFB, // s_cbranch_execnz -> 4
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 8).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let all = super::all_lane_blocks(&st).expect("all-lane blocks");
+        assert!(matches!(st.exits[1], structure::LaneExit::Branch { taken: 1, not_taken: 2, .. }), "{:?}", st.exits);
+        assert_eq!(all, [true, false, true], "the entry, the loop, after the loop");
+        let was = super::TEST_LANE_LOOP_FIX.replace(Some(false));
+        let before = super::all_lane_blocks(&st).expect("all-lane blocks");
+        super::TEST_LANE_LOOP_FIX.set(was);
+        assert_eq!(before, [true, true, true], "VICTORY_LANE_LOOP_FIX=0: as before");
     }
 
     #[test]
