@@ -97,6 +97,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_HALF_BITS",
                     "VICTORY_CUBE_GRAD_LOD",
                     "VICTORY_LOCAL_ANY_MASKS",
+                    "VICTORY_HEAP_BELOW_ZERO",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
