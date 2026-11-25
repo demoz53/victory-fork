@@ -331,21 +331,44 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
+/// Whether the 64-byte line at `line` can be written (a clzero's).
+///
+/// The region a `VirtualQuery` finds writable is kept per thread, and a
+/// line inside it is not asked about again: the system finds a region's
+/// size by walking its pages, and for the title's memory (gigabytes of one
+/// region) that took milliseconds a call; at a call for every clzero the
+/// title runs, it took whole seconds a frame (all13n0-prof: the hottest
+/// thread in `NtQueryVirtualMemory` under this function). A block of it
+/// made read-only since (the write watch's guards) is still written: the
+/// write faults inside the handler, and the guards' own vectored handler
+/// takes that fault as it takes the title's writes.
 fn writable_line(line: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
     };
+    thread_local! {
+        static WRITABLE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
     let Some(end) = line.checked_add(64) else {
         return false;
     };
+    let (from, to) = WRITABLE.with(std::cell::Cell::get);
+    if from <= line && end <= to {
+        return true;
+    }
     // SAFETY: plain data filled in by VirtualQuery.
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: valid out pointer of exact struct size.
     let found = unsafe { VirtualQuery(line as *const _, &mut m, size_of_val(&m)) } != 0;
-    found
+    let region_end = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+    let ok = found
         && m.State == MEM_COMMIT
         && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
-        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
+        && region_end >= end;
+    if ok {
+        WRITABLE.with(|w| w.set((m.BaseAddress as usize, region_end)));
+    }
+    ok
 }
 
 /// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
