@@ -6437,7 +6437,12 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // `VICTORY_RUN_NAME=<text>`: shown before the frame rate, so a run can be told apart on screen.
+        static RUN: OnceLock<String> = OnceLock::new();
+        let run = RUN.get_or_init(|| {
+            std::env::var("VICTORY_RUN_NAME").map(|n| format!("[{n}] ")).unwrap_or_default()
+        });
+        let text = format!(" | VIctory {run}{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
