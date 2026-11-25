@@ -182,9 +182,143 @@ pub fn report_crashes() {
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
     unsafe {
+        // The AMD-only instructions first: the title traps on them tens of
+        // thousands of times a second, and every handler ahead of this one
+        // would see each of those traps (`VICTORY_AMD_FIRST=0`: last, with
+        // the crash report, as before).
+        if amd_first() {
+            AddVectoredExceptionHandler(1, Some(amd_handler));
+        }
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
     }
+    amd_counts_logger();
+}
+
+/// Whether the AMD-only instructions have a vectored handler of their own,
+/// first in the chain ([`amd_handler`]).
+fn amd_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMD_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// The AMD-only instructions, ahead of every other vectored handler: they
+/// are emulated, anything else goes on down the chain.
+unsafe extern "system" fn amd_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { emulate_amd_only(info) } { -1 } else { EXCEPTION_CONTINUE_SEARCH }
+}
+
+/// The AMD-only instructions emulated, by kind: clzero (exceptions, and the
+/// lines they zeroed), monitorx, mwaitx (exceptions; of them, waits that
+/// saw their line change), rdpru, clwb, SSE4a's extrq/insertq.
+static AMD_COUNTS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+const AMD_NAMES: [&str; 8] = [
+    "clzero",
+    "lines clzero zeroed",
+    "monitorx",
+    "mwaitx",
+    "mwaitx waits that saw their line change",
+    "rdpru",
+    "clwb",
+    "extrq/insertq",
+];
+
+fn amd_count(kind: usize, n: u64) {
+    AMD_COUNTS[kind].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Every five seconds, what was emulated in them (nothing when nothing was).
+fn amd_counts_logger() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("victory-amd-counts".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let counts: Vec<u64> = AMD_COUNTS.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+            if counts.iter().all(|&c| c == 0) {
+                continue;
+            }
+            let named: Vec<String> =
+                AMD_NAMES.iter().zip(&counts).map(|(name, n)| format!("{name} {:.0}", *n as f64 / 5.0)).collect();
+            tracing::info!("AMD-only instructions emulated per second: {}", named.join(", "));
+        });
+    });
+}
+
+thread_local! {
+    /// The line the thread's last `monitorx` named ([`mwaitx`]).
+    static MONITORED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `mwaitx` waits until the line `monitorx` named is written, or its timer
+/// (with `ecx` bit 1, `ebx` cycles), or a millisecond at most, has run
+/// out: the title spins on a fence value in memory this way, and returned
+/// at once (a yield) every pass of its spin was two exceptions, hundreds of
+/// thousands a second, the thread's whole core. Waking early is what the
+/// instruction may always do. `VICTORY_MWAITX_WAIT=0`: a yield, as before.
+fn mwaitx(context: &CONTEXT) {
+    static WAITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let line = MONITORED.with(std::cell::Cell::get) & !7;
+    if line == 0
+        || !*WAITS.get_or_init(|| std::env::var_os("VICTORY_MWAITX_WAIT").is_none_or(|v| v != "0"))
+        || !readable_word(line)
+    {
+        std::thread::yield_now();
+        return;
+    }
+    // SAFETY: a readable word (checked above) the title watches.
+    let read = || unsafe { (line as *const u64).read_volatile() };
+    let was = read();
+    const MOST: u64 = 1_000_000; // nanoseconds
+    let most = if context.Rcx & 2 != 0 {
+        // The timer counts the time-stamp counter's cycles: at about 3 GHz.
+        (u64::from(context.Rbx as u32) / 3).clamp(1_000, MOST)
+    } else {
+        MOST
+    };
+    let started = std::time::Instant::now();
+    let mut spins = 0u32;
+    loop {
+        if read() != was {
+            amd_count(4, 1);
+            return;
+        }
+        if started.elapsed().as_nanos() as u64 >= most {
+            return;
+        }
+        spins += 1;
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Whether the 8 bytes at `at` can be read (one `VirtualQuery`, cached per
+/// thread for the page last asked about).
+fn readable_word(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    thread_local! {
+        static LAST: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((usize::MAX, false)) };
+    }
+    let page = at & !0xfff;
+    if (at & 0xfff) > 0x1000 - 8 {
+        return false;
+    }
+    let (last, ok) = LAST.with(std::cell::Cell::get);
+    if last == page {
+        return ok;
+    }
+    // SAFETY: plain data filled in by VirtualQuery.
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the structure's size.
+    let found = unsafe { VirtualQuery(page as *const _, &mut m, size_of_val(&m)) } != 0;
+    let ok = found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.Protect != 0;
+    LAST.with(|l| l.set((page, ok)));
+    ok
 }
 
 /// What the vectored handler reports as it happens.
@@ -244,11 +378,19 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                 if !writable_line((context.Rax & !63) as usize) {
                     return false;
                 }
+                amd_count(0, 1);
                 return clzero(context);
             }
-            [0x0f, 0x01, 0xfa, ..] => {}
-            [0x0f, 0x01, 0xfb, ..] => std::thread::yield_now(),
+            [0x0f, 0x01, 0xfa, ..] => {
+                amd_count(2, 1);
+                MONITORED.with(|m| m.set(context.Rax as usize));
+            }
+            [0x0f, 0x01, 0xfb, ..] => {
+                amd_count(3, 1);
+                mwaitx(context);
+            }
             [0x0f, 0x01, 0xfd, ..] => {
+                amd_count(5, 1);
                 // Flags are left as they are: a Zen 3 changes none, for
                 // known counters or not (measured in user mode).
                 let known = context.Rcx as u32 <= 1;
@@ -267,16 +409,19 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     let flags = cmp_flags(end, limit);
                     context.EFlags = context.EFlags & !CMP_FLAGS | flags;
                     context.Rip += pass.len as u64;
+                    amd_count(6, 1);
                     return true;
                 }
                 if let Some(len) = clwb_len(slice) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
+                    amd_count(6, 1);
                     return true;
                 }
                 let Some(len) = sse4a(slice, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
+                amd_count(7, 1);
                 context.Rip += len as u64;
                 return true;
             }
@@ -404,8 +549,11 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
 /// `context` is the state of a thread that faulted at a `clzero`; the
 /// lines its registers name are the title's to zero.
 unsafe fn clzero(context: &mut CONTEXT) -> bool {
-    // SAFETY: (every use) a line the title asked to zero.
-    let zero = |rax: u64| unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
+    let zero = |rax: u64| {
+        amd_count(1, 1);
+        // SAFETY: (every use) a line the title asked to zero.
+        unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) }
+    };
     let at = context.Rip as usize;
     // The loops' other instructions are read only where that stays inside
     // the faulting instruction's page (the next one may not be mapped).
@@ -1722,6 +1870,32 @@ mod tests {
             assert!(context.Rax >> 32 == 0 && context.Rdx >> 32 == 0);
             assert_eq!(count != 0, known, "ecx {ecx:#x}");
         }
+    }
+
+    /// `mwaitx` after `monitorx`: back as soon as the watched word changes,
+    /// and with the timer within about its time when it does not.
+    #[test]
+    fn mwaitx_waits_for_its_line_or_its_timer() {
+        let word = Box::new(std::sync::atomic::AtomicU64::new(1));
+        let at = std::ptr::from_ref(&*word) as u64;
+        let mut xmm = [reg(0, 0); 16];
+        assert_eq!(emulate(&[0x0f, 0x01, 0xfa], at, &mut xmm), Some(3));
+        // No change: the millisecond at most (no timer in this context).
+        let started = std::time::Instant::now();
+        assert_eq!(emulate(&[0x0f, 0x01, 0xfb], 0, &mut xmm), Some(3));
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_micros(900), "{waited:?}");
+        assert!(waited < std::time::Duration::from_millis(100), "{waited:?}");
+        // A write from another thread ends the wait.
+        let address = at as usize;
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            // SAFETY: the box outlives the thread (joined below).
+            unsafe { (*(address as *const std::sync::atomic::AtomicU64)).store(2, Ordering::Relaxed) };
+        });
+        assert_eq!(emulate(&[0x0f, 0x01, 0xfb], 0, &mut xmm), Some(3));
+        writer.join().unwrap();
+        assert_eq!(word.load(Ordering::Relaxed), 2);
     }
 
     #[test]
