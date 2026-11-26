@@ -76,7 +76,12 @@ Arguments, in order, each with its type: `i:<int>` (also `i:0x..`), `u:<u64>`, `
 
 The context built is exactly what the game's script VM hands a handler: `{u64* args, u64* result, u32 arg_count,
 u32 result_count}` in rcx, 8-byte argument slots (ints and floats in the low bytes), an 8-slot zeroed result buffer.
-It is called on the frame hook's thread, once. Its result is shown as slots and as i32, f32 and vec3.
+It is called on the frame hook's thread, once. Its result is shown as the first three slots, slot 0 as i32 and as
+f32, and as a vec3. How results come back (seen in the game): an int, float or bool in the low bytes of slot 0; a vec3
+packed as the VM packs vector arguments, x in the low and y in the high half of slot 0 and z in the low half of slot 1
+(the first 12 bytes); an entity handle (PLAYER_PED_ID, GET_PLAYER_VEHICLE) as two opaque slots, the game's own 16-byte
+script handle (not a pointer; pass it on to another command as `u:<slot 0> u:<slot 1>`, or use `h:player` /
+`h:vehicle`).
 
 Limits: no script is made current, so commands that act for a running script (creating script-owned entities, script
 events, anything that needs a script's own memory) do nothing or may crash the game. Wrong arguments may crash the

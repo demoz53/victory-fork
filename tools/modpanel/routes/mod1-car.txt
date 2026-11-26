@@ -1,15 +1,20 @@
-# mod1-car: vehicle spawn from the keys file (VICTORY_MOD=1 VICTORY_TITLE_COMMANDS=1), about 11 s after control.
-# To the yard 280 m north-east (seen in mod1-tp), write the game's vehicle list beside the status file, spawn the
-# first model of that list 5 m ahead, get in, repair, and teleport home WITH the vehicle (it moves with the player).
-teleport -2155 -5330
-wait 20f
-vehicle list
-spawn vehicle #0
-wait 50f
-J 8f
+# mod1-car (second form): vehicle spawn by name, from the keys file (VICTORY_MOD=1 VICTORY_TITLE_COMMANDS=1),
+# about 14 s after control.
+# 1 At the water's edge facing the water (heading 2.17): an airboat 5 m out on the water, get in, drive-less hop 20 m
+#   further out with it (the vehicle teleports with its driver), repair.
+# 2 In the yard 280 m north-east, facing SOUTH (heading 3.14: the white fence is north): a Banshee 5 m ahead.
+teleport -2368.0 -5530.9 3.3 2.17
+wait 10f
+spawn vehicle airboat09
+wait 40f
 vehicle enter
 wait 10f
+tp rel 20 0
+wait 12f
 vehicle repair
 wait 6f
-teleport -2357.4 -5525.4 3.0 2.17
-wait 30f
+teleport -2155 -5330 3.99 3.14
+wait 20f
+spawn vehicle banshee
+wait 40f
+J 8f

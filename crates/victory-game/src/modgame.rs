@@ -189,6 +189,8 @@ pub mod sites {
     pub const WORLD_DEFAULT_LOCATION: Pin = Pin { site: WORLD_DEFAULT_LOCATION_READ, disp: 2, end: 6, target: 0x0ab4_5df0 };
     pub const PHYSICS_WORLD: Pin = Pin { site: PHYSICS_WORLD_READ, disp: 3, end: 7, target: 0x0ab4_40c8 };
     pub const VEHICLE_COUNTER: Pin = Pin { site: VEHICLE_COUNTER_READ, disp: 2, end: 6, target: 0x0a21_b750 };
+    /// The vehicle pool object, read by VehicleFromEntityId (`mov rdx, [rip+X]`).
+    pub const VEHICLE_POOL: Pin = Pin { site: VEHICLE_FROM_ID, disp: 14, end: 18, target: 0x0abb_e8c8 };
 }
 
 /// The CPed vtable and the two slots called through an entity's vtable.
@@ -274,8 +276,8 @@ struct State {
     spawn: Option<SpawnJob>,
     /// The game's vehicle models, read once.
     models: Option<Vec<VehicleModel>>,
-    /// The vehicle last spawned (checked alive before use), or 0.
-    spawned: usize,
+    /// The vehicle last spawned and its pool slot (checked alive before use), or (0, 0).
+    spawned: (usize, u32),
     /// `wanted n` waiting for the game to show the level: (n, since, line).
     wanted_check: Option<(u32, Instant, String)>,
     /// Times never wanted was put back since it was set (said once, then counted).
@@ -345,7 +347,7 @@ pub fn configure(var: &dyn Fn(&str) -> Option<String>) -> bool {
         kept_at: None,
         spawn: None,
         models: None,
-        spawned: 0,
+        spawned: (0, 0),
         wanted_check: None,
         never_again: 0,
         handlers: None,
@@ -602,6 +604,7 @@ const POOL_STRIDE: usize = 0x08;
 const POOL_CAPACITY: usize = 0x0c;
 const POOL_FLAGS: usize = 0x28;
 const POOL_LIVE_MASK: usize = 0x30;
+const POOL_GENERATION_MASK: u32 = 0x07fe_0000;
 /// The entity's physics instance, set by the world entity manager.
 const PHYSICS_INST: usize = 0x38;
 /// Model request flags of the script request-model command; the request index bits.
@@ -653,7 +656,7 @@ struct SpawnJob {
     word: u16,
     since: Instant,
     /// Once made: the vehicle, its params (until [`VP_KEEP`]), whether it is in the world.
-    made: Option<(usize, Option<Box<VehicleParams>>, Instant, bool)>,
+    made: Option<(usize, u32, Option<Box<VehicleParams>>, Instant, bool)>,
 }
 
 /// Reads a NUL-terminated text of at most 256 bytes.
@@ -756,7 +759,7 @@ fn start_spawn(st: &mut State, base: usize, line: &str, m: &modcmd::Model) -> Re
         return Err("a vehicle spawn is still under way".into());
     }
     st.need(base, &SPAWN_SITES)?;
-    for p in [sites::MODEL_REQUEST_DEFAULTS, sites::VEHICLE_COUNTER, sites::WORLD_ENTITY_MANAGER, sites::WORLD_DEFAULT_LOCATION, sites::PHYSICS_WORLD] {
+    for p in [sites::MODEL_REQUEST_DEFAULTS, sites::VEHICLE_COUNTER, sites::WORLD_ENTITY_MANAGER, sites::WORLD_DEFAULT_LOCATION, sites::PHYSICS_WORLD, sites::VEHICLE_POOL] {
         st.pin(base, p)?;
     }
     let models = match st.models.clone() {
@@ -870,12 +873,39 @@ fn create_vehicle(base: usize, id: u32, at: [f32; 3], heading: f32) -> Option<(u
 }
 
 /// Whether `veh` is still the live vehicle of its id (the generation-checked lookup).
-fn vehicle_alive(base: usize, veh: usize) -> bool {
-    // SAFETY: VehicleFromEntityId (checked) with the id read from a vehicle we made (its storage stays in the pool).
+/// The vehicle pool slot of `veh` (index | generation), when it is a live slot
+/// (VIper `Pool::slot_of`; the pool word pinned by the caller). A vehicle is
+/// the same live one while its slot stays the same: the entity id at +0x9c is
+/// not usable for this right after creation (the first spawn in the game was
+/// judged gone a frame after it was made, and never put in the world).
+fn vehicle_slot(base: usize, veh: usize) -> Option<u32> {
+    let plausible = |p: usize| (0x1_0000..0x7fff_ffff_0000).contains(&p) && p & 7 == 0;
+    // SAFETY: the pool word (pinned) and its object's fields, each pointer checked, the index below the capacity.
     unsafe {
-        let f: extern "C" fn(u32) -> usize = std::mem::transmute(base + sites::VEHICLE_FROM_ID.rva as usize);
-        f(entity_id(veh)) == veh
+        let p = ((base + sites::VEHICLE_POOL.target as usize) as *const usize).read_volatile();
+        if !plausible(p) {
+            return None;
+        }
+        let storage = ((p + POOL_STORAGE) as *const usize).read_unaligned();
+        let stride = ((p + POOL_STRIDE) as *const u32).read_unaligned() as usize;
+        let cap = (((p + POOL_CAPACITY) as *const u32).read_unaligned() as usize).min(1 << 17);
+        let flags = ((p + POOL_FLAGS) as *const usize).read_unaligned();
+        if !plausible(storage) || stride == 0 || !plausible(flags) || veh < storage || !(veh - storage).is_multiple_of(stride) {
+            return None;
+        }
+        let i = (veh - storage) / stride;
+        if i >= cap {
+            return None;
+        }
+        let f = ((flags + 4 * i) as *const u32).read_unaligned();
+        let mask = ((p + POOL_LIVE_MASK) as *const u32).read_unaligned();
+        (mask & !f == 0).then_some(i as u32 | (f & POOL_GENERATION_MASK))
     }
+}
+
+/// Whether `veh` is still the live vehicle of that pool slot.
+fn vehicle_alive(base: usize, veh: usize, slot: u32) -> bool {
+    veh != 0 && vehicle_slot(base, veh) == Some(slot)
 }
 
 /// One frame of a spawn under way.
@@ -883,7 +913,7 @@ fn step_spawn(st: &mut State, base: usize, ped: usize, frame_no: u64) {
     let Some(job) = st.spawn.as_mut() else { return };
     let name = format!("{} {}", job.model.make, job.model.name).trim().to_owned();
     let mut finish: Option<(bool, String)> = None;
-    let mut spawned_now = 0;
+    let mut spawned_now = (0, 0);
     match job.made.as_mut() {
         None => {
             let w = job.word;
@@ -902,10 +932,19 @@ fn step_spawn(st: &mut State, base: usize, ped: usize, frame_no: u64) {
                 let made = create_vehicle(base, job.id, at, h);
                 release_request(base, &mut job.word);
                 match made {
-                    Some((veh, params)) => {
-                        say(false, &format!("VICTORY_MOD: {name} made at x={:.2} y={:.2} z={:.2} (frame {frame_no}, {} ms after asking)", at[0], at[1], at[2], job.since.elapsed().as_millis()));
-                        job.made = Some((veh, params, Instant::now(), false));
-                    }
+                    Some((veh, params)) => match vehicle_slot(base, veh) {
+                        Some(slot) => {
+                            say(false, &format!("VICTORY_MOD: {name} made at x={:.2} y={:.2} z={:.2} (frame {frame_no}, {} ms after asking; pool slot {slot:#x})", at[0], at[1], at[2], job.since.elapsed().as_millis()));
+                            job.made = Some((veh, slot, params, Instant::now(), false));
+                        }
+                        None => {
+                            // Not in the vehicle pool: leave it alone (never touched again), only clean our block.
+                            if let Some(p) = params {
+                                cleanup_params(base, p);
+                            }
+                            finish = Some((false, format!("refused: {name} was made at {veh:#x}, which is not a live vehicle pool slot; left alone")));
+                        }
+                    },
                     None => finish = Some((false, format!("refused: the game did not make {name} (vehicle budget or pool full?)"))),
                 }
             } else if job.since.elapsed() >= MODEL_WAIT {
@@ -913,13 +952,13 @@ fn step_spawn(st: &mut State, base: usize, ped: usize, frame_no: u64) {
                 finish = Some((false, format!("refused: {name}'s model did not load in {} s", MODEL_WAIT.as_secs())));
             }
         }
-        Some((veh, params, at, in_world)) => {
-            let veh = *veh;
-            if !vehicle_alive(base, veh) {
+        Some((veh, slot, params, at, in_world)) => {
+            let (veh, slot) = (*veh, *slot);
+            if !vehicle_alive(base, veh, slot) {
                 if let Some(p) = params.take() {
                     cleanup_params(base, p);
                 }
-                finish = Some((false, format!("{name} was made but is gone again")));
+                finish = Some((false, format!("{name} was made, but its vehicle pool slot is no longer live: the game removed it")));
             } else {
                 // SAFETY: the live vehicle we made (checked above).
                 let phys = unsafe { ((veh + PHYSICS_INST) as *const usize).read_unaligned() };
@@ -944,12 +983,12 @@ fn step_spawn(st: &mut State, base: usize, ped: usize, frame_no: u64) {
                 }
                 if *in_world && params.is_none() {
                     finish = Some((true, format!("ok: {name} is in front of the player")));
-                    spawned_now = veh;
+                    spawned_now = (veh, slot);
                 }
             }
         }
     }
-    if spawned_now != 0 {
+    if spawned_now.0 != 0 {
         st.spawned = spawned_now;
     }
     if let Some((good, text)) = finish {
@@ -1242,7 +1281,7 @@ fn native(st: &mut State, base: usize, ped: usize, target: &modcmd::Target, args
     let r = out.0;
     let lo = r[0] as u32;
     let text = format!(
-        "{} +{rva:#x} hash {hash:#018x}: slots {:#x} {:#x} {:#x}; as i32 {}, f32 {}, vec3 ({}, {}, {})",
+        "{} +{rva:#x} hash {hash:#018x}: slots {:#x} {:#x} {:#x}; slot 0 as i32 {}, as f32 {}; as a vec3 (x and y in slot 0, z in slot 1) ({}, {}, {})",
         if name.is_empty() { "handler" } else { &name },
         r[0],
         r[1],
@@ -1453,8 +1492,9 @@ fn run(st: &mut State, base: usize, ped: usize, frame_no: u64, line: &str, cmd: 
         Command::VehicleList => vehicle_list(st, base),
         Command::Enter => {
             st.need(base, &[sites::PED_INTO_VEHICLE, sites::VEHICLE_FROM_ID, sites::PED_COMPONENT_51])?;
-            let veh = st.spawned;
-            if veh == 0 || !vehicle_alive(base, veh) {
+            st.pin(base, sites::VEHICLE_POOL)?;
+            let (veh, slot) = st.spawned;
+            if !vehicle_alive(base, veh, slot) {
                 return Err("no vehicle spawned by the mod is there (spawn vehicle first)".into());
             }
             // SAFETY: the live player and the live vehicle we made (checked above).
@@ -1938,6 +1978,7 @@ mod tests {
             sites::WORLD_DEFAULT_LOCATION,
             sites::PHYSICS_WORLD,
             sites::VEHICLE_COUNTER,
+            sites::VEHICLE_POOL,
         ];
         for p in pins {
             let d = p.disp as usize;
@@ -1971,7 +2012,7 @@ mod tests {
             kept_at: None,
             spawn: None,
             models: None,
-            spawned: 0,
+            spawned: (0, 0),
             wanted_check: None,
             never_again: 0,
             handlers: None,
