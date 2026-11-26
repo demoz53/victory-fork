@@ -95,6 +95,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_PERMUTE_HALVES",
                     "VICTORY_SHORT_WAVE_LAST",
                     "VICTORY_LANE_MODULO",
+                    "VICTORY_THREAD_TICKET",
                     "VICTORY_VCC_LOOP_POLARITY",
                     "VICTORY_SKIP_DESCRIPTORS",
                     "VICTORY_DIV_FIXUP",

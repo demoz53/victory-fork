@@ -4,7 +4,8 @@
 //!
 //! Ported from DiogoPCastelos/victory-fork (GPL-3.0-or-later), commits 0698344c3 ("A CPU
 //! model of a 64-lane wave and lane tests on the card; three translator fixes they found")
-//! and 999e1e5e0 by DiogoPCastelos.
+//! and 999e1e5e0 by DiogoPCastelos; the thread ticket ([`thread_ticket`]) from
+//! fxceless/victory-fork pull request #1261 by Garu667 (GPL-3.0).
 
 use super::*;
 
@@ -69,6 +70,46 @@ pub fn lane_modulo() -> bool {
 thread_local! {
     /// A test's setting of [`lane_modulo`] for this thread.
     pub(in crate::emit) static TEST_LANE_MODULO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a program with console lanes in a group of several host waves of 32 lanes, off
+/// the path of a console wave64 program in host waves of 32 (which has its counter already),
+/// takes its console threads from an LDS counter too ([`ticket`], through
+/// [`Lower::wave_base`]): every thread zeroes the dword, the group meets, and each host wave
+/// takes the next run of 32. `VICTORY_THREAD_TICKET=0`: the flat id of the wave's first lane
+/// rounded down to the wave size, plus the lane, as before. That is each thread's own number
+/// only while every host wave holds a wave-aligned run of flat ids, and a 32-lane card fills a
+/// two-dimensional group from tiles of 16 by 2: in a group of 32 by 2 both host waves round
+/// down to the same base, and half the threads take the numbers (and the places they store
+/// to) of the other half. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does).
+pub fn thread_ticket() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_THREAD_TICKET.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's setting of [`thread_ticket`] for this thread.
+    pub(in crate::emit) static TEST_THREAD_TICKET: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The LDS dword of the counter a program with console lanes takes its console threads from
+/// ([`thread_ticket`]), reserved past `lds_dwords`: for a group of `group` threads in several
+/// host waves of `wave` = 32 lanes that is not on the halves path (`halves`: it has its
+/// counter). None otherwise: one host wave, waves of 64 (not taken: the counter counts in
+/// 32s), the switch off, or no room left in the program's LDS ([`MAX_LDS_DWORDS`]).
+pub(super) fn ticket(lds_dwords: &mut u32, halves: bool, console_lanes: bool, group: u32, wave: u32) -> Option<u32> {
+    if halves || !console_lanes || wave != 32 || group <= wave || !thread_ticket() || *lds_dwords >= MAX_LDS_DWORDS {
+        return None;
+    }
+    let slot = *lds_dwords;
+    *lds_dwords += 1;
+    Some(slot)
 }
 
 /// The first of the LDS dwords a group of `group` threads keeps for `ds_bpermute_b32` across

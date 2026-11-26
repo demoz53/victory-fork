@@ -34,7 +34,7 @@ pub(super) use loop_regions::scope as after_loop_scope;
 /// Lane fixes of wave64 compute on 32-lane hosts that the lane tests found.
 mod lanes;
 #[cfg(test)]
-pub(super) use lanes::{TEST_LANE_MODULO, TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST};
+pub(super) use lanes::{TEST_LANE_MODULO, TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST, TEST_THREAD_TICKET};
 
 type Why = &'static str;
 
@@ -342,6 +342,9 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// A program with console lanes in a group of several host waves, not on the `halves`
+    /// path: the LDS dword of `wave_base`'s counter ([`lanes::ticket`]).
+    ticket: Option<u32>,
     /// Whether `halves` is the program's own first LDS dword, borrowed because the group's
     /// LDS had no room past the program's ([`lds_fit`]).
     halves_borrowed: bool,
@@ -1842,6 +1845,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // console lanes in a group of several host waves: `wave_base`'s counter ([`lanes::ticket`])
+        let mut ticket: Option<u32> = None;
         // the scatter's scratch base (`ds_permute_b32`)
         let mut scatter: Option<u32> = None;
         // the area of `ds_bpermute_b32` across two host waves ([`lanes::permute_area`])
@@ -2001,6 +2006,9 @@ impl<'a> Lower<'a> {
                     halves = Some(s.lds_dwords);
                     s.lds_dwords += 1;
                 }
+            }
+            if halves.is_none() {
+                ticket = lanes::ticket(&mut s.lds_dwords, false, console_lanes, group, wave);
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -2176,6 +2184,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            ticket,
             halves_borrowed,
             scatter,
             permute_area,
@@ -4250,7 +4259,7 @@ impl<'a> Lower<'a> {
     /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
     /// found. Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.ticket)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -4852,7 +4861,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.ticket.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
