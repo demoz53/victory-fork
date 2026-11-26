@@ -2587,8 +2587,43 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Whether a host copy let go takes its snapshots still queued for
+/// [`take_snapshots`] out of the queue (on by default; `VICTORY_SNAP_FORGET=0`
+/// leaves them, as before). An entry names the copy's mapping and its
+/// snapshot buffer by address: taken after the copy went (its snapshot
+/// buffer pooled for another), it would read freed memory and write
+/// another copy's snapshot. The submission that queued it holds the copy
+/// until its lists are reset, so this is not known to happen; fxceless
+/// pull request #936 (faycalbaklouti, from go2afri/gta6-vi-port; GPL-3.0)
+/// closes the same gap by taking every queued snapshot at the drop, which
+/// from another thread could take other copies' before their refreshes:
+/// here only this copy's entries go, and none is taken.
+fn snap_forget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SNAP_FORGET").is_none_or(|v| v != "0"))
+}
+
+/// Takes out of the snapshot queue the entries whose snapshot lies in
+/// `[from, to)`; how many.
+fn forget_snaps(from: usize, to: usize) -> usize {
+    forget_in(&mut SNAPS.lock().unwrap_or_else(|e| e.into_inner()), from, to)
+}
+
+/// [`forget_snaps`] in the queue `snaps`.
+fn forget_in(snaps: &mut Vec<(usize, usize, usize)>, from: usize, to: usize) -> usize {
+    let before = snaps.len();
+    snaps.retain(|&(_, dst, _)| dst < from || dst >= to);
+    before - snaps.len()
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if snap_forget()
+            && let Some(before) = self.before.get_mut().unwrap_or_else(|e| e.into_inner()).as_ref()
+        {
+            let at = before.as_ptr() as usize;
+            forget_snaps(at, at + before.capacity().max(1));
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.start, self.len);
@@ -5074,6 +5109,20 @@ mod lookup_cache_tests {
             super::unregister(0x7e58_0000 + k, o.as_ptr() as u64);
         }
         println!("an ask for a buffer's host copy: {}", line.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod snap_forget_tests {
+    /// A copy's queued snapshots are taken out by address, others stay.
+    #[test]
+    fn a_copys_queued_snapshots_go_with_it() {
+        // (A queue of the test's own: the shared one is taken by other
+        // tests' submissions, which would copy these entries.)
+        let (m, o) = (0x10_0000usize, 0x20_0000usize);
+        let mut snaps = vec![(0x1000, m, 64), (0x2000, m + 2048, 64), (0x3000, o, 64), (0x4000, m + 4096, 64)];
+        assert_eq!(super::forget_in(&mut snaps, m, m + 4096), 2);
+        assert_eq!(snaps, [(0x3000, o, 64), (0x4000, m + 4096, 64)]);
     }
 }
 

@@ -2512,7 +2512,8 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            // Not marked again for the next pass (`VICTORY_PASS_UNMARKED`).
+            let Some(view) = host.mirror_unmarked(index, handle) else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
