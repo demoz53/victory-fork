@@ -135,6 +135,13 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/cachekey (on top of all23; not merged yet)
+The translator fingerprint (`victory_shader::TRANSLATOR_FINGERPRINT`, the shader cache's key) now hashes, of `Cargo.lock`, only victory-shader's dependency closure, and of the workspace `Cargo.toml` only its workspace, package and profile sections and those crates' dependency lines: a dependency another crate takes no longer turns every cache cold. Its VALUE CHANGES ONCE with this branch (one warm).
+
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_LIBRARY_PER_KEY` | `1` | off | the host pipeline library is one file per shader-cache run key, `cache\pipelines\host-pipelines-<k-…>.bin` (own `.next`, own fixed `.tmp`; the save turn stays the folder's); the old `host-pipelines.bin` is never written or deleted, but opened read-only as a fallback: a pipeline found there and not in the key's file is loaded from it and copied into the key's file. The first run with it starts an empty key file, fills it from the fallback where it can and makes the rest | test/cachekey | no |
+
 ## New in all23 (merged on top of all22)
 From test/watch5 (holds test/watch4), test/async4 (holds test/async3), test/leak1, test/pic3, test/stream3 and
 test/stable1, test/trim2; each row's "From" names its source.

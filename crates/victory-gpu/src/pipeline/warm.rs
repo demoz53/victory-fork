@@ -403,7 +403,7 @@ fn p_untranslated(p: &Pending) -> bool {
 pub fn batch(opts: &Options) -> Result<Report, String> {
     WARMING.store(true, Ordering::Relaxed);
     let dir = super::library::dir().ok_or("no library folder set")?;
-    let file_len = std::fs::metadata(dir.join("host-pipelines.bin")).map_or(0, |m| m.len());
+    let file_len = std::fs::metadata(dir.join(super::library::library_file())).map_or(0, |m| m.len());
     // The early list is loaded now, so that the save writes it back whole.
     let _ = super::library::wanted_early("");
     let opened = super::library::open_now().ok_or("no host pipeline library (no host GPU?)")?;
