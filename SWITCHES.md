@@ -1,7 +1,7 @@
 # SWITCHES.md - every switch added since test/all14n, in test/all23
 
 `test/all23` = `test/all22` (7c275212b) + merges, in this order, of test/watch5 (2a61eb7d2, holds test/watch4),
-test/async4 (8798ddb11, holds test/async3), test/leak1 (0af946da1), test/pic4 (fcf8630c2, holds test/pic3 6518051e4), test/stream3 (972fbdb77),
+test/async5 (f4d212aa8, holds test/async4 8798ddb11 and test/async3), test/leak1 (0af946da1), test/pic4 (fcf8630c2, holds test/pic3 6518051e4), test/stream3 (972fbdb77),
 test/stable1 (f830f7c2e) and test/trim2 (46c8acccd; holds test/leak1). Left out (not finished when merged):
 test/shader3, test/shader4.
 
@@ -12,6 +12,8 @@ ALL default-on changes since all21 (a run with nothing set does these; each line
 - `VICTORY_PLACED_PADDING` on (all23, test/leak1): `VICTORY_PLACED_PADDING=0`.
 - `VICTORY_OWNERLESS_VIEWS` 1,048,576 (all23, test/leak1): `VICTORY_OWNERLESS_VIEWS=0` (keeps all, as before).
 - `VICTORY_RETIRE_AHEAD` 64 (all23, test/stable1): `VICTORY_RETIRE_AHEAD=0`.
+- `VICTORY_PREWARM_READERS` on (all23, test/async5): a settle's prewarm leaves alone a one-sided copy that a flight
+  in the air read: `VICTORY_PREWARM_READERS=0`.
 - `VICTORY_WRITE_ALIAS_TEXTURES` on (all23, test/pic4): a write of ours into title memory also makes the textures
   placed at other views of those pages upload again: `VICTORY_WRITE_ALIAS_TEXTURES=0`.
 - `VICTORY_VIEW_STATS` on, log only: the "dstorage views" line every 5 s while DirectStorage works (all23,
@@ -93,9 +95,10 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | 26 | `VICTORY_OWNERLESS_VIEWS` is 1,048,576 (table entries of views no resource releases - constant buffer views and placed views that did not fit a record - are kept at most this many, oldest freed under a new generation; before: kept for the run) | test/leak1 (TaynanGT/Vice-Tay PR #27 d3626d257) | `VICTORY_OWNERLESS_VIEWS=0` |
 | 27 | `VICTORY_RETIRE_AHEAD` is 64 (what a sweep or a slot change lets go waits for the running submissions and 64 more, not only the running ones) | test/stable1 (AntoninMichelq e90063015) | `VICTORY_RETIRE_AHEAD=0` |
 | 28 | `VICTORY_WRITE_ALIAS_TEXTURES` is on (a write of ours into title memory also makes the textures placed at other views of those pages upload again) | test/pic4 fcf8630c2 (all23) | `VICTORY_WRITE_ALIAS_TEXTURES=0` |
+| 29 | `VICTORY_PREWARM_READERS` is on (a settle's prewarm leaves alone a one-sided copy a flight in the air read) | test/async5 f4d212aa8 (all23) | `VICTORY_PREWARM_READERS=0` |
 
-Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE, all20 HEAP_FORGET and SDWA_SEXT, all22 GUARD_VIEWS_ONLY and AMBIENT_AIR_FINITE, all23 PLACED_PADDING, OWNERLESS_VIEWS, RETIRE_AHEAD and WRITE_ALIAS_TEXTURES):
-`VICTORY_PLACED_PADDING=0 VICTORY_OWNERLESS_VIEWS=0 VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_HEAP_FORGET=0 VICTORY_SDWA_SEXT=0 VICTORY_GUARD_VIEWS_ONLY=0 VICTORY_AMBIENT_AIR_FINITE=0 VICTORY_RETIRE_AHEAD=0 VICTORY_WRITE_ALIAS_TEXTURES=0 VICTORY_SHADER_CACHE_KEY=exe`
+Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE, all20 HEAP_FORGET and SDWA_SEXT, all22 GUARD_VIEWS_ONLY and AMBIENT_AIR_FINITE, all23 PLACED_PADDING, OWNERLESS_VIEWS, RETIRE_AHEAD, WRITE_ALIAS_TEXTURES, PREWARM_READERS):
+`VICTORY_PLACED_PADDING=0 VICTORY_OWNERLESS_VIEWS=0 VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_HEAP_FORGET=0 VICTORY_SDWA_SEXT=0 VICTORY_GUARD_VIEWS_ONLY=0 VICTORY_AMBIENT_AIR_FINITE=0 VICTORY_RETIRE_AHEAD=0 VICTORY_WRITE_ALIAS_TEXTURES=0 VICTORY_PREWARM_READERS=0 VICTORY_SHADER_CACHE_KEY=exe`
 (leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
 entries a build finds. Five of these change translated code - LOOP_EXITS and the four lane fixes of test/loops2,
 343 compute programs by its agent's count - so a run with them restored needs a warm of its own.)
@@ -140,6 +143,8 @@ test/stable1, test/trim2; each row's "From" names its source.
 | `VICTORY_WRITE_ALIAS_TEXTURES` | `0` restores | ON | a write of ours into title memory (shader results put back, the title's copies, the title's kernel reads: `watch::writing`) already made the textures picked by index placed in the written range be looked at again; now also those placed at the other views of the written 64 KiB pages (at most `VICTORY_GUARD_ALIASES` views a page). The card writes skin and tattoo textures' memory through a buffer view; their uploads stayed stale (noise on skin, a new pattern each launch). Counter: the "textures picked by index" line's "pages at other views of memory we wrote looked at again". Test: the other view's page is listed, the written view's own pages not | test/pic4 (Belobug PR #139, Zetsukae a208d61db, faac6de43) | no |
 | `VICTORY_PLACED_PADDING` | `0` restores | ON | a placed view's shape (the key its table entry is found by) leaves out the words the title does not write (resource words 1 and 13, an SRV's word 3, the union words its dimension does not use): the same view written again finds its entry instead of making a new one each time (the placed-view leak) | test/leak1 43e668fb8 (TaynanGT/Vice-Tay PR #27 d3626d257) | no |
 | `VICTORY_OWNERLESS_VIEWS` | a number of entries; `0` keeps all, as before | ON: 1,048,576 | table entries of views no resource releases (constant buffer views, placed views that did not fit a record) are kept at most this many, oldest freed first; shape counts on the memory line | test/leak1 0af946da1 | no |
+| `VICTORY_LOG_ASYNC` | `1` | off | log lines formatted on the logging thread, written to stderr by a thread of its own (`victory-log`); bounded at 8 MiB waiting: past it INFO lines are counted and dropped (reported), WARN/ERROR written at once after what came before; flushed at a crash, a panic, the host GPU's failure and the title's exit/TerminateProcess | p3n1cillin/yuriko e6a4c9f8e (GPL-3.0) | no |
+| `VICTORY_PREWARM_READERS` | `0` restores | **ON** (fix) | a settle's prewarm (SETTLE_PREWARM, ONE_FLIGHT_PREWARM) leaves alone a one-sided copy that a flight still in the air read (the card reads the copy itself): the prewarm wrote the title's newer bytes under that read (Belobug #139; PR #203's test, Lux-Designs, ported as `prewarm_readers_tests`, fails without the fix) | test/async5 f4d212aa8 | no |
 
 From test/watch4 (on top of test/watch3 a2b96a048):
 `VICTORY_JOURNAL_UNLOCKED` fixed (72dc1fb20, review finding): an answer now waits for every asking in flight over its range.
