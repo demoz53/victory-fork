@@ -1191,6 +1191,9 @@ struct Hosted {
     /// The host was out of memory when it was made: tried again from this
     /// moment (`crate::host::now_ms`; 0: no such refusal; [`oom_retry_ms`]).
     retry_at: std::sync::atomic::AtomicU64,
+    /// The wait before that try (ms), doubled at every refusal in a row
+    /// ([`oom_backoff`]).
+    retry_wait: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1670,13 +1673,21 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // Out of memory (the card full while the world streams) is
             // tried again later; any other refusal is for good, as before.
             match oom_retry_ms() {
-                Some(ms) if LAST_OUT_OF_MEMORY.with(std::cell::Cell::take) => {
-                    r.host.retry_at.store(crate::host::now_ms() + ms, Relaxed);
+                Some(first) if LAST_OUT_OF_MEMORY.with(std::cell::Cell::take) => {
+                    let wait = oom_backoff(r.host.retry_wait.load(Relaxed), first);
+                    r.host.retry_wait.store(wait, Relaxed);
+                    let now = crate::host::now_ms();
+                    r.host.retry_at.store(now + wait, Relaxed);
                     let n = OOM_RETRIES[0].fetch_add(1, Relaxed) + 1;
-                    if n <= 16 || n.is_power_of_two() {
+                    // At most one line every 5 s, with the count since the start.
+                    let last = OOM_WARNED.load(Relaxed);
+                    if (last == 0 || now >= last + 5000)
+                        && OOM_WARNED.compare_exchange(last, now.max(1), Relaxed, Relaxed).is_ok()
+                    {
                         tracing::warn!(
                             resource = ?this,
-                            "a host texture refused for want of memory is tried again in {ms} ms (VICTORY_OOM_RETRY_MS; 0: never, as before): {n} such refusals since the start, {} made at a later try",
+                            "host textures refused for want of memory are tried again, each after {first} ms doubled at every refusal in a row up to {} s (VICTORY_OOM_RETRY_MS; 0: never, as before): {n} such refusals since the start, {} made at a later try; this one waits {wait} ms",
+                            OOM_RETRY_MOST_MS / 1000,
                             OOM_RETRIES[1].load(Relaxed)
                         );
                     }
@@ -1686,6 +1697,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             return None;
         };
         if r.host.retry_at.swap(0, Relaxed) != 0 {
+            r.host.retry_wait.store(0, Relaxed);
             OOM_RETRIES[1].fetch_add(1, Relaxed);
         }
         let twin = twin_texture(&r.desc, &texture);
@@ -1736,6 +1748,26 @@ fn oom_retry_ms() -> Option<u64> {
     });
     (ms > 0).then_some(ms)
 }
+
+/// The longest wait before a texture refused for want of memory is tried
+/// again ([`oom_backoff`]).
+#[cfg(windows)]
+const OOM_RETRY_MOST_MS: u64 = 32_000;
+
+/// The wait before the next try of a texture refused for want of memory:
+/// `first` after its first refusal, then double the wait before (`was`) at
+/// every refusal in a row, up to [`OOM_RETRY_MOST_MS`]. While the card is
+/// really full each texture then tries a few times a minute, not twice a
+/// second for good.
+#[cfg(windows)]
+fn oom_backoff(was: u64, first: u64) -> u64 {
+    if was == 0 { first } else { was.saturating_mul(2).min(OOM_RETRY_MOST_MS.max(first)) }
+}
+
+/// When the last out-of-memory warning was said (`crate::host::now_ms`,
+/// at least 1; 0: none yet).
+#[cfg(windows)]
+static OOM_WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Host textures refused for want of memory since the start, and of them
 /// made at a later try ([`oom_retry_ms`]).
@@ -2776,6 +2808,7 @@ fn hand_out_resource(
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             retry_at: std::sync::atomic::AtomicU64::new(0),
+            retry_wait: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             serial: std::sync::atomic::AtomicU64::new(0),
@@ -3962,6 +3995,24 @@ mod tests {
             crate::texture::unstage(made);
         }
         drop(memory);
+    }
+
+    /// A texture refused for want of memory waits twice as long at every
+    /// refusal in a row, up to the most (VICTORY_OOM_RETRY_MS).
+    #[cfg(windows)]
+    #[test]
+    fn an_out_of_memory_retry_waits_longer_each_time() {
+        let mut wait = 0;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            wait = super::oom_backoff(wait, 500);
+            seen.push(wait);
+        }
+        assert_eq!(&seen[..7], &[500, 1000, 2000, 4000, 8000, 16000, 32000]);
+        assert!(seen[7..].iter().all(|&w| w == super::OOM_RETRY_MOST_MS));
+        // A first wait longer than the most is kept.
+        assert_eq!(super::oom_backoff(0, 60_000), 60_000);
+        assert_eq!(super::oom_backoff(60_000, 60_000), 60_000);
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
