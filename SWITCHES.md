@@ -506,3 +506,21 @@ switch.
   by a copy after our raise; what REFLECT changes for it (the unbounded sky reflection in 0x1b7ff28ced0 reaching the
   skin's composite) is inferred, not traced.
 
+## CPU rewrite (test/cpurw, on top of all23): a title patch, in memory, opt-in
+The title was built for the console's Zen 2. On this PC's Intel CPU every `insertq` (SSE4a), `clzero`, `monitorx` and
+`mwaitx` it runs is an invalid-opcode exception that the loader emulates (`crates/victory-loader/src/crash.rs`):
+all23-s-reaper1 counts, a second, 22,000-23,500 for clzero, 15,000-20,000 each for monitorx and mwaitx, about 500 for
+insertq. With the switch the 41 known sites (`crates/victory-game/src/cpu_sites.rs`: 19 insertq, 10 clzero, 8 clwb,
+2 monitorx, 2 mwaitx) are rewritten once, in the mapped image, where the other title patches are made: after the
+image is mapped and before its imports are bound, its DLLs loaded or its main thread made, so no thread is in a site.
+No file changes. Per site: only if this CPU lacks the instruction (CPUID; this PC has `clwb`, so its 8 sites are left
+alone), only if the bytes there are the table's, decode as the row's instruction, what would move with it is
+register-only and no branch lands inside. A site that fails a check is left to the exception path and named in one
+line. `VICTORY_TITLE_PATCHES=0` turns it off with the others. One line at load (stdout and the log) says how many
+sites were rewritten per kind, how many the CPU runs itself and how many are left and why; the per-second "AMD-only
+instructions emulated" counts stay, and fall to nothing for the kinds rewritten.
+
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_CPU_REWRITE` | `1`; `list` | off (the exception path, as before) | title patch (in memory), opt-in. `1`: `insertq` and `clzero` sites become a 5-byte jump to a stub in memory of ours within 2 GiB of the image (written, then made read-and-execute, then pointed at); the stub does the instruction with SSE2 on the site's own registers, keeps the one xmm register it borrows (and `rcx` for clzero) in stack it takes below `rsp`, changes no flag, and jumps back; a clzero (3 bytes) takes the next register-only instruction (`add rax, 40h` or a `cmp`) into its stub. `monitorx` becomes `nop eax`, `mwaitx` `pause; nop`, `clwb m8` `nop m8`, in place. `list`: one line a site with what would be done; nothing written. A crash report or a stack walk that meets a stub names its site (`... stub of title+0x...`) and goes on from there | SonicRaT/XNW 2fa40fef6 (`crates/xnw-loader/src/rewrite.rs`, `rewrite_table.rs`; SonicRaT; GPL-3.0): the method, both stubs and the 41 sites, each site checked again in our executable | no |
+| `VICTORY_CPU_REWRITE_MWAITX` | `0` | unset (the pair is rewritten with the rest) | with `VICTORY_CPU_REWRITE=1`: the two monitorx and the two mwaitx sites (the title's fence wait, title+0x4fb0ad0) stay on the exception path, so the wait is today's (`VICTORY_MWAITX_WAIT`: inside the handler, until the fence's line changes or the instruction's own timer runs out; the title gives that timer as 100 us in QueryPerformanceCounter ticks, 1000 on a PC, which the handler takes as cycles: about 1 us) and only clzero and insertq stop trapping. Both, because the handler's mwaitx waits on the line its monitorx named. Rewritten, a pass of the wait's loop is `read the fence; pause; read the fence; Sleep(0)` with no exception (its other form: once, then `Sleep(1)` a pass): the same busy wait, which never blocked, polling far more often; its stall timeout is by the clock, not by passes | ours | no |
