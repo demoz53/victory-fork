@@ -2269,6 +2269,32 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
     Some((plane.layout.clone(), r.data() as usize, t.size as usize))
 }
 
+/// Tests: the console layout of a 64x64 two-channel float texture shaders
+/// write, with its mips, as [`title_texture`] gives one: the layout, its
+/// mips and its bytes.
+#[cfg(all(test, windows))]
+pub(crate) fn test_wave_map_layout() -> (victory_formats::texture::Layout, u32, usize) {
+    const MIPS: u16 = 7;
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 64,
+        height: 64,
+        depth_or_array_size: 1,
+        mip_levels: MIPS,
+        format: 16,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 4,
+    };
+    let t = texture_layout(&desc).expect("a layout");
+    let [plane] = &t.planes[..] else {
+        panic!("one plane");
+    };
+    (plane.layout.clone(), u32::from(MIPS), t.size as usize)
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2555,6 +2581,9 @@ impl Drop for Resource {
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        // Texels on their way back into its title memory do not land.
+        #[cfg(windows)]
+        crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,

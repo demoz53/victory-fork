@@ -2111,8 +2111,10 @@ struct Deferred {
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
-    /// the list's shaders write, copied when the list closes.
-    back_wanted: Vec<(usize, Vec<Option<[u32; 10]>>)>,
+    /// the list's shaders write, copied when the list closes: the
+    /// resource, its unordered access views, and where it lay at its first
+    /// writer ([`crate::texback::Target`]; none: not asked).
+    back_wanted: Vec<(usize, Vec<Option<[u32; 10]>>, Option<crate::texback::Target>)>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
     /// Whether the indirect-work budget is zeroed for this recording (a
@@ -6707,12 +6709,20 @@ impl HostList {
         }
         let mut deferred = self.deferred();
         let view = view.copied();
-        if let Some((_, views)) = deferred.back_wanted.iter_mut().find(|(r, _)| *r == resource as usize) {
+        if let Some((_, views, _)) = deferred.back_wanted.iter_mut().find(|(r, _, _)| *r == resource as usize) {
             if !views.contains(&view) {
                 views.push(view);
             }
         } else {
-            deferred.back_wanted.push((resource as usize, vec![view]));
+            // Where the texture lies now, at its first writer: the copy
+            // lands there or not at all (`crate::texback::checked`).
+            let target = crate::texback::checked().then(|| crate::texback::Target::new(resource));
+            if matches!(target, Some(None)) {
+                // Not a texture with one plane in title memory: no copy
+                // (`crate::texback::record` made none of it either).
+                return;
+            }
+            deferred.back_wanted.push((resource as usize, vec![view], target.flatten()));
         }
     }
 
@@ -6720,7 +6730,12 @@ impl HostList {
     /// back go into read-back buffers ([`crate::texback::record`]).
     fn textures_back(&self) {
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
-        for (resource, views) in wanted {
+        for (resource, views, target) in wanted {
+            // Released, or its memory mapped anew, since its writer was
+            // recorded: no copy, and the resource is not looked at.
+            if target.as_ref().is_some_and(crate::texback::Target::stale) {
+                continue;
+            }
             let resource = resource as crate::object::This;
             let Some(copy) = crate::resource::host_copy(resource) else {
                 continue;
@@ -6740,7 +6755,7 @@ impl HostList {
             if let Some(state) = before {
                 self.settle(&copy, state);
             }
-            let back = crate::texback::record(&self.list, resource, &copy.texture, &views);
+            let back = crate::texback::record(&self.list, resource, &copy.texture, &views, target);
             if let Some(state) = after {
                 self.settle(&copy, state);
             }
