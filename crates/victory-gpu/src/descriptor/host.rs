@@ -27,10 +27,13 @@ pub(crate) struct HostHeap {
     count: u32,
     /// Dynamic slots from `dynamic_first`: [`DYNAMIC`] in view heaps, none
     /// in sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
-    /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
+    /// ours keeps 2^18 there, 2^16 and 2^17 both ran out in this title,
+    /// and more for a title heap it does not hold whole:
+    /// [`capped_dynamic_slots`].)
     dynamic: u32,
     /// The first dynamic slot: `count`, or in a view heap with a heap map
-    /// the one after the map's slot ([`MapLayout`]).
+    /// the one after the pool's last ([`MapLayout`]: the one after the
+    /// map's slot unless the heap has more than [`DYNAMIC`] of them).
     dynamic_first: u32,
     /// The title's own slot count (`count` may be fewer).
     title_count: u32,
@@ -151,7 +154,10 @@ struct HeapMap {
 /// tables made in place need; `pool` slots for the title slots past the
 /// window that hold views (looked up in the map by translated shaders);
 /// the map's raw view at `slot`; then the fork's [`DYNAMIC`] dynamic slots
-/// and its null guard slot last, where they were without a map.
+/// and its null guard slot last, where they were without a map. A heap with
+/// more dynamic slots (`dynamic`, [`capped_dynamic_slots`]) takes them from
+/// the pool's end: they then start below the map's slot, which stays where
+/// the translations read it and is never handed out.
 ///
 /// On NVIDIA a shader-visible view heap holds at most 1,000,000 views
 /// ([`PORTABLE_VIEWS`]); the title's has 1,245,184 slots, some
@@ -163,29 +169,46 @@ struct MapLayout {
     window: u32,
     pool: u32,
     slot: u32,
+    /// The dynamic slots, up to the guard: [`DYNAMIC`], or more, and then
+    /// the map's slot is one of them.
+    dynamic: u32,
 }
 
 impl MapLayout {
     /// The layout for `title_count` title slots, an identity window of up
-    /// to `window` slots and the map at `slot`.
-    fn new(title_count: u32, window: u32, slot: u32) -> Self {
+    /// to `window` slots, the map at `slot` and `dynamic` dynamic slots (no
+    /// fewer than [`DYNAMIC`], and none of the window's).
+    fn new(title_count: u32, window: u32, slot: u32, dynamic: u32) -> Self {
         let window = window.min(slot).min(title_count);
+        let guard = slot + 1 + DYNAMIC;
+        let dynamic = dynamic.clamp(DYNAMIC, guard - window);
+        // The pool ends where the dynamic slots start, at the map's slot
+        // at the latest.
+        let pool_end = (guard - dynamic).min(slot);
         MapLayout {
             window,
-            pool: (slot - window).min(title_count - window),
+            pool: (pool_end - window).min(title_count - window),
             slot,
+            dynamic,
         }
     }
 
     /// The first dynamic slot.
     fn dynamic_first(self) -> u32 {
-        self.slot + 1
+        self.guard() - self.dynamic
+    }
+
+    /// The map's slot among the dynamic slots (counted from the first), if
+    /// it is one of them: it is never handed out.
+    fn slot_in_dynamic(self) -> Option<u32> {
+        self.slot.checked_sub(self.dynamic_first())
     }
 
     /// The null guard slot, the heap's last: the limit translated shaders
-    /// clamp view indices to.
+    /// clamp view indices to (fixed by the map's slot, however many dynamic
+    /// slots there are).
     fn guard(self) -> u32 {
-        self.dynamic_first() + DYNAMIC
+        self.slot + 1 + DYNAMIC
     }
 
     /// The heap's slots.
@@ -903,8 +926,94 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 // The heap map leaves the fork's dynamic slots and guard slot in place.
 const _: () = assert!(MAP_SLOT + 1 + DYNAMIC == PORTABLE_VIEWS - 1);
 
+/// The fewest slots a capped host heap keeps for the title's own (with a
+/// heap map: past its identity window), however many dynamic slots
+/// `VICTORY_DYNAMIC_SLOTS` asks for ([`capped_dynamic_slots`]).
+const LEAST_TITLE: u32 = 1 << 16;
+
+/// The slots a capped host heap with a heap map keeps for the title's
+/// (identity window and pool) when `VICTORY_DYNAMIC_SLOTS` is not set: the
+/// number fxceless/victory-fork PR #1258 keeps ([`capped_dynamic_slots`]).
+const CAPPED_TITLE: u32 = 393_215;
+
+/// `VICTORY_DYNAMIC_SLOTS`, if it is set to a number: the dynamic slots of
+/// a title heap that a capped host heap does not hold whole.
+fn dynamic_slots_set() -> Option<u32> {
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The dynamic slots of a host heap capped at [`PORTABLE_VIEWS`] (NVIDIA;
+/// its null guard slot is `guard`) for a title heap that does not fit in it
+/// with [`DYNAMIC`] more: they come out of the title's. `set` is
+/// `VICTORY_DYNAMIC_SLOTS`: at least [`DYNAMIC`], which is what every such
+/// heap had before (`VICTORY_DYNAMIC_SLOTS=262144` is the layout as it
+/// was), and leaving the title [`LEAST_TITLE`] slots past the heap map's
+/// identity window (`window`; `None`: a heap without a map).
+///
+/// (Ported from fxceless/victory-fork PR #1258 = DexNom/VIctory PR #68, by
+/// notquiteog, adapted to the heap map.) 262,144 dynamic slots ran dry in
+/// the open world: a frame asks for about 200,000 and holds them until the
+/// card has run it, the tables that found none were refused and their
+/// draws dropped (our play session 6: 20,958 tables refused, up to 3,595 a
+/// frame; the PR: 13,000 to 60,000 per 5 s on an RTX 5060 Ti, none with
+/// 606,784 and 350,000 free at the fewest).
+///
+/// Not set, with a heap map: the title keeps [`CAPPED_TITLE`] slots, the
+/// PR's number, here the identity window and 262,143 pool slots; the other
+/// 606,784 are dynamic. Nothing is lost by position: a table reaching past
+/// the window is made afresh in dynamic slots wherever it lies (`draw.rs`,
+/// `tables`), and a view a shader picks by index past the window is in
+/// whichever pool slot the map names. Only a pool used up loses views (they
+/// read the guard, and "heap map pool used up" is logged): of the 606,782
+/// pool slots, fewer than 65,536 were held in every run logged so far (the
+/// diagnostics line "heap map pool", written at each 65,536 held, is in
+/// none of 161 logs, the play session among them).
+///
+/// Not set, without a heap map (`VICTORY_HEAP_MAP=0`): [`DYNAMIC`] as
+/// before. There a title slot is its own host slot, and the PR's finding
+/// that the title's heap from slot 393,216 on is only its ring of per-draw
+/// tables (none a view only an index reaches) was not measured on our
+/// tree: `VICTORY_DYNAMIC_SLOTS=606784` is the PR's split.
+fn capped_dynamic_slots(guard: u32, window: Option<u32>, set: Option<u32>) -> u32 {
+    let most = guard
+        .saturating_sub(window.unwrap_or(0).saturating_add(LEAST_TITLE))
+        .max(DYNAMIC);
+    let unset = match window {
+        Some(_) => guard.saturating_sub(CAPPED_TITLE),
+        None => DYNAMIC,
+    };
+    set.unwrap_or(unset).clamp(DYNAMIC, most)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        // Whether the translator looks bindless views up in a heap map, as
+        // it does from the first translation on (asked now if none ran).
+        #[cfg(not(test))]
+        if !sampler && heap_map_on() {
+            probe_view_limit();
+        }
+        let layout = (!sampler)
+            .then(heap_map)
+            .flatten()
+            .filter(|&(window, _)| count > window)
+            .map(|(window, slot)| {
+                // A title heap the window and the pool do not hold whole
+                // gives up pool slots for dynamic ones.
+                let dynamic = if count > slot {
+                    capped_dynamic_slots(slot + 1 + DYNAMIC, Some(window), dynamic_slots_set())
+                } else {
+                    DYNAMIC
+                };
+                MapLayout::new(count, window, slot, dynamic)
+            });
+        Self::laid_out(sampler, count, layout)
+    }
+
+    /// A host heap for a title heap of `count` slots, with a heap map laid
+    /// out as `layout` says if there is one.
+    fn laid_out(sampler: bool, count: u32, layout: Option<MapLayout>) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -923,27 +1032,18 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
+        let mut extra = if sampler { 0 } else { DYNAMIC };
         let title_count = count;
-        // Whether the translator looks bindless views up in a heap map, as
-        // it does from the first translation on (asked now if none ran).
-        #[cfg(not(test))]
-        if !sampler && heap_map_on() {
-            probe_view_limit();
-        }
-        let layout = (!sampler)
-            .then(heap_map)
-            .flatten()
-            .filter(|&(window, _)| count > window)
-            .map(|(window, slot)| MapLayout::new(count, window, slot));
         let made = match layout {
             Some(l) => {
+                extra = l.dynamic;
                 tracing::warn!(
                     count,
                     window = l.window,
                     pool = l.pool,
                     map_slot = l.slot,
-                    "host view heap with a heap map: title slots past the window that hold views get pool slots"
+                    dynamic = l.dynamic,
+                    "host view heap with a heap map: title slots past the window that hold views get pool slots (VICTORY_DYNAMIC_SLOTS=262144: the dynamic slots as they were)"
                 );
                 make(l.size()).map(|heap| (heap, l.window, l.size()))
             }
@@ -960,7 +1060,10 @@ impl HostHeap {
                 // them needs remapping. The heap's last slot stays null, and shaders read it for
                 // any view index from there on (`set_view_heap_limit`): a read past the heap's
                 // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
+                // Without a heap map the dynamic slots stay [`DYNAMIC`]
+                // unless `VICTORY_DYNAMIC_SLOTS` says otherwise.
+                extra = capped_dynamic_slots(PORTABLE_VIEWS - 1, None, dynamic_slots_set());
+                tracing::warn!(error = %e, count, dynamic = extra, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
                 victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
                 (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
             }
@@ -1020,6 +1123,14 @@ impl HostHeap {
             Some(l) => (l.pool, l.dynamic_first(), title_count),
             None => (0, count, count),
         };
+        // Which dynamic slots are taken: none, but for the map's slot where
+        // it lies among them (a heap with more than [`DYNAMIC`]), for good.
+        let mut taken = vec![false; extra as usize];
+        let mut free = extra;
+        if let Some(at) = layout.and_then(MapLayout::slot_in_dynamic) {
+            taken[at as usize] = true;
+            free -= 1;
+        }
         let h = HostHeap {
             heap,
             cpu,
@@ -1039,8 +1150,8 @@ impl HostHeap {
             title_start: AtomicU64::new(0),
             reclaimed: AtomicU64::new(u64::MAX),
             kept: Mutex::new(vec![None; (dynamic_first + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, taken)),
+            free: std::sync::atomic::AtomicU32::new(free),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1153,7 +1264,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1183,7 +1294,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.dynamic_first + first as u32)
     }
 
@@ -3681,16 +3792,90 @@ mod tests {
     /// slots than the title has past the window.
     #[test]
     fn the_titles_view_heap_is_laid_out_in_a_million_slots() {
-        let l = MapLayout::new(1_245_184, WINDOW, MAP_SLOT);
+        let l = MapLayout::new(1_245_184, WINDOW, MAP_SLOT, DYNAMIC);
         assert_eq!((l.window, l.pool, l.slot), (131_072, 606_782, 737_854));
+        assert_eq!(l.slot_in_dynamic(), None);
         assert_eq!(l.dynamic_first(), PORTABLE_VIEWS - DYNAMIC - 1, "the fork's first dynamic slot");
         assert_eq!(l.guard(), PORTABLE_VIEWS - 1, "the fork's guard slot");
         assert_eq!(l.size(), PORTABLE_VIEWS);
-        let wide = MapLayout::new(1_245_184, 900_000, MAP_SLOT);
+        let wide = MapLayout::new(1_245_184, 900_000, MAP_SLOT, DYNAMIC);
         assert_eq!((wide.window, wide.pool), (MAP_SLOT, 0));
-        let small = MapLayout::new(20, 16, 24);
+        let small = MapLayout::new(20, 16, 24, DYNAMIC);
         assert_eq!((small.window, small.pool, small.dynamic_first()), (16, 4, 25));
         assert_eq!(small.size(), 25 + DYNAMIC + 1);
+    }
+
+    /// A title heap too big for a capped host heap (NVIDIA: the guard slot
+    /// at 999,999) keeps 393,215 slots (the heap map's window and 262,143
+    /// pool slots) unless `VICTORY_DYNAMIC_SLOTS` says how many are
+    /// dynamic: no fewer than [`DYNAMIC`] (the layout as it was), and
+    /// leaving the pool [`LEAST_TITLE`]. Without a heap map it keeps
+    /// [`DYNAMIC`] unless told. The map's slot and the guard stay where the
+    /// translations read them; the map's slot, then among the dynamic
+    /// slots, is not one to hand out.
+    #[test]
+    fn a_capped_heap_gives_pool_slots_to_dynamic_ones() {
+        let guard = PORTABLE_VIEWS - 1;
+        let mapped = |set| capped_dynamic_slots(guard, Some(WINDOW), set);
+        assert_eq!(mapped(None), 606_784);
+        assert_eq!(mapped(Some(DYNAMIC)), DYNAMIC);
+        assert_eq!(mapped(Some(500_000)), 500_000);
+        assert_eq!(mapped(Some(10)), DYNAMIC);
+        assert_eq!(mapped(Some(u32::MAX)), guard - WINDOW - LEAST_TITLE);
+        assert_eq!(capped_dynamic_slots(guard, None, None), DYNAMIC);
+        assert_eq!(capped_dynamic_slots(guard, None, Some(606_784)), 606_784);
+        assert_eq!(capped_dynamic_slots(guard, None, Some(u32::MAX)), guard - LEAST_TITLE);
+        // A small heap's layout (tests) has no room for more.
+        assert_eq!(capped_dynamic_slots(25 + DYNAMIC, Some(16), None), DYNAMIC);
+
+        let l = MapLayout::new(1_245_184, WINDOW, MAP_SLOT, mapped(None));
+        assert_eq!((l.window, l.pool, l.slot, l.dynamic), (131_072, 262_143, 737_854, 606_784));
+        assert_eq!(l.window + l.pool, CAPPED_TITLE);
+        assert_eq!(l.dynamic_first(), 393_215);
+        assert_eq!(l.slot_in_dynamic(), Some(737_854 - 393_215));
+        assert_eq!((l.guard(), l.size()), (PORTABLE_VIEWS - 1, PORTABLE_VIEWS));
+        // As it was, with `VICTORY_DYNAMIC_SLOTS=262144`.
+        let old = MapLayout::new(1_245_184, WINDOW, MAP_SLOT, mapped(Some(DYNAMIC)));
+        assert_eq!((old.pool, old.dynamic_first(), old.slot_in_dynamic()), (606_782, 737_855, None));
+        // Never into the window.
+        let all = MapLayout::new(1_245_184, WINDOW, MAP_SLOT, u32::MAX);
+        assert_eq!((all.pool, all.dynamic_first()), (0, WINDOW));
+    }
+
+    /// A heap with more dynamic slots than [`DYNAMIC`] hands out the ones
+    /// below the map's slot and the ones above it, never the map's slot,
+    /// and no run across it.
+    #[test]
+    fn dynamic_slots_around_the_map_slot_are_handed_out() {
+        if host().is_none() {
+            return;
+        }
+        // Window 16, map at 40, 12 dynamic slots more than the fork's:
+        // pool 16..29, dynamic 29..41+DYNAMIC, the map's slot the 12th.
+        let l = MapLayout::new(64, 16, 40, DYNAMIC + 12);
+        assert_eq!((l.pool, l.dynamic_first(), l.slot_in_dynamic()), (13, 29, Some(11)));
+        let Some(heap) = HostHeap::laid_out(false, 64, Some(l)) else {
+            return;
+        };
+        assert_eq!((heap.count(), heap.dynamic_first, heap.dynamic), (16, 29, DYNAMIC + 12));
+        assert!(heap.kept.lock().unwrap()[40].is_some(), "the map's raw view holds it");
+        // 11 below the map's slot, then past it: no run lies across it.
+        assert_eq!(heap.dynamic(8), Some(29));
+        assert_eq!(heap.dynamic(8), Some(41));
+        assert_eq!(heap.dynamic(3), Some(49));
+        assert_eq!(heap.dynamic(DYNAMIC - 11), Some(52));
+        // What is left is the three below the map's slot.
+        assert_eq!(heap.dynamic(4), None);
+        assert_eq!(heap.dynamic(3), Some(37));
+        assert_eq!(heap.dynamic(1), None);
+        // Three free below the map's slot and eight above it: no run of
+        // nine, though eleven are free.
+        heap.release(37, 3);
+        heap.release(41, 8);
+        assert_eq!(heap.dynamic(9), None);
+        assert_eq!(heap.dynamic(8), Some(41));
+        assert_eq!(heap.dynamic(3), Some(37));
+        assert_eq!(heap.dynamic(1), None);
     }
 
     /// A view heap made while the translator has a heap map (as a capped
