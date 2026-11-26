@@ -1379,7 +1379,49 @@ pub fn writing(at: usize, len: usize) -> KernelWrite {
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    // And at the other views of its pages: what the card wrote into a
+    // texture's memory through a buffer and we put back reached the textures
+    // placed at another view of those pages only when their turn to be
+    // looked at again came (`VICTORY_WRITE_ALIAS_TEXTURES`).
+    for (from, to) in alias_pages_written(at, end) {
+        crate::descriptor::host::remapped(from, to - from);
+    }
     KernelWrite { write, title: None }
+}
+
+/// `VICTORY_WRITE_ALIAS_TEXTURES` (ON by default; `0` as before): a write of
+/// ours into title memory ([`writing`]: the shader results we put back, the
+/// title's copies, the title's kernel reads) also makes the textures placed
+/// at the other views of the written pages be looked at again, not only
+/// those placed in the written range. Belobug/VIctory-Belobug-AMD PR #139
+/// (Zetsukae, a208d61db and faac6de43, GPL-3.0): the card writes skin and
+/// tattoo textures' memory through a buffer view; their uploads stayed stale
+/// until their next look (noise on skin, a new pattern each launch).
+fn write_alias_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_WRITE_ALIAS_TEXTURES").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Since the start: 64 KiB pages at other views of memory we wrote, made
+/// to be looked at again for the textures placed there
+/// ([`write_alias_textures`]; the frame lines' "textures picked by index"
+/// line).
+pub(crate) static ALIAS_PAGES_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The 64 KiB pages at other views of the pages of `[at, end)` (no more than
+/// [`guard_aliases`] views a page), as ranges; none with
+/// `VICTORY_WRITE_ALIAS_TEXTURES=0` or `VICTORY_GUARD_ALIASES=0`.
+fn alias_pages_written(at: usize, end: usize) -> Vec<(usize, usize)> {
+    let most = guard_aliases();
+    if at >= end || most == 0 || !write_alias_textures() {
+        return Vec::new();
+    }
+    const K64: usize = 1 << 16;
+    let (mut pages, _) = crate::inplace::aliases_between(at, end, most);
+    pages.sort_unstable();
+    pages.dedup();
+    ALIAS_PAGES_WRITTEN.fetch_add(pages.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    pages.into_iter().map(|page| (page, page + K64)).collect()
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -1835,6 +1877,28 @@ fn writable(at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A write into memory one page of which another view also shows: that
+    /// view's page is made to be looked at again (#139), the written view's
+    /// own pages are not listed (they go as the range itself).
+    #[test]
+    fn a_write_reaches_the_textures_at_other_views_of_its_pages() {
+        const K64: usize = 1 << 16;
+        let (a, b) = (0x7_8000_0000usize, 0x7_9000_0000usize);
+        // Two views of section 991: a shows pages 0..4, b shows pages 2..3.
+        crate::inplace::title_memory_view(a, 4 * K64, 991, 0);
+        crate::inplace::title_memory_view(b, K64, 991, 2 * K64 as u64);
+        let before = ALIAS_PAGES_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+        // A write into a's page 2: b's page.
+        assert_eq!(super::alias_pages_written(a + 2 * K64 + 100, a + 2 * K64 + 200), vec![(b, b + K64)]);
+        // Into b: a's page 2.
+        assert_eq!(super::alias_pages_written(b + 8, b + 16), vec![(a + 2 * K64, a + 3 * K64)]);
+        // Into a's page 0: no other view.
+        assert!(super::alias_pages_written(a, a + K64).is_empty());
+        assert!(ALIAS_PAGES_WRITTEN.load(std::sync::atomic::Ordering::Relaxed) >= before + 2);
+        crate::inplace::views_gone(a, 4 * K64);
+        crate::inplace::views_gone(b, K64);
+    }
+
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
