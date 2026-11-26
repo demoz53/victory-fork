@@ -4153,6 +4153,7 @@ fn cbv_narrow_loads(in_place: bool) {
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            group_split: 1,
         };
         #[cfg(windows)]
         for (backend, warp) in [("hardware", false), ("WARP", true)] {
