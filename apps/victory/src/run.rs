@@ -440,8 +440,16 @@ fn apply_title_patches(
         return;
     }
     victory_game::hooks::configure(image.base(), victory_gpu::frame::current);
+    victory_game::hooks::set_teleport_source(keys_file_teleport);
     // SAFETY: the title's image, mapped and not yet run.
     unsafe { install_hooks(image.base(), size, &hooks) };
+}
+
+/// The next `teleport` line the keys file reached (`VICTORY_KEYS_FILE`).
+#[cfg(windows)]
+fn keys_file_teleport() -> Option<victory_game::hooks::Teleport> {
+    victory_hle::modules::gameinput::take_teleport()
+        .map(|t| victory_game::hooks::Teleport { to: [t.x, t.y, t.z], heading: t.heading })
 }
 
 /// Installs each hook whose function's entry and whose called functions'
@@ -737,6 +745,30 @@ mod patch_tests {
         assert_eq!(&moved[..h.entry.len()], h.entry);
         let back = u64::from_le_bytes(moved[h.entry.len() + 6..].try_into().unwrap()) as usize;
         assert_eq!(back, image.as_ptr() as usize + h.rva as usize + h.entry.len());
+    }
+
+    #[test]
+    fn the_frame_hook_is_installed_only_over_its_expected_code() {
+        let var = |n: &str| (n == "VICTORY_PLAYER_POS_LOG").then(|| "1".to_owned());
+        let hooks = victory_game::hooks::wanted(&var);
+        assert_eq!(hooks.iter().map(|h| h.name).collect::<Vec<_>>(), ["frame"]);
+        let h = &hooks[0];
+        let mut sites: Vec<(u32, &[u8])> = vec![(h.rva, h.entry)];
+        sites.extend(h.calls.iter().copied());
+        // SetHeading's entry is not there: nothing.
+        let mut image = image_with(&sites[..sites.len() - 1]);
+        // SAFETY: our own buffer, nothing runs it.
+        assert!(unsafe { install_hooks(image.as_mut_ptr() as usize, image.len(), &hooks) }.is_empty());
+        let mut image = image_with(&sites);
+        // SAFETY: as above.
+        assert_eq!(unsafe { install_hooks(image.as_mut_ptr() as usize, image.len(), &hooks) }, ["frame"]);
+        assert_eq!(image[h.rva as usize..][..2], [0xff, 0x25]);
+        // Asked for by VICTORY_TITLE_COMMANDS or VICTORY_TELEPORT too; a bad VICTORY_TELEPORT alone asks nothing.
+        let cmd = |n: &str| (n == "VICTORY_TITLE_COMMANDS").then(|| "1".to_owned());
+        assert_eq!(victory_game::hooks::wanted(&cmd).len(), 1);
+        let bad = |n: &str| (n == "VICTORY_TELEPORT").then(|| "1,2".to_owned());
+        assert!(victory_game::hooks::wanted(&bad).is_empty());
+        assert_eq!(keys_file_teleport(), None, "no keys file in tests");
     }
 
     #[test]

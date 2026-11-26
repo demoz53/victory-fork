@@ -350,6 +350,43 @@ unsafe impl Sync for Hub {}
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// A command of `VICTORY_KEYS_FILE` for the title's own thread: `teleport
+/// <x> <y> <z> [<heading>]` (metres, x east, y north, z up; heading in
+/// radians, 0 north, counter-clockwise). Taken out of the key lines when
+/// the player reaches it and handed to [`take_teleport`], which the front
+/// end's once-a-frame title hook drains (`victory_game::hooks`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Teleport {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub heading: Option<f32>,
+}
+
+/// Teleports reached in the keys file, for the title's frame hook.
+static TELEPORTS: Mutex<VecDeque<Teleport>> = Mutex::new(VecDeque::new());
+
+/// The oldest teleport the keys file has reached and nothing has taken.
+pub fn take_teleport() -> Option<Teleport> {
+    TELEPORTS.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
+}
+
+/// `teleport <x> <y> <z> [<heading>]`, every number finite, coordinates
+/// within 100 km; `None` for anything else.
+pub fn parse_teleport(line: &str) -> Option<Teleport> {
+    let mut words = line.split_whitespace();
+    if words.next()? != "teleport" {
+        return None;
+    }
+    let numbers: Vec<f32> = words.map(|w| w.parse::<f32>().ok().filter(|v| v.is_finite())).collect::<Option<_>>()?;
+    let coordinate = |v: f32| v.abs() <= 100_000.0;
+    match numbers[..] {
+        [x, y, z] if [x, y, z].into_iter().all(coordinate) => Some(Teleport { x, y, z, heading: None }),
+        [x, y, z, h] if [x, y, z].into_iter().all(coordinate) => Some(Teleport { x, y, z, heading: Some(h) }),
+        _ => None,
+    }
+}
+
 /// The title's presents when the last poll began ([`Hub::fresh`]).
 #[cfg(all(windows, feature = "diagnostics"))]
 static POLLED_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -1270,17 +1307,24 @@ mod script {
         Frames(u32),
     }
 
-    /// One line of the keys file: the keys held together (none for `wait`).
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    /// One line of the keys file: the keys held together (none for `wait`);
+    /// a `teleport` line holds nothing for one frame and hands its command
+    /// to the title's frame hook when it is reached.
+    #[derive(Clone, Debug, PartialEq)]
     pub(super) struct Line {
         pub(super) keys: Vec<u8>,
         pub(super) hold: Hold,
+        pub(super) command: Option<super::Teleport>,
     }
 
     /// `<key>`, `<key>+<key>... <ms>`, `wait <ms>`, `<key>+... <n>f` or
     /// `wait <n>f` (ms at most 60000, n from 1 to 6000); `None` for anything
     /// else.
     pub(super) fn parse(line: &str) -> Option<Line> {
+        if line.split_whitespace().next() == Some("teleport") {
+            let t = super::parse_teleport(line)?;
+            return Some(Line { keys: Vec::new(), hold: Hold::Frames(1), command: Some(t) });
+        }
         let mut words = line.split_whitespace();
         let key = words.next()?;
         let count = words.next();
@@ -1304,7 +1348,7 @@ mod script {
         } else {
             key.split('+').map(key_code).collect::<Option<Vec<u8>>>()?
         };
-        Some(Line { keys, hold })
+        Some(Line { keys, hold, command: None })
     }
 
     /// When the line held now ends.
@@ -1434,6 +1478,17 @@ mod script {
                     && let Some(line) = self.queue.pop_front()
                 {
                     self.played.lines += 1;
+                    if let Some(t) = line.command {
+                        tracing::info!(
+                            x = t.x,
+                            y = t.y,
+                            z = t.z,
+                            heading = ?t.heading,
+                            frame,
+                            "VICTORY_KEYS_FILE: teleport handed to the title's frame hook"
+                        );
+                        super::TELEPORTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(t);
+                    }
                     let end = match line.hold {
                         Hold::Bare | Hold::Ms(_) => {
                             let hold = match line.hold {
@@ -1499,17 +1554,50 @@ mod script {
 
         #[test]
         fn lines_parse_in_every_form() {
-            assert_eq!(line("Enter"), Line { keys: vec![0x0D], hold: Hold::Bare });
+            assert_eq!(line("Enter"), Line { keys: vec![0x0D], hold: Hold::Bare, command: None });
             assert_eq!(
                 line("W+L 1500"),
-                Line { keys: vec![b'W', b'L'], hold: Hold::Ms(Duration::from_millis(1500)) }
+                Line { keys: vec![b'W', b'L'], hold: Hold::Ms(Duration::from_millis(1500)), command: None }
             );
-            assert_eq!(line("wait 300"), Line { keys: vec![], hold: Hold::Ms(Duration::from_millis(300)) });
-            assert_eq!(line("w 20f"), Line { keys: vec![b'W'], hold: Hold::Frames(20) });
-            assert_eq!(line("W+A+Up 1f"), Line { keys: vec![b'W', b'A', 0x26], hold: Hold::Frames(1) });
-            assert_eq!(line("wait 6000f"), Line { keys: vec![], hold: Hold::Frames(6000) });
-            assert_eq!(line("  D   7f  "), Line { keys: vec![b'D'], hold: Hold::Frames(7) });
+            assert_eq!(line("wait 300"), Line { keys: vec![], hold: Hold::Ms(Duration::from_millis(300)), command: None });
+            assert_eq!(line("w 20f"), Line { keys: vec![b'W'], hold: Hold::Frames(20), command: None });
+            assert_eq!(line("W+A+Up 1f"), Line { keys: vec![b'W', b'A', 0x26], hold: Hold::Frames(1), command: None });
+            assert_eq!(line("wait 6000f"), Line { keys: vec![], hold: Hold::Frames(6000), command: None });
+            assert_eq!(line("  D   7f  "), Line { keys: vec![b'D'], hold: Hold::Frames(7), command: None });
             assert_eq!(line("W 60000").hold, Hold::Ms(Duration::from_millis(60_000)));
+        }
+
+        #[test]
+        fn teleport_lines_parse_and_are_handed_on_when_reached() {
+            use super::super::{Teleport, parse_teleport, take_teleport};
+            assert_eq!(
+                parse_teleport("teleport 12.5 -40 31.25"),
+                Some(Teleport { x: 12.5, y: -40.0, z: 31.25, heading: None })
+            );
+            assert_eq!(parse_teleport("  teleport 1 2 3 1.57 ").unwrap().heading, Some(1.57));
+            for bad in [
+                "teleport", "teleport 1 2", "teleport 1 2 3 4 5", "teleport x 2 3", "teleport 1 2 NaN",
+                "teleport 1 inf 3", "teleport 1 2 3 inf", "teleport 200000 0 0", "teleports 1 2 3", "Teleport 1 2 3",
+            ] {
+                assert_eq!(parse_teleport(bad), None, "{bad:?}");
+                assert_eq!(parse(bad), None, "{bad:?}");
+            }
+            let l = line("teleport 1 2 3");
+            assert_eq!((l.keys.len(), l.hold), (0, Hold::Frames(1)));
+            // Played in order: the teleport is handed on when the player reaches it, not when it is read.
+            while take_teleport().is_some() {}
+            let t0 = Instant::now();
+            let mut p = Player::new(t0);
+            p.push(line("W 2f"));
+            p.push(line("teleport 1 2 3 0.5"));
+            p.push(line("J 1f"));
+            assert_eq!(p.tick(t0, 0), vec![b'W']);
+            assert_eq!(take_teleport(), None, "not reached yet");
+            assert_eq!(p.tick(t0, 1), vec![b'W']);
+            assert_eq!(p.tick(t0, 2), Vec::<u8>::new(), "the teleport's frame holds nothing");
+            assert_eq!(take_teleport(), Some(Teleport { x: 1.0, y: 2.0, z: 3.0, heading: Some(0.5) }));
+            assert_eq!(take_teleport(), None);
+            assert_eq!(p.tick(t0, 3), vec![b'J']);
         }
 
         #[test]
