@@ -393,6 +393,13 @@ struct Physical {
     placeholders: BTreeMap<usize, usize>,
 }
 
+/// `VICTORY_UNMAP_NOTIFY_AFTER=1` (opt-in, no test yet): an unmapped
+/// view is reported to the GPU side after the unmap, not before it (fxceless
+/// PR #1005). Before, a refresh in between could note its blocks clean and
+/// card copies kept the dead view's bytes.
+static UNMAP_NOTIFY_AFTER: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("VICTORY_UNMAP_NOTIFY_AFTER").is_ok_and(|v| v.trim() == "1"));
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
@@ -1078,7 +1085,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        victory_gpu::title_memory_remapped(at, size);
+        let after = *UNMAP_NOTIFY_AFTER;
+        if !after {
+            victory_gpu::title_memory_remapped(at, size);
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1089,6 +1099,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        // Told once the view is gone: a GPU copy that guarded it in between
+        // would otherwise keep it clean, and its old bytes, from then on.
+        if after {
+            victory_gpu::title_memory_remapped(at, size);
+        }
         physical.placeholders.insert(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());

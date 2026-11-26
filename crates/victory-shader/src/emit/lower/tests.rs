@@ -452,6 +452,46 @@ fn a_descriptor_selected_by_scc_picks_its_heap_index() {
     lower_with(&words, layout(), used()).unwrap();
 }
 
+/// A buffer descriptor read through the resource heap's own root parameter
+/// at a byte offset of `offset` (21 bits, signed) from the heap's start, and
+/// stored through. With [`super::heap_below_zero`] a negative offset (here
+/// -0x40) gives slot 0 by a signed compare and a select, so its DXIL differs
+/// from the plain shift's; a positive one is the shift either way
+/// (JordanFromIT/CGBJ-VIctory fa3aee394's case: 0x40 slot 2, 0xe0 slot 7,
+/// 0x1fffc0 below the start).
+#[test]
+fn a_descriptor_below_the_heap_start_is_slot_zero() {
+    let heap = RootParam {
+        root: RootType::ResourceHeap,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 2,
+        slot: 0,
+    };
+    let lowered = |offset: u32, on: bool| {
+        let words = [
+            0xBE83_0380u32, // s_mov_b32 s3, 0
+            0xF408_0401,    // s_load_dwordx4 s[16:19], s[2:3], offset
+            0xFA00_0000 | offset,
+            0xE070_2000,
+            0x8004_0000, // buffer_store_dword v0, v0, s[16:19], 0 idxen
+            S_ENDPGM,
+        ];
+        super::with_heap_below_zero(on, || lower_with(&words, vec![heap], vec![]))
+            .unwrap()
+            .dxil
+    };
+    for offset in [0x40, 0xe0, 0x1f_ffc0] {
+        // Each form lowers; the same switch gives the same code.
+        assert_eq!(lowered(offset, true), lowered(offset, true));
+        assert_eq!(lowered(offset, false), lowered(offset, false));
+    }
+    // The fix adds the compare and select: the DXIL changes with it, for
+    // any offset (the offset is a run-time sum of the scalar base).
+    assert_ne!(lowered(0x1f_ffc0, true), lowered(0x1f_ffc0, false));
+}
+
 /// Tables of 2D textures at s0 and samplers at s1.
 fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
     let range = |kind, user_data, slot| UsedResource {

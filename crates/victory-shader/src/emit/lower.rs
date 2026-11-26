@@ -1415,6 +1415,34 @@ pub fn lds_fit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_FIT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a descriptor read from below the start of a heap is taken as heap slot 0
+/// (`VICTORY_HEAP_BELOW_ZERO=0`: its byte offset shifted unsigned, a slot near 0x7ffffff,
+/// as before). From JordanFromIT/CGBJ-VIctory fa3aee394 ("Shader: take a descriptor below the
+/// heap as slot 0"): the slot read the host's stride table about 512 MiB past its start, a
+/// GPU page fault and then a ring timeout. Part of the translation: the shader cache keys on
+/// it (`victory-gpu`'s does).
+pub fn heap_below_zero() -> bool {
+    if let Some(on) = HEAP_BELOW_ZERO_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BELOW_ZERO").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// [`with_heap_below_zero`]'s setting for translations on this thread.
+    static HEAP_BELOW_ZERO_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`heap_below_zero`] giving `on` on this thread (tests).
+#[cfg(test)]
+pub fn with_heap_below_zero<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = HEAP_BELOW_ZERO_HERE.replace(Some(on));
+    let r = f();
+    HEAP_BELOW_ZERO_HERE.set(was);
+    r
+}
+
 /// Whether a cube sampled with explicit gradients (`image_sample_d*` on a cube, sampled at
 /// the level the longer gradient gives) takes that level as the console does: the log2 of
 /// the footprint in texels, and `_cl`'s minimum level (`VICTORY_CUBE_GRAD_LOD=0`: the log2
@@ -7710,7 +7738,18 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok((self.s.m.bin(c, Bin::LShr, addr, shift), root))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        if !heap_below_zero() {
+            return Ok((index, root));
+        }
+        // A descriptor below the heap's start (the console reads whatever
+        // memory lies there) is taken as slot 0. Shifted unsigned it was
+        // slot 0x7ffffff or so: a structured buffer's stride was read from
+        // the stride table 512 MiB past its start (a GPU page fault, then a
+        // ring timeout), and the host heap's slot address wraps below it.
+        let zero = self.s.m.i32(0);
+        let below = self.s.m.cmp(c, pred::SLT, addr, zero);
+        Ok((self.s.m.select(c, below, zero, index), root))
     }
 
     /// Heap index `index` of a descriptor read through a root parameter of
