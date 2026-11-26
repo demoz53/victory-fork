@@ -1,5 +1,6 @@
 //! What every thread spends its time on, and where every thread is when
-//! frames stop: `VICTORY_PROFILE=<file>` samples each thread that ran since
+//! frames stop: `VICTORY_PROFILE=<file>` (any value but a number, which is
+//! the log sampler's interval: `crate::sampler`) samples each thread that ran since
 //! the last pass (`VICTORY_PROFILE_MS`, 10 by default), unwinds its stack,
 //! and every `VICTORY_PROFILE_WINDOW_S` seconds (10) writes to the file, per
 //! busy thread, its share of a core and its costliest stacks, with our own
@@ -49,6 +50,10 @@ pub fn profile(progress: fn() -> u64) {
     let Ok(path) = std::env::var("VICTORY_PROFILE") else {
         return;
     };
+    // A number is the log sampler's interval (`crate::sampler`), not a file.
+    if path.trim().parse::<u64>().is_ok() {
+        return;
+    }
     let number = |name: &str, default: u64| {
         std::env::var(name)
             .ok()
@@ -503,7 +508,7 @@ fn stack_of(thread: HANDLE, frames: &mut Vec<u64>) -> bool {
 
 /// The committed, readable run of pages holding `at` (one region as
 /// `VirtualQuery` sees it), or `None`.
-fn committed_around(at: usize) -> Option<(usize, usize)> {
+pub(crate) fn committed_around(at: usize) -> Option<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -521,7 +526,7 @@ fn committed_around(at: usize) -> Option<(usize, usize)> {
 
 /// The start of the function holding `pc`, or `pc` itself where no unwind
 /// table covers it (a leaf, generated code).
-fn function_of(pc: u64) -> u64 {
+pub(crate) fn function_of(pc: u64) -> u64 {
     let mut image = 0;
     // SAFETY: looks up the function table entry covering `pc`, if any.
     let entry = unsafe { RtlLookupFunctionEntry(pc, &mut image, std::ptr::null_mut()) };
@@ -536,7 +541,7 @@ fn function_of(pc: u64) -> u64 {
 #[repr(C, align(16))]
 struct Aligned(CONTEXT);
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {
@@ -567,7 +572,7 @@ impl Tsc {
 /// Function names: ours and the system's from dbghelp, the title's as
 /// module+rva. Only the profiler thread uses dbghelp.
 #[derive(Default)]
-struct Names {
+pub(crate) struct Names {
     ready: bool,
     /// Our executable's module name (`victory`).
     own: String,
@@ -608,6 +613,10 @@ impl Names {
         if let Some(k) = self.known.get(&f) {
             return k.clone();
         }
+        // dbghelp is single-threaded and one per process: the stall
+        // profiler, the log sampler and tests side by side take turns.
+        static DBGHELP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _turn = DBGHELP.lock().unwrap_or_else(|e| e.into_inner());
         self.init();
         let located = crate::crash::locate(f as usize);
         let file = located.split('+').next().unwrap_or("");
@@ -650,7 +659,7 @@ impl Names {
         k
     }
 
-    fn name(&mut self, f: u64) -> String {
+    pub(crate) fn name(&mut self, f: u64) -> String {
         self.lookup(f).1
     }
 
