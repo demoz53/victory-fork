@@ -2185,7 +2185,9 @@ impl State {
     /// buffer whose view is 688 dwords into that table.
     fn material_demand(&self, p: &HostPipeline) {
         use crate::material_demand as demand;
-        for stage in &p.stages {
+        // The listed shaders are pixel shaders: the other stages are not
+        // looked up (a frame binds thousands of draws).
+        for stage in p.stages.iter().filter(|s| s.shader.stage == "pixel") {
             let Some(fields) = demand::fields(&stage.shader.hash) else {
                 continue;
             };
