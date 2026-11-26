@@ -73,6 +73,8 @@ struct Tally {
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
+    /// With `--digest`: one line per emitted shader ([`digest_line`]).
+    digest: bool,
     lines: Vec<String>,
 }
 
@@ -157,6 +159,7 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
+    digest: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
@@ -206,6 +209,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            digest,
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -528,6 +532,18 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let _ = lock(out).write_all(line.as_bytes());
 }
 
+/// `--digest`: an emitted shader as one line, `<label>  emitted <bytes>
+/// bytes <hash>` (the first 16 hex digits of the bytes' BLAKE3). The walk
+/// sorts its lines, so two runs' outputs compare line by line: a program
+/// whose line differs was translated to different host code.
+fn digest_line(label: &str, dxil: &[u8]) -> String {
+    format!(
+        "{label}  emitted {} bytes {}",
+        dxil.len(),
+        &blake3::hash(dxil).to_hex()[..16]
+    )
+}
+
 /// Validates an emitted shader if asked to.
 fn check(
     mut shader: emit::HostShader,
@@ -535,6 +551,10 @@ fn check(
     checks: &mut Checks,
     label: impl Fn() -> String,
 ) {
+    // Before the validator, which signs the container in place.
+    if t.digest {
+        t.lines.push(digest_line(&label(), &shader.dxil));
+    }
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
@@ -783,4 +803,25 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::digest_line;
+
+    #[test]
+    fn a_digest_line_changes_with_the_bytes_and_only_with_them() {
+        let label = "dir/0123.compute.cdxil@0x0 #0123 ~89ab Cs";
+        let a = digest_line(label, &[1, 2, 3, 4]);
+        assert_eq!(a, digest_line(label, &[1, 2, 3, 4]));
+        assert!(a.starts_with("dir/0123.compute.cdxil@0x0 #0123 ~89ab Cs  emitted 4 bytes "));
+        // The hash: 16 hex digits after the size.
+        let hash = a.rsplit(' ').next().unwrap();
+        assert_eq!(hash.len(), 16);
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        // One byte changed, the same length: only the hash differs.
+        let b = digest_line(label, &[1, 2, 3, 5]);
+        assert_ne!(a, b);
+        assert_eq!(a[..a.len() - 16], b[..b.len() - 16]);
+    }
 }

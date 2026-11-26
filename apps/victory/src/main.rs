@@ -84,6 +84,12 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Print one line per emitted shader with its size and a hash of
+        /// its bytes: two runs (two settings of the `VICTORY_*`
+        /// translation switches, or two builds) differ in exactly the
+        /// programs whose host code changed (`tools/shader-sweep.sh`).
+        #[arg(long)]
+        digest: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
@@ -212,6 +218,7 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
+            digest,
             jobs,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -227,6 +234,7 @@ fn main() -> Result<()> {
                 validate,
                 pipelines,
                 list,
+                digest,
                 jobs.map(NonZeroUsize::get),
             )
         }
@@ -343,5 +351,23 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Translate { jobs, .. } if jobs == NonZeroUsize::new(1))
         );
+    }
+
+    #[test]
+    fn translate_takes_the_digest_flag_and_leaves_it_off_by_default() {
+        let cli = Cli::try_parse_from(["victory", "translate", "--digest", "a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Translate {
+                digest: true,
+                list: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["victory", "translate", "a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Translate { digest: false, .. }
+        ));
     }
 }
