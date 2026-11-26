@@ -7,6 +7,8 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
+mod shader_cache;
 mod translate;
 #[cfg(windows)]
 mod warm;
@@ -152,6 +154,37 @@ enum Command {
         #[arg(long, hide = true)]
         child: bool,
     },
+    /// Show what a translated-shader cache folder holds, one line per run
+    /// key (a translator and its settings) with its files, size and newest
+    /// file, so dead keys can be told. Removes nothing unless
+    /// --prune-older-than and --yes are both given.
+    #[cfg(windows)]
+    ShaderCache {
+        /// The cache folder (a run's is `<cache>/shaders`).
+        dir: PathBuf,
+        /// List the folder (what happens without any option too).
+        #[arg(long)]
+        list: bool,
+        /// Also say which keys' newest file is older than this many days.
+        /// They are removed only with --yes.
+        #[arg(long, value_name = "DAYS")]
+        prune_older_than: Option<u64>,
+        /// With --prune-older-than: remove what it lists.
+        #[arg(long)]
+        yes: bool,
+        /// Instead of listing: translate the containers (`*.cdxil`) in these
+        /// files and folders through this build's part of the cache, under
+        /// this process's `VICTORY_*` translation switches, and say how many
+        /// were there already.
+        #[arg(long, num_args = 1.., value_name = "PATH")]
+        warm: Vec<PathBuf>,
+        /// --warm: worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<NonZeroUsize>,
+        /// --warm: only the first so many containers, in name order.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -238,6 +271,23 @@ fn main() -> Result<()> {
                 jobs.map(NonZeroUsize::get),
             )
         }
+        #[cfg(windows)]
+        Command::ShaderCache {
+            dir,
+            list: _,
+            prune_older_than,
+            yes,
+            warm,
+            jobs,
+            limit,
+        } => shader_cache::run(shader_cache::Args {
+            dir,
+            prune_older_than,
+            yes,
+            warm,
+            jobs: jobs.map(NonZeroUsize::get),
+            limit,
+        }),
         #[cfg(windows)]
         Command::WarmPipelines {
             library_dir,
@@ -351,6 +401,34 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Translate { jobs, .. } if jobs == NonZeroUsize::new(1))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shader_cache_lists_by_default_and_removes_only_when_told_twice() {
+        let cli = Cli::try_parse_from(["victory", "shader-cache", "--list", "dir"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ShaderCache {
+                prune_older_than: None,
+                yes: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["victory", "shader-cache", "dir", "--prune-older-than", "7"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ShaderCache {
+                prune_older_than: Some(7),
+                yes: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["victory", "shader-cache", "dir", "--warm", "a", "b", "--limit", "5"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::ShaderCache { ref warm, limit: Some(5), .. } if warm.len() == 2
+        ));
     }
 
     #[test]
