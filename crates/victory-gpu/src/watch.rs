@@ -500,17 +500,22 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    // With `VICTORY_GUARD_FIRST=1`: view memory the guards hold already is
+    // not asked of the kernel, whose answer there is a failure.
+    let failed = guarded && guard_first() && guards_know(first) || {
+        // SAFETY: the answer buffer holds `count` entries.
+        let answer = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        answer != 0
+    };
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -551,6 +556,31 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
+
+/// `VICTORY_GUARD_FIRST=1` (off by default): [`writes`] of a range whose
+/// first block the guards hold (read-only by our hand, or noted absent: a
+/// view of physical pages, which the runtime tells us when it unmaps) goes
+/// to the guards without asking the kernel's write watch first.
+///
+/// The write watch cannot watch views, so there that asking always fails,
+/// and only then were the guards asked. In the open world (all19-s-best1)
+/// one copy's refreshes made some 20,300 askings a frame, 104.5 ms summed,
+/// of which only about 3,300 were answered by the kernel (24.6 ms for all
+/// 5,073 kernel answers): most of the rest were failed kernel calls ahead
+/// of the guards' answer, each under the journal's one lock, which every
+/// thread that refreshes a copy or checks a texture waits for. The guards'
+/// own test is the one [`guard`] already trusts to skip asking Windows
+/// whether the range is a view.
+fn guard_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_FIRST").is_some_and(|v| v == "1"))
+}
+
+/// Whether the guards hold page `first` (64 KiB): guarded, or noted absent.
+fn guards_know(first: usize) -> bool {
+    let g = guards_timed();
+    g.protected.contains(&first) || g.absent.contains(&first)
+}
 
 /// Whether the guards keep their blocks as bits, 4,096 blocks (256 MiB of
 /// address space) to a chunk of 64 words, and a check walks a range of them
