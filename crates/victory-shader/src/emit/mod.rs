@@ -132,9 +132,10 @@ pub use pairs::{Mode as WavePairs, mode_for as wave_pairs_for};
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried, wave_wide_first};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_INTEGER,
+    LAUNCH_SPACE, MEMORY_FAULTS, MEMORY_PAGES, MESH_PAYLOAD_BYTES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_INTEGER,
     SLOT_SIGNED, SLOT_STRIDE_BITS, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS, set_view_heap_limit, set_view_heap_map, view_heap_limit, view_heap_map,
+    USER_VIEW_BIAS, mesh_clamp_in_draw, mesh_payload_bytes, set_view_heap_limit, set_view_heap_map, view_heap_limit,
+    view_heap_map,
 };
 
 /// The loop limit without an override: 2^20.

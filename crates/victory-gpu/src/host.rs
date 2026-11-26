@@ -8809,6 +8809,7 @@ impl Meter {
         }
         crate::draw::window_line(frames);
         crate::draw::batch_line(frames);
+        crate::launch::line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

@@ -12,6 +12,36 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The bytes of payload a translated mesh shader declares (and never reads)
+/// under `VICTORY_MESH_CLAMP_IN_DRAW`: the host then puts an amplification
+/// shader of its own in front of it (`victory-gpu`'s `launch`), whose
+/// payload must have the size the mesh shader declares. A mesh shader that
+/// declares none is refused with one; one that declares a payload is still
+/// taken without an amplification shader. Ported from fablinoo/kelvaroq
+/// patch 0041 (GPL-3.0).
+pub const MESH_PAYLOAD_BYTES: u32 = 4;
+/// The register space the host's amplification shader binds in (`b0`,
+/// `t0`, `u0`): no translated shader binds there.
+pub const LAUNCH_SPACE: u32 = 9;
+
+/// Whether indirect mesh records are bounded inside the draw by an
+/// amplification stage of the host's (`VICTORY_MESH_CLAMP_IN_DRAW=1` or `2`;
+/// off by default): translated mesh shaders then declare
+/// [`MESH_PAYLOAD_BYTES`] of payload. Unset or `0`, their code is as before.
+pub fn mesh_clamp_in_draw() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_MESH_CLAMP_IN_DRAW").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// The payload bytes a translated mesh shader declares: [`MESH_PAYLOAD_BYTES`]
+/// under [`mesh_clamp_in_draw`], else none.
+pub fn mesh_payload_bytes() -> u32 {
+    if mesh_clamp_in_draw() != 0 { MESH_PAYLOAD_BYTES } else { 0 }
+}
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -798,7 +828,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        mesh_payload_bytes(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];
