@@ -85,6 +85,10 @@ One new default-on change: `VICTORY_GUARD_VIEWS_ONLY` (a clear bug fix with test
 ## New in test/watch5 (on top of test/watch4 813c2805d)
 Four review fixes, no new switch, each with a test that fails before it: (1) JOURNAL_UNLOCKED: an asking that keeps the journal's lock (the light refresh's self-check) settles before it answers; (2) LIGHT_REFRESH under JOURNAL_UNLOCKED: blocks passed over for an asking in flight get their bits when it lands (speed only); (3) ASK_ONCE (default on) / ASK_ONCE_VIEWS: what the standing asking notes goes under a number above askings made since, and a stamp never falls (a correctness fix of the default build too); (4) GUARD_OUTSIDE without JOURNAL_UNLOCKED: blocks armed outside the locks are noted again, above every number given, once they stand, and the asking answers under that number.
 
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_ASK_SKIP_VIEWS` | `1` | off | ranges whose first block the guards hold (view memory, which has no write watch) are left out of the kernel askings: the submission's one asking (ask_ahead runs, which otherwise fail and are asked again by halves down to single ranges; the lone ranges; ASK_ONCE_VIEWS ranges) and every asking (as GUARD_FIRST). Diagnostics builds: a "kernel calls" line after the journal-lock line (GetWriteWatch answered / failed / not made; hole checks made / from the cache; placeholder questions) | ours (test/watch5) | no |
+
 ## New in test/watch4 (on top of test/watch3 a2b96a048)
 `VICTORY_JOURNAL_UNLOCKED` fixed (72dc1fb20, review finding): an answer now waits for every asking in flight over its range.
 | Switch | Values | Default | What it does | From | Shader |

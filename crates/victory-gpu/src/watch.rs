@@ -343,6 +343,69 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// Since the last frame line, the write watch's kernel calls by kind
+/// ([`kernel_line`]): `GetWriteWatch` answered, failed (memory that is not
+/// write-watched: view memory, or a range across reservations), not made
+/// (view memory the guards know, [`skip_views`]); hole checks
+/// (`VirtualQuery`, [`uncommitted_end`]) made and answered from a cache,
+/// placeholder questions.
+static KERNEL_CALLS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn kernel_count(kind: usize) {
+    KERNEL_CALLS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The frame line's account of the write watch's kernel calls, per frame,
+/// taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kernel_line(frames: f64) -> String {
+    let f = frames.max(1.0);
+    let [answered, failed, skipped, holes, cached, placeholders] =
+        [0, 1, 2, 3, 4, 5].map(|i| KERNEL_CALLS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / f);
+    format!(
+        "the write watch's kernel calls per frame: GetWriteWatch {answered:.0} answered, {failed:.0} failed (not \
+         write-watched), {skipped:.0} not made (view memory the guards know, VICTORY_ASK_SKIP_VIEWS {}); hole checks \
+         (VirtualQuery) {holes:.0} made, {cached:.0} answered from a cache, {placeholders:.0} placeholder questions",
+        if skip_views() { "on" } else { "off" },
+    )
+}
+
+/// Whether the write watch leaves out of its kernel askings the ranges
+/// whose first block the guards hold (read-only by our hand, or noted
+/// unmapped: view memory, which has no write watch), at a submission's
+/// one asking ([`ask_ahead`], [`ask_lone`], [`ask_views`]) and at every
+/// asking ([`writes`], as `VICTORY_GUARD_FIRST`) (`VICTORY_ASK_SKIP_VIEWS=1`;
+/// off by default).
+///
+/// The submission's one asking asks the kernel about the span of every
+/// copy it refreshes, view memory too: such an asking can only fail, and
+/// a run of them asked together (8 MiB apart at most) fails and is asked
+/// again by halves, down to single ranges, each call walking the page
+/// tables of its range. A profile of the Series S house scene
+/// (vf-bis-all22-s-wft-prof) has `ask_kernel` at 19 % of the submitting
+/// thread's running, while the askings it counts, the answered ones, are
+/// 9,855 a frame. What the guards answer is what they answered after the
+/// failed call.
+pub(crate) fn skip_views() -> bool {
+    #[cfg(test)]
+    if SKIP_VIEWS_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SKIP_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// Tests: [`skip_views`] on, whatever the switch says.
+#[cfg(test)]
+pub(crate) static SKIP_VIEWS_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// With [`skip_views`]: for each of `firsts` (page numbers), whether the
+/// guards hold it; one look under their lock.
+fn views_held(firsts: impl Iterator<Item = usize>) -> Vec<bool> {
+    let g = guards();
+    firsts.map(|first| g.protected.contains(&first) || g.absent.contains(&first)).collect()
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -355,6 +418,19 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
+    // View memory the guards know: no kernel asking, which would fail.
+    if skip_views() && !pieces.is_empty() {
+        let held = views_held(pieces.iter().map(|p| p.0));
+        let before = pieces.len();
+        let mut i = 0;
+        pieces.retain(|_| {
+            i += 1;
+            !held[i - 1]
+        });
+        for _ in pieces.len()..before {
+            kernel_count(2);
+        }
+    }
     if pieces.len() < 2 {
         return;
     }
@@ -499,6 +575,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// [`ask_once`] after [`ask_ahead`]: the ranges that lie alone, asked under
 /// the standing asking.
 fn ask_lone(ranges: &[(usize, usize)]) {
+    // View memory the guards know is left to the guards ([`skip_views`]).
+    let held = if skip_views() { views_held(ranges.iter().map(|r| r.0 / PAGE)) } else { Vec::new() };
     #[cfg(feature = "diagnostics")]
     let _who = asking_for(1);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -523,8 +601,12 @@ fn ask_lone(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
+    for (i, &(start, end)) in ranges.iter().enumerate() {
         if start >= end {
+            continue;
+        }
+        if held.get(i).copied().unwrap_or(false) {
+            kernel_count(2);
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -628,7 +710,10 @@ fn ask_views(ranges: &[(usize, usize)]) {
         // With `VICTORY_GUARD_FIRST=1`, as in [`writes`]: a range whose
         // first block the guards hold cannot be write-watched, no kernel
         // asking first.
-        let held = guard_first() && guards_know(first);
+        let held = (guard_first() || skip_views()) && guards_know(first);
+        if held {
+            kernel_count(2);
+        }
         if !held && ask_kernel(j, first, last) {
             j.ahead.push((first, last, false));
             reach = reach.max(last);
@@ -783,6 +868,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    kernel_count(usize::from(failed));
     if failed {
         return false;
     }
@@ -899,7 +985,10 @@ fn writes_as(
     let started = std::time::Instant::now();
     // With `VICTORY_GUARD_FIRST=1`: view memory the guards hold already is
     // not asked of the kernel, whose answer there is a failure.
-    let failed = guarded && guard_first() && guards_know(first) || {
+    let failed = guarded && (guard_first() || skip_views()) && guards_know(first) && {
+        kernel_count(2);
+        true
+    } || {
         // SAFETY: the answer buffer holds `count` entries.
         let answer = unsafe {
             GetWriteWatch(
@@ -911,6 +1000,7 @@ fn writes_as(
                 &mut granularity,
             )
         };
+        kernel_count(usize::from(answer != 0));
         answer != 0
     };
     // With [`guard_outside`]: the guards' blocks to make read-only, once
@@ -1044,7 +1134,10 @@ fn writes_unlocked(
         let mut granularity = 0;
         // With `VICTORY_GUARD_FIRST=1`: view memory the guards hold already
         // is not asked of the kernel, whose answer there is a failure.
-        let failed = guarded && guard_first() && guards_know(first) || {
+        let failed = guarded && (guard_first() || skip_views()) && guards_know(first) && {
+            kernel_count(2);
+            true
+        } || {
             // SAFETY: the answer buffer holds `count` entries.
             let answer = unsafe {
                 GetWriteWatch(
@@ -1056,6 +1149,7 @@ fn writes_unlocked(
                     &mut granularity,
                 )
             };
+            kernel_count(usize::from(answer != 0));
             answer != 0
         };
         if !failed {
@@ -4444,6 +4538,37 @@ pub(crate) mod tests {
         assert!(hooked, "the block was armed outside the locks");
         let raised = RAISED.load(Ordering::SeqCst);
         assert!(stamp > raised, "noted at {stamp}, a standing answer took it at {raised}");
+    }
+
+    /// `VICTORY_ASK_SKIP_VIEWS`: the submission's one asking makes no kernel
+    /// call for view memory the guards know (it could only fail), and every
+    /// copy of views kept beside writers under contention stays true with
+    /// it, the journal's lock held or let go.
+    #[test]
+    fn known_views_are_not_asked_of_the_kernel() {
+        use std::sync::atomic::Ordering;
+        let _turn = light_turn();
+        const PAGES: usize = 8;
+        let (section, one, two) = two_views(PAGES * BLOCK);
+        forget_pages(one, one + PAGES * BLOCK);
+        SKIP_VIEWS_TEST.store(true, Ordering::Relaxed);
+        // Guarded once: the guards know it.
+        assert!(writes_as(one, one + PAGES * BLOCK, true, 0, false, false).is_some());
+        let ranges: Vec<(usize, usize)> = (0..PAGES).map(|k| (one + k * BLOCK, one + (k + 1) * BLOCK)).collect();
+        let skipped = KERNEL_CALLS[2].load(Ordering::Relaxed);
+        ask_once_end();
+        ask_ahead(&ranges);
+        ask_lone(&ranges);
+        ask_once_end();
+        let now = KERNEL_CALLS[2].load(Ordering::Relaxed);
+        for unlocked in [false, true] {
+            copies_under_contention_stay_true(one, PAGES, true, unlocked);
+        }
+        SKIP_VIEWS_TEST.store(false, Ordering::Relaxed);
+        drop_views(section, &[one, two], PAGES * BLOCK);
+        forget_pages(one, one + PAGES * BLOCK);
+        forget_pages(two, two + PAGES * BLOCK);
+        assert!(now >= skipped + 2 * PAGES as u64, "every range left out, ahead and alone");
     }
 
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
