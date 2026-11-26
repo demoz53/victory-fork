@@ -9910,6 +9910,9 @@ impl Meter {
                 if let Some(line) = crate::watch::light_line(frames) {
                     tracing::info!("{line}");
                 }
+                // `VICTORY_JOURNAL_UNLOCKED`: the journal's lock as the
+                // askings take it, with the switch or without.
+                tracing::info!("{}", crate::watch::journal_line(frames));
             }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
