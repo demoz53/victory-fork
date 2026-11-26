@@ -6892,6 +6892,11 @@ impl<'a> Lower<'a> {
                 self.x.p.blocks[b].insts.iter().any(writes)
             });
             if per_lane {
+                // (the paired form: the wave's first lane is a lower one, whichever lane of
+                // the thread is being lowered)
+                if self.twin.is_some() {
+                    d = self.both(|l| l.i32_of(value))?[0];
+                }
                 self.s.flags |= flags::WAVE_OPS;
                 let i32t = self.s.t.i32;
                 d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
