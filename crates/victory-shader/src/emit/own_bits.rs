@@ -38,6 +38,12 @@
 //! left to the forms of the program in which every lane runs that code (`emit`'s retries: the
 //! skips left out, the branches around it taken wave-wide), where the halves do exchange.
 //! `VICTORY_WAVE_OWN_BITS=0` turns this off.
+//!
+//! Two holes in the first form of these checks are closed, each with its own switch (on;
+//! `=0` as before): the set of bits still to visit kept in an SGPR itself, read after the loop
+//! (`VICTORY_OWN_BITS_SCALAR`, avatarmanz/VIctory-7900XTX PR #286 by sharan104), and lane
+//! masks a round writes outside the body, which the STALE check did not follow
+//! (`VICTORY_OWN_BITS_LATCH`, fxceless/victory-fork PR #789 by AscilCH).
 
 use std::collections::{HashMap, HashSet};
 
@@ -482,7 +488,11 @@ impl Ctx<'_> {
             }
             pattern.insert(u);
         }
-        if cur != r && !self.joins(cur).is_empty() {
+        // A scalar join is the set itself (`cur == r`): carried out of the loop, which is left
+        // with one bit to go, it holds the wave OR's highest bit, and a host wave of 32 would
+        // read its own half's highest bit there (`VICTORY_OWN_BITS_SCALAR=0`: not checked, as
+        // before).
+        if (cur != r || scalar_join_checked()) && !self.joins(cur).is_empty() {
             return Err((head, USED));
         }
         let (Some(idx), Some((nx, bit))) = (idx, next) else {
@@ -641,6 +651,29 @@ impl Ctx<'_> {
                         })
                     })
         };
+        // A value defined in the loop or before it in "some bits" (`pre`).
+        let value_in_region = |v: Value| -> bool {
+            self.def.get(&v).is_some_and(|&(b, _)| lp[b] || pre[b])
+                || (0..n).any(|b| (lp[b] || pre[b]) && p.blocks[b].phis.iter().any(|phi| phi.value == v))
+        };
+        let atom_in_region = |a: Atom| -> bool {
+            match a {
+                Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) => value_in_region(v),
+                Atom::Opaque(lo, hi) => value_in_region(lo) || value_in_region(hi),
+                Atom::Constant(_) => false,
+            }
+        };
+        // A lane mask whose lanes may differ from round to round (or that the pass cannot see).
+        let mask_depends_on_region = |w: Value| -> bool {
+            let lo = st.highs.get(&w).copied().unwrap_or(w);
+            st.masks
+                .get(&lo)
+                .is_none_or(|&m| st.bools.support(m).iter().any(|&a| atom_in_region(a)))
+        };
+        let latch_masks = latch_masks_checked();
+        // fresh lane masks written outside the body in the loop (a compare in the latch on the
+        // round's bit number): the halves visit other rounds, so these must not outlive theirs
+        let mut non_body_masks: Vec<Atom> = Vec::new();
         // ---- a round outside the body leaves nothing behind ----
         for b in (0..n).filter(|&b| lp[b] || pre[b]) {
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
@@ -649,8 +682,28 @@ impl Ctx<'_> {
                 }
                 let u = (b, i);
                 for &(reg, w) in &inst.writes {
-                    if rem.contains(&w) || is_mask(w) || matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                    if rem.contains(&w) || matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
                         continue;
+                    }
+                    if is_mask(w) {
+                        // (`VICTORY_OWN_BITS_LATCH=0`: every mask left to the STALE check, which
+                        // follows only the lane's own-bit test, as before)
+                        if !latch_masks {
+                            continue;
+                        }
+                        if lp[b]
+                            && let Some(&m) = st.masks.get(&w)
+                        {
+                            for atom in st.bools.support(m) {
+                                if matches!(atom, Atom::Lane(v) | Atom::Quad(v) | Atom::Opaque(v, _) if v == w) {
+                                    non_body_masks.push(atom);
+                                }
+                            }
+                        }
+                        // (a loop-invariant mask, such as the EXEC saved before the loop, may)
+                        if !mask_depends_on_region(w) {
+                            continue;
+                        }
                     }
                     for user in self.users.get(&w).into_iter().flatten() {
                         let stays = match *user {
@@ -696,14 +749,14 @@ impl Ctx<'_> {
                 }
             }
         }
-        // ---- no mask that depends on the test outlives its round ----
+        // ---- no mask that depends on the test or on a compare outside the body outlives its round ----
         let phi_block: HashMap<Value, usize> = p
             .blocks
             .iter()
             .enumerate()
             .flat_map(|(b, blk)| blk.phis.iter().map(move |phi| (phi.value, b)))
             .collect();
-        let mut dep: HashSet<Atom> = tests.iter().map(|t| t.0).collect();
+        let mut dep: HashSet<Atom> = tests.iter().map(|t| t.0).chain(non_body_masks).collect();
         let mut changed = true;
         while changed {
             changed = false;
@@ -785,6 +838,50 @@ impl Ctx<'_> {
         }
         Ok(alike)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`scalar_join_checked`] and [`latch_masks_checked`], for its thread
+    /// only.
+    static TEST_CHECKS: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`scalar_join_checked`] and [`latch_masks_checked`] as given (tests).
+#[cfg(test)]
+pub(super) fn with_checks<R>(scalar: bool, latch: bool, f: impl FnOnce() -> R) -> R {
+    let was = TEST_CHECKS.replace(Some((scalar, latch)));
+    let r = f();
+    TEST_CHECKS.set(was);
+    r
+}
+
+fn switch_on(name: &str, cell: &'static std::sync::OnceLock<bool>) -> bool {
+    *cell.get_or_init(|| std::env::var_os(name).is_none_or(|v| v != "0"))
+}
+
+/// Whether the joins of a set of bits still to visit kept in an SGPR itself are checked like
+/// those of its VGPR copy (avatarmanz/VIctory-7900XTX PR #286, sharan104). On;
+/// `VICTORY_OWN_BITS_SCALAR=0` as before.
+fn scalar_join_checked() -> bool {
+    #[cfg(test)]
+    if let Some((s, _)) = TEST_CHECKS.get() {
+        return s;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    switch_on("VICTORY_OWN_BITS_SCALAR", &ON)
+}
+
+/// Whether lane masks written outside the body of the loop, which may differ from round to
+/// round, are kept from outliving the round like the lane's own-bit test (fxceless/victory-fork
+/// PR #789, AscilCH). On; `VICTORY_OWN_BITS_LATCH=0` as before.
+fn latch_masks_checked() -> bool {
+    #[cfg(test)]
+    if let Some((_, l)) = TEST_CHECKS.get() {
+        return l;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    switch_on("VICTORY_OWN_BITS_LATCH", &ON)
 }
 
 /// The wave ORs of `p` that only steer a loop over each lane's own bits (see the module
@@ -948,6 +1045,85 @@ mod tests {
         // (reading s14 there without counting in it is nothing of the loop's)
         let p = light_loop(true, &[ADD_BIT_NUMBER], &[], &[0x7E0C_020E]);
         assert_eq!(found(&p).totals.len(), 1);
+    }
+
+    /// The loop of `light_loop` with the bits still to visit joined in s8 itself (no VGPR
+    /// copy, no first-lane read), and `after` after it (the same words as the lane test
+    /// `a_scalar_loops_last_bit_after_it_is_the_whole_waves`). Ported from
+    /// avatarmanz/VIctory-7900XTX PR #286 (sharan104), 82a3a8e32.
+    fn scalar_light_loop(after: &[u32]) -> Vec<u32> {
+        let mut w = WAVE_OR_V7_TO_S7.to_vec();
+        w.extend_from_slice(&[
+            0xBF06_8007, // s_cmp_eq_u32 s7, 0
+            0xBF85_000E, // s_cbranch_scc1 past the loop
+            0xBE88_0307, // s_mov_b32 s8, s7
+            0xBF82_0001, // s_branch to the loop's head
+            0xBE88_0309, // again: s_mov_b32 s8, s9
+            0xBE8A_1308, // head: s_ff1_i32_b32 s10, s8
+            0x8F0B_0A81, // s_lshl_b32 s11, 1, s10
+            0x3608_0E0B, // v_and_b32 v4, s11, v7
+            0xBE8C_047E, // s_mov_b64 s[12:13], exec
+            0x7DAA_0880, // v_cmpx_ne_u32 exec, 0, v4
+            0xBF88_0001, // s_cbranch_execz past the body
+            ADD_BIT_NUMBER,
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x8909_080B, // s_xor_b32 s9, s11, s8
+            0xBF06_0B08, // s_cmp_eq_u32 s8, s11
+            0xBF84_FFF4, // s_cbranch_scc0 again
+        ]);
+        w.extend_from_slice(after);
+        w
+    }
+
+    #[test]
+    fn the_last_bits_left_read_after_a_scalar_loop_are_not_the_lanes_own() {
+        // s8 leaves the loop holding the OR's highest bit
+        let program = |after: &[u32]| {
+            let mut w = scalar_light_loop(after);
+            w.push(0xBF81_0000); // s_endpgm
+            let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            crate::ir::build(&code, true, 256).unwrap()
+        };
+        assert_eq!(found(&program(&[])).totals.len(), 1);
+        // v_mov_b32 v6, s8: the last bit of the OR, which another lane may have set
+        let read_after = program(&[0x7E0C_0208]);
+        assert!(found(&read_after).totals.is_empty());
+        // (`VICTORY_OWN_BITS_SCALAR=0`: taken as the lane's own, the fault)
+        assert_eq!(with_checks(false, true, || found(&read_after).totals.len()), 1);
+    }
+
+    #[test]
+    fn a_non_test_mask_written_in_latch_cannot_escape_after_loop() {
+        // Ported from fxceless/victory-fork PR #789 (AscilCH), a7ecccf23.
+        // v_cmp_eq_u32 s[14:15], s10, v0 in latch writes a non-test mask depending on
+        // the round's bit index s10 (which differs between wave64 and split wave32).
+        let cmp_latch = [0xD4C2_000E, 0x0002_000A];
+        // Direct use in `after`: v_cndmask_b32 v6, v1, v2, s[14:15]
+        let cnd = 257 | (258 << 9) | (14 << 18);
+        let p_direct = light_loop(true, &[ADD_BIT_NUMBER], &cmp_latch, &[0xD501_0006, cnd]);
+        assert!(p_direct.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "v_cmp_eq_u32"));
+        assert!(
+            found(&p_direct).totals.is_empty(),
+            "non-test latch mask read by v_cndmask_b32 after the loop must be rejected"
+        );
+        // (`VICTORY_OWN_BITS_LATCH=0`: taken, the fault)
+        assert_eq!(with_checks(true, false, || found(&p_direct).totals.len()), 1);
+
+        // Indirect escape through EXEC: latch narrows EXEC with s[14:15] (so s[14:15]
+        // itself has only an in-loop user), guarding a VALU instruction in `after`.
+        let p_exec = light_loop(
+            true,
+            &[ADD_BIT_NUMBER],
+            &[cmp_latch[0], cmp_latch[1], 0xBE80_240E], // s_and_saveexec_b64 s[0:1], s[14:15]
+            &[0x7E0C_0281],                              // v_mov_b32 v6, 1 (guarded by s[14:15])
+        );
+        assert!(
+            found(&p_exec).totals.is_empty(),
+            "non-test latch mask escaping via EXEC guard into post-loop block must be rejected"
+        );
+        // a latch compare read only in its own round stays the lane's own
+        let p_inside = light_loop(true, &[ADD_BIT_NUMBER], &cmp_latch, &[]);
+        assert_eq!(found(&p_inside).totals.len(), 1);
     }
 
     #[test]

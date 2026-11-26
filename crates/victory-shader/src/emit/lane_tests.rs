@@ -270,6 +270,49 @@ fn card_with(what: &str, body: &[u32], adjust: impl FnOnce(&mut NativeProgram)) 
     Some(Card { host, root, pso, shader, threads })
 }
 
+/// [`card_with`] through the whole of `emit` (its retries and forms, as the title's programs
+/// are translated) for a host of 32-lane waves; also the 64-lane form, validated. A test's
+/// switch (thread-local) set around the call applies to the lowering. `None` as [`card`].
+fn card_emitted(what: &str, body: &[u32], adjust: impl FnOnce(&mut NativeProgram)) -> Option<Card> {
+    let mut console = native_of(body, true, 64);
+    adjust(&mut console);
+    let threads = match &console.io {
+        StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+        _ => 64,
+    };
+    let p = ir::build(&console.code, console.wave64, console.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let io = io::raise(&p, &console).expect("io::raise");
+    let res = resource::track(&p, &console.layout, console.stage, Some(&st)).expect("resource::track");
+    let empty_bytes = crate::dxbc::build(&[]);
+    let empty = crate::Container::parse(&empty_bytes).unwrap();
+    let on = |host_wave: u32| {
+        let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
+        let r = super::super::emit(&empty, &console, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        r
+    };
+    validate(&on(64).unwrap_or_else(|e| panic!("{what}: not emitted for 64-lane waves: {e}")));
+    let shader = on(32).unwrap_or_else(|e| panic!("{what}: not emitted for 32-lane waves: {e}"));
+    validate(&shader);
+    let host = match Host::new(false) {
+        Ok(h) => h,
+        Err(_) => {
+            eprintln!("{what}: no SM 6.6 hardware device; NOT RUN");
+            return None;
+        }
+    };
+    if host.wave_lanes().is_none_or(|lanes| lanes.1 > 32) {
+        eprintln!("{what}: the hardware device runs waves over 32 lanes; the 32-lane path is NOT RUN here");
+        return None;
+    }
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .unwrap_or_else(|e| panic!("{what}: the hardware device refuses the 32-lane form: {e}"));
+    eprintln!("{what}: emitted for 32-lane waves (PSV0 waves {:?}), running on the hardware device", psv0_wave(&shader));
+    Some(Card { host, root, pso, shader, threads })
+}
+
 impl Card {
     /// Runs the program with root constants s0..s3; the UAV's first 64 dwords.
     fn run(&self, s: [u32; 4]) -> Vec<u32> {
@@ -1029,4 +1072,282 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     let missing: Vec<usize> = (0..64).filter(|&i| got[i] != 1).collect();
     assert!(missing.is_empty(), "dwords not written: {missing:?}");
     eprintln!("thread ticket: 64 of 64 console threads, each its own, on the hardware device");
+}
+
+const V_OR_B32: u32 = 0x1C;
+const V_LSHRREV_B32: u32 = 0x16;
+const V_MUL_U32_U24: u32 = 0x0B;
+const V_CNDMASK_B32: u32 = 0x01;
+const V_CMP_LT_U32: u32 = 0xC1;
+const V_CMP_EQ_U32: u32 = 0xC2;
+const V_CMP_GT_U32: u32 = 0xC4;
+
+/// Inside `if (lane < s0)`, each lane's mask v7 = 1 << (lane >> 2) is ORed over the wave and a
+/// loop visits its bits with the bits still to visit joined in s8 itself (the scalar form of the
+/// title's light loop, `own_bits`), each lane adding the numbers of its own bits to v5. The loop
+/// is left with one bit to go, so s8 then holds the wave OR's highest bit; every lane stores
+/// s8 | v5 << 16. Taken as each host wave's own OR (`VICTORY_OWN_BITS_SCALAR=0`), the lanes of
+/// the lower host wave store their own half's highest bit instead (avatarmanz/VIctory-7900XTX
+/// PR #286, sharan104).
+#[test]
+fn a_scalar_loops_last_bit_after_it_is_the_whole_waves() {
+    let mut w = prologue();
+    w.push(S_WAITCNT_LGKM0);
+    // s[4:11] (the UAV's descriptor and its table) kept in s[24:31]: the loop uses them
+    for k in [4, 6, 8, 10] {
+        w.push(sop1(S_MOV_B64, 20 + k, k));
+    }
+    w.extend([
+        vop2(V_LSHRREV_B32, 6, int(2), 0), // v6 = lane >> 2
+        vop1(V_MOV_B32, 8, int(1)),
+        vop2(V_LSHLREV_B32, 7, v(6), 8), // v7 = 1 << (lane >> 2)
+        vop1(V_MOV_B32, 5, int(0)),
+        vop1(V_MOV_B32, 13, int(0)),
+        vopc(V_CMP_GT_U32, 0, 0), // v_cmp_gt_u32 vcc, s0, v0
+        sop1(S_AND_SAVEEXEC_B64, 20, VCC_LO),
+    ]);
+    let skip = w.len();
+    w.push(sopp(S_CBRANCH_EXECZ));
+    w.extend(super::super::wave::WAVE_OR_V7_TO_S7);
+    w.extend([
+        0xBF06_8007, // s_cmp_eq_u32 s7, 0
+        0xBF85_000E, // s_cbranch_scc1 past the loop
+        0xBE88_0307, // s_mov_b32 s8, s7
+        0xBF82_0001, // s_branch to the loop's head
+        0xBE88_0309, // again: s_mov_b32 s8, s9
+        0xBE8A_1308, // head: s_ff1_i32_b32 s10, s8
+        0x8F0B_0A81, // s_lshl_b32 s11, 1, s10
+        0x3608_0E0B, // v_and_b32 v4, s11, v7
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DAA_0880, // v_cmpx_ne_u32 exec, 0, v4
+        0xBF88_0001, // s_cbranch_execz past the body
+        0x4A0A_0A0A, // v_add_nc_u32 v5, s10, v5
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x8909_080B, // s_xor_b32 s9, s11, s8
+        0xBF06_0B08, // s_cmp_eq_u32 s8, s11
+        0xBF84_FFF4, // s_cbranch_scc0 again
+        vop1(V_MOV_B32, 13, 8), // after the loop: v13 = s8
+    ]);
+    let join = w.len();
+    w.push(sop1(S_MOV_B64, EXEC, 20));
+    for k in [4, 6, 8, 10] {
+        w.push(sop1(S_MOV_B64, k, 20 + k));
+    }
+    w.push(vop2(V_LSHLREV_B32, 5, int(16), 5));
+    w.push(vop2(V_OR_B32, 12, v(13), 5));
+    epilogue(&mut w);
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    w[skip] |= rel(skip, join);
+    let want = |s0: u32| -> [u32; 64] {
+        let or = (0..64u32).filter(|&l| l < s0).fold(0u32, |m, l| m | 1 << (l >> 2));
+        let last = if or == 0 { 0 } else { 1u32 << (31 - or.leading_zeros()) };
+        std::array::from_fn(|l| if (l as u32) < s0 { last | (l as u32 >> 2) << 16 } else { 0 })
+    };
+    let _one = one_at_a_time();
+    // the fault, with the check off: the lower host wave's own highest bit
+    let what = "scalar own-bits loop, check off";
+    if let Some(card) = super::super::own_bits::with_checks(false, true, || card_emitted(what, &w, |_| {})) {
+        let got = card.run([64, 0, 0, 0]);
+        let wrong = (0..32).filter(|&l| got[l] != want(64)[l]).count();
+        eprintln!("{what}: {wrong} of the lower host wave's 32 lanes wrong (32 is the fault)");
+        assert_eq!(wrong, 32, "the fault this test is for is not shown: {:#x} at lane 0", got[0]);
+        assert_eq!(got[0] & 0xFFFF, 1 << 7, "the lower half's own highest bit");
+    }
+    let Some(card) = card_emitted("scalar own-bits loop", &w, |_| {}) else { return };
+    for s0 in [64, 40, 1, 0] {
+        let got = card.run([s0, 0, 0, 0]);
+        compare(&format!("scalar own-bits loop, lanes below {s0}"), &got, &some(want(s0)));
+    }
+    eprintln!("scalar own-bits loop: the whole wave's last bit in every lane, as the model");
+}
+
+/// Inside `if (lane < s0)`, the lanes of the upper host wave first count to s2 (a loop whose
+/// result feeds the increment, so it stays), then every lane takes the unsigned minimum of an
+/// LDS word with 0 and adds 1 to it, both atomically; after the branch every lane stores the
+/// word. The console runs the wave's lanes in step: all minimums, then all adds, the word is
+/// the number of lanes below s0. Taken as writes only (`VICTORY_LDS_ATOMICS_READ=0`), the two
+/// host waves meet only around the branch: the lower one gets through both atomics while the
+/// upper one counts, and the upper one's minimum then clears its adds (avatarmanz/VIctory-7900XTX
+/// PR #204, feanorsun).
+#[test]
+fn lds_atomics_in_a_lane_branch_keep_the_consoles_order() {
+    let mut w = prologue();
+    w.extend([
+        vop1(V_MOV_B32, 9, int(0)), // the word's address, and the minimum
+        vop1(V_MOV_B32, 17, int(2)),
+        vop2(V_LSHRREV_B32, 11, int(5), 0), // v11 = lane >> 5
+        vop2(V_MUL_U32_U24, 11, 2, 11),     // v11 = s2 in the upper host wave, 0 in the lower
+        vopc(V_CMP_GT_U32, 0, 0),           // v_cmp_gt_u32 vcc, s0, v0
+        sop1(S_AND_SAVEEXEC_B64, 12, VCC_LO),
+    ]);
+    let skip = w.len();
+    w.push(sopp(S_CBRANCH_EXECZ));
+    w.extend([vop1(V_MOV_B32, 16, int(0)), vop1(V_MOV_B32, 10, v(0)), sop1(S_MOV_B64, 14, EXEC)]);
+    let top = w.len();
+    w.push(vopc(V_CMP_LT_U32, v(16), 11)); // v_cmp_lt_u32 vcc, v16, v11
+    w.push(sop2(S_AND_B64, EXEC, EXEC, VCC_LO));
+    let leave = w.len();
+    w.push(sopp(S_CBRANCH_EXECZ));
+    for _ in 0..8 {
+        w.extend([vop2(V_MUL_U32_U24, 10, LITERAL, 10), 0x0019_660D, vop2(V_ADD_NC_U32, 10, LITERAL, 10), 0x3C6E_F35F]);
+    }
+    w.push(vop2(V_ADD_NC_U32, 16, int(1), 16));
+    let back = w.len();
+    w.push(sopp(S_BRANCH));
+    let end = w.len();
+    w.push(sop1(S_MOV_B64, EXEC, 14));
+    w.push(vopc(V_CMP_EQ_U32, 3, 10)); // v_cmp_eq_u32 vcc, s3, v10 (never: s3 = -1)
+    w.push(vop2(V_CNDMASK_B32, 2, int(1), 17)); // v2 = 1 (2 if it were)
+    w.extend(ds(0x07, 0, 9, 9)); // ds_min_u32 v9, v9
+    w.extend(ds(0x00, 0, 9, 2)); // ds_add_u32 v9, v2
+    let join = w.len();
+    w.push(sop1(S_MOV_B64, EXEC, 12));
+    w.extend(ds(0x36, 12, 9, 0)); // ds_read_b32 v12, v9
+    w.push(S_WAITCNT_LGKM0);
+    epilogue(&mut w);
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    w[skip] |= rel(skip, join);
+    w[leave] |= rel(leave, end);
+    w[back] |= rel(back, top);
+    let lds = |n: &mut NativeProgram| {
+        if let StageIo::Cs(cs) = &mut n.io {
+            cs.rsrc2 |= 1 << 15; // 128 dwords of LDS
+        }
+    };
+    let names: Vec<&str> = {
+        let p = ir::build(&native_of(&w, true, 64).code, true, 64).expect("ir::build");
+        p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).filter(|n| n.starts_with("ds_")).collect()
+    };
+    assert_eq!(names, ["ds_min_u32", "ds_add_u32", "ds_read_b32"]);
+    // (under the translation's iteration limit for compute loops, 4,096: past it a lane is
+    // taken out of the program)
+    const COUNT: u32 = 4_000;
+    let _one = one_at_a_time();
+    // the race, with atomics taken as writes only
+    let what = "LDS atomics in a lane branch, as writes only";
+    let was = lower::TEST_LDS_ATOMICS_READ.replace(Some(false));
+    let old = card_emitted(what, &w, lds);
+    lower::TEST_LDS_ATOMICS_READ.set(was);
+    if let Some(card) = old {
+        for s0 in [64, 33] {
+            let got = card.run([s0, 0, COUNT, u32::MAX]);
+            eprintln!("{what}: lanes below {s0}: the word is {} (the console: {s0})", got[0]);
+        }
+    }
+    let was = lower::TEST_LDS_ATOMICS_READ.replace(Some(true));
+    let new = card_emitted("LDS atomics in a lane branch", &w, lds);
+    lower::TEST_LDS_ATOMICS_READ.set(was);
+    let Some(card) = new else { return };
+    for s0 in [64, 33, 1, 0] {
+        let got = card.run([s0, 0, COUNT, u32::MAX]);
+        compare(&format!("LDS atomics in a lane branch, lanes below {s0}"), &got, &some([s0; 64]));
+    }
+    eprintln!("LDS atomics in a lane branch: every minimum before every add, as the model");
+}
+
+/// A wave64 lane mask held as a number, its two dwords written apart (LLVM's two `s_mov_b32`
+/// for a 64-bit constant it cannot inline; `vcc_lo` and `vcc_hi` set apart the same way), taken
+/// as EXEC: `s_and_saveexec_b64 s[20:21], s[12:13]`, then `v_mov_b32 v12, 1` in the lanes it
+/// holds, lanes 32-63 by the high dword's bits. Named by its low dword alone
+/// (`VICTORY_MASK_PAIR=0`), lowering guessed the high dword as the register written beside the
+/// low one: none for halves written apart (JMAN730/project-flamingo issue #806, pablogonz12;
+/// Marvisak/VIctory PR #2836, kotekompotek), and a stale one where the high dword is rewritten
+/// after a 64-bit write (the second form).
+#[test]
+fn a_mask_whose_halves_are_written_apart_tests_its_high_dword() {
+    const S_MOV_B32: u32 = 0x03;
+    const LO: u32 = 0x0F0F_00FF;
+    const HI: u32 = 0xA5A5_5A5A;
+    let under = |w: &mut Vec<u32>| {
+        w.extend([
+            sop1(S_AND_SAVEEXEC_B64, 20, 12),
+            vop1(V_MOV_B32, 12, int(1)),
+            sop1(S_MOV_B64, EXEC, 20),
+        ]);
+        epilogue(w);
+    };
+    let apart = {
+        let mut w = prologue();
+        w.extend([sop1(S_MOV_B32, 12, LITERAL), LO, sop1(S_MOV_B32, 13, LITERAL), HI]);
+        under(&mut w);
+        w
+    };
+    let rewritten = {
+        let mut w = prologue();
+        // s_mov_b64 s[12:13], s[0:1] (s0 = LO, s1 = 0), then s13 = HI
+        w.extend([sop1(S_MOV_B64, 12, 0), sop1(S_MOV_B32, 13, LITERAL), HI]);
+        under(&mut w);
+        w
+    };
+    let bits = u64::from(HI) << 32 | u64::from(LO);
+    let want: [u32; 64] = std::array::from_fn(|l| if bits >> l & 1 != 0 { 1 } else { DEAD });
+    let _one = one_at_a_time();
+    for (what, words) in [("a mask written in halves", &apart), ("a mask's high dword rewritten", &rewritten)] {
+        // with the switch off: lanes 32-63 wrong where the dwords' bits differ
+        let off = format!("{what}, named by its low dword");
+        let was = crate::structure::TEST_MASK_PAIRS.replace(Some(false));
+        let old = card_emitted(&off, words, |_| {});
+        crate::structure::TEST_MASK_PAIRS.set(was);
+        if let Some(card) = old {
+            let got = card.run([LO, 0, 0, 0]);
+            let wrong = (0..64).filter(|&l| got[l] != want[l]).count();
+            eprintln!("{off}: {wrong} lanes wrong");
+            assert!(wrong > 0, "{off}: the fault this test is for is not shown");
+        }
+        let Some(card) = card_emitted(what, words, |_| {}) else { return };
+        let got = card.run([LO, 0, 0, 0]);
+        compare(what, &got, &some(want));
+        eprintln!("{what}: every lane its bit of the pair, as the model");
+    }
+}
+
+/// A wave64 select on a lane mask held as a number, its halves written apart:
+/// `v_cndmask_b32 v12, 0, 1, s[12:13]` gives each lane its bit of the pair, lanes 32-63 the
+/// high dword's. The select alone asks for the console's lanes (avatarmanz/VIctory-7900XTX
+/// PR #308, compaccount1-coder; `VICTORY_SELECT_LANES`): without them the upper host wave's
+/// lanes took the bits of host lanes 0-31 (a debug build stops on `cross_lane`'s assertion).
+#[test]
+fn a_wave64_select_on_a_number_gives_each_lane_its_bit() {
+    const S_MOV_B32: u32 = 0x03;
+    const LO: u32 = 0x0F0F_00FF;
+    const HI: u32 = 0xA5A5_5A5A;
+    let mut w = prologue();
+    w.extend([sop1(S_MOV_B32, 12, LITERAL), LO, sop1(S_MOV_B32, 13, LITERAL), HI]);
+    // v_cndmask_b32 v12, 0, 1, s[12:13] (VOP3)
+    w.extend([0xD400_0000 | 0x101 << 16 | 12, 12 << 18 | int(1) << 9 | int(0)]);
+    epilogue(&mut w);
+    let bits = u64::from(HI) << 32 | u64::from(LO);
+    let want: [u32; 64] = std::array::from_fn(|l| (bits >> l & 1) as u32);
+    let _one = one_at_a_time();
+    let was = lower::TEST_SELECT_LANES.replace(Some(true));
+    let new = card_emitted("a select on a number", &w, |_| {});
+    lower::TEST_SELECT_LANES.set(was);
+    let Some(card) = new else { return };
+    compare("a wave64 select on a number", &card.run([0; 4]), &some(want));
+    eprintln!("a wave64 select on a number: every lane its bit of the pair, as the model");
+}
+
+/// A select on an all-or-none selector (`s_cselect_b64 s[12:13], -1, 0` on `s0 == 0`): every
+/// lane takes the same side, so `VICTORY_SELECT_LANES` leaves the program in its plain form, and
+/// every lane stores 1 when s0 is 0, else 0.
+#[test]
+fn a_select_on_an_all_or_none_mask_is_every_lanes() {
+    let mut w = prologue();
+    w.extend([
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0x858C_80C1, // s_cselect_b64 s[12:13], -1, 0
+    ]);
+    // v_cndmask_b32 v12, 0, 1, s[12:13] (VOP3)
+    w.extend([0xD400_0000 | 0x101 << 16 | 12, 12 << 18 | int(1) << 9 | int(0)]);
+    epilogue(&mut w);
+    let _one = one_at_a_time();
+    let was = lower::TEST_SELECT_LANES.replace(Some(true));
+    let new = card_emitted("a select on all or none", &w, |_| {});
+    lower::TEST_SELECT_LANES.set(was);
+    let Some(card) = new else { return };
+    for s0 in [0, 1] {
+        let want = [u32::from(s0 == 0); 64];
+        compare(&format!("a select on all or none, s0 = {s0}"), &card.run([s0, 0, 0, 0]), &some(want));
+    }
+    eprintln!("a select on all or none: every lane the same side, as the model");
 }

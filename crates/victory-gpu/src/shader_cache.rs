@@ -131,7 +131,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// The order, and `VICTORY_WAVE_LOCAL` being here twice, are kept as they
 /// were: with `VICTORY_SHADER_CACHE_KEY=exe` the key is, byte for byte,
 /// what it was while the executable was the identity.
-const SWITCHES: [&str; 46] = [
+const SWITCHES: [&str; 51] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LDS_REGIONS",
@@ -189,6 +189,12 @@ const SWITCHES: [&str; 46] = [
     "VICTORY_NAN_EXACT",
     // (test/shader3: the tiled cascade shadow programs' exact form, fxceless PR #1002)
     "VICTORY_CASCADES_EXACT",
+    // (test/shader4: wave64 fixes, each on unless "0")
+    "VICTORY_OWN_BITS_SCALAR",
+    "VICTORY_OWN_BITS_LATCH",
+    "VICTORY_LDS_ATOMICS_READ",
+    "VICTORY_MASK_PAIR",
+    "VICTORY_SELECT_LANES",
 ];
 
 /// The translation settings of this process that are in the run's key by
