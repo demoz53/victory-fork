@@ -17,6 +17,10 @@
 //! execution was followed by a move of the scratch buffer back to the
 //! common state, which drivers may treat as a full wait.
 //!
+//! With `VICTORY_INDIRECT_BATCH` the executions of one record without a
+//! count buffer (nearly all the title's) are clamped in batches ([`batch`]):
+//! the rest of this is for the others, and for every execution without it.
+//!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
 //! tail slots. Each list has a budget (2^27 vertex instances or threads,
@@ -35,6 +39,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use crate::host::{HostList, host, transition};
+
+pub(crate) mod batch;
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -373,6 +379,18 @@ thread_local! {
 /// number noted as `label` (the pipeline's shaders), which [`dispatch_label`]
 /// gives back for the number the clamp wrote.
 pub(crate) fn with_dispatch<R>(label: impl FnOnce() -> String, f: impl FnOnce() -> R) -> R {
+    let was = EXECUTION.replace(note_dispatch(label));
+    let r = f();
+    EXECUTION.set(was);
+    r
+}
+
+/// A new execution number noted as `label` (the pipeline's shaders), with
+/// what the clamp of a dispatch's records is told about it besides: the
+/// parts its records run in (bits 28 to 30) and whether its pipeline is
+/// watched (bit 31). What [`with_dispatch`] sets for its clamp, and what a
+/// batched clamp's job of a dispatch record carries ([`batch`]).
+pub(crate) fn note_dispatch(label: impl FnOnce() -> String) -> u32 {
     let n = NEXT_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % DISPATCH_RING;
     let watched;
     {
@@ -386,10 +404,7 @@ pub(crate) fn with_dispatch<R>(label: impl FnOnce() -> String, f: impl FnOnce() 
     }
     // (the parts its records run in, for the clamp's count of records cut)
     let parts = parts(|| ring_label(n));
-    let was = EXECUTION.replace(n | ((parts - 1).min(7) << 28) | if watched { 1 << 31 } else { 0 });
-    let r = f();
-    EXECUTION.set(was);
-    r
+    n | ((parts - 1).min(7) << 28) | if watched { 1 << 31 } else { 0 }
 }
 
 thread_local! {
@@ -812,6 +827,67 @@ fn record_clamp_at(
 /// memory holds at recording is not what the call reads.
 pub(crate) fn executes_nothing(max: u32) -> bool {
     max == 0
+}
+
+/// The batched clamp's pipeline ([`batch`]).
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE));
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no batched argument clamp (VICTORY_INDIRECT_BATCH): records are clamped one at a time");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Opens a batch in `list` ([`batch`]): a pass that clamps the records of
+/// the executions recorded after it, of `source` (a host copy's number and
+/// buffer) and of the `recent` ones after it. The table to add them to,
+/// and the scratch buffer its places are in. Replaces the list's compute
+/// root signature and pipeline (callers bind theirs after). `None` if the
+/// clamp is not available.
+///
+/// Ported from avatarmanz/VIctory-7900XTX 037596241 (GPL-3.0-or-later).
+pub(crate) fn open_batch(
+    list: &HostList,
+    source: (u64, &ID3D12Resource),
+    recent: &[(u64, ID3D12Resource)],
+) -> Option<(batch::Table, ID3D12Resource)> {
+    let c = batch_clamp()?;
+    let gpu = |b: &ID3D12Resource| {
+        // SAFETY: a live buffer.
+        Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
+    };
+    // A source there is none of is the first again, which no job names.
+    let mut ids = [0u64; batch::SOURCES];
+    let mut sources = [gpu(source.1)?; batch::SOURCES];
+    ids[0] = source.0;
+    let budget = list.budget()?;
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
+    let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
+    for (i, (id, buffer)) in others.enumerate() {
+        if let Some(at) = gpu(buffer) {
+            // Bound, and read only if a job names it: kept alive like the
+            // copies draws read (`Shadow::refresh`).
+            list.keep(buffer);
+            (ids[i + 1], sources[i + 1]) = (*id, at);
+        }
+    }
+    // Diagnostics: a pass of ours after one wait for every earlier shader
+    // write, counted with the clamps of one execution.
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    // SAFETY: the list's own upload memory of that many bytes, 256-byte
+    // aligned, until it is reset.
+    Some((unsafe { batch::Table::new(at, base, ids) }, dst))
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -2203,6 +2279,420 @@ void main() {
         // SAFETY: the list has run; a mapped buffer.
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
         assert_eq!(hits, expected, "every record of every part runs once, the first after both later clamps");
+    }
+
+    /// A command signature of one argument of `kind` on `device`.
+    fn one_argument(device: &ID3D12Device, kind: u32, stride: u32) -> ID3D12CommandSignature {
+        let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a valid single-argument command signature description.
+        unsafe {
+            device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap();
+        }
+        sig.unwrap()
+    }
+
+    /// What a batch's table says of records added to it
+    /// (`VICTORY_INDIRECT_BATCH`): one job per record, charged for every
+    /// execution that reads it, and none for what the pass cannot read.
+    /// (avatarmanz/VIctory-7900XTX 037596241.)
+    #[test]
+    fn batch_tables() {
+        use batch::{JOBS, SLOT, TABLE, TIMES, Table, job};
+        let mut memory = vec![0xffff_ffffu32; TABLE as usize / 4 + 1];
+        // SAFETY: the vector holds the table and outlives its use.
+        let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 4096, [7, 9, 0, 0]) };
+        assert_eq!(t.jobs(), 0);
+        assert_eq!(t.place(7, 64, 10), Some(4096));
+        assert_eq!(t.place(9, 64, 10), Some(4096 + u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 2), Some(4096 + 2 * u64::from(SLOT)), "another kind is another record");
+        // The same record again: the same place, charged twice.
+        assert_eq!(t.place(9, 64, 10), Some(4096 + u64::from(SLOT)));
+        assert_eq!(t.jobs(), 3);
+        assert_eq!(&memory[..4], [3, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff]);
+        assert_eq!(memory[4..8], [job(0, 10, 1), 64, 4096, 0]);
+        assert_eq!(memory[8..12], [job(1, 10, 2), 64, 4096 + SLOT, 0]);
+        assert_eq!(job(1, 10, 2), 1 | 10 << 4 | 3 << 8 | 2 << 16);
+        // SAFETY: as above.
+        let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 4096, [7, 9, 0, 0]) };
+        assert_eq!(memory[0], 0, "a new table has no job");
+        assert_eq!(t.place(7, 64, 10), Some(4096));
+        assert_eq!(t.place(9, 64, 10), Some(4096 + u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 2), Some(4096 + 2 * u64::from(SLOT)));
+        // Not a copy of the pass, not on 4 bytes, past 32 bits, not a kind.
+        for (id, offset, kind) in [(8, 64, 10), (7, 66, 10), (7, 1 << 32, 10), (7, u64::from(u32::MAX) & !3, 10), (7, 64, 3)] {
+            assert_eq!(t.place(id, offset, kind), None);
+        }
+        // Read more often than one job may be charged for: another job.
+        for _ in 1..TIMES {
+            assert_eq!(t.place(7, 64, 10), Some(4096));
+        }
+        assert_eq!(t.place(7, 64, 10), Some(4096 + 3 * u64::from(SLOT)));
+        assert_eq!(t.place(7, 64, 10), Some(4096 + 3 * u64::from(SLOT)));
+        for i in 4..u64::from(JOBS) {
+            assert_eq!(t.place(7, 1024 + 16 * i, 0), Some(4096 + i * u64::from(SLOT)));
+        }
+        assert_eq!(t.place(7, 1024, 1), None, "full");
+        assert_eq!(t.place(7, 1024 + 16 * 5, 0), Some(4096 + 5 * u64::from(SLOT)));
+        assert_eq!((memory[0], memory[TABLE as usize / 4]), (JOBS, 0xffff_ffff));
+    }
+
+    /// A dispatch's record is a job of each pipeline that reads it, noted
+    /// with the execution that asked first (the fourth word): what the
+    /// clamp of one execution is told ([`with_dispatch`]).
+    #[test]
+    fn batch_tables_note_dispatch_records_by_who_reads_them() {
+        use batch::{SLOT, TABLE, Table, job};
+        let mut memory = vec![0u32; TABLE as usize / 4];
+        // SAFETY: the vector holds the table and outlives its use.
+        let mut t = unsafe { Table::new(memory.as_mut_ptr().cast(), 0, [7, 0, 0, 0]) };
+        let mut made = 0;
+        let mut next = || {
+            made += 1;
+            0x8000_0000 | made
+        };
+        assert_eq!(t.place_noted(7, 128, 2, 0xA, &mut next), Some(0));
+        // The same pipeline again: the same job, no new execution noted.
+        assert_eq!(t.place_noted(7, 128, 2, 0xA, &mut next), Some(0));
+        // Another pipeline reads the same record: a job and a note of its own.
+        assert_eq!(t.place_noted(7, 128, 2, 0xB, &mut next), Some(u64::from(SLOT)));
+        assert_eq!(memory[0], 2);
+        assert_eq!(memory[4..8], [job(0, 2, 2), 128, 0, 0x8000_0001]);
+        assert_eq!(memory[8..12], [job(0, 2, 1), 128, SLOT, 0x8000_0002]);
+        assert_eq!(made, 2);
+    }
+
+    /// A batch clamps records exactly as the clamp of one execution does, of
+    /// any kind, sensible or not; they are added to its table after the pass
+    /// was recorded; and it leaves the list's budget and every note beside
+    /// it (mesh groups, dispatch groups, records cut, the watched ones) as
+    /// that clamp does. (After avatarmanz/VIctory-7900XTX 037596241.)
+    #[test]
+    fn warp_batch_clamps_as_the_clamp_of_one_does() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let kinds = [0u32, 1, 2, 10];
+        let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, 1 << 24, (1 << 26) + 1, u32::MAX];
+        // Every kind with many records, in two sources.
+        let mut records: Vec<(u32, [u32; 5])> = Vec::new();
+        for kind in kinds {
+            for (i, a) in values.into_iter().enumerate() {
+                for (k, b) in values.into_iter().enumerate() {
+                    records.push((kind, [a, b, values[(i * 3 + k) % 4], 77, 0xABCD]));
+                }
+            }
+        }
+        let (src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+        let (_other, other_ptr, other_gpu) = warp.shared_buffer(64 << 10);
+        for (i, (_, words)) in records.iter().enumerate() {
+            for (w, word) in words.iter().enumerate() {
+                // SAFETY: 400 records of 32 bytes in 64 KiB.
+                unsafe {
+                    src_ptr.cast::<u32>().add(i * 8 + w).write_volatile(*word);
+                    other_ptr.cast::<u32>().add(i * 8 + w).write_volatile(*word);
+                }
+            }
+        }
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(64 << 10);
+        let dst = warp.default_uav(64 << 10);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        for (i, (kind, _)) in records.iter().enumerate().step_by(3) {
+            let offset = i as u64 * 32;
+            let words = batch::words(*kind).unwrap();
+            let stride = words * 4;
+            // A dispatch's execution: its number, the parts its pipeline
+            // runs in (one or two) and whether it is watched.
+            let execution = if *kind == 2 { (i as u32 & 0x3fff) | ((i as u32 / 3 % 2) << 28) | ((i as u32 / 6 % 2) << 31) } else { 0 };
+            let read = |p: *mut u8| -> Vec<u32> {
+                // SAFETY: the mapping holds more.
+                (0..words as usize).map(|w| unsafe { p.cast::<u32>().add(w).read_volatile() }).collect()
+            };
+            let mut seen = Vec::new();
+            for batched in [false, true] {
+                // SAFETY: mapped buffers; nothing runs.
+                unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
+                if batched {
+                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu);
+                    // SAFETY: the mapped table; the list has not run.
+                    let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
+                    assert_eq!(table.place_noted(1 + i as u64 % 2, offset, *kind, 0, || execution), Some(0));
+                } else {
+                    let was = EXECUTION.replace(execution);
+                    assert!(record_clamp_as(
+                        &warp.clamp,
+                        &warp.list,
+                        (&dst, D3D12_RESOURCE_STATE_COMMON),
+                        budget_gpu,
+                        (&src, offset),
+                        None,
+                        (*kind, stride, 1),
+                        false,
+                    ));
+                    EXECUTION.set(was);
+                }
+                // SAFETY: an open list; the records are readable as arguments.
+                unsafe {
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(stride));
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                warp.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let budget: Vec<u32> = (0..11).map(|k| unsafe { budget_ptr.cast::<u32>().add(k).read_volatile() }).collect();
+                seen.push((read(back_ptr), budget));
+            }
+            assert_eq!(seen[0], seen[1], "record {i} of kind {kind}: {:?} (clamped alone, then in a batch)", records[i].1);
+        }
+    }
+
+    /// Records past the list's budget come out empty, and one read by many
+    /// executions is charged for each. (avatarmanz/VIctory-7900XTX 037596241.)
+    #[test]
+    fn warp_batch_charges_every_execution() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        const BUDGET: u32 = 1 << 27;
+        // 2^26 vertices each, as much as a draw is let run: two fill it.
+        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+            let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (back, back_ptr, _) = warp.shared_buffer(1024);
+            let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+            let dst = warp.default_uav(64 << 10);
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            // SAFETY: mapped buffers, which the list has not read yet.
+            let mut table = unsafe {
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                for r in 0..records {
+                    for (w, word) in [1u32 << 24, 4, 5, 6].into_iter().enumerate() {
+                        src_ptr.cast::<u32>().add(r as usize * 4 + w).write_volatile(word);
+                    }
+                }
+                batch::Table::new(table_ptr, 0, [1, 0, 0, 0])
+            };
+            for _ in 0..times {
+                for r in 0..records {
+                    assert_eq!(table.place(1, r * 16, 0), Some(r * u64::from(batch::SLOT)));
+                }
+            }
+            // SAFETY: an open list; the records are readable as arguments.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                warp.list.CopyBufferRegion(&back, 0, &dst, 0, 256);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the list has run; mapped words.
+            let (spent, out): (u32, Vec<u32>) = unsafe {
+                (
+                    budget_ptr.cast::<u32>().read_volatile(),
+                    (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
+                )
+            };
+            assert_eq!(out.iter().filter(|&&v| v == 1 << 24).count(), filled, "{times} times {records}: {out:?}");
+            assert!(out.iter().all(|&v| v == 0 || v == 1 << 24));
+            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+        }
+    }
+
+    /// A pass of many jobs (more than one group of its threads), filled
+    /// after it was recorded and out of order: every job's record lands at
+    /// its own place, bounded, whatever the jobs beside it are.
+    #[test]
+    fn warp_batch_of_many_jobs_bounds_each_at_its_place() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        const RECORDS: u32 = 200;
+        let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(64 << 10);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst = warp.default_uav(64 << 10);
+        // Mesh records 32 bytes apart: record `r` asks for `r + 1` groups,
+        // every fiftieth for all ones (a slot the title has not filled), which
+        // is bounded to the most a mesh dispatch runs; all fit the budget.
+        let asked = |r: u32| if r % 50 == 49 { u32::MAX } else { r + 1 };
+        // SAFETY: mapped buffers, which no list reads yet.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            for r in 0..RECORDS {
+                for (w, word) in [asked(r), 1, 1].into_iter().enumerate() {
+                    src_ptr.cast::<u32>().add(r as usize * 8 + w).write_volatile(word);
+                }
+            }
+        }
+        batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+        // SAFETY: the mapped table; the list has not run.
+        let mut table = unsafe { batch::Table::new(table_ptr, 0, [5, 0, 0, 0]) };
+        // Backwards, as the title draws some of its buffers.
+        let places: Vec<(u32, u64)> = (0..RECORDS).rev().map(|r| (r, table.place(5, u64::from(r) * 32, 10).unwrap())).collect();
+        assert_eq!(table.jobs(), RECORDS);
+        // SAFETY: an open list; the records are readable as arguments.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, u64::from(RECORDS * batch::SLOT));
+        }
+        warp.submit_and_wait();
+        let mut spent = 0u32;
+        for (r, at) in places {
+            // SAFETY: the list has run; mapped words inside the copy.
+            let got: Vec<u32> = (0..3).map(|w| unsafe { back_ptr.cast::<u32>().add(at as usize / 4 + w).read_volatile() }).collect();
+            let groups = asked(r).min(65_535);
+            assert_eq!(got, [groups, 1, 1], "record {r} at {at}");
+            spent += groups * 128;
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { budget_ptr.cast::<u32>().read_volatile() }, spent, "each charged once");
+    }
+
+    /// Two batches through a host list, twice (the second recording finds
+    /// the scratch buffer as the first one's end left it): executions with
+    /// nothing between them read what they asked for, of two source buffers,
+    /// the second batch while the first one's places are still read. With
+    /// the debug layer on no barrier names a state the buffer is not in.
+    /// (avatarmanz/VIctory-7900XTX 037596241.)
+    #[test]
+    fn host_list_batches() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let mut sources = Vec::new();
+        for first in [1u32, 100] {
+            let Some((buffer, ptr)) = host.shared_buffer(1024) else {
+                return;
+            };
+            for i in 0..16u32 {
+                for (w, word) in [first + i, 1, 1].into_iter().enumerate() {
+                    // SAFETY: inside the mapping.
+                    unsafe { ptr.cast::<u32>().add(i as usize * 8 + w).write_volatile(word) };
+                }
+            }
+            sources.push(buffer);
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        for _ in 0..2 {
+            // SAFETY: the mapping holds 256 bytes; nothing runs.
+            unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+            let mut expected = 0;
+            // More batches than one scratch buffer holds.
+            for k in 0..12u32 {
+                let (mut table, scratch) =
+                    open_batch(&list, (1, &sources[0]), &[(1, sources[0].clone()), (2, sources[1].clone())]).unwrap();
+                // SAFETY: an open list; the worker's root signature and
+                // pipeline; buffers the test holds until the list has run.
+                unsafe {
+                    list.list.SetComputeRootSignature(&worker.root);
+                    list.list.SetPipelineState(&worker.pso);
+                    list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                }
+                for (id, record) in [(1u64, 3 + k % 4), (2, 5), (1, 0), (2, 5)] {
+                    let at = table.place(id, u64::from(record) * 32, 2).unwrap();
+                    // SAFETY: as above.
+                    unsafe { list.list.ExecuteIndirect(&signature, 1, &scratch, at, None, 0) };
+                    expected += record + if id == 1 { 1 } else { 100 };
+                }
+            }
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; a mapped buffer.
+            let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+            assert_eq!(hits, expected, "every execution runs what it asked for");
+        }
+    }
+
+    /// A clamp of one execution in the middle of a batch (a count buffer, a
+    /// dispatch in parts: what batches leave alone) uses the list's other
+    /// scratch buffer: the batch's records are read after it and still run.
+    #[test]
+    fn host_list_batch_outlives_a_clamp_of_one() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let apart = one_argument(&host.device, 2, 32);
+        let Some((source, ptr)) = host.shared_buffer(1024) else {
+            return;
+        };
+        for i in 0..16u32 {
+            for (w, word) in [i + 1, 1, 1].into_iter().enumerate() {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i as usize * 8 + w).write_volatile(word) };
+            }
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        // SAFETY: the mapping holds 256 bytes; nothing runs.
+        unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+        let bind = || {
+            // SAFETY: an open list; the worker's root signature and pipeline;
+            // buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            }
+        };
+        let (mut table, scratch) = open_batch(&list, (1, &source), &[]).unwrap();
+        bind();
+        let first = table.place(1, 2 * 32, 2).unwrap();
+        // SAFETY: as in `bind`.
+        unsafe { list.list.ExecuteIndirect(&signature, 1, &scratch, first, None, 0) };
+        // One clamped on its own: records 4 and 5 (5 + 6 groups).
+        let alone = bound(&list, (&source, 4 * 32), None, (2, 32, 2)).unwrap();
+        assert!(alone != scratch, "not the batches' buffer");
+        bind();
+        // SAFETY: as in `bind`.
+        unsafe { list.list.ExecuteIndirect(&apart, 2, &alone, 0, None, 0) };
+        // The batch goes on: another record, and the first one again.
+        let later = table.place(1, 9 * 32, 2).unwrap();
+        assert_eq!(table.place(1, 2 * 32, 2), Some(first));
+        // SAFETY: as in `bind`.
+        unsafe {
+            list.list.ExecuteIndirect(&signature, 1, &scratch, later, None, 0);
+            list.list.ExecuteIndirect(&signature, 1, &scratch, first, None, 0);
+        }
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: the list has run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 3 + (5 + 6) + 10 + 3);
     }
 }
 
