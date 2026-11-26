@@ -2020,8 +2020,8 @@ mod title_memory_tests {
             );
         }
         for slices in [1u32, 2] {
-            // Four RGBA8 mips, 512x512 down to 64x64. The last row fills
-            // its entire 256-byte host pitch. The backing is ours.
+            // Five RGBA8 mips, 512x512 down to 32x32 (a texture of fewer keeps
+            // every level: `drop_levels`). The backing is ours.
             let words = [
                 3u32,
                 0,
@@ -2030,7 +2030,7 @@ mod title_memory_tests {
                 512,
                 0,
                 512,
-                (4 << 16) | slices,
+                (5 << 16) | slices,
                 28,
                 1,
                 0,
@@ -2103,7 +2103,7 @@ mod title_memory_tests {
             assert_ne!(last.hash, original);
             assert_ne!(fingerprint(at, size), print);
             assert!(upload.dirty.load(Relaxed));
-            let host_mip = (slice * (4 - drop)) as usize;
+            let host_mip = (slice * (5 - drop)) as usize;
             let offset = upload.footprints[host_mip].Offset as usize;
             // SAFETY: first byte of this live, mapped staging subresource.
             assert_eq!(unsafe { upload.data.add(offset).read() }, 0xab);
