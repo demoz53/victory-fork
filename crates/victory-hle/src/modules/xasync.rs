@@ -478,8 +478,26 @@ struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
+    /// Set by the first completion, which then runs without a lock: a
+    /// provider's cleanup may wait for a thread completing the same call
+    /// ([`cleanup_unlocked`]).
+    claimed: AtomicBool,
+    /// The status is published.
     done: Mutex<bool>,
     finished: Condvar,
+}
+
+/// Whether a completion runs the provider's cleanup with no lock held
+/// (`VICTORY_XASYNC_CLEANUP_UNLOCKED`, on; `0`: under the call's `done`
+/// lock, as before). Held, a cleanup that waits for a thread completing the
+/// same call, or for one in a blocking `XAsyncGetStatus`, deadlocks with it
+/// and the title's async worker hangs for good. Ported from upstream
+/// Marvisak/VIctory pull request #114 (Manuel Perez), as fxceless/victory-fork
+/// pull request #1330 carries it.
+fn cleanup_unlocked() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_XASYNC_CLEANUP_UNLOCKED").is_none_or(|v| v != "0"));
+    *ON
 }
 
 impl Call {
@@ -548,6 +566,7 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
+        claimed: AtomicBool::new(false),
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
@@ -599,9 +618,20 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     if result == E_PENDING {
         return;
     }
-    let mut done = lock(&call.done);
-    if *done {
-        return;
+    // The first completion claims the call; a second one leaves it alone.
+    // Without the switch the claim is the `done` lock, held through the
+    // provider's cleanup as before.
+    let mut held = None;
+    if cleanup_unlocked() {
+        if call.claimed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+    } else {
+        let done = lock(&call.done);
+        if *done {
+            return;
+        }
+        held = Some(done);
     }
     // Read before publishing: once the status is set, the title may free
     // the block.
@@ -623,6 +653,9 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
             calls.remove(&(block as usize));
         }
     }
+    // Published, then the waiters woken: with the switch the lock is taken
+    // only now, after the cleanup.
+    let mut done = held.unwrap_or_else(|| lock(&call.done));
     *done = true;
     call.finished.notify_all();
     drop(done);
@@ -664,6 +697,11 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// provider completed it first.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
+        // A completion that claimed the call may still be running its
+        // cleanup, with the status not yet published: leave it alone too.
+        if call.claimed.load(Ordering::Acquire) {
+            return;
+        }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
         XAsyncComplete(block, E_ABORT, 0);
     }
@@ -1081,6 +1119,43 @@ static VTABLE: Methods<31> = Methods([
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    /// The call a test provider looks at in its cleanup, and what it saw
+    /// (1: the completion lock was free, 2: held).
+    static CLEANED: std::sync::Mutex<Option<Arc<Call>>> = std::sync::Mutex::new(None);
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    extern "system" fn cleanup_checks(op: u32, _: *const ProviderData) -> HRESULT {
+        if op == OP_CLEANUP {
+            let call = CLEANED.lock().unwrap().clone();
+            let free = call.is_some_and(|c| c.done.try_lock().is_ok());
+            SEEN.store(if free { 1 } else { 2 }, Ordering::SeqCst);
+        }
+        S_OK
+    }
+
+    /// A failed call's cleanup runs without the completion lock: a cleanup
+    /// that waits for a thread completing the same call would otherwise
+    /// deadlock with it. The status is published after the cleanup, and a
+    /// second completion or a cancel leaves the call alone. (Upstream #114.)
+    #[test]
+    fn cleanup_runs_without_the_completion_lock() {
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let (context, none) = (std::ptr::null_mut(), std::ptr::null());
+        let provider = Some(cleanup_checks as Provider);
+        let begun = XAsyncBegin(&mut block, context, none, none.cast(), provider);
+        assert_eq!(begun, S_OK);
+        *CLEANED.lock().unwrap() = call(&mut block);
+        XAsyncComplete(&mut block, E_ABORT, 0);
+        assert_eq!(SEEN.load(Ordering::SeqCst), 1, "cleanup ran under the lock");
+        assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+        *CLEANED.lock().unwrap() = None;
+    }
 
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)
