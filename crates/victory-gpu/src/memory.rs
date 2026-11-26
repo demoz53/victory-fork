@@ -45,7 +45,7 @@
 //! dirty-page mask written by the shader would bound both.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -88,22 +88,55 @@ unsafe impl Send for Memory {}
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 
 
-/// A bit per directory page: whether it has a copy's number. Entries are
-/// only ever given, never taken back.
-struct Numbered(Vec<u64>);
+/// Opt in to copying back only buffers named by a raw-address store's dispatch.
+/// A pointer loaded from another buffer may refer to an unnamed copy.
+fn named_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAMED_WRITES").is_some_and(|v| v == "1"))
+}
+
+/// CPU mirror of the directory. The opt-in needs the owning copy, while the
+/// usual path needs just one bit per page. Neither reads write-combined memory.
+enum Numbered {
+    Bits(Vec<u64>),
+    Owners(Vec<u16>),
+}
 
 impl Numbered {
-    fn new(pages: u32) -> Self {
-        Numbered(vec![0; (pages as usize).div_ceil(64)])
+    fn new(pages: u32, owners: bool) -> Self {
+        if owners {
+            Self::Owners(vec![0; pages as usize])
+        } else {
+            Self::Bits(vec![0; (pages as usize).div_ceil(64)])
+        }
+    }
+
+    fn owner(&self, page: u64) -> Option<usize> {
+        match self {
+            Self::Owners(owners) => usize::from(*owners.get(page as usize)?).checked_sub(1),
+            Self::Bits(_) => None,
+        }
     }
 
     fn has(&self, page: u64) -> bool {
-        self.0.get((page / 64) as usize).is_some_and(|w| w >> (page % 64) & 1 != 0)
+        match self {
+            Self::Bits(bits) => bits.get((page / 64) as usize).is_some_and(|w| w >> (page % 64) & 1 != 0),
+            Self::Owners(_) => self.owner(page).is_some(),
+        }
     }
 
-    fn set(&mut self, page: u64) {
-        if let Some(w) = self.0.get_mut((page / 64) as usize) {
-            *w |= 1 << (page % 64);
+    fn set(&mut self, page: u64, index: usize) {
+        match self {
+            Self::Bits(bits) => {
+                if let Some(w) = bits.get_mut((page / 64) as usize) {
+                    *w |= 1 << (page % 64);
+                }
+            }
+            Self::Owners(owners) => {
+                if let Some(owner) = owners.get_mut(page as usize) {
+                    *owner = u16::try_from(index + 1).expect("copy index fits in the directory");
+                }
+            }
         }
     }
 }
@@ -135,7 +168,7 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory", true)?,
-            numbered: Numbered::new(MEMORY_PAGES),
+            numbered: Numbered::new(MEMORY_PAGES, named_writes()),
             faults: make(u64::from(MEMORY_FAULTS), "faults", false)?,
             copies: Vec::new(),
             heaps: HashMap::new(),
@@ -201,7 +234,7 @@ impl Memory {
                             other.add(1).write_volatile((at - first) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
-                        self.numbered.set(at / PAGE);
+                        self.numbered.set(at / PAGE, n);
                     }
                     at += PAGE;
                 }
@@ -222,7 +255,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
-        self.numbered.set(page);
+        self.numbered.set(page, n);
     }
 
     /// The pages shaders found empty since the last frame.
@@ -258,9 +291,14 @@ impl Memory {
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    fn name(&mut self, address: u64, named: &mut Vec<usize>, collect: bool) {
+        let next = (address & !(CELL - 1)).checked_add(CELL);
+        for at in Some(address).into_iter().chain(next) {
+            self.map(at);
+            if collect && let Some(index) = self.numbered.owner(at / PAGE) && !named.contains(&index) {
+                named.push(index);
+            }
+        }
     }
 }
 
@@ -288,8 +326,10 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
+    let narrow = writes && named_writes();
+    let mut named = Vec::new();
     for &address in addresses {
-        m.name(address);
+        m.name(address, &mut named, narrow);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -299,10 +339,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, &mut named, narrow);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, &mut named, narrow);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -324,12 +364,20 @@ pub(crate) fn ready(
     // numbered copy this list has not covered yet, including copies numbered
     // by another command list since this list's previous dispatch.
     const KEEP: usize = usize::MAX - 0x6d;
-    let (read_from, write_from) = list.memory_sync_range(m.copies.len(), writes);
+    let (read_from, write_from) = list.memory_sync_range(m.copies.len(), writes && !narrow);
     for shadow in &m.copies[read_from..] {
         let (start, len) = shadow.span();
         shadow.refresh(list, start, len);
     }
-    if writes {
+    if narrow {
+        for index in named {
+            if list.first_named_write(index) {
+                let shadow = &m.copies[index];
+                let (start, len) = shadow.span();
+                shadow.gpu_writes(list, start, len);
+            }
+        }
+    } else if writes {
         for shadow in &m.copies[write_from..] {
             let (start, len) = shadow.span();
             shadow.gpu_writes(list, start, len);
@@ -350,16 +398,27 @@ pub(crate) fn ready(
 mod numbered_tests {
     use super::Numbered;
 
+    #[test]
+    fn named_pages_distinguish_copy_zero_from_absent_pages() {
+        let mut pages = Numbered::new(64, true);
+        pages.set(0, 0);
+        pages.set(63, super::COPIES as usize - 1);
+        assert_eq!(pages.owner(0), Some(0));
+        assert_eq!(pages.owner(63), Some(super::COPIES as usize - 1));
+        assert_eq!(pages.owner(1), None);
+        assert_eq!(pages.owner(u64::MAX), None);
+    }
+
     /// Pages are numbered one by one, at both ends; past the end nothing is.
     #[test]
     fn pages_are_numbered_one_by_one() {
-        let mut n = Numbered::new(1 << 21);
+        let mut n = Numbered::new(1 << 21, false);
         assert!(!n.has(0) && !n.has(63) && !n.has(64));
-        n.set(63);
-        n.set((1 << 21) - 1);
+        n.set(63, 0);
+        n.set((1 << 21) - 1, 0);
         assert!(n.has(63) && !n.has(62) && !n.has(64));
         assert!(n.has((1 << 21) - 1));
-        n.set(1 << 21);
+        n.set(1 << 21, 0);
         assert!(!n.has(1 << 21));
     }
 }

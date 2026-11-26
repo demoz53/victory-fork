@@ -719,6 +719,9 @@ struct Guards {
     /// page (a file read straight into title memory then fails with
     /// ERROR_INVALID_USER_BUFFER).
     kernel: Vec<KernelOpen>,
+    /// Faulted views and their tracked aliases, until each is taken with
+    /// every view protected again. Open memory stays dirty at every ask.
+    faulted: BTreeMap<usize, std::time::Instant>,
 }
 
 /// Blocks `[first, end)` a write through the kernel may be writing
@@ -843,6 +846,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BlockSet::new(),
     absent: BlockSet::new(),
     kernel: Vec::new(),
+    faulted: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -895,21 +899,95 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     let mut g = guards_timed();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    Some(guard_after_faults(&mut g, first, last, guard_rest()))
+}
+
+fn guard_after_faults(g: &mut Guards, first: usize, last: usize, rest: std::time::Duration) -> Vec<usize> {
+    // Without `VICTORY_GUARD_REST` and `VICTORY_OPEN_ONE_VIEW` nothing is
+    // ever in `faulted`: the walk as it was, with no look at the map (which
+    // panics over a range that ends before it starts).
+    if g.faulted.is_empty() || first >= last || g.faulted.range(first..last).next().is_none() {
+        return guard_range(g, first, last);
+    }
+    // Each faulted block of the range, and whether its rest is over.
+    let faults: Vec<(usize, bool)> =
+        g.faulted.range(first..last).map(|(&block, &when)| (block, when.elapsed() >= rest)).collect();
+    let most = guard_aliases();
+    let mut written = Vec::new();
+    let mut next = first;
+    let mut i = 0;
+    while i < faults.len() {
+        let (block, rested) = faults[i];
+        if next < block {
+            written.extend(guard_range(g, next, block));
+        }
+        // With the faulted blocks that follow it, as long as they answer
+        // alike: a run, made read-only in one call as the walk's runs of
+        // written blocks are (the title writes a buffer block after block;
+        // a call for each was hundreds of them a frame).
+        let mut end = block + 1;
+        i += 1;
+        while i < faults.len() && faults[i] == (end, rested) {
+            end += 1;
+            i += 1;
+        }
+        // Told as written at every asking while they are here.
+        written.extend(block * BLOCK / PAGE..end * BLOCK / PAGE);
+        if rested {
+            protect(g, block, end);
+            rearmed(g, block, end, most);
+        }
+        next = end;
+    }
+    if next < last {
+        written.extend(guard_range(g, next, last));
+    }
+    written
+}
+
+/// After [`protect`] of the faulted blocks `[from, to)`: those read-only
+/// now at every tracked view of their pages are faulted no longer (their
+/// bytes are taken by the asker); the others stay, not clean, and are told
+/// as written again.
+fn rearmed(g: &mut Guards, from: usize, to: usize, most: usize) {
+    let all = |g: &Guards, from: usize, to: usize| {
+        g.protected.range_vec(from..to).len() == to - from && {
+            let (aliases, _) = crate::inplace::aliases_between(from * BLOCK, to * BLOCK, most);
+            aliases.iter().all(|at| g.protected.contains(&(at / BLOCK)))
+        }
+    };
+    // The whole run in one look at the views, as a rule.
+    if all(g, from, to) {
+        for block in from..to {
+            g.faulted.remove(&block);
+        }
+        return;
+    }
+    for block in from..to {
+        if to - from > 1 && all(g, block, block + 1) {
+            g.faulted.remove(&block);
+        } else {
+            g.clean.remove(&block);
+        }
+    }
+}
+
+fn guard_range(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
     if guard_bits() {
-        return Some(guard_bits_here(&mut g, first, last));
+        return guard_bits_here(g, first, last);
     }
     let clean: Vec<usize> = g.clean.range_vec(first..last);
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
+        return written;
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
@@ -941,10 +1019,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+            protect(g, from, block);
         }
     }
-    Some(written)
+    written
 }
 
 /// [`guard`]'s walk of blocks `[first, last)` with [`guard_bits`]: only the
@@ -1575,12 +1653,58 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::resource::evict_placed_in(at as u64, len as u64);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    if !g.faulted.is_empty() {
+        let gone: Vec<_> = g.faulted.range(range.clone()).map(|(&block, _)| block).collect();
+        for block in gone {
+            g.faulted.remove(&block);
+        }
+    }
     g.absent.remove_range(range.clone());
     g.protected.remove_range(range.clone());
     g.clean.remove_range(range.clone());
     // A write through the kernel announced there wrote what the memory
     // showed before (or failed): the new memory may be guarded at once.
     g.kernel.retain(|k| k.end <= range.start || k.first >= range.end);
+}
+
+/// Zero disables the rest. One selects the upstream 3 ms interval, and
+/// larger values are microseconds.
+fn guard_rest() -> std::time::Duration {
+    static REST: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *REST.get_or_init(|| {
+        let us = std::env::var("VICTORY_GUARD_REST").ok()
+            .and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+        std::time::Duration::from_micros(if us == 1 { 3000 } else { us })
+    })
+}
+
+fn open_one_view() -> bool {
+    static ONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONE.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
+}
+
+/// Open the faulting view, invalidating every tracked view before the
+/// writer resumes. Kernel writes still take the normal all-view path.
+fn open_fault(g: &mut Guards, at: usize, one: bool, rest: std::time::Duration) -> bool {
+    if !one && rest.is_zero() {
+        return open(g, at, at + 1);
+    }
+    let block = at / BLOCK;
+    if !g.protected.contains(&block) {
+        return false;
+    }
+    let (aliases, _) = crate::inplace::aliases_between(block * BLOCK, (block + 1) * BLOCK, guard_aliases());
+    let now = std::time::Instant::now();
+    g.faulted.insert(block, now);
+    for alias in aliases {
+        let other = alias / BLOCK;
+        g.faulted.insert(other, now);
+        g.clean.remove(&other);
+        if !one {
+            open_here(g, alias, alias + 1);
+        }
+    }
+    open_here(g, at, at + 1)
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -1606,7 +1730,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        if open_fault(&mut g, at, open_one_view(), guard_rest()) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1618,9 +1742,15 @@ fn install() {
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: the handler only touches our guard state and protections.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
+    ONCE.call_once(|| {
+        // The handler's switches are read here, ahead of it (`guard_rest`
+        // by every `guard` as well): `open_one_view`, read first inside a
+        // fault, was the environment looked up, and memory asked for, in
+        // the middle of whatever the title's thread was doing when it wrote
+        // the block.
+        let _ = (open_one_view(), guard_rest());
+        // SAFETY: the handler only touches our guard state and protections.
+        unsafe { AddVectoredExceptionHandler(1, Some(on_write)) };
     });
 }
 
@@ -2017,6 +2147,67 @@ mod tests {
         }
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
+    }
+
+    #[test]
+    fn resting_faults_keep_other_views_dirty_until_all_views_are_rearmed() {
+        use std::time::Duration;
+        if super::guard_aliases() < 2 {
+            return;
+        }
+        let (section, reader, writer) = two_views(BLOCK);
+        guard(reader, reader + BLOCK).unwrap();
+        let block = reader / BLOCK;
+        {
+            let mut g = super::guards();
+            assert!(super::open_fault(&mut g, writer, true, Duration::from_secs(60)));
+            assert!(g.protected.contains(&block));
+            assert!(!g.protected.contains(&(writer / BLOCK)));
+            for _ in 0..2 {
+                assert!(!super::guard_after_faults(&mut g, block, block + 1, Duration::from_secs(60)).is_empty());
+                assert!(!g.protected.contains(&(writer / BLOCK)));
+            }
+            assert!(!super::guard_after_faults(&mut g, block, block + 1, Duration::ZERO).is_empty());
+            assert!(g.protected.contains(&(writer / BLOCK)));
+            assert!(super::guard_after_faults(&mut g, block, block + 1, Duration::ZERO).is_empty());
+        }
+        drop_views(section, &[reader, writer], BLOCK);
+    }
+
+    /// Faulted blocks next to each other rest and are made read-only again
+    /// as one run, at both views; a block of the range that did not fault
+    /// stays as it was.
+    #[test]
+    fn rested_faults_next_to_each_other_are_rearmed_together() {
+        use std::time::Duration;
+        if super::guard_aliases() < 2 {
+            return;
+        }
+        let (section, reader, writer) = two_views(3 * BLOCK);
+        guard(reader, reader + 3 * BLOCK).unwrap();
+        let (r, w) = (reader / BLOCK, writer / BLOCK);
+        let pages = |from: usize, to: usize| (from * BLOCK / PAGE..to * BLOCK / PAGE).collect::<Vec<_>>();
+        {
+            let mut g = super::guards();
+            // The title writes the first two blocks through its own view.
+            assert!(super::open_fault(&mut g, writer, true, Duration::from_secs(60)));
+            assert!(super::open_fault(&mut g, writer + BLOCK, true, Duration::from_secs(60)));
+            // Resting: told as written, the written view left open.
+            assert_eq!(super::guard_after_faults(&mut g, r, r + 3, Duration::from_secs(60)), pages(r, r + 2));
+            assert!(!g.protected.contains(&w) && !g.protected.contains(&(w + 1)));
+            // Rested: told once more, and read-only again at both views.
+            assert_eq!(super::guard_after_faults(&mut g, r, r + 3, Duration::ZERO), pages(r, r + 2));
+            assert!((0..3).all(|i| g.protected.contains(&(r + i)) && g.protected.contains(&(w + i))));
+            assert!(g.faulted.range(r..r + 3).next().is_none());
+            assert!(super::guard_after_faults(&mut g, r, r + 3, Duration::ZERO).is_empty());
+            // The written view's own guard has not taken them yet.
+            assert_eq!(g.faulted.range(w..w + 3).count(), 2);
+            let taken = super::guard_after_faults(&mut g, w, w + 3, Duration::ZERO);
+            assert_eq!(taken[..2 * BLOCK / PAGE], pages(w, w + 2));
+            assert!(g.faulted.range(w..w + 3).next().is_none());
+            assert!(super::guard_after_faults(&mut g, w, w + 3, Duration::ZERO).is_empty());
+        }
+        drop_views(section, &[reader, writer], 3 * BLOCK);
     }
 
     /// The title wrote the pages of a guarded texture through another view
