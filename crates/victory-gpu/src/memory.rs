@@ -374,12 +374,14 @@ pub(crate) fn ready(
             if list.first_named_write(index) {
                 let shadow = &m.copies[index];
                 let (start, len) = shadow.span();
+                crate::host::declared::note(crate::host::declared::NUMBERED, shadow, start, len);
                 shadow.gpu_writes(list, start, len);
             }
         }
     } else if writes {
         for shadow in &m.copies[write_from..] {
             let (start, len) = shadow.span();
+            crate::host::declared::note(crate::host::declared::NUMBERED, shadow, start, len);
             shadow.gpu_writes(list, start, len);
         }
     }

@@ -76,6 +76,11 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(crate::fence::FenceRef, u64),
+    /// With [`behind`]: the part that was at the head of the line is being
+    /// prepared and sent by the thread that runs the line, with the line
+    /// unlocked, so the title can add to its end meanwhile; whatever is
+    /// added stays behind this (the line is not empty), signals too.
+    Running,
 }
 
 /// The queues that hold something (their addresses).
@@ -154,7 +159,9 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if lock(&queue(this).held).is_empty() {
+    // With [`behind`] nothing runs on the title's thread: every list goes
+    // behind the line, which our thread runs.
+    let first = if !behind() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
             .position(|&l| crate::list::cut_list(l))
@@ -336,20 +343,201 @@ static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// one.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
+    if !all && behind() {
+        // The thread of ours runs what is free to run ([`behind`]).
+        wake();
+        return;
+    }
+    release_held_now(all);
+}
+
+/// Whether a submission is only put in its queue's line by the thread that
+/// submits it, and prepared and sent by a thread of ours, `victory-submit`
+/// (`VICTORY_ASYNC_SUBMIT=1`; off by default; needs submissions sent ahead,
+/// `VICTORY_RELAY` or `VICTORY_LATE_WAIT`, and lists cut at their waits,
+/// the default). Our port of fxceless f85101b60 (first as 99250881f on
+/// all12), brought onto the relay's tree.
+///
+/// Why (prof-s1 and waits-base2, Series S, about 125 ms a frame): the title
+/// thread that submits is the frame's critical path, 42 % of it running in
+/// our preparing and 58 % standing, mostly in settles (5.8 a frame, 35 ms,
+/// all of them our preparing reading title memory a flight's shaders may
+/// write); the title does nothing with the result of that work, which only
+/// has to be done before the lists run, in order.
+///
+/// With the switch a submission's lists are taken from the title's lists
+/// (as they already are when the queue holds anything) and put behind the
+/// queue's line; [`worker`] runs the lines in order, settles and all, while
+/// the title goes on. A signal of the queue goes behind them, as behind
+/// anything held. What must see the lines run goes through them on its own
+/// thread first ([`before_sync`]): a present, a fence the title blocks on
+/// without an event, and every submission of ours that is waited for. So a
+/// present returns, as without the switch, only once everything before it
+/// has been prepared and sent, and the frame before is complete on the
+/// card side when the title begins the next one; with
+/// `crate::host::flip_landed` the title's flip wait also waits until the
+/// frame before has landed (fx PR #995's `VICTORY_FLIP_LANDED`, tunczzz:
+/// its asynchronous submission, which also put the present behind the
+/// line, lost the first room's walls because the title read an older
+/// frame's results after its flip wait).
+///
+/// What it assumes, as fxceless's does: title memory a submission reads is
+/// not rewritten by the title between its submit call and our thread's
+/// preparing of it (on the console the card reads it later still).
+#[cfg(windows)]
+pub(crate) fn behind() -> bool {
+    #[cfg(test)]
+    if BEHIND_HERE.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1");
+        let on = asked && crate::host::late() && cuts();
+        if on {
+            match std::thread::Builder::new().name("victory-submit".into()).spawn(worker) {
+                Ok(_) => tracing::info!(
+                    "submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no thread to prepare submissions on: they are prepared as before");
+                    return false;
+                }
+            }
+        } else if asked {
+            tracing::warn!(
+                "VICTORY_ASYNC_SUBMIT=1 needs submissions sent ahead (VICTORY_RELAY or VICTORY_LATE_WAIT) and lists cut at their waits: off"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Tests: [`behind`] is on for this thread (no worker runs the lines).
+    static BEHIND_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether there is something for [`worker`] to look at.
+#[cfg(windows)]
+static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+#[cfg(windows)]
+fn wake() {
+    *lock(&WORK.0) = true;
+    WORK.1.notify_one();
+}
+
+/// The thread of [`behind`]: runs what queues hold as far as it is free to
+/// run, each time something was added or a fence moved.
+#[cfg(windows)]
+fn worker() {
+    crate::cores::keep_on_fast_cores("victory-submit");
+    loop {
+        {
+            let mut work = lock(&WORK.0);
+            while !*work {
+                work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+            }
+            *work = false;
+        }
+        release_held_now(false);
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread is inside [`release_held_now`].
+    static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With [`behind`], before whatever must see what the queues were given
+/// before it (a submission of ours that is waited for, a present, a fence
+/// the title blocks on): what the queues hold and is free to run runs
+/// first, on this thread (behind the part our thread may be sending), so
+/// nothing passes it.
+#[cfg(windows)]
+pub(crate) fn before_sync(why: usize) {
+    if behind() && !RELEASING_HERE.get() {
+        let stood = std::time::Instant::now();
+        release_held_now(false);
+        BEHIND_STATS[why].fetch_add(stood.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// [`before_sync`]'s callers, the places of [`BEHIND_STATS`] their time is
+/// added to: a present, a fence the title blocks on, a submission of ours,
+/// a change of page mappings (done at once, behind every earlier
+/// submission: [`copy_page_mappings`]).
+#[cfg(windows)]
+pub(crate) const BEFORE_PRESENT: usize = 0;
+#[cfg(windows)]
+pub(crate) const BEFORE_FENCE: usize = 1;
+#[cfg(windows)]
+pub(crate) const BEFORE_OURS: usize = 2;
+#[cfg(windows)]
+pub(crate) const BEFORE_MAPPING: usize = 3;
+/// [`BEHIND_STATS`]: parts sent from the lines with the line open, and
+/// microseconds spent preparing and sending them.
+#[cfg(windows)]
+const SENT_PARTS: usize = 4;
+#[cfg(windows)]
+const SENT_US: usize = 5;
+
+/// Since the last frame line, with [`behind`]: microseconds title threads
+/// stood running the lines (and waiting for our thread to finish the part
+/// it sends) at each of [`before_sync`]'s places; then [`SENT_PARTS`] and
+/// [`SENT_US`].
+#[cfg(windows)]
+static BEHIND_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The frame line's account of [`behind`] (`frames`: since the last).
+#[cfg(windows)]
+pub(crate) fn behind_line(frames: f64) {
+    if !behind() {
+        return;
+    }
+    let s: Vec<f64> = BEHIND_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "submissions prepared off the title's submit calls per frame (VICTORY_ASYNC_SUBMIT=1): {:.1} parts sent from the \
+         lines in {:.1} ms; the title's threads stood running the lines first {:.1} ms at presents, {:.1} ms at blocking \
+         fence waits, {:.1} ms at submissions of ours, {:.1} ms at page mapping changes",
+        s[SENT_PARTS],
+        s[SENT_US] / 1000.0,
+        s[BEFORE_PRESENT] / 1000.0,
+        s[BEFORE_FENCE] / 1000.0,
+        s[BEFORE_OURS] / 1000.0,
+        s[BEFORE_MAPPING] / 1000.0,
+    );
+}
+
+/// [`release_held`] on this thread, now (one thread at a time runs the
+/// lines: one that finds another doing it waits until it is done).
+#[cfg(windows)]
+fn release_held_now(all: bool) {
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    let was_here = RELEASING_HERE.replace(true);
+    struct Leave(bool);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            RELEASING_HERE.set(self.0);
+        }
+    }
+    let _leave = Leave(was_here);
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+            let line = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(line);
             loop {
                 match held.first() {
-                    None => break,
+                    None | Some(Held::Running) => break,
                     Some(Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence.as_this()) < *value =>
                     {
@@ -359,7 +547,7 @@ pub(crate) fn release_held(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
-                    Held::Wait(..) => {}
+                    Held::Wait(..) | Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -401,7 +589,25 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            if behind() && !all {
+                                // The line is open while this part is
+                                // prepared and sent (its settles too): the
+                                // title adds behind the marker meanwhile.
+                                // Only the thread holding `RELEASING` takes
+                                // from a line's head.
+                                held.insert(0, Held::Running);
+                                drop(held);
+                                let sending = std::time::Instant::now();
+                                host.execute_late(lists, order);
+                                BEHIND_STATS[SENT_PARTS].fetch_add(1, Ordering::Relaxed);
+                                BEHIND_STATS[SENT_US].fetch_add(sending.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                held = lock(line);
+                                if matches!(held.first(), Some(Held::Running)) {
+                                    held.remove(0);
+                                }
+                            } else {
+                                host.execute_late(lists, order);
+                            }
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
@@ -1020,20 +1226,28 @@ extern "system" fn present(
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
+    // (With `behind`: what the queues hold runs here first, on this
+    // thread, so the present goes behind it as without the switch.)
+    #[cfg(windows)]
+    before_sync(BEFORE_PRESENT);
     #[cfg(windows)]
     if crate::host::late() && !crate::host::late_free_present() {
         crate::host::settle_for_present();
-        release_held(false);
+        release_held_now(false);
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
-        release_held(false);
+        release_held_now(false);
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
     release_held(forces());
+    // What the title gave the card up to this present, for the next
+    // frame's flip wait (`crate::host::flip_landed`).
+    #[cfg(windows)]
+    crate::host::present_sent();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -1203,6 +1417,10 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    // With `VICTORY_ASYNC_SUBMIT` the submissions the title made before
+    // this are first prepared (they read the pages as mapped before it).
+    #[cfg(windows)]
+    before_sync(BEFORE_MAPPING);
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -1470,6 +1688,81 @@ mod tests {
         assert!(!lock(&WAITING).contains(&q_addr));
         releaser.join().unwrap();
         assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+    }
+
+    /// A queue and two fences for the ordering tests.
+    #[cfg(windows)]
+    fn queue_and_fences() -> (This, This, This) {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut f1, mut f2) = (null, null);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut f1), S_OK);
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut f2), S_OK);
+        (q, f1, f2)
+    }
+
+    #[cfg(windows)]
+    fn release_all(objects: &[This]) {
+        for &o in objects {
+            while slot::<extern "system" fn(This) -> u32>(o, 0x10)(o) > 0 {}
+        }
+    }
+
+    /// `VICTORY_ASYNC_SUBMIT`: while the part at a line's head is being
+    /// sent (the `Running` marker), nothing behind it runs, a signal
+    /// included, whoever runs the lines; once it is sent, the rest does.
+    #[cfg(windows)]
+    #[test]
+    fn what_follows_a_part_being_sent_waits_for_it() {
+        let (q, f1, f2) = queue_and_fences();
+        {
+            let mut held = lock(&queue(q).held);
+            held.push(Held::Running);
+            held.push(Held::Signal(crate::fence::FenceRef::new(f1), 3));
+        }
+        lock(&WAITING).push(q as usize);
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(f1), 0, "a signal passed the part being sent");
+        {
+            let mut held = lock(&queue(q).held);
+            assert!(matches!(held.first(), Some(Held::Running)));
+            held.remove(0);
+        }
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(f1), 3);
+        assert!(!lock(&WAITING).contains(&(q as usize)));
+        release_all(&[q, f1, f2]);
+    }
+
+    /// `VICTORY_ASYNC_SUBMIT`: a fence the title blocks on (no event) whose
+    /// signal is still in a queue's line, behind a wait our thread has not
+    /// looked at again, is reached: the blocking wait runs the lines on its
+    /// own thread first. Without that it found the fence short and failed.
+    #[cfg(windows)]
+    #[test]
+    fn a_blocking_fence_wait_sees_signals_still_in_the_lines() {
+        use std::ffi::c_void;
+        BEHIND_HERE.set(true);
+        let (q, f1, f2) = queue_and_fences();
+        // The queue waits for f1 = 1, then signals f2 = 7 behind it.
+        assert_eq!(wait(q, f1, 1), S_OK);
+        assert_eq!(signal(q, f2, 7), S_OK);
+        // The title meets f1 on the processor; with the switch that only
+        // wakes our thread (none runs in this test).
+        assert_eq!(crate::fence::signal(f1, 1), S_OK);
+        let set_event = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f2, 0x48);
+        assert_eq!(set_event(f2, 7, std::ptr::null_mut()), S_OK, "the blocking wait did not see the signal in the line");
+        assert_eq!(crate::fence::completed(f2), 7);
+        BEHIND_HERE.set(false);
+        release_all(&[q, f1, f2]);
     }
 
     #[cfg(windows)]

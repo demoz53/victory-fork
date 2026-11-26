@@ -20,6 +20,8 @@ use crate::object::{HRESULT, S_FALSE, S_OK, This};
 const TIMEOUT: HRESULT = S_FALSE;
 /// The frame-origin event: the one that starts frames and makes tokens.
 const ORIGIN: u32 = 0;
+/// The flip event: the title's blocking wait before each present.
+const FLIP: u32 = 2;
 /// Make the frame's token even if the wait times out (the title starts the
 /// frame early).
 const TOKEN_ON_TIMEOUT: u32 = 2;
@@ -127,6 +129,12 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    // The blocking flip wait first waits for the frame before to land
+    // (`VICTORY_FLIP_LANDED`), then for the tick as always.
+    #[cfg(windows)]
+    if kind == FLIP {
+        crate::host::flip_wait(timeout_ms);
+    }
     let started = Instant::now();
     let limit = Duration::from_millis(u64::from(timeout_ms));
     let deadline = started.checked_add(limit);
@@ -178,6 +186,9 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        // Where the frame before ends, for this frame's flip wait.
+        #[cfg(windows)]
+        crate::host::frame_begins();
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };

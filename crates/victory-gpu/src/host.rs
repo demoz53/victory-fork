@@ -2370,6 +2370,9 @@ struct Deferred {
     /// Recorded GPU write declarations per host copy and range. A new
     /// refresh of that copy must still be flushed by its next declaration.
     gpu_written: std::collections::HashMap<usize, std::collections::HashSet<(usize, usize)>>,
+    /// What each fill of upload memory (by its destination) is for
+    /// ([`fill_kind`]), for the settle line.
+    fill_kinds: std::collections::HashMap<usize, u8>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// The source last copied into each view's host texture by
@@ -2450,6 +2453,7 @@ impl Deferred {
         crate::copystat::add(crate::copystat::C::ResetDropNs, dropping.elapsed().as_nanos() as u64);
         self.refreshed.clear();
         self.gpu_written.clear();
+        self.fill_kinds.clear();
         self.textures.clear();
         self.texture_aliases.clear();
         self.writes.clear();
@@ -3544,8 +3548,34 @@ static ALIAS_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atom
 /// bytes are in title memory, and the window's next refresh finds the
 /// pages written.
 fn alias_copy() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_some_and(|v| v == "1"))
+    alias_mode() > 0
+}
+
+/// `VICTORY_ALIAS_COPY`: 0 (unset) waits; 1 carries ([`alias_copy`]); 2
+/// (`hold`) carries and holds ([`alias_holds`]).
+fn alias_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_ALIAS_COPY").as_deref() {
+        Ok("1") => 1,
+        Ok("hold") => 2,
+        _ => 0,
+    })
+}
+
+/// `VICTORY_ALIAS_COPY=hold`: carries as `=1` (no wait), and each carried
+/// range counts as written by the carrying submission until it lands, as a
+/// texture read-back's range does (owner 0): until then a refresh of either
+/// copy over it (the reader's, which the carry would then overwrite with
+/// older bytes on the card, or the writer's, whose bytes the carry has not
+/// read yet) and any other read of it waits, and no later carry is planned
+/// over it. The race `=1` leaves open: the writer's copy is the CPU's
+/// memory, and once the writer's flight has landed a later preparing may
+/// refresh it (the title's newer bytes, a count it zeroed for the next
+/// frame) before the card has run the carry, which then takes those
+/// (all8-aliascopy and all13a-aliasprobe: the picture darkened; all13a with
+/// `=hold`: it did not). Our 5b467e978 (test/all13a), brought onto all21.
+fn alias_holds() -> bool {
+    alias_mode() == 2
 }
 
 /// The plan for [`alias_copy`] if every step of `runs` that waits for
@@ -3700,6 +3730,20 @@ fn blocked_by_steps<'a>(
     immed: &[(usize, usize)],
     steps: impl IntoIterator<Item = &'a Step>,
 ) -> Option<(usize, Option<usize>)> {
+    blocked_by_steps_noting(written, by_copy, immed, steps, false)
+}
+
+/// [`blocked_by_steps`]; `count`: a fill or read-only copy let through
+/// ahead of flights ([`fill_ahead`]) is noted for the check at their
+/// landing (only where the submission is really prepared: [`blocked_by`]
+/// with its count).
+fn blocked_by_steps_noting<'a>(
+    written: &[(usize, usize)],
+    by_copy: &[(usize, usize, usize)],
+    immed: &[(usize, usize)],
+    steps: impl IntoIterator<Item = &'a Step>,
+    count: bool,
+) -> Option<(usize, Option<usize>)> {
     if written.is_empty() && immed.is_empty() {
         return None;
     }
@@ -3710,9 +3754,30 @@ fn blocked_by_steps<'a>(
         let read_back = by_copy.iter().any(|&(owner, a, b)| owner == 0 && a < to && b > from);
         touches(immed, from, to) || (touches(written, from, to) && (read_back || !fill_is_titles(from, to - from)))
     };
+    // VICTORY_FILL_AHEAD: a read that only shader writes of flights meet
+    // (no bottom-of-pipe write, no read-back's range) may go ahead.
+    let ahead = |from: usize, to: usize| {
+        touches(written, from, to)
+            && !touches(immed, from, to)
+            && !by_copy.iter().any(|&(owner, a, b)| owner == 0 && a < to && b > from)
+    };
     let mut read_stat: Option<Option<usize>> = None;
     for step in steps {
         let stat = match step {
+            &Step::Copy(dst, src, len)
+                if fill_ahead::copies(src, len) && ahead(src, src + len) && !any_written(dst, dst + len) =>
+            {
+                if count {
+                    fill_ahead::read(src, len);
+                }
+                None
+            }
+            &Step::Fill(_, src, len) if fill_ahead::on(src, len) && ahead(src, src + len) => {
+                if count {
+                    fill_ahead::read(src, len);
+                }
+                None
+            }
             &Step::Copy(dst, src, len) => (read_written(src, src + len) || any_written(dst, dst + len)).then_some(15),
             &Step::Fill(_, src, len) => read_written(src, src + len).then_some(16),
             Step::Texture { staging, .. } => {
@@ -3736,6 +3801,509 @@ fn blocked_by_steps<'a>(
     read_stat.map(|stat| (WHY_READ, stat))
 }
 
+/// What a fill of upload memory is for ([`HostList::defer_fill_as`]), and
+/// the settles for "a fill of upload memory" told apart by it: which kind
+/// of read still meets flights at its submission although
+/// `VICTORY_FILL_ON_CARD` copies the constant views over what flights write
+/// on the card (that choice is made when the view is recorded, and the
+/// flight its fill then meets may be sent only after that).
+pub(crate) mod fill_kind {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Not told (every other fill).
+    pub(crate) const OTHER: u8 = 0;
+    /// A root constant buffer view not on 256 bytes (`draw::root_view`).
+    pub(crate) const ROOT_CBV: u8 = 1;
+    /// A table's constant buffer view.
+    pub(crate) const TABLE_CBV: u8 = 2;
+    /// A table's constant buffer view read as raw bytes
+    /// (`VICTORY_TABLE_CONSTANTS_IN_PLACE`) with no host copy to view.
+    pub(crate) const RAW_CBV: u8 = 3;
+    /// The source of a title texture copy from a buffer footprint.
+    pub(crate) const TEXTURE_SOURCE: u8 = 4;
+    /// A read of title memory by a step of ours (rectangle vertices).
+    const READ_OF_OURS: usize = 5;
+    /// [`BLOCKED`]: of those, the ones whose bytes meet a root unordered
+    /// view's declaration (from its address to its buffer's end), and the
+    /// others (diagnostics builds).
+    const MEETS_ROOT: usize = 6;
+    const MEETS_OTHER: usize = 7;
+
+    /// Since the last frame line: settles for "a fill of upload memory" by
+    /// the kind of the first fill that met flights, then [`MEETS_ROOT`],
+    /// [`MEETS_OTHER`].
+    static BLOCKED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    /// A submission of `runs` settles for a fill (or a read of ours) that
+    /// meets what flights may write: counted by kind.
+    pub(super) fn blocked(
+        written: &[(usize, usize)],
+        by_copy: &[(usize, usize, usize)],
+        immed: &[(usize, usize)],
+        runs: &[&super::HostList],
+    ) {
+        for list in runs {
+            let deferred = list.deferred();
+            for step in &deferred.copies {
+                let (src, len, kind) = match *step {
+                    super::Step::Fill(dst, src, len) => {
+                        (src, len, usize::from(deferred.fill_kinds.get(&dst).copied().unwrap_or(OTHER)))
+                    }
+                    super::Step::HostRead(src, len, _) => (src, len, READ_OF_OURS),
+                    _ => continue,
+                };
+                if super::blocked_by_steps(written, by_copy, immed, std::iter::once(step)).is_none() {
+                    continue;
+                }
+                BLOCKED[kind].fetch_add(1, Relaxed);
+                let root = super::declared::meets_root(by_copy, src, src + len);
+                BLOCKED[if root { MEETS_ROOT } else { MEETS_OTHER }].fetch_add(1, Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// With the frame line.
+    pub(super) fn line(frames: f64) {
+        let b: Vec<f64> = BLOCKED.iter().map(|b| b.swap(0, Relaxed) as f64 / frames).collect();
+        if b.iter().all(|&n| n == 0.0) {
+            return;
+        }
+        tracing::info!(
+            "settles for a fill of upload memory per frame, by the first fill that met flights: root constant views {:.1}, \
+             table constant views {:.1}, table constants read raw {:.1}, texture copies' sources {:.1}, other fills {:.1}, \
+             reads of ours (rectangle vertices) {:.1}; of them meeting a root unordered view's declaration (address to \
+             its buffer's end) {:.1}, meeting other declarations {:.1} (diagnostics builds tell the two apart)",
+            b[usize::from(ROOT_CBV)],
+            b[usize::from(TABLE_CBV)],
+            b[usize::from(RAW_CBV)],
+            b[usize::from(TEXTURE_SOURCE)],
+            b[usize::from(OTHER)],
+            b[READ_OF_OURS],
+            b[MEETS_ROOT],
+            b[MEETS_OTHER],
+        );
+    }
+}
+
+/// Where flights' shader writes are declared (`Shadow::gpu_writes`'
+/// callers), counted by origin for the frame line: a root unordered view
+/// (no size: from its address to the end of its title buffer), a view in a
+/// table (its own range), a numbered copy of the memory pass (the copy's
+/// whole span), the heap's unordered buffer views (their spans).
+pub(crate) mod declared {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(crate) const ROOT_UAV: usize = 0;
+    pub(crate) const VIEW: usize = 1;
+    pub(crate) const NUMBERED: usize = 2;
+    pub(crate) const HEAP: usize = 3;
+
+    /// Since the last frame line, per origin: declarations, bytes.
+    static COUNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+    /// Diagnostics: root unordered views' declarations seen lately (host
+    /// copy, from, to), for [`meets_root`].
+    #[cfg(feature = "diagnostics")]
+    static ROOT: std::sync::Mutex<Option<std::collections::HashMap<(usize, usize), usize>>> = std::sync::Mutex::new(None);
+
+    /// Shaders may write `len` bytes of `shadow`'s memory from `at`,
+    /// declared by `origin`.
+    pub(crate) fn note(origin: usize, shadow: &std::sync::Arc<crate::shadow::Shadow>, at: u64, len: u64) {
+        let len = len.min(shadow.left(at));
+        COUNT[2 * origin].fetch_add(1, Relaxed);
+        COUNT[2 * origin + 1].fetch_add(len, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if origin == ROOT_UAV {
+            let owner = std::sync::Arc::as_ptr(shadow) as usize;
+            let mut root = ROOT.lock().unwrap_or_else(|e| e.into_inner());
+            let map = root.get_or_insert_with(Default::default);
+            if map.len() >= 4096 {
+                map.clear();
+            }
+            map.insert((owner, at as usize), (at + len) as usize);
+        }
+    }
+
+    /// Whether `[from, to)` lies in a root unordered view's declaration
+    /// that is in the air (`by_copy`: the line's ranges per host copy).
+    pub(crate) fn meets_root(by_copy: &[(usize, usize, usize)], from: usize, to: usize) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            let root = ROOT.lock().unwrap_or_else(|e| e.into_inner());
+            root.as_ref().is_some_and(|map| {
+                map.iter().any(|(&(owner, a), &b)| {
+                    a < to && b > from && by_copy.iter().any(|&(o, x, y)| o == owner && x < to && y > from)
+                })
+            })
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = (by_copy, from, to);
+            false
+        }
+    }
+
+    /// With the frame line.
+    pub(super) fn line(frames: f64) {
+        let c: Vec<f64> = COUNT.iter().map(|c| c.swap(0, Relaxed) as f64 / frames).collect();
+        if c.iter().all(|&n| n == 0.0) {
+            return;
+        }
+        let mb = |b: f64| b / (1 << 20) as f64;
+        tracing::info!(
+            "shader writes declared per frame, by origin: root unordered views {:.0} ({:.0} MB, each to its buffer's end), \
+             views in tables {:.0} ({:.0} MB), numbered copies {:.0} ({:.0} MB), the heap's unordered views {:.0} ({:.0} MB)",
+            c[0],
+            mb(c[1]),
+            c[2],
+            mb(c[3]),
+            c[4],
+            mb(c[5]),
+            c[6],
+            mb(c[7]),
+        );
+    }
+}
+
+/// Fills of upload memory (constant buffers copied into the list's own
+/// memory when it is submitted), and with `=2` title buffer copies that
+/// only READ title memory flights "may write", are no longer waited for
+/// with `VICTORY_FILL_AHEAD=1` (off by default); what the flights then
+/// write is checked against them when they land. Our port of fxceless main
+/// f85101b60 (there on by default, `VICTORY_FILL_WAIT=1` turning it off)
+/// with fxceless #860 (turbinedogbla-creator): a fill keeps a fingerprint
+/// of what it read, a title rewrite since is not taken for a miss, and a
+/// real miss holds back only the 64 KiB pieces it touched (past 8 such
+/// pieces every fill waits again). First as aebce6702 on all13a; brought
+/// onto the relay tree (one merge site, `shadow::put_back`; read-backs'
+/// ranges still waited for).
+///
+/// Why a declaration cannot simply be narrowed instead: a root unordered
+/// view has no size, and the translated shader's offsets are computed at
+/// run time, so the bytes it may store to are all that is left of its
+/// title buffer (`draw::State::root_uav`); the title's 174 MB heap is one
+/// such buffer, and its constants for draws lie in it too. Which bytes the
+/// shaders really changed is known only at the landing, where the card's
+/// compare finds them; that is where this checks.
+///
+/// What it risks, and how it is bounded: a fill that reads bytes a flight
+/// in the air is about to change takes the old bytes, and the lists of
+/// that one submission draw with them. The check sees it after the fact,
+/// when the flight lands ([`fill_ahead::wrote`]); from then on fills of
+/// that 64 KiB wait as before, so each real miss is one submission (at
+/// most the one or two frames in the air) drawing with old constants, once
+/// per piece. Both counts are on the frame line with a warning at the first
+/// miss and at the latch.
+mod fill_ahead {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Fills are looked up by the 64 KiB of title memory they read.
+    const PIECE: usize = 1 << 16;
+    /// A fill is checked against flights that land this many frames after
+    /// it at most.
+    const KEEP: u64 = 16;
+    /// Pieces held back by real misses past which every fill waits again.
+    const HELD_MAX: usize = 8;
+
+    /// Every fill waits again (more than [`HELD_MAX`] pieces held back).
+    static WAIT: AtomicBool = AtomicBool::new(false);
+    /// Whether [`HELD`] holds any piece.
+    static ANY_HELD: AtomicBool = AtomicBool::new(false);
+    /// The 64 KiB pieces whose fills wait again after a real miss in them.
+    static HELD: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+    /// Since the last frame line: fills that read ahead; landings' writes
+    /// that touched one's piece. Since the start: real misses (fills that
+    /// read bytes a flight then changed); fills not compared because the
+    /// title rewrote their bytes since.
+    static COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+    #[cfg(test)]
+    thread_local! {
+        /// Tests: the mode on this thread, whatever the switch says.
+        static TEST_MODE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// `VICTORY_FILL_AHEAD`: 0 (unset) waits as before; 1 fills read ahead
+    /// of flights; 2 also title buffer copies that only read where flights
+    /// may write (their destination, title memory, keeps what they copied:
+    /// a late finding leaves it stale until the title writes it again).
+    fn mode() -> u8 {
+        #[cfg(test)]
+        if let Some(mode) = TEST_MODE.get() {
+            return mode;
+        }
+        static MODE: OnceLock<u8> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            let mode = std::env::var("VICTORY_FILL_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(2);
+            if mode > 0 {
+                tracing::info!(
+                    mode,
+                    "fills of upload memory (and with 2 read-only title buffer copies) over what flights may write are not \
+                     waited for, and checked when the flights land (VICTORY_FILL_AHEAD)"
+                );
+            }
+            mode
+        })
+    }
+
+    /// The fingerprint a fill keeps of what it read.
+    fn print(src: usize, len: usize) -> u64 {
+        crate::texture::fingerprint(src as u64, len as u64)
+    }
+
+    #[derive(Default)]
+    struct Piece {
+        /// The frame its old fills were last dropped in.
+        pruned: u64,
+        /// From, to, frame, the number of the last submission started when
+        /// it read (the flights in the air then have that number or a lower
+        /// one, and only their writes can be ones it missed), and the
+        /// fingerprint of what it read.
+        fills: Vec<(usize, usize, u64, u64, u64)>,
+    }
+
+    /// The lowest submission number among the flights the landing thread
+    /// is landing now; 0: not known (a landing by another way), and then
+    /// every write counts.
+    static LANDING: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn landing(first: u64) {
+        LANDING.store(first, Relaxed);
+    }
+
+    static READ: Mutex<Option<HashMap<usize, Piece>>> = Mutex::new(None);
+
+    /// Whether a fill of `len` bytes at `src` reads ahead of flights now:
+    /// the switch is on, not every fill waits again, and none of its pieces
+    /// is held back.
+    pub(super) fn on(src: usize, len: usize) -> bool {
+        mode() > 0 && free(src, len)
+    }
+
+    /// Whether a read-only copy of `len` bytes from `src` does too.
+    pub(super) fn copies(src: usize, len: usize) -> bool {
+        mode() > 1 && free(src, len)
+    }
+
+    fn free(src: usize, len: usize) -> bool {
+        if WAIT.load(Relaxed) {
+            return false;
+        }
+        if len == 0 || !ANY_HELD.load(Relaxed) {
+            return true;
+        }
+        let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(held) = held.as_ref() else { return true };
+        !(src / PIECE..=(src + len - 1) / PIECE).any(|piece| held.contains(&piece))
+    }
+
+    /// A real miss in `[from, to)`: its pieces are held back; whether it is
+    /// the first piece held.
+    fn hold(from: usize, to: usize) -> bool {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let held = held.get_or_insert_with(HashSet::new);
+        let first = held.is_empty();
+        held.extend(from / PIECE..=(to - 1) / PIECE);
+        ANY_HELD.store(true, Relaxed);
+        if held.len() > HELD_MAX && !WAIT.swap(true, Relaxed) {
+            tracing::warn!(
+                "fills of upload memory read ahead of flights that changed their bytes in {} pieces of 64 KiB: every fill \
+                 waits for flights again from here on, as without VICTORY_FILL_AHEAD",
+                held.len()
+            );
+        }
+        first
+    }
+
+    /// A fill reads `len` bytes at `src` ahead of flights that may write
+    /// them.
+    pub(super) fn read(src: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        COUNT[0].fetch_add(1, Relaxed);
+        let frame = crate::frame::current();
+        let print = print(src, len);
+        let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+        let map = read.get_or_insert_with(HashMap::new);
+        for piece in src / PIECE..=(src + len - 1) / PIECE {
+            let p = map.entry(piece).or_default();
+            if p.pruned != frame {
+                p.pruned = frame;
+                p.fills.retain(|f| f.2 + KEEP >= frame);
+            }
+            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed), print));
+        }
+    }
+
+    /// A landing is about to put `new` into title memory at `at`: bytes
+    /// shaders wrote, merged into the title's.
+    pub(crate) fn wrote(at: usize, new: &[u8]) {
+        if new.is_empty() || WAIT.load(Relaxed) || mode() == 0 {
+            return;
+        }
+        let frame = crate::frame::current();
+        let landing = LANDING.load(Relaxed);
+        let mut hits: Vec<(usize, usize, u64, u64)> = {
+            let read = READ.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(map) = read.as_ref() else { return };
+            let end = at + new.len();
+            (at / PIECE..=(end - 1) / PIECE)
+                .filter_map(|piece| map.get(&piece))
+                .flat_map(|p| p.fills.iter().copied())
+                .filter(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
+                .map(|f| (f.0, f.1, f.2, f.4))
+                .collect()
+        };
+        if hits.is_empty() {
+            return;
+        }
+        // A fill that spans pieces is kept in each of them.
+        hits.sort_unstable();
+        hits.dedup();
+        COUNT[1].fetch_add(1, Relaxed);
+        let mut now = Vec::new();
+        for (from, to, read_in, print_then) in hits {
+            // The title rewrote the bytes since the fill (or a landing
+            // before this one did, and was compared then): what is there
+            // now is not what the fill read, so it cannot tell a miss.
+            if print(from, to - from) != print_then {
+                COUNT[3].fetch_add(1, Relaxed);
+                continue;
+            }
+            let (a, b) = (from.max(at), to.min(at + new.len()));
+            now.clear();
+            now.resize(b - a, 0);
+            // Title memory as it is: what the fill read. Not there: nothing
+            // to say.
+            if !super::read_into(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
+                continue;
+            }
+            let n = COUNT[2].fetch_add(1, Relaxed) + 1;
+            let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if hold(from, to) {
+                tracing::warn!(
+                    "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
+                     them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
+                     Fills that read its 64 KiB wait for flights from here on; past {HELD_MAX} such pieces, every fill does \
+                     ({n} such fills)",
+                    to - from,
+                    a + first
+                );
+            }
+        }
+    }
+
+    /// With the frame line.
+    pub(super) fn line(frames: f64) {
+        let [ahead, looked] = [0, 1].map(|i| COUNT[i].swap(0, Relaxed));
+        if ahead == 0 && looked == 0 {
+            return;
+        }
+        let kept = {
+            let frame = crate::frame::current();
+            let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+            read.as_mut().map_or(0, |map| {
+                map.retain(|_, p| {
+                    p.fills.retain(|f| f.2 + KEEP >= frame);
+                    !p.fills.is_empty()
+                });
+                map.values().map(|p| p.fills.len()).sum::<usize>()
+            })
+        };
+        tracing::info!(
+            "fills of upload memory over what flights may write, not waited for (VICTORY_FILL_AHEAD): {:.1} per frame; {:.1} \
+             landings' writes per frame fell in the same 64 KiB as one and were compared with it; since the start: real misses \
+             (fills that read bytes a flight then changed) {} ({} pieces of 64 KiB held back{}); fills not compared because the \
+             title had rewritten their bytes since {}; {kept} fills kept to check",
+            ahead as f64 / frames,
+            looked as f64 / frames,
+            COUNT[2].load(Relaxed),
+            HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashSet::len),
+            if WAIT.load(Relaxed) { "; the latch tripped: every fill waits again" } else { "" },
+            COUNT[3].load(Relaxed)
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn held(at: usize) -> bool {
+            HELD.lock().unwrap().as_ref().is_some_and(|h| h.contains(&(at / PIECE)))
+        }
+
+        /// From fxceless #860: a title rewrite after a fill is not a miss;
+        /// a real miss holds back only its piece; shaders writing what was
+        /// there already are no miss.
+        #[test]
+        fn only_real_misses_hold_fills_back() {
+            const LEN: usize = 480;
+            TEST_MODE.set(Some(1));
+            // Three pieces of 64 KiB of their own, one per case.
+            let mut memory = vec![0u8; 4 * PIECE];
+            let start = memory.as_ptr() as usize;
+            let base = start.next_multiple_of(PIECE) - start;
+            let at = |i: usize| start + base + i * PIECE;
+            let (rewritten, missed, same) = (at(0), at(1), at(2));
+            for i in 0..3 {
+                memory[base + i * PIECE..][..LEN].fill(1);
+            }
+            read(rewritten, LEN);
+            memory[base..][..LEN].fill(2);
+            wrote(rewritten, &[3; LEN]);
+            assert!(!held(rewritten), "a rewrite by the title is not a miss");
+            assert!(on(rewritten, LEN));
+            read(missed, LEN);
+            wrote(missed, &[3; LEN]);
+            assert!(held(missed), "a real miss holds its piece back");
+            assert!(!on(missed, LEN));
+            assert!(on(same, LEN));
+            assert!(!WAIT.load(Relaxed), "one piece does not make every fill wait");
+            read(same, LEN);
+            wrote(same, &[1; LEN]);
+            assert!(!held(same));
+            assert!(on(same, LEN));
+            // Copies only with mode 2.
+            assert!(!copies(same, LEN));
+            TEST_MODE.set(Some(2));
+            assert!(copies(same, LEN) && !copies(missed, LEN));
+            TEST_MODE.set(None);
+            drop(memory);
+        }
+
+        /// Ahead only of shader writes: a fill over a bottom-of-pipe write
+        /// or a read-back's range (whose bytes the landing writes without a
+        /// merge the check sees) still waits; off, every fill waits.
+        #[test]
+        fn fills_go_ahead_only_of_shader_writes() {
+            use super::super::{Step, WHY_READ, blocked_by_steps};
+            let written = [(0x10_0000usize, 0x20_0000usize)];
+            let fill = [Step::Fill(0x1000, 0x18_0000, 0x100)];
+            TEST_MODE.set(Some(0));
+            assert_eq!(blocked_by_steps(&written, &[(7, 0x10_0000, 0x20_0000)], &[], &fill), Some((WHY_READ, Some(16))));
+            TEST_MODE.set(Some(1));
+            assert_eq!(blocked_by_steps(&written, &[(7, 0x10_0000, 0x20_0000)], &[], &fill), None);
+            assert_eq!(
+                blocked_by_steps(&written, &[(0, 0x17_0000, 0x19_0000)], &[], &fill),
+                Some((WHY_READ, Some(16))),
+                "a read-back's range is waited for"
+            );
+            assert_eq!(
+                blocked_by_steps(&written, &[(7, 0x10_0000, 0x20_0000)], &[(0x18_0040, 0x18_0048)], &fill),
+                Some((WHY_READ, Some(16))),
+                "a bottom-of-pipe write is waited for"
+            );
+            TEST_MODE.set(None);
+        }
+    }
+}
+
+pub(crate) use fill_ahead::wrote as shaders_write;
+
 /// [`late_blocked`] against `written` (joined), `by_copy` (per owner), and
 /// `immed` (bottom-of-pipe writes); `count` whether the kind of read is
 /// counted for the frame line.
@@ -3752,7 +4320,7 @@ fn blocked_by(
     let mut read_stat: Option<Option<usize>> = None;
     for list in runs {
         let deferred = list.deferred();
-        if let Some((why, stat)) = blocked_by_steps(written, by_copy, immed, &deferred.copies) {
+        if let Some((why, stat)) = blocked_by_steps_noting(written, by_copy, immed, &deferred.copies, count) {
             if why == WHY_RUN {
                 return Some(WHY_RUN);
             }
@@ -3767,6 +4335,9 @@ fn blocked_by(
         {
             LATE_STATS[slot].fetch_add(1, Ordering::Relaxed);
             crate::waitstat::read_by(slot.min(18));
+            if slot == 16 {
+                fill_kind::blocked(written, by_copy, immed, runs);
+            }
             if slot >= 19 {
                 LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
@@ -4139,6 +4710,186 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
+/// Whether the title's blocking flip wait also waits until everything it
+/// gave the card before the present of the frame before the one it records
+/// has landed: shader writes copied back, read-backs, bottom-of-pipe values
+/// and fences behind it (`VICTORY_FLIP_LANDED`: `1` on, `0` off; unset: on
+/// with `VICTORY_ASYNC_SUBMIT=1`, off without it; needs [`late`]).
+///
+/// After fx PR #995's `VICTORY_FLIP_LANDED` (tunczzz, 72dbd10, GPL-3.0).
+/// The title paces itself by a blocking wait for the flip once a frame,
+/// and on the console that comes after the card has run the frame shown.
+/// Ours comes on a clock tick (`crate::frame`), whatever the card or the
+/// relay has done. A title that reads what a frame's work wrote for it
+/// once that frame's flip has passed, without a fence, reads an older
+/// frame's results here whenever the work has not landed by then: #995's
+/// asynchronous submission, with the present behind the line, lost the
+/// first room's walls that way in every run. Ours runs the lines before a
+/// present returns (`crate::queue::before_sync`), so the frame before is
+/// always sent by then; this makes its landing certain as well. The title
+/// still records its frame beside our preparing of the one before: only
+/// the end of the frame before is waited for, where the console's flip
+/// waits for it too. Bounded by the title's own time-out and by a second
+/// and a half.
+pub(crate) fn flip_landed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_FLIP_LANDED").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::queue::behind(),
+        } && late();
+        if on {
+            tracing::info!("a flip wait waits until the work of the frame before has landed (VICTORY_FLIP_LANDED)");
+        }
+        on
+    })
+}
+
+/// Submissions started when the title's last present had run the queues'
+/// lines ([`present_sent`]); and as it was when the title's current frame
+/// began ([`frame_begins`]): the end of the frame before it.
+static PRESENT_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line ([`flip_landed`]): blocking flip waits; of
+/// them those that found the frame before not landed; microseconds they
+/// waited; waits that gave up (time-out).
+static FLIP_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A present has run the queues' lines: what was started so far is the
+/// frame's (`crate::queue`'s present, before its own copy is sent).
+pub(crate) fn present_sent() {
+    PRESENT_SENT.store(STARTED.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// The title begins a frame (`crate::frame`'s origin wait hands out a token).
+pub(crate) fn frame_begins() {
+    FRAME_BEFORE.store(PRESENT_SENT.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// The title's blocking flip wait (`timeout_ms` as it passed it), before
+/// the wait for the tick: with [`flip_landed`], waits until the frame
+/// before the one the title records has landed.
+pub(crate) fn flip_wait(timeout_ms: u32) {
+    if timeout_ms == 0 || !flip_landed() {
+        return;
+    }
+    let target = FRAME_BEFORE.load(Ordering::Acquire);
+    FLIP_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let landed = || FINISHED.load(Ordering::Acquire) >= target;
+    if landed() {
+        return;
+    }
+    FLIP_STATS[1].fetch_add(1, Ordering::Relaxed);
+    let began = std::time::Instant::now();
+    let limit = std::time::Duration::from_millis(u64::from(timeout_ms).min(1500));
+    let met = wait_until(
+        limit,
+        landed,
+        // Nothing in the air and nothing being landed: whatever was sent
+        // has landed.
+        || {
+            let line = line();
+            line.line.is_empty() && !line.settling
+        },
+        |most| {
+            let line = line();
+            let _ = LINE_LANDED.wait_timeout(line, most);
+        },
+    );
+    FLIP_STATS[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if !met {
+        FLIP_STATS[3].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Until `done`, for at most `limit`: `park` waits for something to move
+/// (a landing) for at most the time it is given; `idle` says nothing more
+/// will. Whether `done` came true.
+fn wait_until(
+    limit: std::time::Duration,
+    done: impl Fn() -> bool,
+    idle: impl Fn() -> bool,
+    park: impl Fn(std::time::Duration),
+) -> bool {
+    let began = std::time::Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        if idle() {
+            return done();
+        }
+        let left = limit.saturating_sub(began.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        park(left.min(std::time::Duration::from_millis(2)));
+    }
+}
+
+#[cfg(test)]
+mod flip_tests {
+    use super::wait_until;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// The flip wait's order: what the title reads after it is what the
+    /// landing of the frame before wrote, however late that landing is.
+    #[test]
+    fn a_read_after_the_flip_wait_sees_the_landed_results() {
+        let finished = Arc::new(AtomicU64::new(4));
+        let memory = Arc::new(AtomicU64::new(0));
+        let lander = {
+            let (finished, memory) = (finished.clone(), memory.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                // The landing: results into title memory, then the count.
+                memory.store(0xC0FFEE, Ordering::Relaxed);
+                finished.store(7, Ordering::Release);
+            })
+        };
+        let met = wait_until(
+            Duration::from_secs(5),
+            || finished.load(Ordering::Acquire) >= 7,
+            || false,
+            std::thread::sleep,
+        );
+        assert!(met);
+        assert_eq!(memory.load(Ordering::Relaxed), 0xC0FFEE);
+        lander.join().unwrap();
+    }
+
+    /// Nothing left in the air ends the wait; so does the time-out.
+    #[test]
+    fn the_flip_wait_ends_when_nothing_can_land_or_time_is_up() {
+        assert!(!wait_until(Duration::from_secs(5), || false, || true, |_| panic!("parked with nothing in the air")));
+        let began = std::time::Instant::now();
+        assert!(!wait_until(Duration::from_millis(20), || false, || false, std::thread::sleep));
+        assert!(began.elapsed() >= Duration::from_millis(20));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(wait_until(Duration::ZERO, || true, || false, |_| panic!("parked when done")));
+    }
+}
+
+/// The frame line's account of [`flip_landed`].
+fn flip_line(frames: f64) {
+    if !flip_landed() {
+        return;
+    }
+    let f: Vec<f64> = FLIP_STATS.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "the title's flip waits per frame (VICTORY_FLIP_LANDED=1): {:.2}, {:.2} of them found the frame before not landed \
+         and waited {:.2} ms for it, {:.2} gave up at the title's time-out",
+        f[0],
+        f[1],
+        f[2] / 1000.0,
+        f[3],
+    );
+}
+
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
@@ -4389,7 +5140,7 @@ fn late_line(frames: f64) {
     if alias_copy() {
         let a: Vec<f64> = ALIAS_STATS.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "refreshes over another copy's shader writes carried on the card per frame (VICTORY_ALIAS_COPY=1): {:.1} \
+            "refreshes over another copy's shader writes carried on the card per frame (VICTORY_ALIAS_COPY=1 or hold): {:.1} \
              submissions went on without a wait, {:.1} ranges {:.2} MB carried over, {:.1} plans given up",
             a[0],
             a[1],
@@ -4435,6 +5186,8 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    crate::queue::behind_line(frames);
+    flip_line(frames);
 }
 
 #[cfg(test)]
@@ -5921,6 +6674,9 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
+                // VICTORY_FILL_AHEAD: the landing's writes are compared
+                // with the fills read ahead of these flights.
+                fill_ahead::landing(flights.iter().map(|f| f.number).min().unwrap_or(0));
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 let carded = std::time::Instant::now();
                 self.relay_card_back(&plans, fetch);
@@ -5979,6 +6735,7 @@ impl Host {
             bury(last);
         }
         self.log_messages();
+        fill_ahead::landing(0);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
         {
             let mut line = line();
@@ -6170,6 +6927,9 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // Behind what the queues were given before it and have not run
+        // yet (`crate::queue::behind`).
+        crate::queue::before_sync(crate::queue::BEFORE_OURS);
         let _ = self.submit(runs, false);
     }
 
@@ -6855,6 +7615,12 @@ impl Host {
                         .collect::<Vec<_>>()
                 })
                 .collect();
+            // `VICTORY_ALIAS_COPY=hold`: the carried ranges are in the air
+            // with it, as a read-back's are.
+            let mut backs = backs;
+            if alias_holds() {
+                backs.extend(alias.iter().map(|p| (p.from, p.to)));
+            }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -7900,11 +8666,20 @@ impl HostList {
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
-    /// memory at `dst` when the list is submitted.
+    /// memory at `dst` when the list is submitted. (Every caller says its
+    /// kind now, [`HostList::defer_fill_as`]; kept for fills of none.)
+    #[allow(dead_code)]
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        self.defer_fill_as(dst, src, len, fill_kind::OTHER);
+    }
+
+    /// [`HostList::defer_fill`] for a fill of kind `kind` ([`fill_kind`]).
+    pub(crate) fn defer_fill_as(&self, dst: *mut u8, src: *const u8, len: usize, kind: u8) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Fill(dst as usize, src as usize, len));
+        if kind != fill_kind::OTHER {
+            deferred.fill_kinds.insert(dst as usize, kind);
+        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -9640,6 +10415,9 @@ impl Meter {
             );
         }
         late_line(frames);
+        fill_ahead::line(frames);
+        fill_kind::line(frames);
+        declared::line(frames);
         {
             let f = crate::draw::FILL_FLIGHTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
             if f.iter().any(|&n| n > 0.0) {
