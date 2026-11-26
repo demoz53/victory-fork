@@ -1072,6 +1072,21 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
+    if crate::compose::trace_on() {
+        // SAFETY: the title passes `planes` plane descriptions.
+        let found = unsafe { described(planes, plane_parameters) };
+        let mut text = format!("title presents {planes} planes, {} with a resource:", found.len());
+        for d in &found {
+            let size = crate::resource::host_resource(d.resource).map(|t| {
+                // SAFETY: a live resource.
+                let desc = unsafe { t.GetDesc() };
+                format!("{}x{} format {}", desc.Width, desc.Height, desc.Format.0)
+            });
+            text += &format!(" [{size:?} src {:?} dest {:?} flags {:#x}]", d.src, d.dest, d.flags);
+        }
+        crate::compose::trace(1, "title present", text);
+    }
+    #[cfg(windows)]
     if planes > 1
         && let Some(alpha) = compose_planes()
         && let Some(host) = crate::host::host()

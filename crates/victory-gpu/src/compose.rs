@@ -290,6 +290,24 @@ fn placement(dest: Option<[f32; 4]>, (width, height): (u32, u32)) -> [f32; 4] {
     }
 }
 
+/// `VICTORY_COMPOSE_TRACE=1`: log what each present composes (and what
+/// presents of other shapes do, see `queue.rs`) whenever it changes.
+pub(crate) fn trace_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_COMPOSE_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()))
+}
+
+/// Logs `text` under `what` when it differs from the last one logged for
+/// `what` (`slot`: 0 the composition, 1 the title's present call).
+pub(crate) fn trace(slot: usize, what: &str, text: String) {
+    static LAST: Mutex<[String; 2]> = Mutex::new([String::new(), String::new()]);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last[slot] != text {
+        tracing::info!(trace = %text, "compose trace: {what}");
+        last[slot] = text;
+    }
+}
+
 /// Whether the pass can read `texture` as a plane: a single-sampled 2D
 /// texture of one slice, readable by shaders, in a format [`view_format`]
 /// reads.
@@ -343,6 +361,7 @@ pub(crate) fn record(
         list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(
             4,
         ));
+        let mut traced = format!("swap chain/target {width}x{height}, {} planes", planes.len());
         for (i, p) in planes.iter().enumerate() {
             let d = p.texture.GetDesc();
             let Some(view_format) = view_format(d.Format) else {
@@ -385,6 +404,12 @@ pub(crate) fn record(
             let rtv = host.rtv(Some(target), Some(&rtv));
             let source = source_fractions(p.src, d.Width, d.Height);
             let [l, t, r, b] = placement(p.dest, (width, height));
+            if trace_on() {
+                traced += &format!(
+                    "; plane {i}: texture {}x{} format {}, title src {:?} -> read fractions {:?} (whole texture if the title's was unusable), title dest {:?} -> pixels [{l}, {t}, {r}, {b}], blend {blend}",
+                    d.Width, d.Height, d.Format.0, p.src, source, p.dest
+                );
+            }
             list.SetPipelineState(&pipeline);
             list.SetGraphicsRoot32BitConstants(0, 4, source.as_ptr().cast(), 0);
             list.SetGraphicsRootDescriptorTable(
@@ -409,6 +434,9 @@ pub(crate) fn record(
                 bottom: b.ceil() as i32,
             }]);
             list.DrawInstanced(3, 1, 0, 0);
+        }
+        if trace_on() {
+            trace(0, "composed present", traced);
         }
     }
     true
