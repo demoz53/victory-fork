@@ -910,29 +910,67 @@ fn guard_after_faults(g: &mut Guards, first: usize, last: usize, rest: std::time
     if g.faulted.is_empty() || first >= last || g.faulted.range(first..last).next().is_none() {
         return guard_range(g, first, last);
     }
+    // Each faulted block of the range, and whether its rest is over.
+    let faults: Vec<(usize, bool)> =
+        g.faulted.range(first..last).map(|(&block, &when)| (block, when.elapsed() >= rest)).collect();
+    let most = guard_aliases();
     let mut written = Vec::new();
     let mut next = first;
-    let faults: Vec<_> = g.faulted.range(first..last).map(|(&b, &when)| (b, when)).collect();
-    for (block, when) in faults {
+    let mut i = 0;
+    while i < faults.len() {
+        let (block, rested) = faults[i];
         if next < block {
             written.extend(guard_range(g, next, block));
         }
-        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-        if when.elapsed() >= rest {
-            protect(g, block, block + 1);
-            let (other, _) = crate::inplace::aliases_between(block * BLOCK, (block + 1) * BLOCK, guard_aliases());
-            if g.protected.contains(&block) && other.iter().all(|at| g.protected.contains(&(at / BLOCK))) {
-                g.faulted.remove(&block);
-            } else {
-                g.clean.remove(&block);
-            }
+        // With the faulted blocks that follow it, as long as they answer
+        // alike: a run, made read-only in one call as the walk's runs of
+        // written blocks are (the title writes a buffer block after block;
+        // a call for each was hundreds of them a frame).
+        let mut end = block + 1;
+        i += 1;
+        while i < faults.len() && faults[i] == (end, rested) {
+            end += 1;
+            i += 1;
         }
-        next = block + 1;
+        // Told as written at every asking while they are here.
+        written.extend(block * BLOCK / PAGE..end * BLOCK / PAGE);
+        if rested {
+            protect(g, block, end);
+            rearmed(g, block, end, most);
+        }
+        next = end;
     }
     if next < last {
         written.extend(guard_range(g, next, last));
     }
     written
+}
+
+/// After [`protect`] of the faulted blocks `[from, to)`: those read-only
+/// now at every tracked view of their pages are faulted no longer (their
+/// bytes are taken by the asker); the others stay, not clean, and are told
+/// as written again.
+fn rearmed(g: &mut Guards, from: usize, to: usize, most: usize) {
+    let all = |g: &Guards, from: usize, to: usize| {
+        g.protected.range_vec(from..to).len() == to - from && {
+            let (aliases, _) = crate::inplace::aliases_between(from * BLOCK, to * BLOCK, most);
+            aliases.iter().all(|at| g.protected.contains(&(at / BLOCK)))
+        }
+    };
+    // The whole run in one look at the views, as a rule.
+    if all(g, from, to) {
+        for block in from..to {
+            g.faulted.remove(&block);
+        }
+        return;
+    }
+    for block in from..to {
+        if to - from > 1 && all(g, block, block + 1) {
+            g.faulted.remove(&block);
+        } else {
+            g.clean.remove(&block);
+        }
+    }
 }
 
 fn guard_range(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
@@ -2134,6 +2172,42 @@ mod tests {
             assert!(super::guard_after_faults(&mut g, block, block + 1, Duration::ZERO).is_empty());
         }
         drop_views(section, &[reader, writer], BLOCK);
+    }
+
+    /// Faulted blocks next to each other rest and are made read-only again
+    /// as one run, at both views; a block of the range that did not fault
+    /// stays as it was.
+    #[test]
+    fn rested_faults_next_to_each_other_are_rearmed_together() {
+        use std::time::Duration;
+        if super::guard_aliases() < 2 {
+            return;
+        }
+        let (section, reader, writer) = two_views(3 * BLOCK);
+        guard(reader, reader + 3 * BLOCK).unwrap();
+        let (r, w) = (reader / BLOCK, writer / BLOCK);
+        let pages = |from: usize, to: usize| (from * BLOCK / PAGE..to * BLOCK / PAGE).collect::<Vec<_>>();
+        {
+            let mut g = super::guards();
+            // The title writes the first two blocks through its own view.
+            assert!(super::open_fault(&mut g, writer, true, Duration::from_secs(60)));
+            assert!(super::open_fault(&mut g, writer + BLOCK, true, Duration::from_secs(60)));
+            // Resting: told as written, the written view left open.
+            assert_eq!(super::guard_after_faults(&mut g, r, r + 3, Duration::from_secs(60)), pages(r, r + 2));
+            assert!(!g.protected.contains(&w) && !g.protected.contains(&(w + 1)));
+            // Rested: told once more, and read-only again at both views.
+            assert_eq!(super::guard_after_faults(&mut g, r, r + 3, Duration::ZERO), pages(r, r + 2));
+            assert!((0..3).all(|i| g.protected.contains(&(r + i)) && g.protected.contains(&(w + i))));
+            assert!(g.faulted.range(r..r + 3).next().is_none());
+            assert!(super::guard_after_faults(&mut g, r, r + 3, Duration::ZERO).is_empty());
+            // The written view's own guard has not taken them yet.
+            assert_eq!(g.faulted.range(w..w + 3).count(), 2);
+            let taken = super::guard_after_faults(&mut g, w, w + 3, Duration::ZERO);
+            assert_eq!(taken[..2 * BLOCK / PAGE], pages(w, w + 2));
+            assert!(g.faulted.range(w..w + 3).next().is_none());
+            assert!(super::guard_after_faults(&mut g, w, w + 3, Duration::ZERO).is_empty());
+        }
+        drop_views(section, &[reader, writer], 3 * BLOCK);
     }
 
     /// The title wrote the pages of a guarded texture through another view
