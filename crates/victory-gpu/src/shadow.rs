@@ -1259,6 +1259,10 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 
 mod relay_merge_simd;
 
+/// The guards under contention (fxceless PR #1315, KainanP).
+#[cfg(test)]
+mod guard_bench;
+
 /// `VICTORY_BACK_BLOCKS=1` (off by default): bytes shaders wrote go back
 /// into title memory by 1 KiB block, only the blocks the merge changed
 /// ([`put_back`]), not the whole span from the first changed byte to the
