@@ -31,7 +31,8 @@ exe_b=${EXE_B:-$exe_a}
 JOBS=${JOBS:-4}
 OUT=${OUT:-$(mktemp -d "${TMPDIR:-/tmp}/shader-sweep.XXXXXX")}
 mkdir -p "$OUT"
-tool() { local t; t="$(dirname "$1")/victory-sweep.exe"; cp -f "$1" "$t" && echo "$t"; }
+# (A copy that cannot be replaced because another sweep is running it is used as it is when it is the same file.)
+tool() { local t; t="$(dirname "$1")/victory-sweep.exe"; { cp -f "$1" "$t" 2>/dev/null || cmp -s "$1" "$t"; } && echo "$t"; }
 walk() { # <exe> <env words> <out file> <translate options and paths>...
   local exe=$1 envs=$2 out=$3; shift 3
   # shellcheck disable=SC2086
@@ -45,7 +46,7 @@ walk() { # <exe> <env words> <out file> <translate options and paths>...
   wait "$pid"
 }
 ta=$(tool "$exe_a") || exit 2
-tb=$ta; [ "$exe_b" != "$exe_a" ] && { cp -f "$exe_b" "$(dirname "$exe_b")/victory-sweep.exe" && tb="$(dirname "$exe_b")/victory-sweep.exe" || exit 2; }
+tb=$ta; [ "$exe_b" != "$exe_a" ] && { tb=$(tool "$exe_b") || exit 2; }
 s=$SECONDS
 have() { [ -n "${REUSE:-}" ] && grep -q '^programs ' "$1" 2>/dev/null && echo "reusing $1"; }
 have "$OUT/a.txt" || walk "$ta" "$env_a" "$OUT/a.txt" --digest "$@" || { echo "side A's walk failed: $OUT/a.txt.err"; exit 2; }
