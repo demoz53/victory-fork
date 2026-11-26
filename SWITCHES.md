@@ -1,7 +1,7 @@
 # SWITCHES.md - every switch added since test/all14n, in test/all21
 
 `test/all21` = `test/all20` (14a67b11a) + merges, in this order, of test/heapw's tip (4e380920d: the crash fix of
-`VICTORY_HEAP_WORKER`, `resource::hold`), test/copies (bda62c82c) and test/waits (2c12a2d98, its tip when merged).
+`VICTORY_HEAP_WORKER`, `resource::hold`), test/copies (bda62c82c) and test/waits (2c12a2d98, then again to its tip e95320672).
 No new default-on change: every all21 switch is opt-in, so the default-on list and the restore line are all20's.
 
 `test/all20` = `test/all19` (0045f4def) + merges, in this order, of test/small3 (ed9ad620b; based on all17) and
@@ -82,7 +82,7 @@ diagnostics-build switch).
 | `VICTORY_TITLE_COPY_PLAIN` | `1` | off | the title's buffer copies done at submission (and copy-backs into title memory) are made in place, the kernel's copy only when a page stops it | test/copies (bda62c82c) | no |
 | `VICTORY_WAIT_STATS` | `1` | off | one line after the 5 s frame line: global UAV barriers a frame by cause (title groups, title barriers, clamps before/after, batched clamps, syncs, ours), one-resource UAV barriers, what the title's barrier groups hold, settles by why with ms standing, "title memory read" settles by reader, and the submitting thread's waits for staging, synchronous submissions and the submission lock | test/waits 8c87fc403 | no |
 | `VICTORY_CLAMP_WAITS` | `0` | full wait (as before) | the wait after each in-place indirect clamp is a UAV barrier on the list's budget buffer only (none if no record ran); the wait before stays | test/waits c61be0389 (lordon1a 32b5e420b, after Op-lite f748fb557a, Trexies 6b358fe83) | no |
-| `VICTORY_BARRIER_GROUPS` | `1` | off: KILLS THE GAME at this tip (2c12a2d98; the fix for barriers on textures without the unordered-access flag is not in all21): DO NOT SET | the title's barrier groups: no barrier when none of their barriers orders shader writes; UAV barriers on the named textures' host copies (and twins) when only textures do; one global barrier otherwise (any global or buffer barrier, a texture with no host copy) | test/waits f81db3d21 (after Marvisak PR #642, nathanbzrr 6264e86a6) | no |
+| `VICTORY_BARRIER_GROUPS` | `1` | off (fixed in e95320672: named barriers only on textures made for unordered access, else the global barrier; game test pending) | the title's barrier groups: no barrier when none of their barriers orders shader writes; UAV barriers on the named textures' host copies (and twins) when only textures do; one global barrier otherwise (any global or buffer barrier, a texture with no host copy) | test/waits f81db3d21 (after Marvisak PR #642, nathanbzrr 6264e86a6) | no |
 | `VICTORY_FILL_TITLE` | `1` | off | a fill of upload memory or title buffer copy of at most 64 KiB does not settle flights when the title wrote that view memory since a copy took it, or no shader write landed in its pages in 600 frames (bottom-of-pipe writes and read-backs still waited for) | test/waits 49337278e (avatarmanz 9fea7434c) | no |
 
 ## New in all20 (merged on top of all19)
