@@ -1,4 +1,9 @@
-# SWITCHES.md - every switch added since test/all14n, in test/all18
+# SWITCHES.md - every switch added since test/all14n, in test/all19
+
+`test/all19` = `test/all18` (ddb959c0e) + merges, in this order, of test/meshclamp (9e5d01b28), test/scrub
+(b9ebab139), test/room1 (f424f55f8) and test/heapw (b3a6e21c2). Left out: test/small3 (its worktree had uncommitted
+changes and no pre-build stamp: its agent was still at work). No new default-on change: every all19 switch is opt-in,
+so the default-on list and the restoring line below are all18's.
 
 `test/all18` = `test/all17` (8cc48702e) + merges, in this order, of test/bake2 (53231fab3), test/variants
 (69b26a019), test/ambient (8d5dd30df), test/speed2 (588ca3b52), test/light1 (987d937cb) and test/tables
@@ -55,6 +60,14 @@ buffer views that cannot be made raw (they read zeros on NVIDIA) warned and all 
 the bound render targets kept at each set of targets (for TARGET_VARIANTS), and the skipped-pipeline test made once
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
+
+## New in all19 (merged on top of all18)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_MESH_CLAMP_IN_DRAW` | `1`; `2` also one wait for every shader write before a launched record when a dispatch or a storing draw came since the last such wait | off | every mesh pipeline gets an amplification stage of ours (`launch.hlsl`) that reads the title's indirect mesh record where its passes wrote it, bounds it as the clamp does (65,535 groups, the list's budget) and launches the mesh groups: a single indirect mesh record needs no clamp pass and none of its two waits; calls with a count buffer or several records keep the clamp on the same pipeline made without the stage | test/meshclamp 9e5d01b28 (fablinoo/kelvaroq patch 0041) | YES (every mesh shader declares a 4-byte payload; in the cache key) |
+| `VICTORY_NAN_GUARD` (new values) | `scrub`: every NaN and both infinities become 0 in pixel colour exports and image stores of every stage; `scrub-exports`: colour exports alone (`1` and `stores` as before) | off | NaN/infinity scrubbing that also catches NVIDIA's NaN 0x7FFFFFFF and does not leave +-65504 for the bloom; under `scrub` an image store through an integer view also turns words 0x7F800000-0x7FFFFFFF and 0xFF800000-0xFFFFFFFF (-1 among them) into 0 | test/scrub b9ebab139 (trustno1-coder 77e13a974) | YES (the raw value is in the key) |
+| `VICTORY_AMBIENT_MOST` | a multiple; `0` the estimate replaces the title's output everywhere | unset: 4 (as before) | with `VICTORY_AMBIENT`: how much of what the title left in the resolve's diffuse light image the stand-in keeps, as a multiple of its estimate (the house bedroom's foliage picture and dark blocks are such leftovers) | test/room1 f424f55f8 (darkworldhm 08fdf0b47, idea only) | no |
+| `VICTORY_HEAP_WORKER` | `1` | off | the pass over textures picked by index runs on a worker thread of its own into upload lists that the next submission with flights sent ahead runs before the title's lists (slots made under one lock with that submission; a slot rewritten meanwhile is refused and due again); bake draws still upload on the recording thread. Refused with a warning without `VICTORY_RELAY` or `VICTORY_LATE_WAIT` | test/heapw 6f257f5f7, b3a6e21c2 (fxceless d4a528ba0, PR #1007) | no |
 
 ## New in all18 (merged on top of all17)
 | Switch | Values | Default | What it does | From | Shader |
@@ -191,6 +204,18 @@ switch.
   (`watch::tests::a_range_that_begins_in_an_unmapped_block_is_guarded`,
   `watch::tests::a_write_through_another_view_is_reported_at_the_guarded_one`) fail by design: a resting block is
   told as written at every asking. Run `cargo test` with no `VICTORY_*` switch exported.
+
+## Combining them in all19
+- No pair refuses at start-up beyond `VICTORY_HEAP_WORKER=1` without `VICTORY_RELAY`/`VICTORY_LATE_WAIT` (refused
+  with a warning, by its design; the run lines' `VICTORY_RELAY=2` satisfies it).
+- `VICTORY_MESH_CLAMP_IN_DRAW` with `VICTORY_TARGET_VARIANTS`: a pipeline made again for the bound formats goes the
+  same way as the title's own, so it is launched too. With `VICTORY_INDIRECT_BATCH`: mesh records the stage launches
+  are not in a batch; the rest keep the batched clamp (test/meshclamp was made on test/clamps).
+- `VICTORY_HEAP_WORKER` runs the same texture pass (`State::heap_textures`), so `VICTORY_CLEAR_CHECKED`,
+  `VICTORY_STALE_KEEP_MS`, `VICTORY_MATERIAL_TEXTURE_DEMAND` and `VICTORY_TEXTURE_CATCH_UP_MS` act there as on
+  the recording thread.
+- Shader-changing switches now add MESH_CLAMP_IN_DRAW and the two new NAN_GUARD values. The translator changed
+  (meshclamp, scrub), so the cache's key folder with nothing set differs from all18's.
 
 ## Combining them in all18
 - No pair refuses at start-up; none has to stay apart. Merge resolutions that matter for pairs:
