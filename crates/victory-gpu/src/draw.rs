@@ -3679,7 +3679,9 @@ impl State {
     /// bound with, checks their formats and sizes, and records the passes.
     /// Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_PACKED, Role, Views};
+        use crate::ambient::{
+            AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_PACKED, REFLECTIONS_RESOLVED, Role, Views,
+        };
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3720,11 +3722,57 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle(index), resource))
         };
+        if role == Role::ShadowTrace {
+            // Every 2D float or unorm image the traced shadow pass writes:
+            // lit (`VICTORY_AMBIENT_SHADOW_MASKS`).
+            if !crate::ambient::shadow_masks() {
+                return false;
+            }
+            let mut any = false;
+            let places: Vec<(u8, u32)> = t
+                .used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                .map(|u| (u.slot, u.table_offset_dwords))
+                .collect();
+            for at in places {
+                let Some((of, image, _)) = entry(ResourceType::Uav, at) else { continue };
+                let flat = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                if !flat || !crate::ambient::fillable(of.Format.0 as u32) {
+                    once!(format = of.Format.0, ?at, "a traced shadow pass's output left as it is (not a 2D float image)");
+                    continue;
+                }
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(format = of.Format.0, ?at, "traced shadow outputs filled lit (VICTORY_AMBIENT_SHADOW_MASKS)");
+                });
+                any |= crate::ambient::after(list, role, &Views {
+                    image,
+                    depth: image,
+                    size: [of.Width as u32, of.Height],
+                    slices: 1,
+                });
+            }
+            return any;
+        }
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Reflect => crate::ambient::reflections(),
+            // The first of the places that holds a 2D R32_UINT image.
+            Role::ReflectResolve => {
+                let Some(&at) = REFLECTIONS_RESOLVED.iter().find(|&&at| {
+                    entry(ResourceType::Uav, at).is_some_and(|(d, _, _)| {
+                        d.Format.0 == 42 && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    })
+                }) else {
+                    once!("no reflections' resolve image at (1, 128) or (1, 136)");
+                    return false;
+                };
+                at
+            }
+            Role::ShadowTrace => return false,
         };
         if role == Role::Reflect {
             // What the two images `CS_UpdateHistory_*` may write are
@@ -3756,7 +3804,7 @@ impl State {
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflect => image,
+            Role::Radiance | Role::Air | Role::Reflect | Role::ReflectResolve | Role::ShadowTrace => image,
         };
         let (Some((of, image, _)), Some((seen, depth, _))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
@@ -3764,7 +3812,7 @@ impl State {
         };
         // R32_UINT holding R9G9B9E5 for the resolve and the reflections;
         // R11G11B10_FLOAT for the radiance and the air.
-        let format = if matches!(role, Role::Resolve | Role::Reflect) {
+        let format = if matches!(role, Role::Resolve | Role::Reflect | Role::ReflectResolve) {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT
         } else {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT
