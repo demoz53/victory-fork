@@ -1032,3 +1032,15 @@ fn an_endless_loop_keeps_its_iteration_limit_in_the_latch() {
     assert!(limit.plain.is_empty());
     assert!(limit.tests.is_empty());
 }
+
+#[test]
+fn loop_exits_is_on_unless_switched_off() {
+    // Unset (the default) and any value but "0" are on; the test hook stands in for "0".
+    let was = super::TEST_LOOP_EXITS.replace(None);
+    assert_eq!(super::loop_exits(), std::env::var_os("VICTORY_LOOP_EXITS").is_none_or(|v| v != "0"));
+    super::TEST_LOOP_EXITS.set(Some(false));
+    assert!(!super::loop_exits(), "VICTORY_LOOP_EXITS=0: the latch test as before");
+    super::TEST_LOOP_EXITS.set(Some(true));
+    assert!(super::loop_exits());
+    super::TEST_LOOP_EXITS.set(was);
+}
