@@ -121,7 +121,7 @@ pub(crate) struct HostHeap {
     buffers: Mutex<std::collections::BTreeSet<u32>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: Mutex<crate::fasthash::Set<u32>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -404,11 +404,11 @@ pub(crate) struct Spans {
     /// smaller ([`stale_head_size`]).
     head_size: bool,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: crate::fasthash::Map<u32, u64>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: crate::fasthash::Map<[u32; 14], Option<u64>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.

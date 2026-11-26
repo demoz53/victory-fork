@@ -72,6 +72,8 @@ mod texture;
 #[cfg(windows)]
 mod timing;
 #[cfg(windows)]
+mod fasthash;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod texback;

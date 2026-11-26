@@ -2432,15 +2432,15 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fasthash::Set<(usize, usize, usize)>,
     /// Recorded GPU write declarations per host copy and range. A new
     /// refresh of that copy must still be flushed by its next declaration.
-    gpu_written: std::collections::HashMap<usize, std::collections::HashSet<(usize, usize)>>,
+    gpu_written: crate::fasthash::Map<usize, crate::fasthash::Set<(usize, usize)>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fasthash::Set<usize>,
     /// The source last copied into each view's host texture by
     /// `crate::texture::alias` in this list (both by address).
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: crate::fasthash::Map<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2469,7 +2469,7 @@ struct Deferred {
     /// for reads, since the last step that wrote title memory).
     memory_read_seen: usize,
     memory_write_seen: usize,
-    named_writes: std::collections::HashSet<usize>,
+    named_writes: crate::fasthash::Set<usize>,
 }
 
 impl Deferred {
