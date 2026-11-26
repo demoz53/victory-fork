@@ -80,6 +80,14 @@ diagnostics-build switch).
 | `VICTORY_LOCK_STATS` | `1` | off | waits on the recording path's shared locks (slots, kept, ring, textures, heaps, views, buffers, placed, retired, submit), per lock, on the 5 s frame line; without it a lock is taken as before after one load of a once-set flag | test/locks adf68f33c | no |
 | `VICTORY_HEAP_LOCKS` | `1`; `alt` 20 s each way in turn (logged) | off | `HostHeap::made` read under the shared side of a reader-writer lock for slots already made, `descriptor::VIEWS` and `SHADER_HEAPS` read shared, `HostHeap::kept` cut into 64 locks; without it every path takes the writer side alone, as the one lock before | test/locks 27c580714 (fxceless 5d659e0c8, PR #1146 part 1) | no |
 
+## On test/waits (not merged yet)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_WAIT_STATS` | `1` | off | one line after the 5 s frame line: global UAV barriers a frame by cause (title groups, title barriers, clamps before/after, batched clamps, syncs, ours), one-resource UAV barriers, what the title's barrier groups hold, settles by why with ms standing, "title memory read" settles by reader, and the submitting thread's waits for staging, synchronous submissions and the submission lock | test/waits 8c87fc403 | no |
+| `VICTORY_CLAMP_WAITS` | `0` | full wait (as before) | the wait after each in-place indirect clamp is a UAV barrier on the list's budget buffer only (none if no record ran); the wait before stays | test/waits c61be0389 (lordon1a 32b5e420b, after Op-lite f748fb557a, Trexies 6b358fe83) | no |
+| `VICTORY_BARRIER_GROUPS` | `1` | off | the title's barrier groups: no barrier when none of their barriers orders shader writes; UAV barriers on the named textures' host copies (and twins) when only textures do; one global barrier otherwise (any global or buffer barrier, a texture with no host copy) | test/waits f81db3d21 (after Marvisak PR #642, nathanbzrr 6264e86a6) | no |
+| `VICTORY_FILL_TITLE` | `1` | off | a fill of upload memory or title buffer copy of at most 64 KiB does not settle flights when the title wrote that view memory since a copy took it, or no shader write landed in its pages in 600 frames (bottom-of-pipe writes and read-backs still waited for) | test/waits 49337278e (avatarmanz 9fea7434c) | no |
+
 ## New in all19 (merged on top of all18)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
