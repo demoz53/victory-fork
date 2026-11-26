@@ -124,7 +124,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{heap_half_bits, host_uses_wave32, lane_loop_fix, set_host_max_wave, with_group_base};
+pub use lower::{
+    heap_half_bits, host_uses_wave32, lane_loop_fix, set_host_max_wave, table_constants_in_place, with_group_base,
+    with_table_constants_in_place,
+};
 pub use pairs::{Mode as WavePairs, mode_for as wave_pairs_for};
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried, wave_wide_first};
 pub use rect::rect_list_gs;

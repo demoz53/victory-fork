@@ -1553,6 +1553,7 @@ impl Drop for Counted {
 /// A chunk of upload memory for lists' scratch data: the buffer, its
 /// mapping and its host GPU address.
 struct Chunk {
+    /// Held for the mapping; lent to views of scratch data (`scratch_view`).
     _buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
@@ -7276,6 +7277,17 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, false).map(|(_, _, gpu, data)| (gpu, data))
+    }
+
+    /// As [`HostList::scratch`], for a view of it: the buffer, the byte
+    /// offset in it (on 256) and the CPU pointer.
+    pub(crate) fn scratch_view(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(len, true).and_then(|(buffer, offset, _, data)| Some((buffer?, offset, data)))
+    }
+
+    /// The scratch memory and, if `view`, the buffer it lies in.
+    fn scratch_in(&self, len: u64, view: bool) -> Option<(Option<ID3D12Resource>, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -7284,8 +7296,9 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let shown = view.then(|| buffer.clone());
             self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            return Some((shown, 0, gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -7302,10 +7315,11 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
+        let chunk = &s.chunks[s.current].0;
+        let (buffer, data, gpu) = (view.then(|| chunk._buffer.clone()), chunk.data, chunk.gpu);
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some((buffer, at, gpu + at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:

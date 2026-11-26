@@ -3978,6 +3978,15 @@ impl State {
     /// console only 16. Returns those tables' new byte offsets by root
     /// parameter; the other tables' slots are made from the title's.
     ///
+    /// With `VICTORY_TABLE_CONSTANTS_IN_PLACE=1` translated shaders read a
+    /// table's constant buffer as a raw buffer, and the title's slot holds
+    /// a raw view of its host copy (`descriptor::host::constant_copy`),
+    /// brought up to date for the draw as buffer views are: such a table
+    /// needs no dynamic slots. Only a constant no host copy holds on 16
+    /// bytes still makes its table afresh, its data copied and shown as a
+    /// raw view. (Port of upstream Marvisak/VIctory 683ad7a99, Marvis; the
+    /// fallback after CuteBooty/victory-8gb b472495fb.)
+    ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
@@ -3990,10 +3999,37 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        let in_place = victory_shader::emit::table_constants_in_place();
+        // Whether a table constant is copied for the draw (its table made
+        // afresh): always, unless read in place where a host copy holds it.
+        let copied = |state: &Self, u: &UsedResource| -> bool {
+            if !in_place {
+                return true;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(u.slot)) else {
+                return false;
+            };
+            match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                Some(View::Constant(address, size)) => {
+                    let copied = crate::descriptor::host::constant_copy(address, size).is_none();
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        if copied {
+                            crate::copystat::C::TableConstantsCopied
+                        } else {
+                            crate::copystat::C::TableConstantsInPlace
+                        },
+                        1,
+                    );
+                    copied
+                }
+                _ => false,
+            }
+        };
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| u.kind == ResourceType::Cbv && copied(self, u))
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
@@ -4019,6 +4055,14 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut read: Vec<u8> = used.iter().filter(tables).map(|u| u.slot).collect();
+            read.sort_unstable();
+            read.dedup();
+            crate::copystat::add(crate::copystat::C::TablesRead, read.len() as u64);
+            crate::copystat::add(crate::copystat::C::TablesInPlace, read.len().saturating_sub(fresh.len()) as u64);
+        }
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
@@ -4085,7 +4129,11 @@ impl State {
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::TablesReused, 1);
+                // Constants read in place are brought up to date for this
+                // draw too (those copied were filled for the first).
+                for u in entries.iter().filter(|u| in_place || u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
@@ -4123,13 +4171,14 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 let view = crate::descriptor::view(table + u64::from(k) * 32);
-                let flights = matches!(view, Some(View::Constant(address, size))
+                let flights = !in_place && matches!(view, Some(View::Constant(address, size))
                     if crate::host::late()
                         && crate::host::flights_write(address as usize, address as usize + size as usize));
                 if flights {
                     FILL_FLIGHTS[2].fetch_add(1, Ordering::Relaxed);
                 }
                 let written = !flights
+                    && !in_place
                     && crate::host::late()
                     && crate::host::fill_written_on_card()
                     && matches!(view, Some(View::Constant(address, size))
@@ -4139,6 +4188,20 @@ impl State {
                 }
                 let over = flights || written;
                 match view {
+                    // Read as raw buffers (VICTORY_TABLE_CONSTANTS_IN_PLACE):
+                    // a raw view of the host copy, or of a copy for the draw.
+                    Some(View::Constant(address, size)) if in_place => {
+                        let view = View::Constant(address, size);
+                        if crate::descriptor::host::constant_copy(address, size).is_some() {
+                            host.make_at(index, &view);
+                            readable(list, ResourceType::Cbv, &view);
+                        } else if let Some((buffer, offset, to)) = list.scratch_view(u64::from(size)) {
+                            list.defer_fill(to, address as *const u8, size as usize);
+                            host.raw_at(index, &buffer, offset, u64::from(size.next_multiple_of(4)));
+                        } else {
+                            host.null_raw_at(index);
+                        }
+                    }
                     Some(View::Constant(address, size))
                         if over
                             && crate::host::fill_on_card()
@@ -5588,6 +5651,69 @@ mod tests {
         assert_eq!(heap.dynamic_free(), 0);
         drop(state);
         assert_eq!(heap.dynamic_free(), 0, "not given back again");
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
+        assert_eq!(release(heap_obj), 0);
+    }
+
+    /// A table holding a constant buffer is made afresh in dynamic slots
+    /// for each new set of descriptors as before; with
+    /// `VICTORY_TABLE_CONSTANTS_IN_PLACE` it is read from the title's own
+    /// slot (a raw view of the host copy) and takes none, unless no host
+    /// copy holds the constants, when it is made afresh still.
+    #[test]
+    fn table_constants_read_in_place_take_no_dynamic_slots() {
+        use crate::descriptor::host::DYNAMIC;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null: This = std::ptr::null();
+        let mut heap_obj: This = null;
+        let desc = [0u32, 64, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                desc.as_ptr().cast(),
+                std::ptr::from_ref(&iid).cast(),
+                &mut heap_obj,
+            ),
+            crate::object::S_OK
+        );
+        let table = crate::descriptor::heap(heap_obj).start;
+        let heap = crate::descriptor::heap(heap_obj).host().expect("a host heap");
+        let constants = vec![0u8; 64 << 10];
+        let address = (constants.as_ptr() as u64).next_multiple_of(256);
+        crate::descriptor::create_cbv(null, &[address as u32, (address >> 32) as u32, 256, 0], table);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        for on in [false, true] {
+            victory_shader::emit::with_table_constants_in_place(on, || {
+                let list = host.new_list().expect("host list");
+                let mut state = State::default();
+                state.set_heaps(&[heap_obj]);
+                state.set_table(false, 0, table);
+                let free = heap.dynamic_free();
+                let made = state.tables(&list, &used, &[], false);
+                let in_place = on && crate::descriptor::host::constant_copy(address, 256).is_some();
+                assert!(made.iter().all(|&(_, at)| at != u32::MAX), "{made:?}");
+                assert_eq!(made.is_empty(), in_place, "on {on}: {made:?}");
+                assert_eq!(heap.dynamic_free(), if in_place { free } else { free - 1 }, "on {on}");
+                // The same table again in the list: no more slots either way.
+                assert_eq!(state.tables(&list, &used, &[], false), made, "on {on}");
+                list.close();
+                state.tables_done();
+                assert_eq!(heap.dynamic_free(), free, "on {on}");
+                assert!(free <= DYNAMIC);
+            });
+        }
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
         assert_eq!(release(heap_obj), 0);
     }

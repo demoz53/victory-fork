@@ -308,7 +308,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        // A table's constant buffer, with VICTORY_TABLE_CONSTANTS_IN_PLACE:
+        // a raw view of its data's host copy, read so as an SRV is.
+        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) || Self::table_constant(kind) {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -1342,7 +1344,14 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            // A table's, with VICTORY_TABLE_CONSTANTS_IN_PLACE: a raw view.
+            let raw = Self::table_constant(used);
+            let h = if raw {
+                self.handle(site, src, false, (11, 0))?
+            } else {
+                self.handle(site, src, false, (13, 0x1_0000))?
+            };
+            let read = |l: &mut Self, at: V| if raw { l.raw_dword(h, at) } else { l.cbuffer_dword(h, at) };
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -1355,14 +1364,14 @@ impl<'a> Lower<'a> {
                 return Err("a buffer result");
             };
             if let Some((bits, signed)) = narrow {
-                let x = self.narrow_load(byte, bits, signed, |l, at| l.cbuffer_dword(h, at));
+                let x = self.narrow_load(byte, bits, signed, read);
                 self.write(inst, Reg::V(reg), x, guard);
                 return Ok(());
             }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = read(self, a);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
