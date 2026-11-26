@@ -8666,6 +8666,17 @@ impl Meter {
                         catch_up_micros as f64 / 1e3 / frames
                     );
                 }
+                // Textures the short cut by their two ends called absent
+                // (DexNom/VIctory 921d8d3b4): whether the case happens.
+                let [looks, found, put_off] =
+                    crate::texture::MAPPED_BETWEEN.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if looks + put_off != 0 {
+                    tracing::info!(
+                        "textures with neither their first nor their last page mapped, since the last line: {looks} were \
+                         looked at between the two, {found} of them had memory there (absent by the two ends alone), \
+                         {put_off} looks were put off for a later frame (VICTORY_MAPPED_EXACT=0: none is looked at)"
+                    );
+                }
                 // How long after its slot was written a texture was there
                 // (zm0kiemedia/Neptune_VI b900c6467's QUEUE_AGE line).
                 let ages = crate::descriptor::host::QUEUE_AGE
