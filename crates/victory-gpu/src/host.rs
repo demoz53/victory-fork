@@ -1120,6 +1120,11 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Changed (to a number no list has had) whenever `states` gains or
+    /// changes an entry, and at a reset: a draw that moved its render
+    /// targets at this number need not move them again
+    /// (`VICTORY_TARGETS_ONCE`, [`HostList::states_generation`]).
+    states_generation: std::sync::atomic::AtomicU64,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -6397,6 +6402,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                states_generation: std::sync::atomic::AtomicU64::new(next_states_generation()),
                 twins: Mutex::default(),
                 plane_reset: std::sync::atomic::AtomicBool::new(false),
                 prelude,
@@ -9068,6 +9074,7 @@ impl HostList {
         self._alive.used();
         self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states_moved();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.plane_reset.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -9114,6 +9121,15 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
+        if crate::resource::texture_once() {
+            // One host copy for the whole move (`VICTORY_TEXTURE_ONCE`).
+            let copy = crate::resource::host_copy(resource)?;
+            let before = self.transition_held(&copy, wanted)?;
+            // SAFETY: as `crate::resource::host_resource` hands out its
+            // texture: the resource holds the host copy until the title
+            // releases it (this list holds it past that, in `states`).
+            return Some((unsafe { &*std::ptr::from_ref(&copy.texture) }, before));
+        }
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
@@ -9121,13 +9137,49 @@ impl HostList {
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy));
+                self.states_moved();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    self.states_moved();
+                }
                 (before != wanted).then_some((texture, before))
             }
         }
+    }
+
+    /// [`HostList::transition`] of a host copy the caller holds: the state
+    /// it leaves, if that is a change (the state it takes is
+    /// `copy.legal(wanted)`).
+    pub(crate) fn transition_held(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+        let wanted = copy.legal(wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+                self.states_moved();
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    self.states_moved();
+                }
+                (before != wanted).then_some(before)
+            }
+        }
+    }
+
+    /// The number of the list's texture states now: the same while nothing
+    /// the list names has moved (no list has had it before).
+    pub(crate) fn states_generation(&self) -> u64 {
+        self.states_generation.load(Ordering::Relaxed)
+    }
+
+    fn states_moved(&self) {
+        self.states_generation.store(next_states_generation(), Ordering::Relaxed);
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -9135,7 +9187,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = copy.legal(wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -9147,6 +9199,7 @@ impl HostList {
                 (before != wanted).then_some(before)
             }
         };
+        self.states_moved();
         drop(states);
         if let Some(before) = before {
             let barrier = transition(
@@ -12236,6 +12289,13 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+}
+
+/// The next number of a list's texture states ([`HostList::states_generation`]):
+/// one counter for all lists, so that no two lists' numbers meet.
+fn next_states_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// [`legal_state`] for a texture with resource flags `flags`.

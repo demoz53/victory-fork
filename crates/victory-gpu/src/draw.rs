@@ -709,6 +709,11 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// With `VICTORY_TARGETS_ONCE=1`: the render targets [`State::bind`]
+    /// last moved, the list's states number after that and the count of
+    /// host copies made then: while all three are the same nothing they
+    /// name can have moved, and the moves are left out.
+    targets_moved: Option<(Vec<usize>, u64, u64)>,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
     /// The title's primitive topology (the host's may differ).
@@ -1860,8 +1865,22 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        // With `VICTORY_TARGETS_ONCE=1`: not again while nothing moved.
+        let once = targets_once();
+        let unmoved = once
+            && self.targets_moved.as_ref().is_some_and(|(targets, generation, made)| {
+                *generation == list.states_generation()
+                    && *made == crate::resource::host_copies_made()
+                    && *targets == self.targets
+            });
+        if !unmoved {
+            let made = crate::resource::host_copies_made();
+            for &t in &self.targets {
+                crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            }
+            if once {
+                self.targets_moved = Some((self.targets.clone(), list.states_generation(), made));
+            }
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
@@ -5632,6 +5651,23 @@ fn bind_lean() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_LEAN").is_some_and(|v| v == "1"))
 }
 
+/// Whether a draw leaves out moving its render targets to the render
+/// target state when nothing can have moved since the list's last draw that
+/// did (`VICTORY_TARGETS_ONCE=1`; off by default): the same targets, the
+/// same number of the list's states ([`HostList::states_generation`]: any
+/// entry gained or changed, any reset changes it) and no host copy of a
+/// title resource made since (a copy made again for a target is a new
+/// entry). Each move asked for the target's host copy twice and its
+/// description, and hashed an entry, to find it already right; a world
+/// frame has some 6,000 draws, most on the same targets. After
+/// Marvisak/VIctory pull request #3249 (borosf; GPL-3.0), here for the
+/// render targets only: the depth target's move goes with its twin's use
+/// and a state that changes with the draw's shaders, and stays.
+fn targets_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGETS_ONCE").is_some_and(|v| v == "1"))
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -5666,7 +5702,15 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             crate::texture::UPLOAD_PARTS[4].fetch_add(aliasing.us(), Ordering::Relaxed);
-            if !aliased
+            // With `VICTORY_TEXTURE_ONCE=1` one host copy for the upload and
+            // the state move.
+            let once = crate::resource::texture_once();
+            let copy = if once { crate::resource::host_copy(*resource as This) } else { None };
+            if once {
+                if !aliased && let Some(copy) = &copy && copy.title_written() {
+                    crate::texture::upload(list, *resource as This, &copy.texture);
+                }
+            } else if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
@@ -5683,7 +5727,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            if once {
+                if let Some(copy) = &copy {
+                    crate::list::ensure_held_state(list, copy, state);
+                }
+            } else {
+                crate::list::ensure_state(list, *resource as This, state);
+            }
             // With `VICTORY_BIND_LEAN=1` the host texture and its description
             // are only looked up when the debug line below can be written.
             #[cfg(feature = "diagnostics")]

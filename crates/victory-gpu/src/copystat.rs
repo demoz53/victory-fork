@@ -1118,6 +1118,20 @@ fn log_memory() {
         mb(own[3]),
         own[7],
     );
+    // Asks for host copies answered from a thread's memory (VICTORY_LOOKUP_CACHE).
+    {
+        static BEFORE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let [hit, miss] = [0, 1].map(|k| {
+            let now = crate::shadow::LOOKUPS[k].load(Relaxed);
+            now.saturating_sub(BEFORE[k].swap(now, Relaxed))
+        });
+        if hit > 0 {
+            tracing::info!(
+                "memory, asks for a buffer's host copy since the last line: {hit} answered from the asking thread's memory of them, {miss} from the tables ({:.0}% answered, VICTORY_LOOKUP_CACHE)",
+                100.0 * hit as f64 / (hit + miss).max(1) as f64
+            );
+        }
+    }
     // The placed views' shapes, and the ownerless entries past them.
     tracing::info!("memory, {}", crate::descriptor::shape_line());
     // Round 2: what the view table still holds and what goes around it,
