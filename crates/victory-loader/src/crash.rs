@@ -71,8 +71,6 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
-    // The log's waiting lines first: they lead up to this.
-    victory_core::logging::flush();
     let text = format!("{text}
 {}", report_end());
     eprint!("{text}");
@@ -81,9 +79,6 @@ pub fn log_crash(text: &str) {
 
 fn append_to_log(text: &str) {
     use std::io::Write;
-    // The log's waiting lines first (`VICTORY_LOG_ASYNC=1`): they lead up
-    // to this.
-    victory_core::logging::flush();
     let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

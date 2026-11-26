@@ -369,7 +369,6 @@ fn show_config() -> Result<()> {
             println!("POLICY VIOLATION: {e}");
         }
     }
-    victory_core::logging::flush();
     Ok(())
 }
 

@@ -50,12 +50,6 @@ pub use crash::{
 pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
-
-/// Writes the log lines still waiting (`VICTORY_LOG_ASYNC=1`): before the
-/// process ends.
-pub fn flush_log() {
-    victory_core::logging::flush();
-}
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile;
 #[cfg(all(windows, feature = "diagnostics"))]
