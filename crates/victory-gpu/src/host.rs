@@ -10664,13 +10664,15 @@ mod copy_bench {
         let mut ordinary = vec![1u8; TOTAL];
         let card = upload(TOTAL);
         let avx2 = std::is_x86_feature_detected!("avx2");
-        // SAFETY (each routine): both ranges inside their allocations, apart.
         let routines: Vec<(&str, Copy)> = vec![
+            // SAFETY: both ranges inside their allocations, apart.
             ("memcpy", Box::new(|s, d, n| unsafe { std::ptr::copy_nonoverlapping(s, d, n) })),
+            // SAFETY: as above.
             ("guarded rep movsb (refreshes today)", Box::new(|s, d, n| assert!(unsafe { crate::guarded::copy(s, d, n) }))),
             ("ReadProcessMemory (title copies today)", Box::new(|s, d, n| assert!(read_kernel(s, d, n)))),
             (
                 "guarded streaming (STREAM_COPY=1)",
+                // SAFETY: as above; AVX2 checked first.
                 Box::new(move |s, d, n| assert!(avx2 && unsafe { crate::guarded::copy_streaming(s, d, n) })),
             ),
             (
@@ -10693,6 +10695,7 @@ mod copy_bench {
         }
         // Reading back out of the upload buffer (write-combined, uncached).
         if let Some((_, data)) = card.as_ref() {
+            // SAFETY: both ranges inside their allocations, apart.
             let r = rate(*data, ordinary.as_mut_ptr(), 64 << 10, &|s, d, n| unsafe { std::ptr::copy_nonoverlapping(s, d, n) });
             println!("| memcpy out of the upload buffer | ordinary | | {r:.0} | |");
         }
