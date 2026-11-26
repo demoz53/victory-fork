@@ -281,8 +281,12 @@ fn note_pieces(j: &mut Journal, page: usize, asking: u64, mask: u16) {
 
 /// Notes a write of page `page` at asking `asking` in the journal, with
 /// the kernel pages it wrote ([`pieces`]).
+///
+/// A stamp only rises: a page some asking numbered above `asking` noted
+/// already keeps that asking's number (its pieces take these with it).
 fn note_written(j: &mut Journal, page: usize, asking: u64, mask: u16) {
-    j.written.insert(page, asking);
+    let stamp = j.written.entry(page).or_insert(asking);
+    *stamp = (*stamp).max(asking);
     if pieces() {
         note_pieces(j, page, asking, mask);
     }
@@ -489,12 +493,28 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
+    ask_lone(ranges);
+}
+
+/// [`ask_once`] after [`ask_ahead`]: the ranges that lie alone, asked under
+/// the standing asking.
+fn ask_lone(ranges: &[(usize, usize)]) {
     #[cfg(feature = "diagnostics")]
     let _who = asking_for(1);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
+        j.asked += 1;
+        j.ahead_asked = j.asked;
+    }
+    // Other askings were made since `ask_ahead` numbered the standing
+    // asking (the journal's lock was let go between): what is noted from
+    // here on goes under a number above theirs, else a page one of them
+    // took, written again since, would be noted below what its copy took
+    // and never copied again (review finding, test/watch5). The answers
+    // of the standing asking take the new number, as after [`wrote`].
+    if j.ahead_asked < j.asked {
         j.asked += 1;
         j.ahead_asked = j.asked;
     }
@@ -587,6 +607,12 @@ fn ask_views(ranges: &[(usize, usize)]) {
         j.asked += 1;
         j.ahead_asked = j.asked;
         j.ahead.clear();
+    }
+    // Standing already, under a number other askings may have passed
+    // since: noted under a new one (as in [`ask_lone`]).
+    if j.ahead_asked < j.asked {
+        j.asked += 1;
+        j.ahead_asked = j.asked;
     }
     let mut reach = 0;
     // Ranges the guards know to be views (their first block is guarded or
@@ -4257,6 +4283,74 @@ pub(crate) mod tests {
         drop_views(section, &[one, two], SIZE);
         forget_pages(one, one + SIZE);
         forget_pages(two, two + SIZE);
+    }
+
+    /// `VICTORY_ASK_ONCE`: a lone range asked under the standing asking
+    /// after another asking took a page of it, and the title wrote the page
+    /// again: the page is noted above what that copy took.
+    #[test]
+    fn a_lone_range_is_noted_above_askings_made_since_the_standing_one() {
+        const PAGES: usize = 2;
+        let alloc = || {
+            // SAFETY: a fresh write-watched allocation, freed at the end.
+            let p = unsafe {
+                VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(p, 0);
+            forget_pages(p, p + PAGES * PAGE);
+            p
+        };
+        let (a, lone) = (alloc(), alloc());
+        // The standing asking (two ranges of one allocation, asked ahead).
+        ask_once_end();
+        ask_ahead(&[(a, a + PAGE), (a + PAGE, a + 2 * PAGE)]);
+        // Another asking takes the lone range's page; the title writes it
+        // again.
+        // SAFETY: committed pages of ours.
+        unsafe { (lone as *mut u8).write_volatile(1) };
+        let (taken, _) = writes(lone, lone + PAGE, false).expect("write-watched");
+        // SAFETY: as above.
+        unsafe { (lone as *mut u8).write_volatile(2) };
+        ask_lone(&[(lone, lone + PAGE)]);
+        let stamp = journal().written.get(&(lone / PAGE)).copied().unwrap_or(0);
+        ask_once_end();
+        assert!(stamp > taken, "noted at {stamp}, the copy took the page at {taken}");
+        for p in [a, lone] {
+            forget_pages(p, p + PAGES * PAGE);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// `VICTORY_ASK_ONCE_VIEWS`: view memory asked under a standing asking
+    /// after another asking took a block of it, and the title wrote the
+    /// block again: the block is noted above what that copy took.
+    #[test]
+    fn a_view_asked_once_is_noted_above_askings_made_since() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        forget_pages(one, one + SIZE);
+        // Guarded once, and a standing asking of the other view's memory.
+        ask_once_end();
+        ask_views(&[(one, one + SIZE)]);
+        ask_once_end();
+        let (s2, v2, w2) = two_views(SIZE);
+        ask_views(&[(v2, v2 + SIZE)]);
+        // Another asking takes the block; the title writes it again.
+        // SAFETY: inside the view; the write faults and opens the block.
+        unsafe { (one as *mut u8).write_volatile(1) };
+        let (taken, _) = writes_as(one, one + BLOCK, true, 0, false, false).expect("a view");
+        // SAFETY: as above.
+        unsafe { (one as *mut u8).write_volatile(2) };
+        ask_views(&[(one, one + BLOCK)]);
+        let stamp = journal().written.get(&(one / PAGE)).copied().unwrap_or(0);
+        ask_once_end();
+        assert!(stamp > taken, "noted at {stamp}, the copy took the block at {taken}");
+        drop_views(s2, &[v2, w2], SIZE);
+        drop_views(section, &[one, two], SIZE);
+        for p in [one, two, v2, w2] {
+            forget_pages(p, p + SIZE);
+        }
     }
 
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
