@@ -11,6 +11,12 @@
 /// The system's processor sets of group 0: each one's id and its efficiency
 /// class (higher is faster).
 fn cpu_sets() -> Vec<(u32, u8)> {
+    cpu_sets_with_processor().into_iter().map(|(id, _, class)| (id, class)).collect()
+}
+
+/// [`cpu_sets`] with each set's logical processor: id, logical processor,
+/// efficiency class.
+fn cpu_sets_with_processor() -> Vec<(u32, u8, u8)> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -30,7 +36,7 @@ fn cpu_sets() -> Vec<(u32, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.EfficiencyClass));
+            sets.push((set.Id, set.LogicalProcessorIndex, set.EfficiencyClass));
         }
         at += info.Size as usize;
     }
@@ -42,6 +48,18 @@ fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
     let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
     let fast: Vec<u32> = sets.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
     if fast.len() == sets.len() { Vec::new() } else { fast }
+}
+
+/// The slow logical processors of group 0 as a mask (a lower efficiency
+/// class than the best): 0 where all cores are alike. fxceless/victory-fork's
+/// `framelog::slow_processors` (commit 39731795d), for `VICTORY_SPREAD`.
+pub(crate) fn slow_processors() -> usize {
+    slow_of(&cpu_sets_with_processor())
+}
+
+fn slow_of(sets: &[(u32, u8, u8)]) -> usize {
+    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
+    sets.iter().filter(|c| c.2 < best && u32::from(c.1) < usize::BITS).fold(0, |mask, c| mask | 1usize << c.1)
 }
 
 /// `VICTORY_FAST_CORES` as a stage; anything else than 1 to 4 is 0.
@@ -147,6 +165,17 @@ mod tests {
         assert!(fast_of(&[(256, 0), (257, 0)]).is_empty());
         assert!(fast_of(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
+    }
+
+    #[test]
+    fn the_slow_processors_are_those_of_a_worse_class() {
+        // This PC's layout: 0-15 fast (class 1), 16-31 slow (class 0).
+        let sets: Vec<(u32, u8, u8)> = (0..32u8).map(|p| (256 + u32::from(p), p, u8::from(p < 16))).collect();
+        assert_eq!(slow_of(&sets), 0xFFFF_0000);
+        assert_eq!(slow_of(&[(256, 0, 0), (257, 1, 0)]), 0, "all alike");
+        assert_eq!(slow_of(&[]), 0);
+        // The system's own answer: slow ones only where there are fast ones too.
+        assert_eq!(slow_processors() == 0, fast().0.is_empty());
     }
 
     #[test]
