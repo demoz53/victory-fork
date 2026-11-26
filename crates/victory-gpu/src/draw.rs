@@ -4591,6 +4591,65 @@ mod tests {
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
         assert_eq!(release(heap_obj), 0);
     }
+
+    /// The slots of a list's descriptor tables given back when the card has
+    /// run it (`VICTORY_TABLES_EARLY`, `crate::list::Detached::tables_done`)
+    /// are free at once, and are not given back a second time when the
+    /// list's state is dropped: another list holds them by then.
+    #[test]
+    fn tables_given_back_when_the_card_has_run_them_are_given_back_once() {
+        use crate::descriptor::host::{DYNAMIC, TEST_MAP};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let null: This = std::ptr::null();
+        let mut heap_obj: This = null;
+        let desc = [0u32, 64, 1, 0, 0, 0, 0, 0];
+        let iid = ID3D12DescriptorHeap::IID;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                desc.as_ptr().cast(),
+                std::ptr::from_ref(&iid).cast(),
+                &mut heap_obj,
+            ),
+            crate::object::S_OK
+        );
+        let start = crate::descriptor::heap(heap_obj).start;
+        TEST_MAP.set(Some((16, 24)));
+        let heap = crate::descriptor::heap(heap_obj).host().expect("a host heap");
+        TEST_MAP.set(None);
+        assert_eq!(heap.dynamic_free(), DYNAMIC);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+        let used = [UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        // A table past the window: two dynamic slots.
+        state.set_table(false, 0, start + 15 * 32);
+        assert_eq!(state.tables(&list, &used, &[], false).len(), 1);
+        assert_eq!(heap.dynamic_free(), DYNAMIC - 2);
+        list.close();
+        // The card has run the list.
+        state.tables_done();
+        assert_eq!(heap.dynamic_free(), DYNAMIC, "free at once");
+        // Another list takes every slot, those two among them.
+        assert_eq!(heap.dynamic(DYNAMIC), Some(25));
+        assert_eq!(heap.dynamic_free(), 0);
+        drop(state);
+        assert_eq!(heap.dynamic_free(), 0, "not given back again");
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap_obj, 0x10);
+        assert_eq!(release(heap_obj), 0);
+    }
 }
 
 #[cfg(test)]

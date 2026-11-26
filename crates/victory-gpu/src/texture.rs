@@ -230,6 +230,23 @@ unsafe impl Sync for Through {}
 /// The copy buffers of [`alias`], by the placed view's texture.
 static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 
+/// `VICTORY_ALIAS_ALWAYS` (on by default; `0`: off): [`alias`] owes its
+/// copy until the list has copied that source into the view, not until the
+/// list has used the view in any way (fxceless/victory-fork 19a45d192 =
+/// its PR #1241 by kesku, GPL-3.0). Off, as before: an upload of the view
+/// from title memory earlier in the list (a new view, or one whose memory
+/// was mapped anew, as at a cut) counted as its first use, and with no
+/// change of the source's state the copy was skipped: the shader read the
+/// uploaded bytes, which nothing writes (the packed light of the sky, the
+/// probes and the bounced light read as zero for that list).
+fn alias_always() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_ALWAYS").is_none_or(|v| v != "0"))
+}
+
+/// Copies [`alias`] made that the rule before [`alias_always`] skipped.
+pub(crate) static ALIAS_OWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
 /// with what the host wrote to `source`: the texels of every level and
@@ -338,6 +355,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         }
     };
     let first = list.first_use(placed as usize);
+    // The copy is owed until the list has made it from this source: the
+    // view may have been used already by an upload from title memory.
+    let owed = if alias_always() { list.alias_source_changed(to, from) } else { first };
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -352,8 +372,20 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !owed && before.is_none() {
         return true;
+    }
+    if !first && before.is_none() {
+        // The copy the rule as it was skipped.
+        let n = ALIAS_OWED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::info!(
+                n,
+                view = ?placed,
+                texture = ?source,
+                "a view of a texture the card wrote is copied from it though the list had used the view already (VICTORY_ALIAS_ALWAYS=0: not copied, the shader read what was uploaded from title memory)"
+            );
+        }
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {

@@ -1659,6 +1659,9 @@ fn reopen_remapped() -> bool {
 /// again ([`reopen_remapped`]): the check that guarded them may have come
 /// after the mapping this tells of.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Texels on their way back to a texture there have nowhere to land.
+    #[cfg(windows)]
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

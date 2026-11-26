@@ -2338,6 +2338,32 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
     Some((plane.layout.clone(), r.data() as usize, t.size as usize))
 }
 
+/// Tests: the console layout of a 64x64 two-channel float texture shaders
+/// write, with its mips, as [`title_texture`] gives one: the layout, its
+/// mips and its bytes.
+#[cfg(all(test, windows))]
+pub(crate) fn test_wave_map_layout() -> (victory_formats::texture::Layout, u32, usize) {
+    const MIPS: u16 = 7;
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 64,
+        height: 64,
+        depth_or_array_size: 1,
+        mip_levels: MIPS,
+        format: 16,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 4,
+    };
+    let t = texture_layout(&desc).expect("a layout");
+    let [plane] = &t.planes[..] else {
+        panic!("one plane");
+    };
+    (plane.layout.clone(), u32::from(MIPS), t.size as usize)
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2624,6 +2650,9 @@ impl Drop for Resource {
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        // Texels on their way back into its title memory do not land.
+        #[cfg(windows)]
+        crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
@@ -3856,6 +3885,116 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// An upload of a view from title memory earlier in a list must not
+    /// keep the list from copying the card-written texture the view is
+    /// placed over into it (`VICTORY_ALIAS_ALWAYS`; fxceless/victory-fork
+    /// 19a45d192, its PR #1241 by kesku): the view then reads the packed
+    /// light the card wrote, not the title memory nothing writes.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn alias_after_title_upload_copies_the_gpu_atlas() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &source_desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                resource(source).data() as u64,
+                &texture(4, 4, 67, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(view), Some(source));
+        let written = host_resource(source).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        let packed_light = 0x8c02_0100_u32;
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes;
+        // live textures and an open list.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(packed_light);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        // The view is new: filled from title memory first, as a draw that
+        // finds no alias does, then read through the alias.
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, source));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the completed copy contains at least one 32-bit texel.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        resource_release(view);
+        resource_release(source);
+        assert_eq!(actual, packed_light, "the sampled texture kept the upload from title memory, not what the card wrote");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

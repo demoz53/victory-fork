@@ -2140,6 +2140,9 @@ struct Deferred {
     gpu_written: std::collections::HashMap<usize, std::collections::HashSet<(usize, usize)>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The source last copied into each view's host texture by
+    /// `crate::texture::alias` in this list (both by address).
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2149,8 +2152,10 @@ struct Deferred {
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
-    /// the list's shaders write, copied when the list closes.
-    back_wanted: Vec<(usize, Vec<Option<[u32; 10]>>)>,
+    /// the list's shaders write, copied when the list closes: the
+    /// resource, its unordered access views, and where it lay at its first
+    /// writer ([`crate::texback::Target`]; none: not asked).
+    back_wanted: Vec<(usize, Vec<Option<[u32; 10]>>, Option<crate::texback::Target>)>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
     /// Whether the indirect-work budget is zeroed for this recording (a
@@ -2214,6 +2219,7 @@ impl Deferred {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.textures.clear();
+        self.texture_aliases.clear();
         self.writes.clear();
         self.budget_zeroed = false;
         // As a new list's (fxceless #205: the watermarks start again at
@@ -3736,6 +3742,32 @@ struct RelayFetch {
 /// the card, or for a flight. It takes neither the submission lock nor
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
+/// `VICTORY_TABLES_EARLY` (on by default; `0`: off): with [`relay`], the
+/// dynamic descriptor slots of a flight's lists are given back as soon as
+/// the relay takes the flight off the line, which it does only once the
+/// card has run it, before the landing; off, when the landed lists are
+/// reset by the helper thread, as before (Korinocho/victory-fork
+/// eade35662, GPL-3.0-or-later: there the slots were held three to eight
+/// presented frames, one to two after, and a pool of 262,144 no longer
+/// ran out).
+///
+/// Nothing reads those slots after the flight's fence: its host lists were
+/// taken from the title's when it was sent (`crate::list::Detached`, which
+/// owns the state holding the slots; the earlier parts of a list cut at
+/// waits hold none, its last part all of them), they run once and are only
+/// reset afterwards. The same slots were given back by the same call when
+/// that state was dropped; given back here, the drop finds none left.
+fn tables_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TABLES_EARLY").is_none_or(|v| v != "0");
+        if on && relay() {
+            tracing::info!("descriptor tables' dynamic slots are given back when the card has run their flight, before it is landed (VICTORY_TABLES_EARLY=0: when its lists are reset)");
+        }
+        on
+    })
+}
+
 fn relay_worker() {
     let Some(host) = host() else {
         return;
@@ -3782,7 +3814,18 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(mut items) => {
+                // The card has run these flights: their lists' descriptor
+                // tables are given back here, before the landing.
+                if tables_early() {
+                    for item in &mut items {
+                        if let Late::Run(flight) = item {
+                            flight.lists.iter_mut().for_each(crate::list::Detached::tables_done);
+                        }
+                    }
+                }
+                host.relay_land(items, &mut fetch)
+            }
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
@@ -6752,12 +6795,20 @@ impl HostList {
         }
         let mut deferred = self.deferred();
         let view = view.copied();
-        if let Some((_, views)) = deferred.back_wanted.iter_mut().find(|(r, _)| *r == resource as usize) {
+        if let Some((_, views, _)) = deferred.back_wanted.iter_mut().find(|(r, _, _)| *r == resource as usize) {
             if !views.contains(&view) {
                 views.push(view);
             }
         } else {
-            deferred.back_wanted.push((resource as usize, vec![view]));
+            // Where the texture lies now, at its first writer: the copy
+            // lands there or not at all (`crate::texback::checked`).
+            let target = crate::texback::checked().then(|| crate::texback::Target::new(resource));
+            if matches!(target, Some(None)) {
+                // Not a texture with one plane in title memory: no copy
+                // (`crate::texback::record` made none of it either).
+                return;
+            }
+            deferred.back_wanted.push((resource as usize, vec![view], target.flatten()));
         }
     }
 
@@ -6765,7 +6816,12 @@ impl HostList {
     /// back go into read-back buffers ([`crate::texback::record`]).
     fn textures_back(&self) {
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
-        for (resource, views) in wanted {
+        for (resource, views, target) in wanted {
+            // Released, or its memory mapped anew, since its writer was
+            // recorded: no copy, and the resource is not looked at.
+            if target.as_ref().is_some_and(crate::texback::Target::stale) {
+                continue;
+            }
             let resource = resource as crate::object::This;
             let Some(copy) = crate::resource::host_copy(resource) else {
                 continue;
@@ -6785,7 +6841,7 @@ impl HostList {
             if let Some(state) = before {
                 self.settle(&copy, state);
             }
-            let back = crate::texback::record(&self.list, resource, &copy.texture, &views);
+            let back = crate::texback::record(&self.list, resource, &copy.texture, &views, target);
             if let Some(state) = after {
                 self.settle(&copy, state);
             }
@@ -7387,6 +7443,15 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Notes that the list copies `source` into `view` (host textures,
+    /// `crate::texture::alias`): whether the last such copy into `view` in
+    /// this list, if any, was from another source.
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = windows::core::Interface::as_raw(view) as usize;
+        let source = windows::core::Interface::as_raw(source) as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Advances the list's title-memory copy watermarks to `total` (`writes`:
