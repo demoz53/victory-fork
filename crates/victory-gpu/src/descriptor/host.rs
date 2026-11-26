@@ -1543,7 +1543,12 @@ impl HostHeap {
     /// keeps what it views). True if the slot was made.
     /// (With a heap map, a title slot past the window keeps its pool slot:
     /// it still holds the view, made again once its memory is mapped.)
-    pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+    /// `write`: the write the look at the memory was made for. The look is
+    /// made outside these locks; another writer may have replaced the
+    /// view and mirrored the new texture into the slot meanwhile, so the
+    /// slot is made null only while that write is still the queued one
+    /// ([`clear_checked`]).
+    pub(crate) fn texture_slot_gone(&self, index: u32, write: u64) -> bool {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if made
             .host(index)
@@ -1551,6 +1556,16 @@ impl HostHeap {
             .is_none_or(|&key| key == 0)
         {
             return false;
+        }
+        // `mirror` takes `made` before it queues the write (`note_buffer`):
+        // with both held, no write can come between this check and the
+        // unmake.
+        if clear_checked() {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if textures.same(index, write).is_none() {
+                CLEARS_LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
         }
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2798,6 +2813,21 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 /// since the start: the slot kept showing the old view.
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether [`HostHeap::texture_slot_gone`] makes a slot null only while
+/// the write its caller looked at is still the queued one
+/// (`VICTORY_CLEAR_CHECKED=0`: whatever the slot holds then, as before).
+/// Without it a texture mirrored into the slot between the look at the old
+/// texture's memory and the clear was left null (black) until the slot was
+/// written again. fxceless/victory-fork PR #632 (ryotdev).
+fn clear_checked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLEAR_CHECKED").is_none_or(|v| v != "0"))
+}
+
+/// Since the start: clears [`clear_checked`] left out, the slot having been
+/// written again (or its write done) after the look.
+pub(crate) static CLEARS_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether a slot written with another view of the placed texture it
 /// shows keeps showing the old one until the new is made;
 /// `VICTORY_KEEP_VIEWS=0` makes it null at once, as before.
@@ -3655,6 +3685,59 @@ mod tests {
         spans.forget(4);
         spans.forget(7);
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+    }
+
+    /// A look at a slot's old texture memory that found nothing mapped
+    /// leaves a replacement view mirrored since then in place; a look for
+    /// a write already done does too; one for the queued write clears.
+    /// fxceless/victory-fork PR #632's test (ryotdev), on our heap.
+    #[test]
+    fn an_old_unmapped_observation_preserves_a_replacement_view() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slot = 1;
+        heap.queue_texture(slot, true, false, 10);
+        let (_, observed) = heap.texture_slots_due(10, 1).0[0];
+
+        // The replacement: a 64x64 BC7 texture with backing of its own.
+        static BYTES: [u8; 65536] = [0; 65536];
+        let address = BYTES.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut srv = [0; 16];
+        srv[..6].copy_from_slice(&[98, 4, 5768, 0, 0, 1]);
+        (srv[10], srv[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, srv);
+        let [entry, generation] = super::super::words_for(view.clone());
+        let title = [super::super::VIEW_TAG, entry, generation];
+        let handle = title.as_ptr() as u64;
+        assert_eq!(heap.mirror(slot, handle, false), Some(view.clone()));
+        let (_, replacement) = heap.texture_slots_due(u64::MAX, 1).0[0];
+        assert_ne!(observed, replacement);
+        assert_eq!(heap.mirror(slot, handle, true), Some(view));
+        assert_eq!(super::device_removed(), None);
+        let key = u64::from(generation) << 32 | u64::from(entry);
+        let shown = || {
+            let made = heap.made.lock().unwrap();
+            made.keys[made.host(slot).unwrap() as usize]
+        };
+        assert!(heap.kept.lock().unwrap()[slot as usize].is_some());
+        assert_eq!(shown(), key);
+        if !clear_checked() {
+            return; // VICTORY_CLEAR_CHECKED=0: the old clear
+        }
+        assert!(!heap.texture_slot_gone(slot, observed));
+        assert_eq!(shown(), key);
+        assert_eq!(heap.texture_slots_due(u64::MAX, 1).0, [(slot, replacement)]);
+        // A write done is no longer queued: its look clears nothing either.
+        heap.texture_slot_done(slot, replacement, None);
+        assert!(!heap.texture_slot_gone(slot, replacement));
+        assert_eq!(shown(), key);
+        // A look for the write queued now clears.
+        heap.queue_texture(slot, true, false, 12);
+        let (_, current) = heap.texture_slots_due(u64::MAX, 1).0[0];
+        assert!(heap.texture_slot_gone(slot, current));
+        assert_eq!(shown(), 0);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
