@@ -98,9 +98,141 @@ fn early_budgets() -> (u64, u64) {
 /// The pixel shaders of the title's decoration bake (the title:
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
-/// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+/// targets and name no texture in a table. The first four are the list as
+/// it was (`VICTORY_BAKE_WIDE=0`); the last three are the other ped bakes
+/// codec_d's cool_fox (f4b48ad766) found, which our own runs make too: of
+/// the six pipelines with the ped baker's vertex shader every run makes,
+/// three had a pixel shader the old list did not know.
+const BAKE_PIXEL_SHADERS: [&str; 7] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+    "fa455c8a3c32577b",
+    "d126bcae5d5d8d26",
+    "fcee612943c008e0",
+];
+
+/// How many of [`BAKE_PIXEL_SHADERS`] the old recognition knew.
+const BAKE_PIXEL_SHADERS_OLD: usize = 4;
+
+/// Geometry stages every ped texture compositor and decoration bake shares
+/// (vertex `089d6271be6650ef`, the full-screen triangle of the ped baker;
+/// mesh `d4111a6e6ea49d91`, the decoration projection mesh), for pixel
+/// shader permutations no list names yet (cool_fox f4b48ad766).
+const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
+
+/// Which draws get the bake's care (`VICTORY_BAKE_WIDE`): `0` only the four
+/// pixel shaders known before; `lists` the pixel and geometry lists; unset
+/// or anything else also the shape of a bake ([`bake_rule`]). Without it,
+/// half the ped bakes our runs draw sampled whatever was on the card then
+/// (stand-ins, half-uploaded textures) into skin and clothes for good.
+fn bake_wide() -> u8 {
+    static WIDE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *WIDE.get_or_init(|| parse_bake_wide(std::env::var("VICTORY_BAKE_WIDE").ok().as_deref()))
+}
+
+/// [`bake_wide`] from the switch's value.
+fn parse_bake_wide(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("lists") => 1,
+        _ => 2,
+    }
+}
+
+/// Why a draw counts as a bake ([`bake_rule`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BakeRule {
+    /// Its pixel shader is in [`BAKE_PIXEL_SHADERS`].
+    Pixel,
+    /// A geometry stage of it is in [`BAKE_GEOMETRY_SHADERS`].
+    Geometry,
+    /// No depth target, four or more render targets, and the first one
+    /// square and at least 512 texels wide.
+    Shape,
+}
+
+impl BakeRule {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pixel => "pixel shader list",
+            Self::Geometry => "geometry shader list",
+            Self::Shape => "shape (no depth, 4+ targets, first square >= 512)",
+        }
+    }
+}
+
+/// Whether a graphics draw with shaders `hashes` is one of the title's
+/// texture bakes, and by which rule, at recognition level `wide`
+/// ([`bake_wide`]). `depth`: a depth target is bound; `targets`: the bound
+/// render targets; `first`: width and height of the first one (`None` for
+/// none or a buffer). Ported from codec_d's cool_fox (f4b48ad766)
+/// `is_bake_draw`, which also catches unseen character, head and clothing
+/// permutations by their shape, so that none of them bakes a neutral or
+/// null stand-in into a texture kept for the run.
+fn bake_rule<'a>(
+    hashes: impl Iterator<Item = &'a str> + Clone,
+    wide: u8,
+    depth: bool,
+    targets: usize,
+    first: Option<(u64, u32)>,
+) -> Option<BakeRule> {
+    let pixels = if wide == 0 { &BAKE_PIXEL_SHADERS[..BAKE_PIXEL_SHADERS_OLD] } else { &BAKE_PIXEL_SHADERS[..] };
+    if hashes.clone().any(|h| pixels.contains(&h)) {
+        return Some(BakeRule::Pixel);
+    }
+    if wide == 0 {
+        return None;
+    }
+    if hashes.into_iter().any(|h| BAKE_GEOMETRY_SHADERS.contains(&h)) {
+        return Some(BakeRule::Geometry);
+    }
+    (wide >= 2 && !depth && targets >= 4 && first.is_some_and(|(w, h)| w >= 512 && w == u64::from(h)))
+        .then_some(BakeRule::Shape)
+}
+
+/// Bake draws since [`bake_line`] last spoke, by [`BakeRule`].
+static BAKE_DRAWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Notes a bake draw of pipeline `name` recognised by `rule`: a line once
+/// per distinct pipeline (and rule), and a count for [`bake_line`].
+fn note_bake(name: &str, rule: BakeRule) {
+    BAKE_DRAWS[rule as usize].fetch_add(1, Ordering::Relaxed);
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, u8)>>> = std::sync::Mutex::new(None);
+    let new = SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert((name.to_owned(), rule as u8));
+    if new {
+        tracing::info!(
+            pipeline = name,
+            rule = rule.name(),
+            "a pipeline recognised as one of the title's texture bakes: its draws get the bake's care (VICTORY_BAKE_WIDE=0: only the four pixel shaders known before)"
+        );
+    }
+}
+
+/// At most every 5 s, when there were bake draws: how many, by rule.
+fn bake_line() {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let said = SAID.load(Ordering::Relaxed);
+    if now.saturating_sub(said) < 5000 || BAKE_DRAWS.iter().all(|c| c.load(Ordering::Relaxed) == 0) {
+        return;
+    }
+    if SAID.compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let [pixel, geometry, shape] = BAKE_DRAWS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        tracing::info!(
+            pixel,
+            geometry,
+            shape,
+            wide = bake_wide(),
+            "bake draws since the last such line, by the rule that recognised them (a line at most every 5 s, none while there are none)"
+        );
+    }
+}
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -2058,8 +2190,12 @@ impl State {
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
+        bake_line();
         let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+            && self.bake_rule(p).is_some_and(|rule| {
+                note_bake(&p.name, rule);
+                true
+            });
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -2080,6 +2216,21 @@ impl State {
             &BAKED_MS,
         );
         BAKE_SOURCES.with_borrow_mut(Vec::clear);
+    }
+
+    /// Whether graphics pipeline `p`, drawn with this state, is one of the
+    /// title's texture bakes ([`bake_rule`]).
+    fn bake_rule(&self, p: &HostPipeline) -> Option<BakeRule> {
+        let wide = bake_wide();
+        let first = if wide >= 2 && self.depth == 0 && self.targets.len() >= 4 {
+            self.targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .map(|(w, h, _)| (w, h))
+        } else {
+            None
+        };
+        bake_rule(p.stages.iter().map(|s| s.shader.hash.as_str()), wide, self.depth != 0, self.targets.len(), first)
     }
 
     /// The title slots a bake draw's data names that hold a texture view:
@@ -4639,6 +4790,56 @@ mod rect_bounds_tests {
 #[cfg(test)]
 mod early_textures_tests {
     use super::*;
+
+    /// The bake recogniser at each level of `VICTORY_BAKE_WIDE`: the old
+    /// four pixel shaders, the three cool_fox added, the ped baker's
+    /// geometry stages, and the shape test with its edges.
+    #[test]
+    fn bake_rule_recognises_every_ped_bake() {
+        let rule = |hashes: &[&str], wide, depth, targets, first| {
+            bake_rule(hashes.iter().copied(), wide, depth, targets, first)
+        };
+        let ped_vs = "089d6271be6650ef";
+        let other_vs = "1111111111111111";
+        let other_ps = "2222222222222222";
+        // Known before, at every level.
+        for wide in 0..=2 {
+            assert_eq!(rule(&[ped_vs, "0d1575a396dfe513"], wide, false, 1, None), Some(BakeRule::Pixel));
+            assert_eq!(rule(&[other_vs, "c0a7fe77b1862e10"], wide, true, 1, None), Some(BakeRule::Pixel));
+        }
+        // The three our runs draw that the old list missed (with the ped
+        // baker's vertex shader, as in vf-bis-house-x1).
+        for ps in ["fa455c8a3c32577b", "d126bcae5d5d8d26", "fcee612943c008e0"] {
+            assert_eq!(rule(&[other_vs, ps], 0, false, 4, Some((2048, 2048))), None);
+            assert_eq!(rule(&[ped_vs, ps], 0, false, 4, Some((2048, 2048))), None);
+            assert_eq!(rule(&[other_vs, ps], 1, true, 1, None), Some(BakeRule::Pixel));
+            assert_eq!(rule(&[ped_vs, ps], 2, true, 1, None), Some(BakeRule::Pixel));
+        }
+        // An unknown pixel shader behind a ped geometry stage.
+        for geometry in BAKE_GEOMETRY_SHADERS {
+            assert_eq!(rule(&[geometry, other_ps], 0, false, 1, None), None);
+            assert_eq!(rule(&[geometry, other_ps], 1, true, 1, None), Some(BakeRule::Geometry));
+            assert_eq!(rule(&[geometry, other_ps], 2, true, 1, None), Some(BakeRule::Geometry));
+        }
+        // The shape: only at the full level, and only all of it.
+        let unknown = [other_vs, other_ps];
+        assert_eq!(rule(&unknown, 2, false, 4, Some((512, 512))), Some(BakeRule::Shape));
+        assert_eq!(rule(&unknown, 2, false, 5, Some((2048, 2048))), Some(BakeRule::Shape));
+        assert_eq!(rule(&unknown, 1, false, 4, Some((2048, 2048))), None);
+        assert_eq!(rule(&unknown, 0, false, 4, Some((2048, 2048))), None);
+        assert_eq!(rule(&unknown, 2, true, 4, Some((2048, 2048))), None, "a depth target");
+        assert_eq!(rule(&unknown, 2, false, 3, Some((2048, 2048))), None, "three targets");
+        assert_eq!(rule(&unknown, 2, false, 4, Some((256, 256))), None, "smaller than 512");
+        assert_eq!(rule(&unknown, 2, false, 4, Some((2048, 1024))), None, "not square");
+        assert_eq!(rule(&unknown, 2, false, 4, None), None, "first target unknown");
+        // An ordinary draw is no bake.
+        assert_eq!(rule(&unknown, 2, true, 1, Some((2560, 1440))), None);
+        // The switch's values.
+        assert_eq!(parse_bake_wide(None), 2);
+        assert_eq!(parse_bake_wide(Some("1")), 2);
+        assert_eq!(parse_bake_wide(Some(" 0 ")), 0);
+        assert_eq!(parse_bake_wide(Some("lists")), 1);
+    }
 
     #[test]
     fn early_budget_runs_once_per_frame_and_resets_bake_budget() {
