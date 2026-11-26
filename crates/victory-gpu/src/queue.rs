@@ -1108,14 +1108,24 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        // A plane not written since it was last shown, while another holds
+        // a newer picture: traced, and with `VICTORY_PRESENT_NEWEST=1` the
+        // newer one is shown ([`crate::shown`]). It is read in the state
+        // the lists submitted so far leave it in, and stays in it.
+        let (state, shown) = if let Some(newer) = crate::shown::present(frame, resource) {
+            let state = newer.state.load(Ordering::Relaxed);
+            (state, host.present(&newer.texture, state, frame))
+        } else {
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let shown = host.present(texture, state, frame);
+            crate::resource::host_transition(resource, state);
+            (state, shown)
+        };
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let _ = (state, shown);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

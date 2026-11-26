@@ -60,6 +60,8 @@ mod memory;
 mod guarded;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod shown;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
