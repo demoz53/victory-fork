@@ -1,7 +1,7 @@
 # SWITCHES.md - every switch added since test/all14n, in test/all17
 
 `test/all17` = `test/all16` (fb98a3eda) + merges of test/avfix, test/slots, test/stream2 (to 5fe884eb9), test/res1,
-test/split, test/loops2 (its first commit 9e9272327 only), five commits of test/testkit (0600708fa, 5867481c7,
+test/split, test/loops2 (to its tip 864343dff), five commits of test/testkit (0600708fa, 5867481c7,
 d59bd65f6, c3ec9f984, 2bf01ab20), the two new commits of test/speed1 (to 4e2e1f6e1), test/clamps (d4b2d6324), one
 commit of test/all13y (95d04e060) and test/pairs (97ac88160). `test/all16` = `test/all15b` (3b9488230) +
 test/lx, test/cxall, test/stream1 (holds test/fairq), test/shirt1, test/speed1 (to 625bc32b6), test/compose.
@@ -26,12 +26,17 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | 9 | `VICTORY_ALIAS_ALWAYS` is on (a view of a texture the card wrote is copied from it even if the list already uploaded the view) | test/slots | `VICTORY_ALIAS_ALWAYS=0` |
 | 10 | `VICTORY_QUEUE_AGE` is on (log only: histogram of frames between a slot's write and its texture on the card) | test/stream2 | `VICTORY_QUEUE_AGE=0` |
 | 11 | `VICTORY_MAPPED_EXACT` is on (a texture with only pages in its middle mapped counts as there; looked at in turns) | test/stream2 5fe884eb9 | `VICTORY_MAPPED_EXACT=0` |
-| 12 | the translated-shader cache is keyed by the translator's fingerprint, not by the executable's hash (builds with the same translator share entries; no picture change) | test/testkit d59bd65f6 | `VICTORY_SHADER_CACHE_KEY=exe` |
+| 12 | `VICTORY_PERMUTE_HALVES` is on (ds_bpermute reads across the two host waves of a console wave; before: refused) | test/loops2 664ee75e0 | `VICTORY_PERMUTE_HALVES=0` (shader code) |
+| 13 | `VICTORY_SHORT_WAVE_LAST` is on (the short host wave of a group takes the last console lanes; before: arrival order) | test/loops2 a7afedf05 | `VICTORY_SHORT_WAVE_LAST=0` (shader code) |
+| 14 | `VICTORY_LANE_MODULO` is on (v_readlane and v_writelane take a computed lane modulo the wave) | test/loops2 533f14c8a | `VICTORY_LANE_MODULO=0` (shader code) |
+| 15 | `VICTORY_THREAD_TICKET` is on (console threads of groups of several host waves come from a counter, not from rounding: four sky ambient programs had duplicate thread numbers) | test/loops2 864343dff | `VICTORY_THREAD_TICKET=0` (shader code) |
+| 16 | the translated-shader cache is keyed by the translator's fingerprint, not by the executable's hash (builds with the same translator share entries; no picture change) | test/testkit d59bd65f6 | `VICTORY_SHADER_CACHE_KEY=exe` |
 
 Everything restored (all15b behaviour, one line):
-`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_SHADER_CACHE_KEY=exe`
+`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_SHADER_CACHE_KEY=exe`
 (leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
-entries a build finds.)
+entries a build finds. Five of these change translated code - LOOP_EXITS and the four lane fixes of test/loops2,
+343 compute programs by its agent's count - so a run with them restored needs a warm of its own.)
 
 Always on, with no switch (no behaviour change, some cost): the "title memory remapped" work line every 5 s and the
 look it needs at every mapping call, whether the pages are there already (test/speed1 ec85139be); the "dstorage:
@@ -58,6 +63,10 @@ workers" line's two extra fields; a trace string built at each composed present.
 | `VICTORY_GROUP_SPLIT` | `1` | off | a wave64 compute program whose thread groups hold several console waves that share nothing runs each console wave as a host thread group of its own (else it does not translate: the water tile-mask writer f133e35efed2a48a is one) | test/split (Corgansm/victory-corgi) | YES |
 | `VICTORY_WAVE_PAIRS` | `1` the paired form after the exact forms and before the wave-wide one; `first` before every other retry form (for comparing pictures) | off | a console wave64 compute program on 32-lane host waves runs each console wave as ONE host wave, each thread two lanes (no barrier added inside a branch); f133e35efed2a48a takes it | test/pairs (fxceless PR #854) | YES (by program: only the programs whose answer changes translate again) |
 | `VICTORY_WAVE_PAIRS_ONLY`, `VICTORY_WAVE_PAIRS_NOT` | `<hash>,...` | unset | the paired form for the listed programs alone, or not for the listed ones | test/pairs | YES (by program) |
+| `VICTORY_PERMUTE_HALVES` | `0` off | ON | `ds_bpermute_b32` in a console wave64 program run as two host waves reads the lane its address names in either of them (64 LDS dwords between two group barriers) | test/loops2 664ee75e0 | YES |
+| `VICTORY_SHORT_WAVE_LAST` | `0` off | ON | in a group that is not a multiple of 32 threads only the full host waves take their run from the counter; the short one takes the last run | test/loops2 a7afedf05 | YES |
+| `VICTORY_LANE_MODULO` | `0` off | ON | `v_readlane_b32` and `v_writelane_b32` take a computed lane number modulo the console wave's size (lane 64 is lane 0) | test/loops2 533f14c8a | YES |
+| `VICTORY_THREAD_TICKET` | `0` off | ON | a program with console lanes in a group of several 32-lane host waves takes its console threads from an LDS counter, not from the first lane's flat id rounded down (a 32 by 2 group gave half its threads the other half's numbers) | test/loops2 864343dff | YES |
 | `VICTORY_AFTER_LOOP` | `1` | off | the loops a per-lane branch leaves count as that branch's region | test/loops2 9e9272327 (fxceless PR #1249) | YES |
 | `VICTORY_REMAP_SAME` | `0`, `1`, `2` | 0 | a mapping of pages that are shown there already: 0 views taken away and made again (as before); 1 no view touched, the GPU side told of the bytes; 2 nor is the GPU side told | test/speed1 ec85139be (Neptune) | no |
 | `VICTORY_ALIAS_RUNS` | `1` | off | a copy of page mappings makes one view for a run of pages that follow one another, not one a page | test/speed1 ec85139be (Neptune) | no |
@@ -172,7 +181,7 @@ switch.
   PARTIAL_PROMPT (cs-all1's culprit is among them), VRAM_IDLE_MS (ignored beside TEXTURE_KEEP), DROP_MIPS (softer
   picture; for 8 GB cards), REMAP_SAME and ALIAS_RUNS (runtime mapping: a line of their own).
 - Shader-changing switches now: LOOP_EXITS, NORM_EXACT, HEAP_BELOW_ZERO, LOCAL_LDS_SYNC, NAN_GUARD, GROUP_SPLIT,
-  AFTER_LOOP, WAVE_PAIRS (and its two lists). `tools/shader-sweep.sh` says offline which programs one of them changes.
+  AFTER_LOOP, WAVE_PAIRS (and its two lists), PERMUTE_HALVES, SHORT_WAVE_LAST, LANE_MODULO, THREAD_TICKET. `tools/shader-sweep.sh` says offline which programs one of them changes.
 - Swept offline (tools/shader-sweep.sh, the 3,605 programs of shaders-save-boat, VICTORY_HOST_MAX_WAVE=32):
   `VICTORY_GROUP_SPLIT=1 VICTORY_AFTER_LOOP=1` together change 3 compute programs (20b78ee12ecdb57d,
   ce79e9eba7ae0348, fa0bd10a35bfef3c) and let one more translate (f133e35efed2a48a, refused without them); all 4
