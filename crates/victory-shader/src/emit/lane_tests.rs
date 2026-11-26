@@ -490,7 +490,6 @@ fn the_short_wave_rule_changes_only_groups_that_are_no_multiple_of_32() {
 /// tests name lanes below 64 only on this path (its dual-bank form found the rule); these
 /// cases are added here.
 #[test]
-#[ignore = "fails here: a computed lane number is compared as it is, not modulo the wave size"]
 fn a_lane_number_is_taken_modulo_the_wave() {
     let lanes = [64u32, 95, 96, 127, 101, 0x1_0025, u32::MAX];
     let mut w = prologue();
@@ -517,6 +516,32 @@ fn a_lane_number_is_taken_modulo_the_wave() {
         compare(&format!("v_writelane lane {lane:#x}"), &got, &some(model::writelane(&model::input(), value, lane)));
     }
     eprintln!("v_readlane and v_writelane: 7 lanes past the wave each, as the model");
+}
+
+/// `VICTORY_LANE_MODULO`: a program whose lane numbers are constants (the compiler's
+/// whole-wave sum reads lanes 32 and 0) translates the same with and without the rule; one
+/// with a computed lane only with it off as before.
+#[test]
+fn the_lane_modulo_rule_changes_only_computed_lanes() {
+    let dxil = |words: &[u32], on: bool| {
+        let native = native_of(words, true, 64);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let was = lower::TEST_LANE_MODULO.replace(Some(on));
+        let shader = lowered(&native, &p, &HashSet::new());
+        lower::TEST_LANE_MODULO.set(was);
+        shader.expect("lowered").dxil
+    };
+    let mut sum = prologue();
+    sum.push(vop1(V_MOV_B32, 7, v(0)));
+    sum.extend(crate::emit::wave::WAVE_OR_V7_TO_S7);
+    sum.push(vop1(V_MOV_B32, 12, 7));
+    epilogue(&mut sum);
+    assert_eq!(dxil(&sum, true), dxil(&sum, false), "constant lanes");
+    let mut read = prologue();
+    read.extend(vop3(V_READLANE_B32, 20, v(1), 0));
+    read.push(vop1(V_MOV_B32, 12, 20));
+    epilogue(&mut read);
+    assert_ne!(dxil(&read, true), dxil(&read, false), "a computed lane");
 }
 
 /// `v_readfirstlane_b32` under masks whose first lane is in either half, among them the

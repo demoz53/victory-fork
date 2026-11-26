@@ -50,6 +50,27 @@ thread_local! {
     pub(in crate::emit) static TEST_SHORT_WAVE_LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether `v_readlane_b32` and `v_writelane_b32` take a computed lane number modulo the
+/// console wave's size, as the instruction does (its low six bits in a 64-lane wave: lane 64
+/// is lane 0, -1 is lane 63; [`Lower::lane_mod`]). `VICTORY_LANE_MODULO=0`: the number is
+/// compared as it stands, as before, where one past the wave named no lane (a read gave 0, a
+/// write went nowhere). Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn lane_modulo() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LANE_MODULO.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_MODULO").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's setting of [`lane_modulo`] for this thread.
+    pub(in crate::emit) static TEST_LANE_MODULO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The first of the LDS dwords a group of `group` threads keeps for `ds_bpermute_b32` across
 /// its host waves (64 a console wave, [`Lower::permute_across_halves`]), reserved past
 /// `lds_dwords`. None where there is no such instruction, where the group is one host wave,
@@ -66,6 +87,19 @@ pub(super) fn permute_area(lds_dwords: &mut u32, group: u32, shuffles: bool, loc
 }
 
 impl<'a> Lower<'a> {
+    /// A lane number as `v_readlane_b32` and `v_writelane_b32` take it: modulo the console
+    /// wave's size ([`lane_modulo`]). Left as it is: a constant (the console compiler's, in
+    /// range; the lowering tells constants from computed lanes), and a computed lane of a
+    /// pixel or vertex program, which is a lane of the host's wave (from a mask or `v_mbcnt`
+    /// over it), whatever its size.
+    pub(super) fn lane_mod(&mut self, lane: V) -> V {
+        if matches!(lane, V::Const(_)) || self.mask_data == MaskData::Host || !lane_modulo() {
+            return lane;
+        }
+        let last = self.s.m.i32(self.wave() - 1);
+        self.s.m.bin(self.cur, Bin::And, lane, last)
+    }
+
     /// For [`Self::wave_base`], in the entry block: whether this host wave is full (every one
     /// of its 32 lanes holds a thread), asked only in a group that is not a multiple of 32
     /// threads ([`short_wave_last`]; `None`: every wave is full, or the rule is off), and

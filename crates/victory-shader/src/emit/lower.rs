@@ -34,7 +34,7 @@ pub(super) use loop_regions::scope as after_loop_scope;
 /// Lane fixes of wave64 compute on 32-lane hosts that the lane tests found.
 mod lanes;
 #[cfg(test)]
-pub(super) use lanes::{TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST};
+pub(super) use lanes::{TEST_LANE_MODULO, TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST};
 
 type Why = &'static str;
 
@@ -8986,6 +8986,7 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let lane = self.lane_mod(lane);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -9066,6 +9067,7 @@ impl<'a> Lower<'a> {
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let lane = self.lane_mod(lane);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
