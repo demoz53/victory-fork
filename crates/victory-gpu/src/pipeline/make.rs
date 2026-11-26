@@ -261,9 +261,125 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let frame = crate::frame::current();
+        match compute_wait().and_then(|most| compute_left(frame, most)) {
+            Some(most) if p.graphics.is_none() => wait_made(p, most, frame),
+            _ => wait(p, frame),
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// How long a dispatch waits for its compute pipeline, whatever the frame's
+/// budget ([`wait_budget`]): `VICTORY_PIPELINE_COMPUTE_WAIT` in ms (10000 by
+/// default; `0`: within the frame's budget, as before). A draw still waits
+/// within the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene or a
+/// character is set up, and what they leave is read for as long as it
+/// lasts (avatarmanz issue #75: a character's skin missing for a whole
+/// session on first launches of a build, right on later ones, whose
+/// pipeline library had the pipeline; fxceless pull request #1312,
+/// Exopus-0x65f7ad0: one dispatch of a program first met dropped after the
+/// half second of budget, a 4.4 s compile, the picture wrong for minutes).
+/// Bounded, not endless as #1312: the title's watchdog ends the process
+/// after 30 s without a finished frame, and a compile that never comes back
+/// ([`stuck`]) is not waited for at all.
+fn compute_wait() -> Option<Duration> {
+    #[cfg(test)]
+    return Some(Duration::from_millis(200));
+    #[cfg(not(test))]
+    {
+        static MOST: OnceLock<Option<Duration>> = OnceLock::new();
+        *MOST.get_or_init(|| {
+            let millis = std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(10_000);
+            (millis > 0).then_some(Duration::from_millis(millis))
+        })
+    }
+}
+
+/// What one title frame may spend in [`wait_made`] over all its dispatches
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT_FRAME_MS`, 15000): many programs met for
+/// the first time in one frame must not add up to the title's 30-s
+/// watchdog. Waits on several threads at once are each counted whole.
+fn compute_frame_budget() -> Duration {
+    static MOST: OnceLock<Duration> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let millis = std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_FRAME_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(15_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// The frame [`wait_made`]'s waits are counted in, and what they took.
+static COMPUTE_SPENT: Mutex<(u64, Duration)> = Mutex::new((0, Duration::ZERO));
+
+/// How long a dispatch of frame `frame` may wait for its pipeline: `most`,
+/// or what is left of the frame's [`compute_frame_budget`]; `None` when
+/// nothing is left (then the frame's usual budget applies).
+fn compute_left(frame: u64, most: Duration) -> Option<Duration> {
+    let spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let used = if spent.0 == frame { spent.1 } else { Duration::ZERO };
+    let left = compute_frame_budget().saturating_sub(used).min(most);
+    (!left.is_zero()).then_some(left)
+}
+
+/// Dispatches that waited for their compute pipeline past the frame's
+/// budget ([`compute_wait`]): how many waited, the longest wait (ms), and
+/// how many were dropped all the same (the wait ran out or the compile was
+/// stuck).
+static COMPUTE_WAITED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Waits for `p` until it is made, its compile is [`stuck`], or `most` has
+/// passed; not charged to the frame's budget.
+fn wait_made(p: &Pending, most: Duration, frame: u64) {
+    if stuck(p) {
+        return;
+    }
+    let started = Instant::now();
+    let (lock, done) = &p.completion;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = most.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest.min(STUCK_POLL)).unwrap_or_else(|e| e.into_inner()).0;
+        if stuck(p) {
+            break;
+        }
+    }
+    drop(held);
+    let waited = started.elapsed();
+    {
+        let mut spent = COMPUTE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 != frame {
+            *spent = (frame, Duration::ZERO);
+        }
+        spent.1 += waited;
+    }
+    let ms = waited.as_millis() as u64;
+    let n = COMPUTE_WAITED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let longest = COMPUTE_WAITED[1].fetch_max(ms, Ordering::Relaxed).max(ms);
+    let made = p.made.get().is_some();
+    let dropped = COMPUTE_WAITED[2].fetch_add(u64::from(!made), Ordering::Relaxed) + u64::from(!made);
+    if !made || ms >= 500 || n.is_power_of_two() {
+        tracing::info!(
+            pipeline = %p.key,
+            shaders = %p.names(),
+            waited_ms = ms,
+            made,
+            "a dispatch waited for its compute pipeline (VICTORY_PIPELINE_COMPUTE_WAIT; 0: within the frame's budget); since the start {n} waited, the longest {longest} ms, {dropped} dropped all the same"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start
@@ -802,6 +918,35 @@ mod tests {
         assert!(stuck(&p));
         assert_eq!(WORKERS_STARTED.load(Ordering::Relaxed), before + 1);
         assert!(p.made.get().is_none());
+    }
+
+    /// A dispatch waits for its compute pipeline past the frame's budget,
+    /// and gets it once a worker has made it; bounded ([`compute_wait`]).
+    #[test]
+    fn a_dispatch_waits_for_its_compute_pipeline() {
+        let p = Pending::new(Vec::new(), None);
+        // Taken by a worker that has not finished it yet.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let maker = {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                p.make();
+            })
+        };
+        let started = Instant::now();
+        let _ = ready(&p);
+        assert!(p.made.get().is_some(), "dispatch dropped before its pipeline was made");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        maker.join().unwrap();
+        // One never made is waited for at most the bound.
+        let q = Pending::new(Vec::new(), None);
+        q.queue_state.store(MAKING, Ordering::Relaxed);
+        let q = Arc::new(q);
+        let started = Instant::now();
+        assert!(ready(&q).is_none());
+        assert!(started.elapsed() < compute_wait().unwrap() + Duration::from_secs(2));
     }
 
     /// A pipeline a worker began just now is not stuck, nor is one made.

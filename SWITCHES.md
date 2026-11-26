@@ -68,9 +68,11 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | 23 | `VICTORY_GUARD_VIEWS_ONLY` is on (the write watch's guards make view memory read-only and nothing else) | test/watch2 (all22; fxceless PR #1147) | `VICTORY_GUARD_VIEWS_ONLY=0` |
 | 24 | `VICTORY_AMBIENT_AIR_FINITE` is on (with `VICTORY_AMBIENT` and `VICTORY_AMBIENT_AIR` only: the air pass stays finite) | test/pic2 4aa55718b (all22) | `VICTORY_AMBIENT_AIR_FINITE=0` |
 | 25 | `VICTORY_RETIRE_AHEAD` is 64 (what a sweep or a slot change lets go waits for the running submissions and 64 more, not only the running ones) | test/stable1 (AntoninMichelq e90063015) | `VICTORY_RETIRE_AHEAD=0` |
+| 26 | `VICTORY_XASYNC_CLEANUP_UNLOCKED` is on (XAsyncComplete runs a failed call's cleanup with no lock held) | test/stable2 (upstream #114 / fxceless #1330) | `VICTORY_XASYNC_CLEANUP_UNLOCKED=0` |
+| 27 | `VICTORY_PIPELINE_COMPUTE_WAIT` is 10000 (a dispatch waits up to 10 s for its compute pipeline, 15 s per frame in all, instead of dropping after the 0.5-s budget) | test/stable2 (fxceless #1312) | `VICTORY_PIPELINE_COMPUTE_WAIT=0` |
 
 Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE, all20 HEAP_FORGET and SDWA_SEXT, all22 GUARD_VIEWS_ONLY and AMBIENT_AIR_FINITE):
-`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_HEAP_FORGET=0 VICTORY_SDWA_SEXT=0 VICTORY_GUARD_VIEWS_ONLY=0 VICTORY_AMBIENT_AIR_FINITE=0 VICTORY_RETIRE_AHEAD=0 VICTORY_SHADER_CACHE_KEY=exe`
+`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_HEAP_FORGET=0 VICTORY_SDWA_SEXT=0 VICTORY_GUARD_VIEWS_ONLY=0 VICTORY_AMBIENT_AIR_FINITE=0 VICTORY_RETIRE_AHEAD=0 VICTORY_XASYNC_CLEANUP_UNLOCKED=0 VICTORY_PIPELINE_COMPUTE_WAIT=0 VICTORY_SHADER_CACHE_KEY=exe`
 (leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
 entries a build finds. Five of these change translated code - LOOP_EXITS and the four lane fixes of test/loops2,
 343 compute programs by its agent's count - so a run with them restored needs a warm of its own.)
@@ -84,6 +86,13 @@ buffer views that cannot be made raw (they read zeros on NVIDIA) warned and all 
 the bound render targets kept at each set of targets (for TARGET_VARIANTS), and the skipped-pipeline test made once
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
+
+## New in test/stable2 (on top of test/stable1; freezes and lost one-shot work)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_XASYNC_CLEANUP_UNLOCKED` | `0` restores | ON | `XAsyncComplete` claims the call with an atomic flag and runs the provider's `OP_CLEANUP` (failed result or no result size) with no lock held; the `done` lock is taken only to publish the status after it. Held through the cleanup, a provider whose cleanup waits for the thread completing the same call (or one in a blocking `XAsyncGetStatus`) deadlocked with it: the title's async worker hung, and the game with it. A second completion or an `XAsyncCancel` after the claim leaves the call alone. | upstream Marvisak/VIctory #114 (Manuel Perez) via fxceless PR #1330 | no |
+| `VICTORY_PIPELINE_COMPUTE_WAIT` | ms; `0` restores | ON (10000) | a dispatch whose compute pipeline is still being made waits for it (until made, its compile found stuck, or the bound) instead of within the frame's 0.5-s budget; a dropped dispatch is not run again, so one-shot compute work (a character's skin set up once) stayed missing for the scene or the run (avatarmanz issue #75; "dropped N/frame without a host pipeline: compute ..." counts such drops). Each wait logged when it was long, dropped all the same, or at powers of two. Draws unchanged. | fxceless PR #1312 (Exopus-0x65f7ad0), bounded here | no |
+| `VICTORY_PIPELINE_COMPUTE_WAIT_FRAME_MS` | ms | 15000 | what all of one title frame's dispatches may wait in all under COMPUTE_WAIT (under the title's 30-s watchdog); past it, the frame's usual budget | ours | no |
 
 ## New in test/stable1 (on top of all22; long-session stability)
 | Switch | Values | Default | What it does | From | Shader |
