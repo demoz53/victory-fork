@@ -1,4 +1,8 @@
-# SWITCHES.md - every switch added since test/all14n, in test/all20
+# SWITCHES.md - every switch added since test/all14n, in test/all21
+
+`test/all21` = `test/all20` (14a67b11a) + merges, in this order, of test/heapw's tip (4e380920d: the crash fix of
+`VICTORY_HEAP_WORKER`, `resource::hold`), test/copies (bda62c82c) and test/waits (2c12a2d98, its tip when merged).
+No new default-on change: every all21 switch is opt-in, so the default-on list and the restore line are all20's.
 
 `test/all20` = `test/all19` (0045f4def) + merges, in this order, of test/small3 (ed9ad620b; based on all17) and
 test/locks (27c580714; based on all18). Two new default-on changes (rows 21 and 22 below): `VICTORY_HEAP_FORGET`
@@ -69,6 +73,18 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in all21 (merged on top of all20)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_STREAM_COPY` | `1` | off | refreshes into host copies and snapshots of shader-written ranges (4 KiB and more) written with AVX2 streaming stores, fault-safe (avatarmanz #98, Joly0) | test/copies (bda62c82c) | no |
+| `VICTORY_COPY_THREADS` | `2`-`8` | off | a refresh copy of 2 MiB or more cut into n pieces on a pool of its own (fast cores with FAST_CORES>=2); the caller waits for all | test/copies (bda62c82c) | no |
+| `VICTORY_GUARD_FIRST` | `1` | off | view memory the guards already hold goes to the guards without a failing write-watch call first (under the journal lock) | test/copies (bda62c82c) | no |
+| `VICTORY_TITLE_COPY_PLAIN` | `1` | off | the title's buffer copies done at submission (and copy-backs into title memory) are made in place, the kernel's copy only when a page stops it | test/copies (bda62c82c) | no |
+| `VICTORY_WAIT_STATS` | `1` | off | one line after the 5 s frame line: global UAV barriers a frame by cause (title groups, title barriers, clamps before/after, batched clamps, syncs, ours), one-resource UAV barriers, what the title's barrier groups hold, settles by why with ms standing, "title memory read" settles by reader, and the submitting thread's waits for staging, synchronous submissions and the submission lock | test/waits 8c87fc403 | no |
+| `VICTORY_CLAMP_WAITS` | `0` | full wait (as before) | the wait after each in-place indirect clamp is a UAV barrier on the list's budget buffer only (none if no record ran); the wait before stays | test/waits c61be0389 (lordon1a 32b5e420b, after Op-lite f748fb557a, Trexies 6b358fe83) | no |
+| `VICTORY_BARRIER_GROUPS` | `1` | off: KILLS THE GAME at this tip (2c12a2d98; the fix for barriers on textures without the unordered-access flag is not in all21): DO NOT SET | the title's barrier groups: no barrier when none of their barriers orders shader writes; UAV barriers on the named textures' host copies (and twins) when only textures do; one global barrier otherwise (any global or buffer barrier, a texture with no host copy) | test/waits f81db3d21 (after Marvisak PR #642, nathanbzrr 6264e86a6) | no |
+| `VICTORY_FILL_TITLE` | `1` | off | a fill of upload memory or title buffer copy of at most 64 KiB does not settle flights when the title wrote that view memory since a copy took it, or no shader write landed in its pages in 600 frames (bottom-of-pipe writes and read-backs still waited for) | test/waits 49337278e (avatarmanz 9fea7434c) | no |
+
 ## New in all20 (merged on top of all19)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
@@ -79,14 +95,6 @@ diagnostics-build switch).
 | `VICTORY_SDWA_SEXT` | `0` off | ON | a 16-bit operation's SDWA destination WORD_0 with UNUSED_SEXT sign-extends bit 15 into bits 31:16 (was zero-filled); reserved dst_unused 3 refused. | test/small3 c5dd98428 (Marvisak PR #3124, KainanP) | YES (in the cache key) |
 | `VICTORY_LOCK_STATS` | `1` | off | waits on the recording path's shared locks (slots, kept, ring, textures, heaps, views, buffers, placed, retired, submit), per lock, on the 5 s frame line; without it a lock is taken as before after one load of a once-set flag | test/locks adf68f33c | no |
 | `VICTORY_HEAP_LOCKS` | `1`; `alt` 20 s each way in turn (logged) | off | `HostHeap::made` read under the shared side of a reader-writer lock for slots already made, `descriptor::VIEWS` and `SHADER_HEAPS` read shared, `HostHeap::kept` cut into 64 locks; without it every path takes the writer side alone, as the one lock before | test/locks 27c580714 (fxceless 5d659e0c8, PR #1146 part 1) | no |
-
-## On test/waits (not merged yet)
-| Switch | Values | Default | What it does | From | Shader |
-|---|---|---|---|---|---|
-| `VICTORY_WAIT_STATS` | `1` | off | one line after the 5 s frame line: global UAV barriers a frame by cause (title groups, title barriers, clamps before/after, batched clamps, syncs, ours), one-resource UAV barriers, what the title's barrier groups hold, settles by why with ms standing, "title memory read" settles by reader, and the submitting thread's waits for staging, synchronous submissions and the submission lock | test/waits 8c87fc403 | no |
-| `VICTORY_CLAMP_WAITS` | `0` | full wait (as before) | the wait after each in-place indirect clamp is a UAV barrier on the list's budget buffer only (none if no record ran); the wait before stays | test/waits c61be0389 (lordon1a 32b5e420b, after Op-lite f748fb557a, Trexies 6b358fe83) | no |
-| `VICTORY_BARRIER_GROUPS` | `1` | off | the title's barrier groups: no barrier when none of their barriers orders shader writes; UAV barriers on the named textures' host copies (and twins) when only textures do; one global barrier otherwise (any global or buffer barrier, a texture with no host copy) | test/waits f81db3d21 (after Marvisak PR #642, nathanbzrr 6264e86a6) | no |
-| `VICTORY_FILL_TITLE` | `1` | off | a fill of upload memory or title buffer copy of at most 64 KiB does not settle flights when the title wrote that view memory since a copy took it, or no shader write landed in its pages in 600 frames (bottom-of-pipe writes and read-backs still waited for) | test/waits 49337278e (avatarmanz 9fea7434c) | no |
 
 ## New in all19 (merged on top of all18)
 | Switch | Values | Default | What it does | From | Shader |
@@ -167,10 +175,6 @@ set of shader switches translates once more.
 |---|---|---|---|---|---|
 | `VICTORY_LOOP_EXITS` | `0` off; unset or anything else on | ON (all15b: on only with `=1`) | wave64 compute programs test the loop iteration limit at the loop's own exits, not in the latch (removes the dark tiles on water) | test/lx (rule from all15b ec51e9045, darkworldhm 08fdf0b47) | YES |
 | `VICTORY_REFRESH_RANGES` | `1` | off | a submission's refresh ranges of a host copy are joined when within 64 KiB of each other (coarser than our default exact union; reviewer: unlikely to gain) | test/cxall | no |
-| `VICTORY_STREAM_COPY` | `1` | off | refreshes into host copies and snapshots of shader-written ranges (4 KiB and more) written with AVX2 streaming stores, fault-safe (avatarmanz #98, Joly0) | test/copies | no |
-| `VICTORY_COPY_THREADS` | `2`-`8` | off | a refresh copy of 2 MiB or more cut into n pieces on a pool of its own (fast cores with FAST_CORES>=2); the caller waits for all | test/copies | no |
-| `VICTORY_GUARD_FIRST` | `1` | off | view memory the guards already hold goes to the guards without a failing write-watch call first (under the journal lock) | test/copies | no |
-| `VICTORY_TITLE_COPY_PLAIN` | `1` | off | the title's buffer copies done at submission (and copy-backs into title memory) are made in place, the kernel's copy only when a page stops it | test/copies | no |
 | `VICTORY_BACK_BLOCKS` | `1` | off | copy-back writes only the 1 KiB blocks the merge changed, not the whole span (fewer write-watch echoes) | test/cxall | no |
 | `VICTORY_DECLARE_ONCE` | `1` | off | a list records the GPU-write declaration of one host copy and range once between refreshes, not at every dispatch | test/cxall | no |
 | `VICTORY_NAMED_WRITES` | `1` | off | raw-address stores copy back only the buffers the dispatch names; RISK: a store through a pointer loaded from memory into an unnamed copy is not copied back (test alone first) | test/cxall | no |
