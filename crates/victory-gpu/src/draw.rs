@@ -3675,7 +3675,7 @@ impl State {
     /// bound with, checks their formats and sizes, and records the passes.
     /// Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_PACKED, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3714,20 +3714,47 @@ impl State {
             let host = crate::resource::host_resource(resource as This)?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle(index)))
+            Some((desc, heap.gpu_handle(index), resource))
         };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
-            Role::Reflect => REFLECTIONS,
+            Role::Reflect => crate::ambient::reflections(),
         };
+        if role == Role::Reflect {
+            // What the two images `CS_UpdateHistory_*` may write are
+            // (`crate::ambient::REFLECTIONS_PACKED`), once: which of them the
+            // hold should act on.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                let what = |at| {
+                    entry(ResourceType::Uav, at).map(|(d, _, r)| {
+                        format!("format {} {}x{} title resource {r:#x}", d.Format.0, d.Width, d.Height)
+                    })
+                };
+                tracing::info!(
+                    at40 = ?what(REFLECTIONS),
+                    at48 = ?what(REFLECTIONS_PACKED),
+                    holds = ?crate::ambient::reflections(),
+                    "the images CS_UpdateHistory writes (VICTORY_AMBIENT_REFLECT_AT)"
+                );
+            });
+        }
+        if role == Role::Resolve {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                if let Some((d, _, r)) = entry(ResourceType::Uav, LIGHT) {
+                    tracing::info!(format = d.Format.0, resource = format!("{r:#x}"), "the resolve's diffuse light image");
+                }
+            });
+        }
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
             Role::Radiance | Role::Air | Role::Reflect => image,
         };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+        let (Some((of, image, _)), Some((seen, depth, _))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
