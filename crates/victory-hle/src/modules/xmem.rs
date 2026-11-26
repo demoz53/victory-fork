@@ -367,6 +367,15 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     committed: Box<[AtomicU64]>,
+    /// The section's size in bytes.
+    size: usize,
+    /// With [`kept_views`]: the whole section, mapped by the first
+    /// DirectStorage write into it and kept until the section goes; `None`
+    /// once the host refused that mapping.
+    kept: std::sync::OnceLock<Option<KeptBase>>,
+    /// Bytes `[from, from + len)` of the section, from its start, that live
+    /// views through the kept mapping hold ([`Section::hold`]).
+    holding: Mutex<Vec<(usize, usize)>>,
 }
 
 impl Section {
@@ -374,8 +383,132 @@ impl Section {
         Section {
             handle,
             committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            size: pages * PAGE,
+            kept: std::sync::OnceLock::new(),
+            holding: Mutex::new(Vec::new()),
         }
     }
+
+    /// Claims bytes `[from, from + len)` of the section for one view through
+    /// the kept mapping. False when a live one holds bytes that touch them:
+    /// the kept mapping is one address, so two writers share it only when
+    /// their bytes are apart; the second then takes a view of its own.
+    fn hold(&self, from: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let end = from.saturating_add(len);
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        if holding.iter().any(|&(at, bytes)| from < at.saturating_add(bytes) && at < end) {
+            return false;
+        }
+        holding.push((from, len));
+        true
+    }
+
+    /// Gives back what [`Section::hold`] claimed.
+    fn let_go(&self, from: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = holding.iter().position(|&held| held == (from, len)) {
+            holding.swap_remove(at);
+        }
+    }
+
+    /// The kept mapping of the whole section, mapped read-write the first
+    /// time it is asked for; `None` if the host refuses it (then every
+    /// write into the section keeps a view of its own, as without the
+    /// switch).
+    fn kept_base(&self) -> Option<*mut u8> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let kept = self.kept.get_or_init(|| {
+            // SAFETY: our section, mapped whole; `KeptBase` owns the view
+            // and unmaps it when the section goes.
+            let at = unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, 0) };
+            if at.Value.is_null() {
+                tracing::warn!(
+                    size = self.size,
+                    error = %std::io::Error::last_os_error(),
+                    "mapping a section of physical pages whole failed; its writes keep a view each (VICTORY_XMEM_PERSISTENT_VIEW)"
+                );
+                return None;
+            }
+            VIEW_COUNTS[V_KEPT_SECTIONS].fetch_add(1, Ordering::Relaxed);
+            Some(KeptBase(at.Value.cast()))
+        });
+        kept.as_ref().map(|base| base.0)
+    }
+}
+
+/// A section's kept mapping ([`kept_views`]), unmapped when the section
+/// goes rather than after every write.
+struct KeptBase(*mut u8);
+
+// SAFETY: a mapping may be written from any thread; writers through it hold
+// bytes of their own (`Section::hold`).
+unsafe impl Send for KeptBase {}
+// SAFETY: as above.
+unsafe impl Sync for KeptBase {}
+
+impl Drop for KeptBase {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        // SAFETY: our view, unmapped once (before the section's handle
+        // closes, which would not matter: a view keeps its section).
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0.cast() }) };
+    }
+}
+
+/// Whether DirectStorage writes into physical pages go through one kept
+/// mapping of each section (`VICTORY_XMEM_PERSISTENT_VIEW=1`; off by
+/// default) instead of a view mapped, committed and unmapped for every
+/// request and run of pages. Ported from fxceless/victory-fork PR #231 by
+/// HailLucifer666 (5c60b8906, df57b2899, 20d88e6fe, ad67d2557; GPL-3.0);
+/// the same idea in EFriseer's form there. Each view of ours took the
+/// process's address-space lock twice, which the title's own page remaps
+/// (`map_physical`, hundreds a frame while the world streams) take as well,
+/// and each unmap flushes every core's TLB. Measured there: DirectStorage
+/// requests over 250 ms 1,012 -> 1, 6.3 -> 8.8 fps, and the low-detail
+/// models in cutscenes went away. Costs address space only: the sections'
+/// whole size once more (commit is unchanged: a section's pages are
+/// committed once, whichever view commits them).
+fn kept_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = kept_views_of(std::env::var("VICTORY_XMEM_PERSISTENT_VIEW").ok().as_deref());
+        if on {
+            tracing::info!("physical pages are written through one kept view per section (VICTORY_XMEM_PERSISTENT_VIEW=1)");
+        }
+        on
+    })
+}
+
+/// [`kept_views`] for a value of the switch: on for `1`, `true`, `yes` or
+/// `on`, off for anything else or nothing.
+fn kept_views_of(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|v| {
+        v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("on")
+    })
+}
+
+/// Since the start, for the DirectStorage line (`dstorage`): views of ours
+/// mapped for one write, writes served through a section's kept view,
+/// writes that asked for the kept view and took one of their own (bytes
+/// held by another writer, or the host refused), sections mapped whole,
+/// commits made through kept views.
+static VIEW_COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+const V_MAPPED: usize = 0;
+const V_KEPT: usize = 1;
+const V_KEPT_FELL_BACK: usize = 2;
+const V_KEPT_SECTIONS: usize = 3;
+const V_KEPT_COMMITS: usize = 4;
+
+/// [`VIEW_COUNTS`]: views mapped for one write, writes through a kept view,
+/// kept views refused, sections kept whole, commits through kept views.
+pub(crate) fn view_counts() -> [u64; 5] {
+    std::array::from_fn(|i| VIEW_COUNTS[i].load(Ordering::Relaxed))
 }
 
 // SAFETY: a section handle may be used from any thread.
@@ -648,15 +781,43 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     1
 }
 
-/// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
-struct View {
-    at: MEMORY_MAPPED_VIEW_ADDRESS,
-    len: usize,
+/// A view of consecutive slices of one section, committed and writable:
+/// one of our own, unmapped when dropped, or bytes of the section's kept
+/// view ([`kept_views`]), which stays.
+enum View {
+    Own {
+        at: MEMORY_MAPPED_VIEW_ADDRESS,
+        len: usize,
+    },
+    /// Bytes `[from, from + len)` of the section (from its start), at `ptr`
+    /// in its kept view, held by this view ([`Section::hold`]) until it
+    /// drops. `within` is where they start in the view's first slice.
+    Kept {
+        section: Arc<Section>,
+        ptr: *mut u8,
+        from: usize,
+        len: usize,
+        within: usize,
+    },
+}
+
+/// A view for bytes `[within, within + len)` of the `n` slices from `slice`
+/// on: with `kept` (the switch, [`kept_views`], or forced by tests) the
+/// section's kept view if the host and the other writers allow, else one
+/// of our own.
+fn view_for(kept: bool, slice: &Slice, n: usize, within: usize, len: usize) -> Option<View> {
+    if kept {
+        if let Some(view) = View::kept(slice, n, within, len) {
+            VIEW_COUNTS[V_KEPT].fetch_add(1, Ordering::Relaxed);
+            return Some(view);
+        }
+        VIEW_COUNTS[V_KEPT_FELL_BACK].fetch_add(1, Ordering::Relaxed);
+    }
+    View::map(slice, n)
 }
 
 impl View {
-    /// Maps `n` slices from `slice` on.
+    /// Maps `n` slices from `slice` on, for one write.
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
@@ -673,23 +834,79 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        VIEW_COUNTS[V_MAPPED].fetch_add(1, Ordering::Relaxed);
+        let view = View::Own { at, len };
         commit_slices(slice, at.Value as usize, len).then_some(view)
     }
 
-    fn bytes(&mut self) -> &mut [u8] {
-        // SAFETY: the view holds `len` committed read-write bytes, ours
-        // alone while `self` lives (other views of the slices only alias
-        // them, as the console's do).
-        unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
+    /// Bytes `[within, within + len)` of the `n` slices from `slice` on,
+    /// through the section's kept view, their pages committed; `None` if
+    /// the host refuses the mapping or a commit, if another writer holds
+    /// bytes that touch them, or if they leave the slices or the section.
+    fn kept(slice: &Slice, n: usize, within: usize, len: usize) -> Option<View> {
+        let section = &slice.section;
+        let run = n.checked_mul(PAGE)?;
+        if within.checked_add(len)? > run || slice.index.checked_add(n)?.checked_mul(PAGE)? > section.size {
+            return None;
+        }
+        let base = section.kept_base()?;
+        let from = slice.index * PAGE + within;
+        if !section.hold(from, len) {
+            return None;
+        }
+        // Committed once a page, whichever view of the section does it.
+        if !slice.committed(n) {
+            // SAFETY: the slices lie inside the section (checked above), so
+            // inside its kept view.
+            let at = unsafe { base.add(slice.index * PAGE) };
+            if !commit(at as usize, run) {
+                section.let_go(from, len);
+                return None;
+            }
+            VIEW_COUNTS[V_KEPT_COMMITS].fetch_add(1, Ordering::Relaxed);
+            slice.note_committed(n);
+        }
+        Some(View::Kept {
+            section: section.clone(),
+            // SAFETY: `from + len` lies inside the section (checked above).
+            ptr: unsafe { base.add(from) },
+            from,
+            len,
+            within,
+        })
+    }
+
+    /// Bytes `[within, within + len)` of the view, counted from its first
+    /// slice's start; a kept view gives only the bytes it holds.
+    fn bytes_at(&mut self, within: usize, len: usize) -> &mut [u8] {
+        let (ptr, start, whole) = match self {
+            View::Own { at, len } => (at.Value.cast::<u8>(), 0, *len),
+            View::Kept { ptr, len, within, .. } => (*ptr, *within, *len),
+        };
+        assert!(
+            within >= start && within.checked_add(len).is_some_and(|end| end <= start + whole),
+            "bytes {within}+{len} outside a view holding {start}+{whole}"
+        );
+        // SAFETY: a view of our own holds `whole` committed read-write
+        // bytes, ours alone while `self` lives (other views of the slices
+        // only alias them, as the console's do); a kept view's bytes are
+        // committed and held by it alone (`Section::hold`), and the range
+        // asked for lies within them (asserted above).
+        unsafe { std::slice::from_raw_parts_mut(ptr.add(within - start), len) }
     }
 }
 
 impl Drop for View {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        match self {
+            View::Own { at, .. } => {
+                use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+                // SAFETY: our view.
+                unsafe { UnmapViewOfFile(*at) };
+            }
+            // The section's mapping stays; the bytes held go back.
+            View::Kept { section, from, len, .. } => section.let_go(*from, *len),
+        }
     }
 }
 
@@ -727,19 +944,25 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
-/// costs a map, a commit and an unmap (which flushes every core's TLB).
-/// False if a page is unknown or the host fails.
+/// costs a map, a commit and an unmap (which flushes every core's TLB);
+/// with [`kept_views`] no view at all, the bytes go through the section's
+/// kept view. False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    write_physical_with(kept_views(), pages, offset, data)
+}
+
+/// [`write_physical`], through kept views or not.
+fn write_physical_with(kept: bool, pages: &[usize], offset: usize, data: &[u8]) -> bool {
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let k = (n * PAGE - within).min(data.len() - done);
+        let Some(mut view) = view_for(kept, slice, *n, within, k) else {
             return false;
         };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        view.bytes_at(within, k).copy_from_slice(&data[done..done + k]);
         // The title's views of these pages show new bytes with no fault of
         // theirs: the guard over them is told (`victory_gpu`).
         victory_gpu::title_memory_written(slice.section.handle as usize, (slice.index * PAGE + within) as u64, k);
@@ -763,7 +986,7 @@ pub(crate) struct PageWindow {
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        self.view.bytes_at(within, len)
     }
 
     /// The bytes were written (or the write was tried): the title's views
@@ -781,13 +1004,18 @@ impl PageWindow {
 /// section into the next take that way too: decoded into a buffer, then
 /// copied, one view per section.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
+    page_window_with(kept_views(), pages, offset, len)
+}
+
+/// [`page_window`], through a kept view or not.
+fn page_window_with(kept: bool, pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
     let runs = runs(pages, offset, len)?;
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
     let within = offset % PAGE;
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: view_for(kept, slice, *n, within, len)?,
         within,
         len,
         section: slice.section.handle as usize,
@@ -2015,7 +2243,7 @@ mod tests {
     /// The bytes of one page, through a view of our own.
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
-        View::map(&slice, 1).expect("mapped").bytes().to_vec()
+        View::map(&slice, 1).expect("mapped").bytes_at(0, PAGE).to_vec()
     }
 
     #[test]
@@ -2422,5 +2650,128 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
         }
         assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
+    }
+    /// What a page number is: its section and index in it.
+    fn slice_of(page: usize) -> Slice {
+        physical().pages.get(&page).cloned().expect("known page")
+    }
+
+    #[test]
+    fn kept_views_switch_takes_only_a_yes() {
+        for yes in ["1", "true", "YES", " on "] {
+            assert!(kept_views_of(Some(yes)), "{yes:?}");
+        }
+        for no in ["", "0", "2", "off", "no", "yes!"] {
+            assert!(!kept_views_of(Some(no)), "{no:?}");
+        }
+        assert!(!kept_views_of(None));
+    }
+
+    /// Writes through the kept view land where views of our own put them,
+    /// map the section once, commit each page once and unmap nothing: the
+    /// second write goes through the same mapping.
+    #[test]
+    fn kept_views_write_once_mapped_and_commit_once() {
+        let pages = allocate(3);
+        let section = slice_of(pages[0]).section.clone();
+        assert!(section.kept.get().is_none(), "nothing kept before a write");
+        let data: Vec<u8> = (0..PAGE + 8).map(|i| (i * 11 % 251) as u8).collect();
+        let offset = PAGE - 8;
+        assert!(write_physical_with(true, &pages, offset, &data));
+        let base = section.kept_base().expect("mapped whole");
+        assert!(slice_of(pages[0]).committed(2), "both written pages committed");
+        assert!(!slice_of(pages[2]).committed(1), "not the page left alone");
+        let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
+        assert_eq!(seen[offset..offset + data.len()], data[..]);
+        assert!(seen[..offset].iter().all(|&b| b == 0));
+        assert!(seen[offset + data.len()..].iter().all(|&b| b == 0));
+        // Again: the first mapping, and still in place (a write through an
+        // unmapped one would fault).
+        let again: Vec<u8> = data.iter().map(|b| b ^ 0xff).collect();
+        assert!(write_physical_with(true, &pages, offset, &again));
+        assert_eq!(section.kept_base(), Some(base));
+        let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
+        assert_eq!(seen[offset..offset + data.len()], again[..]);
+        // Nothing is held once the writes are done.
+        assert!(section.holding.lock().unwrap().is_empty());
+        // Unknown pages and bad offsets are refused as before.
+        assert!(!write_physical_with(true, &[pages[0], 0x10], 0, &data[..PAGE + 1]));
+        assert!(!write_physical_with(true, &pages, usize::MAX, &data[..2]));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Views of our own never map the section whole: without the switch the
+    /// path is the one every run before used.
+    #[test]
+    fn own_views_never_keep_the_section() {
+        let pages = allocate(2);
+        let section = slice_of(pages[0]).section.clone();
+        let data: Vec<u8> = (0..2 * PAGE).map(|i| (i % 253) as u8).collect();
+        assert!(write_physical_with(false, &pages, 0, &data));
+        let mut window = page_window_with(false, &pages, 5, 7).expect("one run");
+        window.bytes().fill(1);
+        drop(window);
+        assert!(section.kept.get().is_none(), "the section was mapped whole");
+        let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
+        assert_eq!(seen[..5], data[..5]);
+        assert!(seen[5..12].iter().all(|&b| b == 1));
+        assert_eq!(seen[12..], data[12..]);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// A window on the kept view decodes in place and holds exactly its
+    /// bytes while it lives: a writer of other bytes in the same page shares
+    /// the mapping, one of the same bytes takes a view of its own.
+    #[test]
+    fn kept_windows_hold_their_bytes_only() {
+        let pages = allocate(2);
+        let slice = slice_of(pages[0]);
+        let mut window = page_window_with(true, &pages, 3, PAGE).expect("one run");
+        assert!(matches!(window.view, View::Kept { .. }));
+        assert_eq!(window.bytes().len(), PAGE);
+        window.bytes().fill(0xa5);
+        // Bytes [0, 3) of the same page do not touch the window's.
+        let before = View::kept(&slice, 1, 0, 3).expect("other bytes of the page");
+        // Bytes [PAGE + 2, PAGE + 4) touch its last byte: refused...
+        assert!(View::kept(&slice, 2, PAGE + 2, 2).is_none());
+        // ...and the write takes a view of its own instead.
+        let own = view_for(true, &slice, 2, PAGE + 2, 2).expect("a view of its own");
+        assert!(matches!(own, View::Own { .. }));
+        drop((before, own));
+        drop(window);
+        assert!(slice.section.holding.lock().unwrap().is_empty());
+        // Once the window is gone its bytes may be held again.
+        assert!(View::kept(&slice, 2, PAGE + 2, 2).is_some());
+        let (first, second) = (page_bytes(pages[0]), page_bytes(pages[1]));
+        assert!(first[..3].iter().all(|&b| b == 0));
+        assert!(first[3..].iter().all(|&b| b == 0xa5));
+        assert!(second[..3].iter().all(|&b| b == 0xa5));
+        assert!(second[3..].iter().all(|&b| b == 0));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// A kept view gives its own bytes and no others, and refuses runs that
+    /// leave the section.
+    #[test]
+    fn kept_views_refuse_bytes_they_do_not_hold() {
+        let pages = allocate(2);
+        let slice = slice_of(pages[0]);
+        let mut view = View::kept(&slice, 1, 5, 3).expect("three bytes");
+        assert_eq!(view.bytes_at(5, 3).len(), 3);
+        view.bytes_at(5, 3).copy_from_slice(&[1, 2, 3]);
+        for (within, len) in [(4, 1), (5, 4), (8, 1)] {
+            let outside = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| view.bytes_at(within, len).len()));
+            assert!(outside.is_err(), "{within}+{len} is not the view's");
+        }
+        drop(view);
+        let page = page_bytes(pages[0]);
+        assert_eq!((page[4], &page[5..8], page[8]), (0, &[1u8, 2, 3][..], 0));
+        // Past the run, past the section, and arithmetic that overflows.
+        assert!(View::kept(&slice, 1, PAGE - 1, 2).is_none());
+        assert!(View::kept(&slice, 3, 0, 1).is_none());
+        assert!(View::kept(&slice, usize::MAX, 0, 1).is_none());
+        assert!(View::kept(&slice, 1, usize::MAX, 2).is_none());
+        assert!(slice.section.holding.lock().unwrap().is_empty());
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
