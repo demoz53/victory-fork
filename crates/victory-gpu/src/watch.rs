@@ -206,6 +206,11 @@ fn land(j: &mut Journal, asking: u64) {
     }
 }
 
+/// Tests: called once by the next unlocked asking from the page given,
+/// right after it is in flight, before its kernel call or guards' check.
+#[cfg(test)]
+static AFTER_REGISTER: Mutex<Option<(usize, fn())>> = Mutex::new(None);
+
 thread_local! {
     /// [`unlocked`]: room for a kernel answer asked with the journal's
     /// lock let go.
@@ -1124,6 +1129,17 @@ fn writes_unlocked(
     let now = held.asked;
     held.flying.push((first, last, now));
     drop(held);
+    #[cfg(test)]
+    {
+        let mut hook = AFTER_REGISTER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((page, run)) = *hook
+            && page == first
+        {
+            *hook = None;
+            drop(hook);
+            run();
+        }
+    }
     // The lock let go: the kernel, else the guards.
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -1181,6 +1197,14 @@ fn writes_unlocked(
     }
     let mut held = journal();
     land(&mut held, now);
+    // What it found is noted, and answered, under a number taken now, above
+    // every one given while it was in flight: an answer given meanwhile
+    // without waiting for it (by the light refresh's bits) may hold a page
+    // that the title wrote after that answer, and that this asking found;
+    // noted under the number it was given in flight, below that answer's,
+    // the page would never be taken again by that copy (found in test/watch6).
+    held.asked += 1;
+    let now = held.asked;
     if found.is_none() && viewed.is_none() {
         return None;
     }
@@ -4823,6 +4847,42 @@ pub(crate) mod tests {
         assert!(!placeholder(plain / BLOCK));
         // SAFETY: ours.
         unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_JOURNAL_UNLOCKED` with the light refresh: an asking in flight
+    /// finds a write made after an answer the bits gave meanwhile (with no
+    /// wait for it); it notes the page above that answer's number, so that
+    /// copy takes it again.
+    #[test]
+    fn a_write_after_an_answer_by_the_bits_is_noted_above_it() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        static AT: AtomicUsize = AtomicUsize::new(0);
+        static ANSWERED: AtomicU64 = AtomicU64::new(0);
+        let _turn = light_turn();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        forget_pages(one, one + SIZE);
+        // Guarded, clean, known by the bits.
+        assert!(writes_as(one, one + SIZE, true, 2, false, false).is_some());
+        assert!(known(one, one + SIZE));
+        AT.store(one, Ordering::SeqCst);
+        fn meanwhile() {
+            let at = AT.load(Ordering::SeqCst);
+            let (n, _) = writes_as(at, at + 2 * BLOCK, true, 2, false, false).expect("a view");
+            ANSWERED.store(n, Ordering::SeqCst);
+            // The title writes the block after that answer.
+            // SAFETY: inside the test's view; the write faults and opens it.
+            unsafe { ((at + 8) as *mut u8).write_volatile(1) };
+        }
+        *AFTER_REGISTER.lock().unwrap_or_else(|e| e.into_inner()) = Some((one / PAGE, meanwhile));
+        assert!(writes_as(one, one + SIZE, true, 0, false, true).is_some());
+        let stamp = journal().written.get(&(one / PAGE)).copied().unwrap_or(0);
+        drop_views(section, &[one, two], SIZE);
+        forget_pages(one, one + SIZE);
+        forget_pages(two, two + SIZE);
+        let answered = ANSWERED.load(Ordering::SeqCst);
+        assert!(answered != 0, "the hook ran");
+        assert!(stamp > answered, "noted at {stamp}, an answer by the bits gave {answered}");
     }
 
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
