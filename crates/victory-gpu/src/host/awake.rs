@@ -15,6 +15,25 @@
 //!
 //! Ported from avatarmanz/VIctory-7900XTX (commits 5f86fa302 and 040aa272c,
 //! GPL-3.0-or-later, as this), without its replay options.
+//!
+//! MEASURED ON THIS PROJECT'S RTX 4060 Ti: IT COSTS. The test
+//! `paced_submissions_with_and_without_the_card_kept_awake` (2026-11-25,
+//! while a game test ran beside it, so not on a quiet card), the median
+//! submission of 60, on a queue of its own:
+//!
+//! | work     | in one go | 1.5 ms apart | awake, 400,000 steps | awake, 4,000 steps |
+//! |----------|-----------|--------------|----------------------|--------------------|
+//! | 0.13 ms  | 0.13      | 0.20         | 1.50 apart, 2.19 go  | 0.34 apart, 0.41 go |
+//! | 1.56 ms  | 1.56      | 1.61         | 5.65 apart, 5.51 go  | 2.23 apart, 2.64 go |
+//!
+//! Standing idle for 1.5 ms between submissions cost this card 0.05-0.07 ms
+//! a submission whatever the work (a delay, not lower clocks; the other
+//! process may have kept the clocks up). The counting pass did not take "one
+//! or two wave slots" beside the work: the card ran the two queues in turns,
+//! and work of 1.56 ms took 5.5 ms. So on this card the switch is expected
+//! to slow the frame, as it stands, and the other fork's own runs on this PC
+//! had it on. It stays off; `VICTORY_CARD_AWAKE_STEPS` and the measurement
+//! are there to look again on a quiet card.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,7 +44,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
-/// About 2 ms at full clocks: 500 sends a second.
+/// The counting pass; `STEPS` stands for [`steps`].
 const COUNT: &str = r#"
 #define RS "UAV(u0)"
 RWByteAddressBuffer sum : register(u0);
@@ -33,10 +52,30 @@ RWByteAddressBuffer sum : register(u0);
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x;
-    [loop] for (uint i = 0; i < 400000u; i++) x = x * 1664525u + 1013904223u;
+    [loop] for (uint i = 0; i < STEPSu; i++) x = x * 1664525u + 1013904223u;
     sum.Store(id.x * 4u, x);
 }
 "#;
+
+/// The other fork's pass: about 2 ms at full clocks, 500 sends a second.
+const STEPS: u32 = 400_000;
+
+/// `VICTORY_CARD_AWAKE_STEPS` (1,000 to 4,000,000; else [`STEPS`]).
+fn steps_of(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse().ok()).filter(|n| (1_000..=4_000_000).contains(n)).unwrap_or(STEPS)
+}
+
+/// How long a counting pass counts (`VICTORY_CARD_AWAKE_STEPS`; 400,000 as
+/// in the other fork). A submission that arrives while a pass counts may
+/// have to wait for the whole pass where the card runs a second queue's work
+/// in turns with the first and not beside it; the measurement
+/// `paced_submissions_with_and_without_the_card_kept_awake` says what this
+/// card does. A shorter pass holds a submission up for less; whether it
+/// still keeps the clocks up is for the same measurement on a quiet card.
+fn steps() -> u32 {
+    static STEPS_ASKED: OnceLock<u32> = OnceLock::new();
+    *STEPS_ASKED.get_or_init(|| steps_of(std::env::var("VICTORY_CARD_AWAKE_STEPS").ok().as_deref()))
+}
 
 /// Quiet this long after the last submission.
 const QUIET_MS: u64 = 250;
@@ -97,7 +136,7 @@ pub(super) fn sent(device: &ID3D12Device) {
     STARTED.call_once(|| {
         tracing::info!("the card's clocks are kept up between submissions (VICTORY_CARD_AWAKE)");
         // Runs as long as the process does.
-        std::mem::forget(start(device, wanted));
+        std::mem::forget(start(device, steps(), wanted));
     });
 }
 
@@ -119,15 +158,15 @@ impl Drop for Awake {
     }
 }
 
-/// Keeps the card of `device` busy while `wanted`.
-fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 'static) -> Option<Awake> {
+/// Keeps the card of `device` busy while `wanted`, with passes of `steps`.
+fn start(device: &ID3D12Device, steps: u32, wanted: impl Fn() -> bool + Send + 'static) -> Option<Awake> {
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let passes = std::sync::Arc::new(AtomicU64::new(0));
     let (device, ended, sent) = (device.clone(), stop.clone(), passes.clone());
     let thread = std::thread::Builder::new()
         .name("victory-card-awake".into())
         .spawn(move || {
-            if let Err(e) = run(&device, &wanted, &ended, &sent) {
+            if let Err(e) = run(&device, steps, &wanted, &ended, &sent) {
                 tracing::warn!(error = %e, "the card is not kept awake");
             }
         })
@@ -140,8 +179,15 @@ fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 'static) -> O
     })
 }
 
-fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool, passes: &AtomicU64) -> windows::core::Result<()> {
-    let code = super::compile(COUNT, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+fn run(
+    device: &ID3D12Device,
+    steps: u32,
+    wanted: &dyn Fn() -> bool,
+    stop: &AtomicBool,
+    passes: &AtomicU64,
+) -> windows::core::Result<()> {
+    let source = COUNT.replace("STEPS", &steps.to_string());
+    let code = super::compile(&source, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
     // SAFETY: plain object creation; the code lives through the calls, the
     // root signature is inside it. Two closed lists, sent in turn, whose
     // objects live until what was sent last has run.
@@ -238,6 +284,14 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_counts_as_long_as_the_other_forks_unless_a_length_in_bounds_is_asked() {
+        assert_eq!(steps_of(None), STEPS);
+        assert_eq!(steps_of(Some("4000")), 4_000);
+        assert_eq!(steps_of(Some("12")), STEPS);
+        assert_eq!(steps_of(Some("many")), STEPS);
+    }
+
+    #[test]
     fn the_card_is_left_alone_before_the_first_submission_and_after_a_quiet_while() {
         assert!(!wanted_at(Mode::On, 0, 5));
         assert!(wanted_at(Mode::On, 1001, 1000));
@@ -256,7 +310,7 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
-        let awake = start(&host.device, || true).expect("a thread");
+        let awake = start(&host.device, STEPS, || true).expect("a thread");
         let (seen, back) = host.shared_buffer(4096).unwrap();
         let (from, data) = host.shared_buffer(4096).unwrap();
         // SAFETY: mappings of 4096 bytes; a list, a queue and a fence of the
@@ -292,6 +346,120 @@ mod tests {
         }
         assert!(awake.passes.load(Ordering::Relaxed) >= 3, "no counting passes were sent");
         drop(awake);
+        // SAFETY: a plain query of the device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Compute work over the whole card; `STEPS` stands for how long each of
+    /// its million threads counts.
+    const WORK: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer sums : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint x = id.x;
+    [loop] for (uint i = 0; i < STEPSu; i++) x = x * 1664525u + 1013904223u;
+    sums.Store(id.x * 4u, x);
+}
+"#;
+
+    /// Sends the same work (`work` steps a thread) `n` times on a queue of
+    /// the test's own, each time waiting for the card and then standing idle
+    /// for `gap`: the milliseconds the card took for all of them, and for
+    /// the slowest half's fastest (the median).
+    fn paced(host: &crate::host::Host, work: u32, n: usize, gap: Duration) -> (f64, f64) {
+        const THREADS: u64 = 64 * 16_384;
+        let source = WORK.replace("STEPS", &work.to_string());
+        let code = crate::host::compile(&source, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
+        let sums = host.uav_buffer(THREADS * 4).unwrap();
+        let device = &host.device;
+        // SAFETY: objects of the test's own; a closed list is sent again only
+        // after the card has run it.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso).unwrap();
+            list.SetComputeRootSignature(&root);
+            list.SetComputeRootUnorderedAccessView(0, sums.GetGPUVirtualAddress());
+            list.Dispatch(16_384, 1, 1);
+            list.Close().unwrap();
+            let lists = [Some(list.cast::<ID3D12CommandList>().unwrap())];
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut took = Vec::with_capacity(n);
+            for i in 0..n as u64 {
+                let sent = std::time::Instant::now();
+                queue.ExecuteCommandLists(&lists);
+                queue.Signal(&fence, i + 1).unwrap();
+                // No event: returns when the fence is there.
+                fence.SetEventOnCompletion(i + 1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+                took.push(sent.elapsed().as_secs_f64() * 1e3);
+                // Idle as the card is while a submission is prepared (the CPU is not).
+                let idle = std::time::Instant::now();
+                while idle.elapsed() < gap {
+                    std::hint::spin_loop();
+                }
+            }
+            let all = took.iter().sum();
+            took.sort_by(f64::total_cmp);
+            (all, took[n / 2])
+        }
+    }
+
+    /// A measurement, not a check: what the same work costs this card sent
+    /// in one go and sent with the card idle for 1.5 ms between submissions
+    /// (as between the title's), for light work (256 steps a thread) and
+    /// heavier (8,192): a card that lowers its clocks takes longer apart
+    /// than in one go, and by more for the heavier work (a fixed delay is
+    /// the same for both). Then the same with the card kept awake, by the
+    /// other fork's pass and by one a hundredth as long: these say whether
+    /// keeping it awake brings the time back, and what a pass costs a
+    /// submission that has to wait for it.
+    ///
+    /// On a quiet card, in a process of its own:
+    /// `cargo test -p victory-gpu --lib paced_submissions -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement: wants a quiet card and a process of its own"]
+    fn paced_submissions_with_and_without_the_card_kept_awake() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const N: usize = 60;
+        let gap = Duration::from_micros(1500);
+        for work in [256, 8_192] {
+            paced(host, work, 20, Duration::ZERO); // the pipeline is made, the card is up
+            let mut rows = vec![
+                ("in one go".to_owned(), paced(host, work, N, Duration::ZERO)),
+                ("1.5 ms apart".to_owned(), paced(host, work, N, gap)),
+            ];
+            for pass in [STEPS, STEPS / 100] {
+                let awake = start(&host.device, pass, || true).expect("a thread");
+                std::thread::sleep(Duration::from_millis(50));
+                rows.push((format!("1.5 ms apart, awake by passes of {pass} steps"), paced(host, work, N, gap)));
+                rows.push((format!("in one go, awake by passes of {pass} steps"), paced(host, work, N, Duration::ZERO)));
+                drop(awake);
+            }
+            for (what, (all, median)) in rows {
+                eprintln!("work of {work} steps, {N} submissions {what}: {all:.1} ms on the card, {median:.2} ms the median one");
+            }
+        }
         // SAFETY: a plain query of the device.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
