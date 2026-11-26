@@ -108,6 +108,9 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_LOCAL_ANY_MASKS",
                     "VICTORY_HEAP_HANDLE_LOCAL",
                     "VICTORY_HEAP_BELOW_ZERO",
+                    // Which programs run a console thread group as several host
+                    // groups, and so what their dispatches' z is multiplied by.
+                    "VICTORY_GROUP_SPLIT",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -381,6 +384,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, dword);
     }
+    word(&mut out, s.group_split);
     out
 }
 
@@ -454,6 +458,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<HostShader> {
     for _ in 0..n {
         half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
+    let group_split = r.word().filter(|n| (1..=victory_shader::emit::MAX_GROUP_SPLIT).contains(n))?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -465,6 +470,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         half_views,
+        group_split,
     })
 }
 
@@ -500,6 +506,9 @@ mod tests {
                 shift: 5,
             }],
             half_views: vec![(0, 8), (4, 0)],
+            // (a compute program split in two host groups a console group would say 2;
+            // any value in range comes back as stored)
+            group_split: 2,
         }
     }
 

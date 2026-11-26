@@ -375,6 +375,11 @@ pub struct HostShader {
     /// time keeps the float path (its slot, and so its format, is known only
     /// then). (fxceless #927 by tippythetaidum.)
     pub half_views: Vec<(u8, u32)>,
+    /// Compute: host thread groups per console thread group. A console group of `n` 64-lane
+    /// waves that share nothing runs as `n` host groups of one console wave each, numbered
+    /// along z (`VICTORY_GROUP_SPLIT`, [`group_split_on`]): the host multiplies the z of
+    /// each of the program's dispatches by it. 1: as the console's.
+    pub group_split: u32,
 }
 
 impl HostShader {
@@ -840,7 +845,9 @@ thread_local! {
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
 /// it translates or a branch cannot be widened. Only where a thread group is one console
 /// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// such a branch would wait for threads that never come. (With [`group_split_on`], a group of
+/// several console waves that share nothing is run as one host group per wave, and so
+/// qualifies.)
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -855,6 +862,25 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && host_uses_wave32()) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // Waves of one group that share nothing (no LDS, no barrier) never meet on the
+        // console either: each runs as its own host group ([`lower::with_group_split`]).
+        // (Corgansm/victory-corgi's group split.)
+        crate::native::StageIo::Cs(cs)
+            if group_split_on()
+                && cs.threads.iter().product::<u32>() > 64
+                && cs.threads.iter().product::<u32>().is_multiple_of(64)
+                && cs.threads.iter().product::<u32>() / 64 <= MAX_GROUP_SPLIT
+                && cs.lds_bytes() == 0
+                && !p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier") =>
+        {
+            if why {
+                eprintln!(
+                    "WAVE64-WIDE thread groups of {:?} split into one host group per console wave (VICTORY_GROUP_SPLIT)",
+                    cs.threads
+                );
+            }
+            return lower::with_group_split(|| widen_loop(c, native, p, why));
+        }
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -863,6 +889,46 @@ fn widen(
         }
         _ => return Err(NOT),
     }
+    widen_loop(c, native, p, why)
+}
+
+/// The most host groups a console group is split into ([`HostShader::group_split`]): the
+/// host's indirect clamp carries the factor in eight bits, and the cache refuses more.
+pub const MAX_GROUP_SPLIT: u32 = 16;
+
+/// `VICTORY_GROUP_SPLIT=1` (off by default): a console wave64 compute program on a host of
+/// 32-lane waves whose thread groups hold several console waves that share nothing (no LDS,
+/// no `s_barrier`) may take the wave-wide form ([`widen`]) with each console wave run as a
+/// host thread group of its own ([`lower::with_group_split`]). Without it such a program is
+/// refused that form ("thread groups of several console waves") and, where no other form
+/// takes it, does not translate, so its dispatches are dropped: the water tile-mask writer
+/// `f133e35efed2a48a` (groups of 8 x 16 threads) is one. The forms and their order are as
+/// before for every program the switch does not let into [`widen`]. Part of the translation:
+/// the shader cache keys on it (`victory-gpu`'s does), and the host multiplies the z of the
+/// program's dispatches by [`HostShader::group_split`]. (Ported from Corgansm/victory-corgi,
+/// where it is on by default.)
+pub fn group_split_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GROUP_SPLIT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_SPLIT").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_GROUP_SPLIT`, for its thread only.
+    pub(crate) static TEST_GROUP_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`widen`]'s rounds: `p` translated with more and more of its branches taken wave-wide.
+fn widen_loop(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
@@ -1077,6 +1143,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: l.half_views,
+        group_split: l.group_split,
     };
     Ok((shader, wave_size))
 }
@@ -1638,6 +1705,7 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            group_split: 1,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1651,6 +1719,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                group_split: 1,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2131,6 +2200,7 @@ mod tests {
                 root_uavs: l.root_uavs.clone(),
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                group_split: 1,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2329,6 +2399,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                group_split: 1,
             };
             // 32 dwords = 128 bytes = 8 elements of stride 16.
             let data: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
@@ -2798,6 +2869,7 @@ mod barycentric_tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            group_split: 1,
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.

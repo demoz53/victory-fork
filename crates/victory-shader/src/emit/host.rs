@@ -646,6 +646,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
+        group_split: 1,
     }
 }
 

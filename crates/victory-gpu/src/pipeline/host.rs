@@ -649,6 +649,16 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    /// Compute: host thread groups per console thread group, along z
+    /// (`victory_shader::emit::HostShader::group_split`, `VICTORY_GROUP_SPLIT`): what
+    /// the z of its dispatches is multiplied by. 1 for graphics.
+    pub(crate) fn group_split(&self) -> u32 {
+        if !self.compute {
+            return 1;
+        }
+        self.stages.first().map_or(1, |s| s.translated().host.group_split.max(1))
+    }
+
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {

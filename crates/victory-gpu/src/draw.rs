@@ -2828,6 +2828,22 @@ impl State {
             }
             return;
         }
+        // A console group of several waves the translation split into one host group
+        // per wave (`HostPipeline::group_split`, `VICTORY_GROUP_SPLIT`): z counts the
+        // waves too.
+        let split = p.group_split();
+        let gz = if split > 1 {
+            match gz.checked_mul(split).filter(|&z| z <= 65535) {
+                Some(z) => z,
+                None => {
+                    once!(z = gz, split, "a split dispatch past 65535 groups along z dropped");
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        } else {
+            gz
+        };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
         // SAFETY: an open list with everything set.
@@ -3933,7 +3949,11 @@ impl State {
                 let bounded = if kind == DISPATCH {
                     let this = self.pipeline as This;
                     crate::indirect::note_watched(|| crate::pipeline::shaders_label(this), arguments, count);
-                    crate::indirect::with_dispatch(|| crate::pipeline::shaders_label(this), bound)
+                    // (a program split into one host group per console wave: the clamp
+                    // multiplies each record's z, `HostPipeline::group_split`)
+                    crate::indirect::with_split(p.group_split(), || {
+                        crate::indirect::with_dispatch(|| crate::pipeline::shaders_label(this), bound)
+                    })
                 } else {
                     bound()
                 };
@@ -4018,8 +4038,10 @@ impl State {
                 break;
             };
             let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-            let rest = crate::indirect::with_part(n, || {
-                crate::indirect::bound_at(list, (&args.buffer, offset), count_arg, (kind, stride, max), (at, 0))
+            let rest = crate::indirect::with_split(p.group_split(), || {
+                crate::indirect::with_part(n, || {
+                    crate::indirect::bound_at(list, (&args.buffer, offset), count_arg, (kind, stride, max), (at, 0))
+                })
             });
             if let Some(rest) = rest {
                 self.host_pipeline = 0;

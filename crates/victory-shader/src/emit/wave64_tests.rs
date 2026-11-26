@@ -133,6 +133,7 @@ fn lowered_on(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: Vec::new(),
+        group_split: 1,
     })
 }
 
@@ -1281,6 +1282,7 @@ fn wave32_pixel_shader_runs_as_32_lane_halves_on_wave64_hosts() {
         root_uavs: lowered.root_uavs,
         root_indexed_views: vec![],
         half_views: Vec::new(),
+        group_split: 1,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = ps.dxil.clone();
@@ -1355,6 +1357,7 @@ fn wave32_pixel_shader_runs_as_32_lane_halves_on_wave64_hosts() {
             root_uavs: vl.root_uavs,
             root_indexed_views: vec![],
             half_views: Vec::new(),
+            group_split: 1,
         }
     };
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -1529,6 +1532,7 @@ fn spilled_compute_masks_partial_dispatch_threads_on_wave64_and_wave32() {
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views.clone(),
             half_views: Vec::new(),
+            group_split: 1,
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();
@@ -1644,4 +1648,139 @@ fn a_program_with_all_32_kib_of_lds_keeps_within_it_on_32_lane_waves() {
     let lanes: Vec<u32> = (0..64).collect();
     assert_eq!(&out[0][..64], &lanes[..], "each console thread through its own LDS dword");
     eprintln!("ran on the hardware device: 32 KiB of LDS and the borrowed counter");
+}
+
+/// [`FIRST_LANE_ROUNDS`] for a thread group of two console waves (128 threads), with the
+/// group id z (TGID_Z_EN, in s5) in the address and in the value: lane L of each console wave
+/// (thread t, L = t & 63) runs L rounds, each adding the number of the first lane of its
+/// console wave still in the loop, and stores `z << 16 | 1 + 2 + ... + L` at dword
+/// `z * 128 + t`. `rows`: the group as 8 x 16 threads (the thread id in v0 and v1, as the
+/// title's water mask writers have it) instead of 128 x 1.
+fn two_wave_rounds(rows: bool) -> NativeProgram {
+    let mut native = native_of(&[], true, 128);
+    let mut words = vec![
+        0x7E10_0205, // v_mov_b32 v8, s5 (the group id z)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+        125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+    ];
+    if rows {
+        words.extend_from_slice(&[
+            0x3416_0283, // v_lshlrev_b32 v11, 3, v1 (y * 8)
+            0x3800_010B, // v_or_b32 v0, v11, v0 (the thread's index in the group)
+        ]);
+    }
+    words.extend_from_slice(&[
+        0x7E02_0280, // v_mov_b32 v1, 0 (the sum)
+        0x3604_00BF, // v_and_b32 v2, 63, v0 (rounds left: the lane in its console wave)
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7D8A_0480, // loop: v_cmp_ne_u32 vcc, 0, v2
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF88_0004, // s_cbranch_execz done
+        0xBE87_147E, // s_ff1_i32_b64 s7, exec
+        0x4A02_0207, // v_add_nc_u32 v1, s7, v1
+        0x4E04_0481, // v_subrev_nc_u32 v2, 1, v2
+        0xBF82_FFF9, // s_branch loop
+        0xBEFE_040C, // done: s_mov_b64 exec, s[12:13]
+        0x3412_1087, // v_lshlrev_b32 v9, 7, v8 (z * 128)
+        0x3812_0109, // v_or_b32 v9, v9, v0
+        0x3406_1282, // v_lshlrev_b32 v3, 2, v9 (the thread's byte)
+        0x3414_1090, // v_lshlrev_b32 v10, 16, v8
+        0x3802_030A, // v_or_b32 v1, v10, v1 (z << 16 | sum)
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 3, // buffer_store_dword v1, v3, s[8:11], 0 offen
+        S_ENDPGM,
+    ]);
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 9; // TGID_Z_EN: the group id z after the user SGPRs
+        if rows {
+            cs.threads = [8, 16, 1];
+            cs.rsrc2 |= 1 << 11; // two thread id components, v0 and v1
+        }
+    }
+    native
+}
+
+/// `VICTORY_GROUP_SPLIT` (off by default; Corgansm/victory-corgi's group split): a console
+/// wave64 program whose thread group holds two console waves that share nothing (no LDS, no
+/// barrier) and that needs the wave-wide form ([`two_wave_rounds`]: a first-lane number in a
+/// lane loop). Without the switch the wave-wide form is refused it ("thread groups of
+/// several console waves") and it takes an approximate form or none, translated as before;
+/// with it each console wave runs as a host group of its own (64 threads, two host waves of
+/// 32 that meet inside the loop), `group_split` says 2, and on a card of 32-lane waves every
+/// thread of every console group gets the console's sum, at its console thread and group
+/// ids, when the dispatch's z is doubled.
+#[test]
+fn a_group_of_two_console_waves_is_split_into_a_host_group_per_wave() {
+    for rows in [false, true] {
+        let native = two_wave_rounds(rows);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let io = io::raise(&p, &native).expect("io");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+        let empty_bytes = crate::dxbc::build(&[]);
+        let empty = crate::Container::parse(&empty_bytes).unwrap();
+        let run = |split: Option<bool>| {
+            let was = lower::TEST_HOST_WAVE.replace(Some(32));
+            let was_split = super::TEST_GROUP_SPLIT.replace(split);
+            let r = super::emit(&empty, &native, &p, &st, &io, &res);
+            super::TEST_GROUP_SPLIT.set(was_split);
+            lower::TEST_HOST_WAVE.set(was);
+            r
+        };
+        // off, and unset (the default): the same translation, or the same refusal
+        let (off, unset) = (run(Some(false)), run(None));
+        assert_eq!(off.as_ref().ok().map(|s| &s.dxil), unset.as_ref().ok().map(|s| &s.dxil), "off is the default");
+        assert_eq!(off.is_ok(), unset.is_ok());
+        if let Ok(off) = &off {
+            assert_eq!(off.group_split, 1, "not split without the switch");
+        }
+        let on = run(Some(true)).expect("split, it takes the wave-wide form");
+        assert_eq!(on.group_split, 2, "one host group per console wave");
+        assert_ne!(psv0_wave(&on), (64, 64), "on 32-lane waves");
+        assert_ne!(off.as_ref().ok().map(|s| &s.dxil), Some(&on.dxil));
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = on.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        const GROUPS: u32 = 3;
+        let console: Vec<u32> = (0..GROUPS * 128)
+            .map(|i| {
+                let (z, lane) = (i / 128, i % 64);
+                (z << 16) | (lane * (lane + 1) / 2)
+            })
+            .collect();
+        let on_card = |shader: &HostShader| {
+            let (root, pso) = host.compute_pipeline(shader).ok()?;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                        views: &[View::RawUav(GROUPS * 128)],
+                        samplers: &[],
+                        // (as the host does: z counts the console waves too)
+                        groups: [1, 1, GROUPS * shader.group_split],
+                    },
+                )
+                .expect("dispatch the rounds");
+            Some(out[0][..(GROUPS * 128) as usize].to_vec())
+        };
+        let Some(split) = on_card(&on) else {
+            eprintln!("the hardware device does not take this program (waves of 32?); not run");
+            return;
+        };
+        assert_eq!(split, console, "rows {rows}: every thread of every console group the console's sum");
+        if let Some(whole) = off.as_ref().ok().and_then(on_card) {
+            assert_ne!(whole, console, "rows {rows}: the form taken without the split is not the console's");
+        }
+        eprintln!("ran on the hardware device (rows {rows}): split groups gave every thread the console's sum");
+    }
 }
