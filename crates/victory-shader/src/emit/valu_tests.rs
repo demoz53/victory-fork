@@ -851,6 +851,152 @@ fn float_compares_that_are_always_false_or_true() {
     }
 }
 
+/// The console's answer for float compare `op` (the RDNA2 `v_cmp_<op>_*` suffix): the
+/// ordered ones are false and the unordered ones (`u`, `n*`) true when either operand is a
+/// NaN. `None` for the two constants.
+fn console_float_compare(op: &str, a: f32, b: f32) -> Option<bool> {
+    let nan = a.is_nan() || b.is_nan();
+    Some(match op {
+        "lt" => !nan && a < b,
+        "eq" => !nan && a == b,
+        "le" => !nan && a <= b,
+        "gt" => !nan && a > b,
+        "lg" => !nan && a != b,
+        "ge" => !nan && a >= b,
+        "o" => !nan,
+        "u" => nan,
+        "nge" => nan || a < b,
+        "nlg" => nan || a == b,
+        "ngt" => nan || a <= b,
+        "nle" => nan || a > b,
+        "neq" => nan || a != b,
+        "nlt" => nan || a >= b,
+        _ => return None,
+    })
+}
+
+/// The fourteen float compares that are not constants, by their RDNA2 suffix, with the
+/// VOP3 opcodes of the f32 and the f16 forms.
+const FLOAT_COMPARES: [(&str, u16, u16); 14] = [
+    ("lt", 0x001, 0x0c9),
+    ("eq", 0x002, 0x0ca),
+    ("le", 0x003, 0x0cb),
+    ("gt", 0x004, 0x0cc),
+    ("lg", 0x005, 0x0cd),
+    ("ge", 0x006, 0x0ce),
+    ("o", 0x007, 0x0cf),
+    ("u", 0x008, 0x0e8),
+    ("nge", 0x009, 0x0e9),
+    ("nlg", 0x00a, 0x0ea),
+    ("ngt", 0x00b, 0x0eb),
+    ("nle", 0x00c, 0x0ec),
+    ("neq", 0x00d, 0x0ed),
+    ("nlt", 0x00e, 0x0ee),
+];
+
+/// Runs every float compare, f32 and f16, of v1 with v2 and of v1 with itself (the title's
+/// NaN test `x != x`, `v_cmp_u x, x`) on NaNs (quiet, signalling, negative, NVIDIA's
+/// 0x7FFFFFFF), infinities, zeros of both signs and ordinary numbers, with `VICTORY_NAN_EXACT`
+/// as `exact` says; returns the wrong answers per device, as "device: compare (a, b) = got".
+fn float_compare_mistakes(exact: bool) -> Vec<String> {
+    let f = f32::to_bits;
+    let f32_values = [
+        f32::NAN.to_bits(),
+        0x7F80_0001, // signalling
+        0xFFC0_0000, // negative quiet
+        0x7FFF_FFFF, // the NaN NVIDIA's own operations make
+        f32::INFINITY.to_bits(),
+        f(-0.0),
+        f(1.0),
+    ];
+    let f16_values: [u32; 6] = [0x7E00, 0x7C01, 0xFE00, 0x7C00, 0x8000, 0x3C00];
+    let half = |h: u32| f16_to_f32(h as u16);
+    let mut mistakes = Vec::new();
+    let was = lower::TEST_NAN_EXACT.replace(Some(exact));
+    for f16 in [false, true] {
+        let values: Vec<u32> = if f16 { f16_values.to_vec() } else { f32_values.to_vec() };
+        let value = |x: u32| if f16 { half(x) } else { f32::from_bits(x) };
+        let pairs: Vec<[u32; 4]> =
+            values.iter().flat_map(|&a| values.iter().map(move |&b| [a, b, 0, 0])).collect();
+        let alone: Vec<[u32; 4]> = values.iter().map(|&a| [a, a, 0, 0]).collect();
+        for &(op, op32, op16) in &FLOAT_COMPARES {
+            // 0: v1 with v2; 1: v1 with itself; 2 (f32): the product v1 * v2 with itself, a NaN
+            // the program made (0 * inf), as a title's guard after arithmetic sees it
+            for form in 0..if f16 { 2 } else { 3 } {
+                let inputs = if form == 1 { &alone } else { &pairs };
+                // (v_mul_f32_e64 v5, v1, v2;) v_cmp_<op>_e64 s20, x, y; v_cndmask_b32_e64 v0, 0, 1, s20
+                let mut body = Vec::new();
+                let (x, y) = match form {
+                    0 => (vgpr(1), vgpr(2)),
+                    1 => (vgpr(1), vgpr(1)),
+                    _ => {
+                        body.extend_from_slice(&vop3(0x108, 5, vgpr(1), vgpr(2), 0));
+                        (vgpr(5), vgpr(5))
+                    }
+                };
+                body.extend_from_slice(&vop3(if f16 { op16 } else { op32 }, 20, x, y, 0x80));
+                body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+                let shader = build_valu_cs(&body);
+                let what = format!("v_cmp_{op}_{}{}", if f16 { "f16" } else { "f32" }, ["", " (x, x)", " (a*b, a*b)"][form]);
+                run_cases(&shader, inputs, |backend, _, [a, b, _, _], got| {
+                    let want = if form == 2 {
+                        let m = value(a) * value(b);
+                        console_float_compare(op, m, m)
+                    } else {
+                        console_float_compare(op, value(a), value(b))
+                    }
+                    .unwrap();
+                    if got != u32::from(want) {
+                        mistakes.push(format!("{backend}: {what}({a:#010x}, {b:#010x}) = {got}, want {}", u32::from(want)));
+                    }
+                });
+            }
+        }
+    }
+    lower::TEST_NAN_EXACT.set(was);
+    mistakes
+}
+
+/// `VICTORY_NAN_EXACT=1`: every float compare gives the console's answer with NaN operands
+/// on this machine's card and on WARP, the `x, x` forms (the title's NaN tests) included.
+/// Without the switch the mistakes the devices make are printed, not failed: they are the
+/// driver's (`cargo test -- --nocapture float_compares_tell_nan`).
+#[test]
+fn float_compares_tell_nan_by_its_bits_with_nan_exact() {
+    let plain = float_compare_mistakes(false);
+    eprintln!("VICTORY_NAN_EXACT off: {} wrong answers", plain.len());
+    for m in plain.iter().take(40) {
+        eprintln!("  {m}");
+    }
+    let exact = float_compare_mistakes(true);
+    assert!(exact.is_empty(), "VICTORY_NAN_EXACT=1: {} wrong:
+{}", exact.len(), exact.join("
+"));
+}
+
+/// `VICTORY_NAN_EXACT` changes the code of float compares alone: an integer compare and the
+/// two constant float compares translate to the same bytes with it and without it, and a
+/// float compare to other bytes.
+#[test]
+fn nan_exact_changes_float_compares_alone() {
+    let built = |op: u16, exact: bool| {
+        let was = lower::TEST_NAN_EXACT.replace(Some(exact));
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        lower::TEST_NAN_EXACT.set(was);
+        shader.dxil
+    };
+    // v_cmp_lt_i32 (0x081), v_cmp_f_f32, v_cmp_tru_f16: unchanged
+    for op in [0x081u16, 0x000, 0x0ef] {
+        assert_eq!(built(op, false), built(op, true), "opcode {op:#05x}");
+    }
+    for &(op, op32, op16) in &FLOAT_COMPARES {
+        assert_ne!(built(op32, false), built(op32, true), "v_cmp_{op}_f32");
+        assert_ne!(built(op16, false), built(op16, true), "v_cmp_{op}_f16");
+    }
+}
+
 /// 64-bit integer compares order by the high dword (signed for i64), then
 /// by the low one. AMD's D3D12 compiler runs an ordered i64 `icmp` as if the
 /// dwords were swapped (RX 9070 and gfx1036 alike), so the lowering compares

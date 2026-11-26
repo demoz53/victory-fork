@@ -73,6 +73,11 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/shader3 (on top of all21; not merged yet)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_NAN_EXACT` | `1` | off | every float compare (`v_cmp_*_f32`/`_f16` and their `v_cmpx` forms, not `f`/`tru`) tells a NaN operand by its bits (`(bits & 0x7FFFFFFF) > 0x7F800000`, integer arithmetic): ordered compares are the ordered host compare AND no NaN, unordered ones the opposite ordered compare OR a NaN, so the title's own NaN tests (`v_cmp_u x, x`, `v_cmp_neq x, x`) hold even where a driver compiling under fast math folds `fcmp uno`; keeps NaNs out of temporal filters | test/shader3 (Corgansm/victory-corgi 8b6671cc2, `nan_exact`, on there) | YES (in the cache key) |
+
 ## New in all21 (merged on top of all20)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|

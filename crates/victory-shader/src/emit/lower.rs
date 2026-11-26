@@ -1425,6 +1425,28 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_NAN_EXACT=1`: float compares (`v_cmp_*_f32`, `_f16`, and their `v_cmpx` forms)
+/// tell a NaN operand by its bits ([`Lower::exact_float_compare`]) instead of leaving it to
+/// the host's float compare, which a driver compiling under fast-math assumptions may fold
+/// (NVIDIA: `fcmp uno x, x` to false), so the title's own NaN tests keep NaNs out of its
+/// temporal filters. Off by default: it adds two integer tests to every float compare and is
+/// untried in a game run. Part of the translation (the shader cache keys on it).
+/// (Ported from Corgansm/victory-corgi 8b6671cc2, `VICTORY_NAN_EXACT`, on there.)
+fn nan_exact_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_EXACT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_EXACT").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_exact_on`], for its thread only.
+    pub(super) static TEST_NAN_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -4218,6 +4240,59 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
+    }
+
+    /// A float compare `v_cmp_<op>_f32`/`_f16` of `a` and `b` with its NaN case told by the
+    /// operands' bits ([`Self::is_nan_f32`], `VICTORY_NAN_EXACT=1`): an ordered compare is the
+    /// ordered host compare AND neither operand a NaN, an unordered one the ordered compare of
+    /// the opposite sense OR either operand a NaN. So a title's NaN test (`v_cmp_u_f32 x, x`,
+    /// `v_cmp_neq_f32 x, x`, `v_cmp_nlt_f32` ...) gives the console's answer even where the
+    /// host's compiler takes float compares as never seeing a NaN (the NVIDIA driver may fold
+    /// `fcmp uno x, x` to false), which lets NaNs through the title's guards into temporal
+    /// filters. `f` and `tru` are constants and never come here.
+    /// (After Corgansm/victory-corgi 8b6671cc2, `nan_exact`.)
+    fn exact_float_compare(&mut self, inst: &Inst, op: &str, a: V, b: V) -> Result<V, &'static str> {
+        let c = self.cur;
+        let (p, unordered) = match op {
+            "lt" => (pred::OLT, false),
+            "eq" => (pred::OEQ, false),
+            "le" => (pred::OLE, false),
+            "gt" => (pred::OGT, false),
+            "ge" => (pred::OGE, false),
+            // (`olt | ogt` below: see the `lg` note in the plain lowering)
+            "lg" => (pred::ONE, false),
+            "o" => (pred::TRUE, false),
+            "u" => (pred::FALSE, true),
+            "nge" => (pred::OLT, true),
+            "nlg" => (pred::OEQ, true),
+            "ngt" => (pred::OLE, true),
+            "nle" => (pred::OGT, true),
+            "neq" => (pred::ONE, true),
+            "nlt" => (pred::OGE, true),
+            _ => return Err(inst.name()),
+        };
+        let na = self.is_nan_f32(a);
+        let nb = self.is_nan_f32(b);
+        let any = self.s.m.bin(c, Bin::Or, na, nb);
+        // The ordered part, with no `fcmp false`/`fcmp true` (WARP removes its device on
+        // them) and no `fcmp one` (the AMD driver runs it as unordered).
+        let base = match p {
+            pred::TRUE => None,
+            pred::FALSE => Some(self.s.m.bool(false)),
+            pred::ONE => {
+                let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                Some(self.s.m.bin(c, Bin::Or, lt, gt))
+            }
+            p => Some(self.s.m.cmp(c, p, a, b)),
+        };
+        let yes = self.s.m.bool(true);
+        let none = self.s.m.bin(c, Bin::Xor, any, yes);
+        Ok(match (base, unordered) {
+            (None, _) => none,
+            (Some(base), true) => self.s.m.bin(c, Bin::Or, base, any),
+            (Some(base), false) => self.s.m.bin(c, Bin::And, base, none),
+        })
     }
 
     /// Whether an f32 value is NaN, tested in integer arithmetic so host
@@ -10887,7 +10962,9 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                if op == "lg" {
+                if nan_exact_on() {
+                    self.exact_float_compare(inst, op, a, b)?
+                } else if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.
                     // `fcmp one` means the same, but the AMD D3D12 driver
                     // runs it as unordered (true for a NaN) where NVIDIA
