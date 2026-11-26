@@ -743,7 +743,9 @@ fn record_clamp_as(
 }
 
 /// [`record_clamp_as`] into `dst` from byte `at` on: record `i` lands at
-/// `at + i * stride`, and nothing else of `dst` is written.
+/// `at + i * stride`, and nothing else of `dst` is written. (Tests; the
+/// lists use [`record_clamp_scoped`] with their budget's buffer.)
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_at(
     c: &Clamp,

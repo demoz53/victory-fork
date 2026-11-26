@@ -2279,9 +2279,13 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // VICTORY_BARRIER_GROUPS=1: barriers on the textures named, or none.
-        // SAFETY: the title passes `count` groups at `groups`.
-        if barrier_groups_named()
-            && let Some(groups) = unsafe { read_groups(count, groups) }
+        let read = if barrier_groups_named() {
+            // SAFETY: the title passes `count` groups at `groups`.
+            unsafe { read_groups(count, groups) }
+        } else {
+            None
+        };
+        if let Some(groups) = read
             && let Some(named) = named_targets(groups)
         {
             for texture in &named {
