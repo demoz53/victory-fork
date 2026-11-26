@@ -4036,7 +4036,7 @@ mod fill_ahead {
     /// that touched one's piece. Since the start: real misses (fills that
     /// read bytes a flight then changed); fills not compared because the
     /// title rewrote their bytes since.
-    static COUNT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
     #[cfg(test)]
     thread_local! {
@@ -4185,19 +4185,30 @@ mod fill_ahead {
         COUNT[1].fetch_add(1, Relaxed);
         let mut now = Vec::new();
         for (from, to, read_in, print_then) in hits {
-            // The title rewrote the bytes since the fill (or a landing
-            // before this one did, and was compared then): what is there
-            // now is not what the fill read, so it cannot tell a miss.
-            if print(from, to - from) != print_then {
-                COUNT[3].fetch_add(1, Relaxed);
-                continue;
-            }
             let (a, b) = (from.max(at), to.min(at + new.len()));
             now.clear();
             now.resize(b - a, 0);
-            // Title memory as it is: what the fill read. Not there: nothing
-            // to say.
-            if !super::read_into(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
+            // Title memory as it is. Not there: nothing to say.
+            if !super::read_into(a as *const u8, &mut now) {
+                continue;
+            }
+            let changes = now[..] != new[a - at..b - at];
+            // The title rewrote the bytes since the fill (or a landing
+            // before this one did): what is there now is not what the fill
+            // read, so it cannot prove a miss. But where this landing still
+            // changes bytes of it, the fill read them before the flight
+            // wrote them as surely as without the rewrite: held all the
+            // same, else such a view would read one flight old for good.
+            let rewritten = print(from, to - from) != print_then;
+            if rewritten {
+                COUNT[3].fetch_add(1, Relaxed);
+                if changes {
+                    COUNT[4].fetch_add(1, Relaxed);
+                    hold(from, to);
+                }
+                continue;
+            }
+            if !changes {
                 continue;
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
@@ -4236,13 +4247,15 @@ mod fill_ahead {
             "fills of upload memory over what flights may write, not waited for (VICTORY_FILL_AHEAD): {:.1} per frame; {:.1} \
              landings' writes per frame fell in the same 64 KiB as one and were compared with it; since the start: real misses \
              (fills that read bytes a flight then changed) {} ({} pieces of 64 KiB held back{}); fills not compared because the \
-             title had rewritten their bytes since {}; {kept} fills kept to check",
+             title had rewritten their bytes since {} (of them held all the same, the landing changing bytes they read: {}); \
+             {kept} fills kept to check",
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
             HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, HashSet::len),
             if WAIT.load(Relaxed) { "; the latch tripped: every fill waits again" } else { "" },
-            COUNT[3].load(Relaxed)
+            COUNT[3].load(Relaxed),
+            COUNT[4].load(Relaxed)
         );
     }
 
@@ -4261,20 +4274,31 @@ mod fill_ahead {
         fn only_real_misses_hold_fills_back() {
             const LEN: usize = 480;
             TEST_MODE.set(Some(1));
-            // Three pieces of 64 KiB of their own, one per case.
-            let mut memory = vec![0u8; 4 * PIECE];
+            // Four pieces of 64 KiB of their own, one per case.
+            let mut memory = vec![0u8; 5 * PIECE];
             let start = memory.as_ptr() as usize;
             let base = start.next_multiple_of(PIECE) - start;
             let at = |i: usize| start + base + i * PIECE;
-            let (rewritten, missed, same) = (at(0), at(1), at(2));
-            for i in 0..3 {
+            let (rewritten, missed, same, hidden) = (at(0), at(1), at(2), at(3));
+            for i in 0..4 {
                 memory[base + i * PIECE..][..LEN].fill(1);
             }
+            // The title rewrote the fill's bytes, and the landing changes
+            // none of them (it merges the title's bytes in): no miss.
             read(rewritten, LEN);
             memory[base..][..LEN].fill(2);
-            wrote(rewritten, &[3; LEN]);
+            wrote(rewritten, &[2; LEN]);
             assert!(!held(rewritten), "a rewrite by the title is not a miss");
             assert!(on(rewritten, LEN));
+            // The title rewrote a byte of the fill's, and the landing changes
+            // others it read: held, though the fingerprint cannot prove it.
+            read(hidden, LEN);
+            memory[base + 3 * PIECE] = 9;
+            let mut landed = [1u8; LEN];
+            landed[0] = 9;
+            landed[100] = 7;
+            wrote(hidden, &landed);
+            assert!(held(hidden), "a miss under a title rewrite was hidden");
             read(missed, LEN);
             wrote(missed, &[3; LEN]);
             assert!(held(missed), "a real miss holds its piece back");
