@@ -2723,6 +2723,12 @@ impl HostHeap {
             };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(host));
+                // Its texture was refused for want of memory and is tried
+                // again (`VICTORY_OOM_RETRY_MS`): not noted as made, so the
+                // slot's next use makes it again.
+                if crate::resource::host_retrying(view.resources()[0] as crate::object::This) {
+                    made.keys[host as usize] = 0;
+                }
             }
             self.keep(host, kept.flatten());
             if taken {
