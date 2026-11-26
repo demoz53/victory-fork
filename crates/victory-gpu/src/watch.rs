@@ -910,17 +910,29 @@ fn writes_as(
         }
         publish(j, &guarded);
     }
-    let answer = (
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    );
+    // An asking in flight over the range ([`unlocked`]: this asking kept
+    // the lock for the light refresh's self-check): it may have reset
+    // pages this one's kernel call then did not see, so the answer waits
+    // for it ([`settle`]), the blocks made read-only first (an asking in
+    // flight may be waiting for them in the guards).
+    let overlapping = j.flying.iter().any(|&(a, b, _)| a < last && first < b);
+    if !overlapping {
+        let answer = (
+            now,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        );
+        drop(held);
+        // Read-only before the caller reads the blocks.
+        arming.finish(failed && light != 0);
+        return Some(answer);
+    }
     drop(held);
-    // Read-only before the caller reads the blocks.
     arming.finish(failed && light != 0);
-    Some(answer)
+    let held = settle(journal(), first, last);
+    Some((now, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// [`writes_as`] with [`unlocked`], from where the journal could not answer
@@ -4132,6 +4144,55 @@ pub(crate) mod tests {
             forget_pages(one, one + PAGES * BLOCK);
             forget_pages(two, two + PAGES * BLOCK);
         }
+    }
+
+    /// `VICTORY_JOURNAL_UNLOCKED` with `VICTORY_LIGHT_REFRESH_CHECK`: an
+    /// asking that keeps the journal's lock (the self-check's) answers only
+    /// once an asking in flight over its range has noted what it found: that
+    /// one may have reset the pages first.
+    #[test]
+    fn a_locked_asking_waits_for_an_asking_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const PAGES: usize = 4;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        forget_pages(p, p + PAGES * PAGE);
+        let (first, last) = (p / PAGE, p / PAGE + PAGES);
+        let other = {
+            let mut j = journal();
+            j.asked += 1;
+            let n = j.asked;
+            j.flying.push((first, last, n));
+            n
+        };
+        let answered = AtomicBool::new(false);
+        let answer = std::thread::scope(|scope| {
+            let checked = scope.spawn(|| {
+                // The self-check's way: `check` keeps the lock.
+                let answer = writes_as(p, p + PAGES * PAGE, false, 0, true, true);
+                answered.store(true, Ordering::SeqCst);
+                answer
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let early = answered.load(Ordering::SeqCst);
+            {
+                let mut j = journal();
+                note_written(&mut j, first + 2, other, ALL_PIECES);
+                j.flying.retain(|&(_, _, n)| n != other);
+                LANDED_ASKING.notify_all();
+            }
+            let answer = checked.join().expect("the checked asking");
+            assert!(!early, "answered before the asking in flight noted what it found");
+            answer
+        });
+        let (_, written) = answer.expect("write-watched");
+        assert_eq!(written, [(first + 2, other)]);
+        forget_pages(p, p + PAGES * PAGE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
