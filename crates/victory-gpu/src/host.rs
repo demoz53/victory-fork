@@ -8117,6 +8117,19 @@ impl Host {
         land();
     }
 
+    /// Tests: from here on the host's queue stands at a fence of ours until
+    /// the fence is signalled with 1: what is sent meanwhile stays in the
+    /// air.
+    #[cfg(test)]
+    pub(crate) fn test_gate(&self) -> ID3D12Fence {
+        // SAFETY: plain creation; the queue waits for a fence the test signals.
+        unsafe {
+            let gate: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            self.queue.Wait(&gate, 1).unwrap();
+            gate
+        }
+    }
+
     /// Sends `list`, a closed list of ours (the present's copy), as a
     /// flight ([`late_free_present`]): not waited for, settled with the
     /// others. The caller keeps the list and does not reset it before the

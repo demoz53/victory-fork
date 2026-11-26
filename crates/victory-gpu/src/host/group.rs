@@ -187,6 +187,32 @@ pub(crate) fn late_met_peek(wait: &crate::list::ValueWait) -> bool {
     false
 }
 
+/// Whether preparing `runs`, a part, has to deal with flights in the air
+/// first ([`super::late_blocked`], not counted): it reads title memory they
+/// write when they have run, or runs a step of ours, so its submission
+/// waits for them to land (or has its refreshes carried over on the card
+/// behind them, `VICTORY_ALIAS_COPY`).
+///
+/// Such a part does not join parts that can go now: a batch waits as a
+/// whole, and with it in the batch the parts before it would stand through
+/// its wait with the card idle, where sent one by one they went out while
+/// the card worked. It starts the next batch instead (the first part of a
+/// batch may wait: nothing is held up by it that was not behind it).
+pub(crate) fn meets_flights(runs: &[&HostList]) -> bool {
+    if !super::late() {
+        return false;
+    }
+    let (written, by_copy, immed) = {
+        let line = line();
+        let immed = line.immed_writes();
+        if line.written.is_empty() && immed.is_empty() {
+            return false;
+        }
+        (line.written.clone(), line.by_copy.clone(), immed)
+    };
+    blocked_by(&written, &by_copy, &immed, runs, false).is_some()
+}
+
 /// The most host lists gathered into one batch: half of what may be in the
 /// air at once ([`super::late_most`]), so that a batch never fills the air
 /// alone (`VICTORY_GROUP_COMMIT_LISTS=<n>` sets it; a part of more lists
