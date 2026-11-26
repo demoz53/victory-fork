@@ -339,6 +339,8 @@ pub(crate) fn record(
     (width, height): (u32, u32),
     planes: &[ShownPlane<'_>],
 ) -> bool {
+    // Bindings outside the draw state's memory of them (`VICTORY_SET_CACHE`).
+    let _binds = crate::draw::sets::Announce;
     let device = &host.device;
     let Some(pass) = pass(device) else {
         return false;

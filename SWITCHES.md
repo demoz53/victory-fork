@@ -135,6 +135,12 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/setcache (on all23 a250e5920: the recording threads' binds and lookups)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_SET_CACHE` | `1` | off | a draw state skips an IASetVertexBuffers / IASetIndexBuffer / root constants / root CBV, SRV or UAV call that would give the host list what it provably still holds. Forgotten: another, new or reset host list (a serial per list recording); any binding of a pass of ours on any list or an ExecuteIndirect of the title's (one process count, `draw::sets::foreign_binds`; a source-scan test fails on an unannounced binding); a root signature (its bind point); a heap set (both); a root UAV / root SRV table (its parameter); a replay. Log: "binds per frame: N given ..., M left out as held already (x%)" | test/setcache (zocram4cc/victory-linux-perf d6bce43b6; Proudnoob4 nvidia-hybrid-v2) | no |
+| `VICTORY_FIND_BUCKETS` | `1` | off (acts with `VICTORY_LOOKUP_CACHE=1`) | a thread's remembered host-copy answer from a title buffer stands while no change of the buffer table touched a 64 KiB grain of its span (buffer start to ask, at most 256 grains), instead of being dropped at any table change; answers from windows as before. Always now (a fix of LOOKUP_CACHE): a buffer registered is counted after it is in the table, under its lock (counted before, an ask in between could keep an answer without it for good) | test/setcache (zocram4cc/victory-linux-perf 40e3525ed) | no |
+
 ## New in all23 (merged on top of all22)
 From test/watch5 (holds test/watch4), test/async4 (holds test/async3), test/leak1, test/pic3, test/stream3 and
 test/stable1, test/trim2; each row's "From" names its source.

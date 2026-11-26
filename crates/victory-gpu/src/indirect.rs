@@ -812,6 +812,8 @@ fn record_clamp_scoped(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
+    // Bindings outside the draw state's memory of them (`VICTORY_SET_CACHE`).
+    let _binds = crate::draw::sets::Announce;
     let Some(bytes) = validate_layout(
         (kind, stride, records),
         src_offset,

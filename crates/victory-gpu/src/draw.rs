@@ -697,8 +697,14 @@ fn pipeline_stores(pipeline: usize) -> bool {
 }
 
 /// What one title list has set, and what its host list was last given.
+/// What the host list holds of the bindings this state gives it
+/// (`VICTORY_SET_CACHE`).
+pub(crate) mod sets;
+
 #[derive(Default)]
 pub(crate) struct State {
+    /// What the host list was last given ([`sets`]).
+    sets: sets::Sets,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -1658,6 +1664,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.sets.forget_all();
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1844,11 +1851,9 @@ impl State {
                 StrideInBytes: v.stride,
             };
         }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
-            }
+        if count > 0 && self.sets.vertex_buffers(list.binds_serial(), &views[..count]) {
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe { l.IASetVertexBuffers(0, Some(&views[..count])) };
         }
         if indexed {
             let v = self.index;
@@ -1861,8 +1866,10 @@ impl State {
                 SizeInBytes: v.size,
                 Format: DXGI_FORMAT(v.format as i32),
             };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            if self.sets.index_buffer(list.binds_serial(), &view) {
+                // SAFETY: an open list; the view names a live host buffer.
+                unsafe { l.IASetIndexBuffer(Some(&view)) };
+            }
         }
         const RENDER_TARGET: u32 = 0x4;
         // With `VICTORY_TARGETS_ONCE=1`: not again while nothing moved.
@@ -1946,6 +1953,10 @@ impl State {
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
+            // (Tables are void with the heaps: both bind points' arguments
+            // given again, `VICTORY_SET_CACHE`.)
+            self.sets.forget_roots(false);
+            self.sets.forget_roots(true);
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
@@ -1961,6 +1972,8 @@ impl State {
         TESTED_DEPTH.set((tested, false));
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
+            // Its root arguments are void (`VICTORY_SET_CACHE`).
+            self.sets.forget_roots(compute);
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
@@ -2025,12 +2038,14 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if self.sets.constants(list.binds_serial(), compute, param, &values) {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -2038,7 +2053,9 @@ impl State {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
-                        if let Some(m) = &memory {
+                        if let Some(m) = &memory
+                            && self.sets.view(list.binds_serial(), compute, param, sets::Bound::Srv(m.directory))
+                        {
                             // SAFETY: an open list; the directory lives as
                             // long as the process and the list holds it.
                             unsafe {
@@ -2055,15 +2072,19 @@ impl State {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
                         match self.heap_buffers(list, writes) {
-                            // SAFETY: an open list; the table lives as long
-                            // as the heap the list holds.
-                            Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                            Some(gpu) => {
+                                if self.sets.view(list.binds_serial(), compute, param, sets::Bound::Srv(gpu)) {
+                                    // SAFETY: an open list; the table lives as
+                                    // long as the heap the list holds.
+                                    unsafe {
+                                        if compute {
+                                            l.SetComputeRootShaderResourceView(param, gpu);
+                                        } else {
+                                            l.SetGraphicsRootShaderResourceView(param, gpu);
+                                        }
+                                    }
                                 }
-                            },
+                            }
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
                         continue;
@@ -2102,6 +2123,10 @@ impl State {
                             None,
                         ));
                     }
+                    let bound = if srv { sets::Bound::Srv(gpu) } else { sets::Bound::Cbv(gpu) };
+                    if !self.sets.view(list.binds_serial(), compute, param, bound) {
+                        continue;
+                    }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
                         match (compute, srv) {
@@ -2116,7 +2141,9 @@ impl State {
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
-                    if let Some(m) = &memory {
+                    if let Some(m) = &memory
+                        && self.sets.view(list.binds_serial(), compute, param, sets::Bound::Uav(m.faults))
+                    {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process and the list holds it.
                         unsafe {
@@ -2173,6 +2200,8 @@ impl State {
         compute: bool,
         writes: bool,
     ) -> bool {
+        // Set here, outside the cache (`VICTORY_SET_CACHE`).
+        self.sets.forget_root(compute, param);
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -2284,6 +2313,8 @@ impl State {
         compute: bool,
         biased: bool,
     ) -> bool {
+        // Set here, outside the cache (`VICTORY_SET_CACHE`).
+        self.sets.forget_root(compute, param);
         let heap = match self.heaps[0] {
             0 => None,
             h => Some(crate::descriptor::heap(h as This)),
@@ -4828,6 +4859,8 @@ impl State {
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            // (Behind the draw state's memory of the vertex buffers.)
+            sets::foreign_binds();
         }
         true
     }
@@ -5035,6 +5068,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // Bindings outside the draw state's memory of them (`VICTORY_SET_CACHE`).
+        let _binds = crate::draw::sets::Announce;
         if crate::indirect::executes_nothing(max) {
             return true;
         }

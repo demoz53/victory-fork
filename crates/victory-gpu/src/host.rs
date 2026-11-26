@@ -1188,6 +1188,10 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// A number no other host list and no other recording of this one has
+    /// had, changed at every reset: what `crate::draw::sets` knows of the
+    /// list's bindings is of one value (`VICTORY_SET_CACHE`).
+    binds_serial: std::sync::atomic::AtomicU64,
     /// Changed (to a number no list has had) whenever `states` gains or
     /// changes an entry, and at a reset: a draw that moved its render
     /// targets at this number need not move them again
@@ -1544,6 +1548,8 @@ fn record_plane_pass(
     depth: &ID3D12Resource,
     plane: &ID3D12Resource,
 ) {
+    // Bindings outside the draw state's memory of them (`VICTORY_SET_CACHE`).
+    let _binds = crate::draw::sets::Announce;
     let (Some(host), Some(pass)) = (host(), plane_pass()) else {
         return;
     };
@@ -2646,6 +2652,8 @@ unsafe fn dispatch_card_compare(
     out_at_bytes: u32,
     compare: u32,
 ) {
+    // sets: own list (bindings on a list of ours that records nothing of the
+    // title's: no draw state's memory of bindings is about it).
     const MAX_GROUPS: u32 = 65_535;
     let mut done = 0u32;
     while done < pieces {
@@ -6486,6 +6494,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                binds_serial: std::sync::atomic::AtomicU64::new(next_binds_serial()),
                 states_generation: std::sync::atomic::AtomicU64::new(next_states_generation()),
                 twins: Mutex::default(),
                 plane_reset: std::sync::atomic::AtomicBool::new(false),
@@ -6784,6 +6793,8 @@ impl Host {
     /// then stores the hashes it makes (see [`flagged_parts`] and
     /// `relay`).
     fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+        // sets: own list (bindings on a list of ours that records nothing of the
+        // title's: no draw state's memory of bindings is about it).
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -9171,6 +9182,8 @@ impl HostList {
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        // What was bound before the reset is not bound after it.
+        self.binds_serial.store(next_binds_serial(), Ordering::Relaxed);
         self._alive.used();
         self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -9274,6 +9287,10 @@ impl HostList {
 
     /// The number of the list's texture states now: the same while nothing
     /// the list names has moved (no list has had it before).
+    pub(crate) fn binds_serial(&self) -> u64 {
+        self.binds_serial.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn states_generation(&self) -> u64 {
         self.states_generation.load(Ordering::Relaxed)
     }
@@ -12391,6 +12408,12 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+}
+
+/// The next number of a list's bindings ([`HostList::binds_serial`]).
+fn next_binds_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The next number of a list's texture states ([`HostList::states_generation`]):

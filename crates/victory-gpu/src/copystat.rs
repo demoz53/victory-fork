@@ -1508,6 +1508,17 @@ pub(crate) fn log(frames: f64) {
         c[C::GuardAbsentQueries as usize],
         ms(c[C::GuardAbsentUs as usize]),
     );
+    {
+        let (sent, skipped) = crate::draw::sets::take_counts();
+        if sent + skipped > 0 {
+            tracing::info!(
+                "binds per frame ({frames:.0} frames): {:.0} vertex, index and root binds given to host lists, {:.0} left out as held already ({:.1}%, VICTORY_SET_CACHE)",
+                sent as f64 / frames,
+                skipped as f64 / frames,
+                100.0 * skipped as f64 / (sent + skipped) as f64
+            );
+        }
+    }
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \

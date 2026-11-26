@@ -144,6 +144,8 @@ pub(crate) fn record_into(
     roots: [u32; 3],
     what: Launch,
 ) -> bool {
+    // Bindings outside the draw state's memory of them (`VICTORY_SET_CACHE`).
+    let _binds = crate::draw::sets::Announce;
     let Ok(l6) = windows::core::Interface::cast::<ID3D12GraphicsCommandList6>(list) else {
         return false;
     };

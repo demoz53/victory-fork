@@ -186,6 +186,8 @@ fn run(
     stop: &AtomicBool,
     passes: &AtomicU64,
 ) -> windows::core::Result<()> {
+    // sets: own list (bindings on a list of ours that records nothing of the
+    // title's: no draw state's memory of bindings is about it).
     let source = COUNT.replace("STEPS", &steps.to_string());
     let code = super::compile(&source, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
     // SAFETY: plain object creation; the code lives through the calls, the

@@ -746,6 +746,8 @@ pub(crate) struct Views {
 /// heap set. Replaces the list's compute root signature and pipeline; false
 /// if it recorded nothing.
 pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
+    // Bindings outside the draw state's memory of them (`VICTORY_SET_CACHE`).
+    let _binds = crate::draw::sets::Announce;
     use std::sync::atomic::Ordering;
     let Some(pass) = pass() else {
         return false;
