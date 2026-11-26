@@ -2445,11 +2445,6 @@ impl HostHeap {
     /// again since (that write is queued and looked at in its own turn), or
     /// the slot cannot be made.
     pub(crate) fn publish_ahead(&self, index: u32, handle: u64, key: u64) -> bool {
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        if tag != VIEW_TAG || (u64::from(generation) << 32 | u64::from(i)) != key {
-            return false;
-        }
         struct Publishing;
         impl Drop for Publishing {
             fn drop(&mut self) {
@@ -2458,7 +2453,9 @@ impl HostHeap {
         }
         PUBLISHING.set(true);
         let _publishing = Publishing;
-        self.mirror(index, handle, true).is_some()
+        // The record is read once, by the making itself: a write of the
+        // title's at this moment is either that record or not made here.
+        self.mirror_as(index, handle, true, Some(key)).is_some()
     }
 
     /// The key of the record title slot `index`'s host slot was made from
@@ -2475,6 +2472,12 @@ impl HostHeap {
     /// there. Buffer views are made only for draws (`for_draw`), which also
     /// copy their data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_as(index, handle, for_draw, None)
+    }
+
+    /// [`HostHeap::mirror`], only from the record `expect` names if one is
+    /// given (`None` returned for another).
+    fn mirror_as(&self, index: u32, handle: u64, for_draw: bool, expect: Option<u64>) -> Option<View> {
         let mirrored = if self.map.is_some() { self.title_count } else { self.count };
         if index >= mirrored {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -2504,6 +2507,9 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        if expect.is_some_and(|expect| tag != VIEW_TAG || expect != key) {
+            return None;
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
