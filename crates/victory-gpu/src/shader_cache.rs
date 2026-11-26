@@ -131,7 +131,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// The order, and `VICTORY_WAVE_LOCAL` being here twice, are kept as they
 /// were: with `VICTORY_SHADER_CACHE_KEY=exe` the key is, byte for byte,
 /// what it was while the executable was the identity.
-const SWITCHES: [&str; 44] = [
+const SWITCHES: [&str; 45] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LDS_REGIONS",
@@ -185,6 +185,9 @@ const SWITCHES: [&str; 44] = [
     "VICTORY_MESH_CLAMP_IN_DRAW",
     // (test/small3: SDWA WORD_0 UNUSED_SEXT sign-extends; on unless "0")
     "VICTORY_SDWA_SEXT",
+    // (test/shader5: a comparison sampler's reduction replaced, not ORed into;
+    // on unless "0": the static samplers an entry holds)
+    "VICTORY_COMPARE_REDUCTION",
 ];
 
 /// The translation settings of this process that are in the run's key by
@@ -1055,8 +1058,10 @@ mod tests {
         // Not part of a translation: lines printed and files dumped beside
         // it, the validator and the host device of the offline checks, and
         // what only tests read.
-        const NOT_OUTPUT: [&str; 13] = [
+        const NOT_OUTPUT: [&str; 14] = [
             "VICTORY_WAVE_WHY",
+            // (test/shader5: an ignored test's folder of containers)
+            "VICTORY_SAMPLER_SWEEP",
             "VICTORY_DESC_WHY",
             "VICTORY_EMIT_DUMP",
             "VICTORY_SHADER_CENSUS",
