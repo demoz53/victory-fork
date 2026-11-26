@@ -586,6 +586,35 @@ impl Layout {
         }
     }
 
+    /// The bytes from the texture's start that mip `first` and the smaller
+    /// ones take: the smaller a mip, the nearer the start it lies, so a
+    /// title that streams textures can have memory for the smaller mips only.
+    /// The whole layout where slices follow each other (each holds its whole
+    /// chain), and for thick, 3D and multisampled layouts.
+    /// (DexNom/VIctory 570a941, by Marvisak/VIctory #2859; GPL-3.0.)
+    pub fn bytes_from(&self, first: u32) -> u64 {
+        let whole = first == 0
+            || self.slices != 1
+            || self.thick
+            || self.desc.dimension == Dimension::Tex3d
+            || self.desc.samples != 1
+            || first >= self.desc.mips;
+        if whole {
+            return self.size;
+        }
+        let n = u64::from(self.desc.element_bytes);
+        self.mips[first as usize..]
+            .iter()
+            .map(|m| match m.tail {
+                // The tail is the texture's first block.
+                Some(_) => self.alignment,
+                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * n,
+            })
+            .max()
+            .unwrap_or(self.size)
+            .min(self.size)
+    }
+
     /// Byte offset of element (`x`, `y`) of mip `mip` in array slice or
     /// depth slice `z`. Coordinates must lie inside the mip.
     pub fn offset(&self, mip: u32, x: u32, y: u32, z: u32) -> Result<u64, Error> {
@@ -1770,4 +1799,43 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn smaller_mips_need_only_the_start_of_the_texture() {
+        // 1024x1024 BC1 (8-byte elements) in 4 KiB blocks: the tail first,
+        // then the larger mips (Marvisak/VIctory #2859, after DexNom).
+        let l = Layout::new(&Desc {
+            block: 4,
+            ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
+        assert_eq!(l.bytes_from(0), l.size);
+        let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
+        assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
+        assert_eq!((l.bytes_from(4), l.bytes_from(8)), (4096, 4096));
+        // Each mip lies inside the bytes it is said to need: what lies after
+        // them does not change what it detiles to.
+        let tiled: Vec<u8> = (0..l.size).map(|i| ((i * 7) >> 3) as u8).collect();
+        for mip in 1..9 {
+            let m = l.mips[mip as usize];
+            let pitch = m.width as usize * 8;
+            let read = |tiled: &[u8]| {
+                let mut linear = vec![0; pitch * m.height as usize];
+                l.detile(tiled, mip, 0, &mut linear, pitch, pitch * m.height as usize)
+                    .map(|()| linear)
+            };
+            let len = l.bytes_from(mip) as usize;
+            let mut cut = tiled.clone();
+            cut[len..].fill(0);
+            assert_eq!(read(&cut), read(&tiled), "mip {mip}");
+        }
+        // Slices each hold their chain: the whole texture.
+        let l = Layout::new(&Desc {
+            depth: 2,
+            block: 4,
+            ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
+        assert_eq!(l.bytes_from(4), l.size);
+    }
+
 }

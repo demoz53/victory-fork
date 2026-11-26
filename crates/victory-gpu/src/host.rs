@@ -2112,7 +2112,7 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
-    back_wanted: Vec<usize>,
+    back_wanted: Vec<(usize, Vec<Option<[u32; 10]>>)>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
     /// Whether the indirect-work budget is zeroed for this recording (a
@@ -6699,28 +6699,52 @@ impl HostList {
     /// A draw or dispatch being prepared writes title texture `resource`
     /// through unordered access: if it is of a kind copied back
     /// ([`crate::texback`]), the list copies it when it closes.
-    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+    /// `view`: the unordered access view's description (none: the
+    /// resource's own), which says the mip and slices it can write.
+    pub(crate) fn texture_written(&self, resource: crate::object::This, view: Option<&[u32; 10]>) {
         if !crate::texback::wanted(resource) {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.contains(&(resource as usize)) {
-            deferred.back_wanted.push(resource as usize);
+        let view = view.copied();
+        if let Some((_, views)) = deferred.back_wanted.iter_mut().find(|(r, _)| *r == resource as usize) {
+            if !views.contains(&view) {
+                views.push(view);
+            }
+        } else {
+            deferred.back_wanted.push((resource as usize, vec![view]));
         }
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied
     /// back go into read-back buffers ([`crate::texback::record`]).
     fn textures_back(&self) {
-        const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
-        for resource in wanted {
+        for (resource, views) in wanted {
             let resource = resource as crate::object::This;
             let Some(copy) = crate::resource::host_copy(resource) else {
                 continue;
             };
-            self.settle(&copy, COPY_SOURCE);
-            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+            // The state the title's commands leave it in (its barriers after
+            // the write included), restored after the copy
+            // (`crate::texback::restore_state`): left in COPY_SOURCE, the
+            // next list's shaders that pick it from the heap by a computed
+            // index (no barrier of ours) used it in the wrong state.
+            let last = self
+                .states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(std::sync::Arc::as_ptr(&copy) as usize))
+                .map(|(_, last, _)| *last);
+            let (before, after) = crate::texback::copy_states(last);
+            if let Some(state) = before {
+                self.settle(&copy, state);
+            }
+            let back = crate::texback::record(&self.list, resource, &copy.texture, &views);
+            if let Some(state) = after {
+                self.settle(&copy, state);
+            }
+            if let Some(back) = back {
                 self.deferred().texture_backs.push(back);
             }
         }
