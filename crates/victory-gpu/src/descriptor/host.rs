@@ -282,6 +282,9 @@ thread_local! {
 pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
+    /// Under [`Rule::Start`]: a texture's own first bytes are [`HEAD`] or its size, the
+    /// smaller ([`stale_head_size`]).
+    head_size: bool,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
     by_slot: std::collections::HashMap<u32, u64>,
     /// The bytes a placed texture takes, by resource description: worked
@@ -360,11 +363,15 @@ impl Spans {
         let rule = self.rule;
         // The spans the view cannot be there with.
         let clashing: Vec<u64> = match rule {
-            Rule::Start => self
-                .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
-                .collect(),
+            Rule::Start => {
+                let head = |len: u64| if self.head_size { HEAD.min(len) } else { HEAD };
+                let mine = head(end - start);
+                self.by_start
+                    .range(start.saturating_sub(HEAD - 1)..start.saturating_add(mine))
+                    .filter(|&(&at, &(old_end, _))| at >= start || start < at + head(old_end - at))
+                    .map(|(at, _)| *at)
+                    .collect()
+            }
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
         };
         let mut stale = Vec::new();
@@ -449,6 +456,16 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 /// default; `VICTORY_STALE_TEXTURES=0`: never, as before;
 /// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, the rule
 /// until run 188.
+/// Whether a placed texture's own first bytes under [`Rule::Start`] are the smaller of
+/// [`HEAD`] and its size (`VICTORY_STALE_HEAD_SIZE=0`: [`HEAD`] whatever its size, as
+/// before). The title packs small tint palettes (256 bytes to 4 KiB) a few hundred bytes
+/// apart: each view written made its neighbours stale, and the faces that read them drew
+/// black. (fxceless/victory-fork #923, HLVM04's second comment.)
+fn stale_head_size() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_HEAD_SIZE").is_none_or(|v| v != "0"))
+}
+
 fn stale_rule() -> Rule {
     static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
@@ -1656,6 +1673,7 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    placed.head_size = stale_head_size();
                     placed.note(index, start, end, !seen)
                 }
                 None => {
@@ -2238,6 +2256,35 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// The format the host makes a typed buffer view in ([`int_views_as_float`]): a 32-bit
+/// integer format as the float format of the same width, every other as the title's.
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    if !int_views_as_float() {
+        return format;
+    }
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => {
+            DXGI_FORMAT_R32G32B32A32_FLOAT
+        }
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
+/// Whether typed buffer views of 32-bit integer formats are made in the float format of the
+/// same width (`VICTORY_INT_VIEWS_AS_FLOAT=0`: the title's format, as before). Translated
+/// shaders declare every typed buffer load and store a 32-bit float; through an integer view
+/// a store of an integer's bits as a float may be written as the integer the float rounds to,
+/// where the console moves the bits; the float format of the same width moves them as they
+/// are. (fxceless/victory-fork PR #684 by GamingRipperDoc: plaster and clothing seams.) On
+/// this machine's card a float load through an integer view already gave the bits.
+fn int_views_as_float() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INT_VIEWS_AS_FLOAT").is_none_or(|v| v != "0"))
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -2261,6 +2308,7 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
+    desc.Format = bit_exact_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -2352,6 +2400,7 @@ fn buffer_uav(
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    desc.Format = bit_exact_format(desc.Format);
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
@@ -3438,6 +3487,61 @@ mod tests {
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
     /// overlaps others is left out of the spans, as before.
+    /// Typed buffer views of 32-bit integer formats are made in the float format of the same
+    /// width (the shaders' float loads and stores then move the bits); every other format is
+    /// the title's. (fxceless/victory-fork PR #684.)
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(
+                crate::resource::element(title.0 as u32),
+                crate::resource::element(host.0 as u32)
+            );
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
+    }
+
+    /// Small textures packed a few hundred bytes apart (the title's tint palettes, 256 bytes
+    /// to 4 KiB) are neighbours, not replacements, when a texture's own first bytes are its
+    /// size: the view written next makes none of them stale. A view at the same start, or
+    /// one starting within a larger texture's first 4 KiB, still does; with 4 KiB for every
+    /// texture (`VICTORY_STALE_HEAD_SIZE=0`) each palette made the one before it stale.
+    /// (fxceless/victory-fork #923.)
+    #[test]
+    fn small_palettes_a_few_hundred_bytes_apart_are_neighbours() {
+        let at = 0x1_2340_0000u64;
+        for head_size in [true, false] {
+            let mut spans = Spans { head_size, ..Spans::default() };
+            assert!(spans.note(1, at, at + 0x100, true).is_empty());
+            let second = spans.note(2, at + 0x300, at + 0x400, true);
+            let third = spans.note(3, at + 0x600, at + 0x1600, true);
+            if head_size {
+                assert!(second.is_empty() && third.is_empty(), "palettes are neighbours");
+                // inside the 4 KiB palette at 0x600: a replacement
+                assert_eq!(spans.note(4, at + 0x700, at + 0x800, true), [3]);
+                // the same start with another length: a replacement
+                assert_eq!(spans.note(5, at, at + 0x200, true), [1]);
+            } else {
+                assert_eq!((second, third), (vec![1], vec![2]), "each made the one before stale");
+            }
+        }
+    }
+
     #[test]
     fn never_stale_leaves_overlapping_views_out() {
         let mut spans = Spans { rule: Rule::Never, ..Default::default() };
