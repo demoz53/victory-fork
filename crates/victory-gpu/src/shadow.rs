@@ -1212,22 +1212,31 @@ fn back_blocks() -> bool {
 }
 
 std::thread_local! {
-    /// Title memory as [`read_title`] read it last on this thread, for
-    /// [`put_back`] to tell what the merge changed.
-    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Title memory as [`read_title`] read it last on this thread, and
+    /// where it was read, for [`put_back`] to tell what the merge changed.
+    static READ: std::cell::RefCell<(usize, Vec<u8>)> = const { std::cell::RefCell::new((0, Vec::new())) };
 }
 
 /// Reads title memory at `src` into `dst` (`crate::host::read_into`); with
 /// [`back_blocks`], also keeps what was read for [`put_back`].
 fn read_title(src: *const u8, dst: &mut [u8]) -> bool {
     let ok = crate::host::read_into(src, dst);
-    if ok && back_blocks() {
-        READ.with_borrow_mut(|r| {
-            r.clear();
-            r.extend_from_slice(dst);
-        });
+    if back_blocks() {
+        remember_read(src as usize, ok.then_some(&*dst));
     }
     ok
+}
+
+/// Keeps `bytes`, read at title address `at`, for [`put_back`]; nothing of
+/// a read that failed (nor of the one before it).
+fn remember_read(at: usize, bytes: Option<&[u8]>) {
+    READ.with_borrow_mut(|(read_at, was)| {
+        was.clear();
+        *read_at = at;
+        if let Some(bytes) = bytes {
+            was.extend_from_slice(bytes);
+        }
+    });
 }
 
 /// Puts `merged` back into title memory at `at` (read just before by
@@ -1235,27 +1244,35 @@ fn read_title(src: *const u8, dst: &mut [u8]) -> bool {
 /// the whole span, or with [`back_blocks`] only the 1 KiB blocks that
 /// differ from what was read, joined into runs. Returns the bytes written.
 fn put_back(at: usize, merged: &[u8]) -> usize {
-    let n = merged.len();
-    let whole = || {
-        let _writing = crate::watch::writing(at, n);
-        crate::host::write_mapped(at as *mut u8, merged.as_ptr(), n);
-        n
-    };
-    if !back_blocks() {
-        return whole();
-    }
-    READ.with_borrow(|was| {
-        if was.len() != n {
-            return whole();
-        }
-        let mut written = 0;
-        changed_blocks(merged, was, |a, b| {
-            let _writing = crate::watch::writing(at + a, b - a);
-            crate::host::write_mapped((at + a) as *mut u8, merged[a..].as_ptr(), b - a);
-            written += b - a;
-        });
-        written
+    put_back_by(at, merged, back_blocks(), |at, bytes| {
+        let _writing = crate::watch::writing(at, bytes.len());
+        crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
     })
+}
+
+/// [`put_back`], `write` doing the writing (address, bytes). By block only
+/// if what this thread read last is this very span, the same address and
+/// length: against any other read the blocks left out would be wrong ones,
+/// and what shaders wrote there would never reach the title. Else whole.
+fn put_back_by(at: usize, merged: &[u8], blocks: bool, mut write: impl FnMut(usize, &[u8])) -> usize {
+    if blocks {
+        let by_block = READ.with_borrow(|(read_at, was)| {
+            if *read_at != at || was.len() != merged.len() {
+                return None;
+            }
+            let mut written = 0;
+            changed_blocks(merged, was, |a, b| {
+                write(at + a, &merged[a..b]);
+                written += b - a;
+            });
+            Some(written)
+        });
+        if let Some(written) = by_block {
+            return written;
+        }
+    }
+    write(at, merged);
+    merged.len()
 }
 
 /// Visit contiguous runs of changed 1 KiB blocks, including a partial last block.
@@ -1278,6 +1295,29 @@ fn changed_blocks(merged: &[u8], before: &[u8], mut visit: impl FnMut(usize, usi
 
 #[cfg(test)]
 mod back_block_tests {
+    /// Only the changed blocks of the span read last are written; a span
+    /// read at another address or of another length goes back whole, and
+    /// so does every span with the switch off.
+    #[test]
+    fn blocks_are_left_out_only_against_the_read_of_the_same_span() {
+        let before = vec![7u8; 3000];
+        let mut after = before.clone();
+        after[1500] = 1;
+        let put = |at: usize, merged: &[u8], blocks: bool| {
+            let mut runs = Vec::new();
+            let n = super::put_back_by(at, merged, blocks, |at, bytes| runs.push((at, bytes.to_vec())));
+            assert_eq!(n, runs.iter().map(|r| r.1.len()).sum::<usize>());
+            runs
+        };
+        super::remember_read(0x10_0000, Some(&before));
+        assert_eq!(put(0x10_0000, &after, true), [(0x10_0400, after[1024..2048].to_vec())]);
+        assert_eq!(put(0x10_0000, &after, false), [(0x10_0000, after.clone())], "the switch off");
+        assert_eq!(put(0x20_0000, &after, true), [(0x20_0000, after.clone())], "read elsewhere");
+        assert_eq!(put(0x10_0000, &after[..2999], true), [(0x10_0000, after[..2999].to_vec())], "another length");
+        super::remember_read(0x10_0000, None);
+        assert_eq!(put(0x10_0000, &after, true), [(0x10_0000, after.clone())], "a read that failed");
+    }
+
     #[test]
     fn adjacent_changes_join_and_a_partial_tail_stays_in_bounds() {
         let before = vec![0; 4099];
