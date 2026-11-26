@@ -1336,6 +1336,116 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Whether small fills and copies of title memory go on without waiting
+/// for flights where the title wrote the bytes since they were taken, or
+/// no shader write landed there lately (`VICTORY_FILL_TITLE=1`; off by
+/// default; `crate::host`'s `fill_is_titles`). With it, every landing of
+/// shader writes into title memory notes its 4 KiB pages' frame
+/// ([`landing`]).
+pub(crate) fn fill_title() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"))
+}
+
+/// The frame shader writes last landed in, by 4 KiB page: pieces of 256
+/// MiB made when first written, never freed.
+struct Landed([std::sync::atomic::AtomicPtr<LandedPiece>; Landed::PIECES]);
+
+/// Of 256 MiB: the frame (its low 31 bits and one), 0 for never.
+type LandedPiece = [std::sync::atomic::AtomicU32; Landed::PAGES];
+
+impl Landed {
+    const PAGES: usize = 1 << 16;
+    /// 128 TiB, what a process has.
+    const PIECES: usize = 1 << 19;
+
+    fn stamp(frame: u64) -> u32 {
+        (frame as u32 & 0x7fff_ffff) + 1
+    }
+
+    fn note(&self, page: usize, frame: u64) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        let Some(place) = self.0.get(page / Landed::PAGES) else {
+            return;
+        };
+        let mut piece = place.load(Acquire);
+        if piece.is_null() {
+            let made: Box<LandedPiece> = Box::new([const { std::sync::atomic::AtomicU32::new(0) }; Landed::PAGES]);
+            let made = Box::into_raw(made);
+            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                Ok(_) => made,
+                Err(there) => {
+                    // SAFETY: made just now, and another thread's is there.
+                    drop(unsafe { Box::from_raw(made) });
+                    there
+                }
+            };
+        }
+        // SAFETY: a piece, which is never freed.
+        let at = unsafe { &(&*piece)[page % Landed::PAGES] };
+        let stamp = Landed::stamp(frame);
+        if at.load(Relaxed) != stamp {
+            at.store(stamp, Relaxed);
+        }
+    }
+
+    /// Whether `page` was noted in a frame from `since` on, up to `now`.
+    fn since(&self, page: usize, since: u64, now: u64) -> bool {
+        let Some(place) = self.0.get(page / Landed::PAGES) else {
+            return false;
+        };
+        // SAFETY: null, or a piece, which is never freed.
+        let Some(piece) = (unsafe { place.load(std::sync::atomic::Ordering::Acquire).as_ref() }) else {
+            return false;
+        };
+        let stamp = piece[page % Landed::PAGES].load(std::sync::atomic::Ordering::Relaxed);
+        stamp != 0 && u64::from(Landed::stamp(now).wrapping_sub(stamp) & 0x7fff_ffff) <= now.saturating_sub(since)
+    }
+}
+
+static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+
+/// What shaders wrote is about to go into title memory at `[at, at +
+/// len)` (with [`fill_title`]): its pages are noted as landed in this
+/// frame, and the whole 64 KiB pages of the memory's other views too.
+pub(crate) fn landing(at: usize, len: usize) {
+    if !fill_title() || len == 0 {
+        return;
+    }
+    let frame = crate::frame::current();
+    let (first, last) = (at / KERNEL_PAGE, (at + len - 1) / KERNEL_PAGE);
+    (first..=last).for_each(|page| LANDED.note(page, frame));
+    let most = guard_aliases();
+    if most > 0 {
+        let (aliases, _) = crate::inplace::aliases_between(at, at + len, most);
+        for alias in aliases {
+            let page = alias / KERNEL_PAGE;
+            (page..page + PAGE / KERNEL_PAGE).for_each(|page| LANDED.note(page, frame));
+        }
+    }
+}
+
+/// Whether shaders' writes went into a page of `[at, at + len)` in the
+/// last `frames` frames ([`landing`]).
+pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
+    let now = crate::frame::current();
+    (at / KERNEL_PAGE..=(at + len.max(1) - 1) / KERNEL_PAGE)
+        .any(|page| LANDED.since(page, now.saturating_sub(frames), now))
+}
+
+/// Whether every block of `[at, at + len)` is view memory written since a
+/// host copy last took it: guarded then, and the guard is off now
+/// (written by the title, or by a landing of shader writes). Not for
+/// memory that is no view, which is never guarded (no guard can say).
+pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
+    if len == 0 || !is_view(at, at + len) {
+        return false;
+    }
+    let g = guards();
+    (at / BLOCK..=(at + len - 1) / BLOCK)
+        .all(|b| !g.clean.contains(&b) && !g.absent.contains(&b) && !g.protected.contains(&b))
+}
+
 /// Before the title's kernel read into its own memory `[at, at + len)`
 /// (the runtime calls it as `kernel_will_write`): [`writing`], and the
 /// journal hears of the write when it is done ([`journal_written`]).
@@ -2848,5 +2958,29 @@ mod piece_tests {
         assert_eq!(p.lost, 10);
         assert_eq!(pieces_after(Some(&p), 15, 9), ALL_PIECES, "from before what was lost");
         assert_eq!(pieces_after(Some(&p), 15, 10), 1 << 3 | 1 << 4 | 1 << 9 | 1 << 6);
+    }
+}
+
+#[cfg(test)]
+mod landed_tests {
+    use super::Landed;
+
+    /// The frames pages were last landed in (`VICTORY_FILL_TITLE`; after
+    /// avatarmanz/VIctory-7900XTX 9fea7434c's test).
+    #[test]
+    fn landed_pages_are_known_by_their_frame() {
+        static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+        let landed = &LANDED;
+        for page in [0, 5, Landed::PAGES - 1, Landed::PAGES, 7 * Landed::PAGES + 3] {
+            assert!(!landed.since(page, 0, 100));
+            landed.note(page, 100);
+            assert!(landed.since(page, 100, 100) && landed.since(page, 0, 100) && landed.since(page, 90, 110));
+            assert!(!landed.since(page, 101, 110));
+            landed.note(page, 0x1_0000_0005);
+            assert!(landed.since(page, 0x1_0000_0000, 0x1_0000_0007) && !landed.since(page, 0x1_0000_0006, 0x1_0000_0007));
+            assert!(!landed.since(page + 1, 0, 0x1_0000_0007));
+        }
+        landed.note(usize::MAX / 4096, 1);
+        assert!(!landed.since(usize::MAX / 4096, 0, 1));
     }
 }
