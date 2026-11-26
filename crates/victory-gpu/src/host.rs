@@ -9905,6 +9905,11 @@ impl Meter {
                     n(0),
                     ms(0),
                 );
+                // `VICTORY_LIGHT_REFRESH`: the askings it answered without
+                // the guards (they are not among those above).
+                if let Some(line) = crate::watch::light_line(frames) {
+                    tracing::info!("{line}");
+                }
             }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
