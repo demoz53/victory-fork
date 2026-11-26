@@ -105,6 +105,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_LOCAL_ANY_MASKS",
                     "VICTORY_HEAP_HANDLE_LOCAL",
                     "VICTORY_HEAP_BELOW_ZERO",
+                    "VICTORY_TABLE_CONSTANTS_IN_PLACE",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

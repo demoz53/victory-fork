@@ -841,6 +841,9 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 fn view_stride(view: &View) -> Option<u32> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
+        // A raw view (VICTORY_TABLE_CONSTANTS_IN_PLACE): shaders that pick
+        // it from the heap read it raw too.
+        View::Constant(..) if victory_shader::emit::table_constants_in_place() => return Some(1),
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
         View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
         View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
@@ -1352,7 +1355,10 @@ impl HostHeap {
             return None;
         };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        {
+            crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+            crate::copystat::add(crate::copystat::C::DynamicTaken, n as u64);
+        }
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % self.dynamic as usize) as u32;
@@ -2339,6 +2345,12 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    // A constant buffer read in place: the copy its raw view shows.
+    if let View::Constant(address, size) = *view
+        && victory_shader::emit::table_constants_in_place()
+    {
+        return constant_copy(address, size).map(|(shadow, len)| (shadow, address, len));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -2764,12 +2776,67 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// The host copy a constant buffer of `size` bytes at title `address` is
+/// read from in place, as a raw view ([`make`], with
+/// `VICTORY_TABLE_CONSTANTS_IN_PLACE`), and the bytes of it the view takes:
+/// `size` (whole dwords), or less where the copy ends first. `None` if no
+/// copy holds it or it does not start on 16 bytes in the copy (a raw
+/// view's alignment): a table holding such a constant is made afresh for
+/// the draw with the data copied (`draw::State::tables`).
+/// (After CuteBooty/victory-8gb b472495fb, a port of upstream
+/// Marvisak/VIctory 683ad7a99, Marvis.)
+pub(crate) fn constant_copy(address: u64, size: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64)> {
+    let shadow = crate::shadow::find(address, u64::from(size).max(1))
+        .or_else(|| crate::shadow::find(address, 1))?;
+    shadow.offset_in(address)?;
+    let len = u64::from(size).min(shadow.left(address)) & !3;
+    (len > 0 && shadow.offset(address).is_multiple_of(16)).then_some((shadow, len))
+}
+
+/// Makes a raw shader resource view of `len` bytes of `buffer` from byte
+/// `offset` (on 16) at `at`; `None` if the host would refuse it.
+fn raw_srv(buffer: &ID3D12Resource, offset: u64, len: u64, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<()> {
+    let host = host()?;
+    let (first, count) = (offset / 4, u32::try_from(len / 4).ok()?);
+    // SAFETY: a live buffer.
+    let width = unsafe { buffer.GetDesc() }.Width;
+    if !offset.is_multiple_of(16) || !buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, first, count, 0, true, width) {
+        once!(offset, len, width, "a constant buffer's raw view the host would refuse left null");
+        return None;
+    }
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: first,
+                NumElements: count,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    };
+    // SAFETY: a live buffer and a slot of our heap; the range lies in it.
+    unsafe { host.device.CreateShaderResourceView(buffer, Some(&desc), at) };
+    Some(())
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
+        // Translated shaders read constant buffers in the title's slots as
+        // raw buffers (`victory_shader::emit::table_constants_in_place`):
+        // a raw view of the host copy, on 16 bytes as the console's are,
+        // where a constant buffer view wants 256.
+        &View::Constant(address, size) if victory_shader::emit::table_constants_in_place() => {
+            let (shadow, len) = constant_copy(address, size)?;
+            raw_srv(&shadow.buffer, shadow.offset(address), len, at)?;
+            Some(Some(shadow.buffer.clone()))
+        }
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
@@ -3010,6 +3077,10 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
+        }
+        // Read as a raw buffer (VICTORY_TABLE_CONSTANTS_IN_PLACE).
+        View::Constant(..) if victory_shader::emit::table_constants_in_place() => {
+            return null_buffer_view(at);
         }
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();

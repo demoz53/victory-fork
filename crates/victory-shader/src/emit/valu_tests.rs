@@ -4003,6 +4003,18 @@ const fn mubuf_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
 
 #[test]
 fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
+    cbv_narrow_loads(false);
+}
+
+/// As [`cbv_narrow_buffer_loads_extract_and_sign_extend`], the table's
+/// constant buffer read as a raw buffer (`VICTORY_TABLE_CONSTANTS_IN_PLACE`).
+#[test]
+fn table_constants_in_place_narrow_loads_read_a_raw_view() {
+    cbv_narrow_loads(true);
+}
+
+fn cbv_narrow_loads(in_place: bool) {
+    use super::host::Stride;
     // CBV contents (64 bytes = 16 dwords, 16-byte rows):
     //   dword 0 (bytes 0..4):   [0x05, 0xFE, 0x7F, 0x81]
     //   dword 1 (bytes 4..8):   [0x01, 0x80, 0xAB, 0xCD]
@@ -4104,7 +4116,8 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
         let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        let l = lower::lower(&lower::Parts {
+        let l = super::with_table_constants_in_place(in_place, || {
+            lower::lower(&lower::Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -4114,6 +4127,151 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+        })
+        .unwrap()
+        });
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
+        };
+        #[cfg(windows)]
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let cbv = || if in_place {
+                View::Buffer { data: &cbv_data, stride: Stride::Raw }
+            } else {
+                View::Cbv(&cbv_data)
+            };
+            for &off in offsets {
+                let want = match (bits, signed) {
+                    (8, false) => u32::from(bytes[off as usize]),
+                    (8, true) => (bytes[off as usize] as i8) as i32 as u32,
+                    (16, false) => u32::from(u16::from_le_bytes([
+                        bytes[off as usize],
+                        bytes[off as usize + 1],
+                    ])),
+                    (16, true) => (i16::from_le_bytes([
+                        bytes[off as usize],
+                        bytes[off as usize + 1],
+                    ])) as i32 as u32,
+                    _ => unreachable!(),
+                };
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![off, 0, 0, 0, 0]))],
+                            views: &[cbv(), View::RawUav(16)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    out[0][0], want,
+                    "{backend}: {name} at CBV byte offset {off} = {:#010x}, want {want:#010x}",
+                    out[0][0],
+                );
+            }
+        }
+    }
+}
+
+/// `s_buffer_load_dword` of a table's constant buffer reads the same dword
+/// through a constant buffer view and, with
+/// `VICTORY_TABLE_CONSTANTS_IN_PLACE`, through a raw view (the scalar
+/// path of `smem`), and the program validates either way.
+#[test]
+fn table_constants_in_place_scalar_loads_read_a_raw_view() {
+    use super::host::Stride;
+    let data: [u32; 64] = std::array::from_fn(|i| 0x1000_0000 + i as u32 * 0x0101);
+    for in_place in [false, true] {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(5, 0x80)); // s5 = 0
+        words.extend_from_slice(&s_load_dwordx4(8, 4)); // s[8:11] = CBV at offset 0
+        words.extend_from_slice(&[0xF408_0302, 0xFA00_0020]); // s[12:15] = UAV at 0x20
+        // s_buffer_load_dword s16, s[8:11], 0x24 (dword 9)
+        words.extend_from_slice(&[0xF420_0404, 0xFA00_0024]);
+        // s_buffer_load_dwordx4 s[20:23], s[8:11], 0xa0 (dwords 40-43)
+        words.extend_from_slice(&[0xF428_0504, 0xFA00_00A0]);
+        words.push(vop1(0x001, 0, sgpr(16))); // v0 = s16
+        words.extend_from_slice(&buffer_store_dword(0, 12, 0));
+        words.push(vop1(0x001, 0, sgpr(22))); // v0 = s22 (dword 42)
+        words.extend_from_slice(&buffer_store_dword(0, 12, 4));
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let table = |kind, table_offset_dwords, stride| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![table(ResourceType::Cbv, 0, 0), table(ResourceType::Uav, 8, 4)],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let l = super::with_table_constants_in_place(in_place, || {
+            lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -4139,38 +4297,24 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
                 continue;
             };
             let (root, pso) = host.compute_pipeline(&shader).unwrap();
-            for &off in offsets {
-                let want = match (bits, signed) {
-                    (8, false) => u32::from(bytes[off as usize]),
-                    (8, true) => (bytes[off as usize] as i8) as i32 as u32,
-                    (16, false) => u32::from(u16::from_le_bytes([
-                        bytes[off as usize],
-                        bytes[off as usize + 1],
-                    ])),
-                    (16, true) => (i16::from_le_bytes([
-                        bytes[off as usize],
-                        bytes[off as usize + 1],
-                    ])) as i32 as u32,
-                    _ => unreachable!(),
-                };
-                let out = host
-                    .dispatch(
-                        &root,
-                        &pso,
-                        &Dispatch {
-                            roots: vec![(0, Root::Constants(vec![off, 0, 0, 0, 0]))],
-                            views: &[View::Cbv(&cbv_data), View::RawUav(16)],
-                            samplers: &[],
-                            groups: [1, 1, 1],
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(
-                    out[0][0], want,
-                    "{backend}: {name} at CBV byte offset {off} = {:#010x}, want {want:#010x}",
-                    out[0][0],
-                );
-            }
+            let cbv = if in_place {
+                View::Buffer { data: &data, stride: Stride::Raw }
+            } else {
+                View::Cbv(&data)
+            };
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        views: &[cbv, View::RawUav(16)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0][..2], [data[9], data[42]], "{backend}: in place {in_place}");
         }
     }
 }

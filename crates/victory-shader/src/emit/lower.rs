@@ -1643,6 +1643,40 @@ pub fn heap_half_bits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_HALF_BITS").is_some_and(|v| v == "1"))
 }
 
+/// Whether a constant buffer the program reads through a descriptor table
+/// is read as a raw buffer (scalar loads and per-lane rows alike), as the
+/// title's view heap then holds it: a raw view of the constant data's host
+/// copy (`victory-gpu`'s `descriptor::host::constant_copy`). The host wants
+/// constant buffer views on 256 bytes, the console's are on 16, so with
+/// constant buffer views every table that held one was made afresh per
+/// draw in dynamic slots with the data copied; read raw, the title's own
+/// slots serve and the table needs no slots of its own. Opt-in
+/// (`VICTORY_TABLE_CONSTANTS_IN_PLACE=1`); part of the translation (the
+/// shader cache keys on it). Port of upstream Marvisak/VIctory 683ad7a99
+/// (Marvis, "table constants read in place"), with the host side's
+/// fallback after CuteBooty/victory-8gb b472495fb/7a547593b.
+pub fn table_constants_in_place() -> bool {
+    if let Some(on) = TABLE_CONSTANTS_FORCED.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CONSTANTS_IN_PLACE").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// [`table_constants_in_place`] as a test on this thread sets it.
+    static TABLE_CONSTANTS_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`table_constants_in_place`] answering `on` on this
+/// thread (tests).
+pub fn with_table_constants_in_place<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = TABLE_CONSTANTS_FORCED.with(|c| c.replace(Some(on)));
+    let r = f();
+    TABLE_CONSTANTS_FORCED.with(|c| c.set(was));
+    r
+}
+
 /// Whether `ds_swizzle_b32` offsets from 0xC000 are the ISA's rotate mode
 /// (0xC000-0xDFFF: lane i reads `(i & mask) | ((i + rot) & !mask)` in its
 /// group of 32, rot = offset[9:5], negated with offset[10], mask =
@@ -6617,7 +6651,9 @@ impl<'a> Lower<'a> {
                 (props, None)
             }
             // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+            Fields::Smem { .. }
+                if used.is_some_and(|u| u.kind == ResourceType::Srv) || Self::table_constant(used) =>
+            {
                 ((11, 0), None)
             }
             // A constant buffer: nothing of its descriptor is a number.
@@ -6825,6 +6861,24 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// Whether `used` is a constant buffer in a descriptor table read as a
+    /// raw buffer ([`table_constants_in_place`]).
+    fn table_constant(used: Option<&UsedResource>) -> bool {
+        table_constants_in_place()
+            && used.is_some_and(|u| u.kind == ResourceType::Cbv && u.root == RootType::Table)
+    }
+
+    /// The dword at byte `a` of raw buffer `h`.
+    fn raw_dword(&mut self, h: V, a: V) -> V {
+        let c = self.cur;
+        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+        let r = self
+            .s
+            .op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
     }
 
     /// The dword at a computed byte address of a constant buffer.
