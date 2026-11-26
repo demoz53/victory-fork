@@ -373,6 +373,47 @@ fn refuse(file: &str) {
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
 
+/// The priority a title thread is given for the one it asks for: with
+/// [`title_priorities`], "idle" and "lowest" become "below normal", the
+/// rest as asked. Six of the title's threads run at "idle", the streaming
+/// pager's among them; on the console they have what the rest of the
+/// title leaves of its cores. On a PC whose processors are all busy (our
+/// own workers, pipeline builds) such a thread ran once in four seconds or
+/// so, and the loading that waits for it with it (avatarmanz's run
+/// stream-3: loads done 1.1 s late on average, 4.8 s at worst). Ported
+/// from avatarmanz/VIctory-7900XTX 0d065d352 (GPL-3.0), opt-in here.
+fn title_priority(asked: i32, lift: bool) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    match asked {
+        IDLE..=LOWEST if lift => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// Whether the title's idle and lowest threads run below normal
+/// (`VICTORY_TITLE_PRIORITIES=1`; off by default: as the title sets them).
+fn title_priorities() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TITLE_PRIORITIES").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The title's `SetThreadPriority`, through [`title_priority`]; the first
+/// threads lifted are said in the log.
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> windows_sys::core::BOOL {
+    let given = title_priority(priority, title_priorities());
+    if given != priority {
+        static LIFTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let lifted = LIFTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if lifted <= 16 {
+            tracing::info!(asked = priority, given, lifted, "a title thread runs below normal, not at the priority it asked for (VICTORY_TITLE_PRIORITIES=1)");
+        }
+    }
+    // SAFETY: the title passes a thread handle.
+    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, given) }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -405,6 +446,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -623,6 +665,28 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With the switch the title's idle and lowest threads run below
+    /// normal, the others as it sets them; without it all as set.
+    #[test]
+    fn title_priorities_lift_only_idle_and_lowest() {
+        let asked = [-15, -2, -1, 0, 1, 2, 15];
+        let lifted: Vec<i32> = asked.into_iter().map(|p| title_priority(p, true)).collect();
+        assert_eq!(lifted, [-1, -1, -1, 0, 1, 2, 15]);
+        let as_set: Vec<i32> = asked.into_iter().map(|p| title_priority(p, false)).collect();
+        assert_eq!(as_set, asked);
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        std::thread::spawn(|| {
+            // SAFETY: plain calls on this thread.
+            let thread = unsafe { GetCurrentThread() };
+            assert_eq!(SetThreadPriority(thread, -2), 1);
+            // The switch is not set in tests: as asked.
+            // SAFETY: as above.
+            assert_eq!(unsafe { GetThreadPriority(thread) }, -2);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
