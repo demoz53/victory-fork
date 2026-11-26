@@ -125,6 +125,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        // With submissions prepared by a thread of ours
+        // (`crate::queue::behind`) the signal may still be in a queue's
+        // line: the lines run first, on this thread.
+        #[cfg(windows)]
+        if crate::queue::behind() {
+            drop(waiters);
+            crate::queue::before_sync(crate::queue::BEFORE_FENCE);
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        }
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.

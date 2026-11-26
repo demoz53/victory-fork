@@ -4139,6 +4139,186 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
+/// Whether the title's blocking flip wait also waits until everything it
+/// gave the card before the present of the frame before the one it records
+/// has landed: shader writes copied back, read-backs, bottom-of-pipe values
+/// and fences behind it (`VICTORY_FLIP_LANDED`: `1` on, `0` off; unset: on
+/// with `VICTORY_ASYNC_SUBMIT=1`, off without it; needs [`late`]).
+///
+/// After fx PR #995's `VICTORY_FLIP_LANDED` (tunczzz, 72dbd10, GPL-3.0).
+/// The title paces itself by a blocking wait for the flip once a frame,
+/// and on the console that comes after the card has run the frame shown.
+/// Ours comes on a clock tick (`crate::frame`), whatever the card or the
+/// relay has done. A title that reads what a frame's work wrote for it
+/// once that frame's flip has passed, without a fence, reads an older
+/// frame's results here whenever the work has not landed by then: #995's
+/// asynchronous submission, with the present behind the line, lost the
+/// first room's walls that way in every run. Ours runs the lines before a
+/// present returns (`crate::queue::before_sync`), so the frame before is
+/// always sent by then; this makes its landing certain as well. The title
+/// still records its frame beside our preparing of the one before: only
+/// the end of the frame before is waited for, where the console's flip
+/// waits for it too. Bounded by the title's own time-out and by a second
+/// and a half.
+pub(crate) fn flip_landed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_FLIP_LANDED").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::queue::behind(),
+        } && late();
+        if on {
+            tracing::info!("a flip wait waits until the work of the frame before has landed (VICTORY_FLIP_LANDED)");
+        }
+        on
+    })
+}
+
+/// Submissions started when the title's last present had run the queues'
+/// lines ([`present_sent`]); and as it was when the title's current frame
+/// began ([`frame_begins`]): the end of the frame before it.
+static PRESENT_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAME_BEFORE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line ([`flip_landed`]): blocking flip waits; of
+/// them those that found the frame before not landed; microseconds they
+/// waited; waits that gave up (time-out).
+static FLIP_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A present has run the queues' lines: what was started so far is the
+/// frame's (`crate::queue`'s present, before its own copy is sent).
+pub(crate) fn present_sent() {
+    PRESENT_SENT.store(STARTED.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// The title begins a frame (`crate::frame`'s origin wait hands out a token).
+pub(crate) fn frame_begins() {
+    FRAME_BEFORE.store(PRESENT_SENT.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// The title's blocking flip wait (`timeout_ms` as it passed it), before
+/// the wait for the tick: with [`flip_landed`], waits until the frame
+/// before the one the title records has landed.
+pub(crate) fn flip_wait(timeout_ms: u32) {
+    if timeout_ms == 0 || !flip_landed() {
+        return;
+    }
+    let target = FRAME_BEFORE.load(Ordering::Acquire);
+    FLIP_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let landed = || FINISHED.load(Ordering::Acquire) >= target;
+    if landed() {
+        return;
+    }
+    FLIP_STATS[1].fetch_add(1, Ordering::Relaxed);
+    let began = std::time::Instant::now();
+    let limit = std::time::Duration::from_millis(u64::from(timeout_ms).min(1500));
+    let met = wait_until(
+        limit,
+        landed,
+        // Nothing in the air and nothing being landed: whatever was sent
+        // has landed.
+        || {
+            let line = line();
+            line.line.is_empty() && !line.settling
+        },
+        |most| {
+            let line = line();
+            let _ = LINE_LANDED.wait_timeout(line, most);
+        },
+    );
+    FLIP_STATS[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if !met {
+        FLIP_STATS[3].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Until `done`, for at most `limit`: `park` waits for something to move
+/// (a landing) for at most the time it is given; `idle` says nothing more
+/// will. Whether `done` came true.
+fn wait_until(
+    limit: std::time::Duration,
+    done: impl Fn() -> bool,
+    idle: impl Fn() -> bool,
+    park: impl Fn(std::time::Duration),
+) -> bool {
+    let began = std::time::Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        if idle() {
+            return done();
+        }
+        let left = limit.saturating_sub(began.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        park(left.min(std::time::Duration::from_millis(2)));
+    }
+}
+
+#[cfg(test)]
+mod flip_tests {
+    use super::wait_until;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// The flip wait's order: what the title reads after it is what the
+    /// landing of the frame before wrote, however late that landing is.
+    #[test]
+    fn a_read_after_the_flip_wait_sees_the_landed_results() {
+        let finished = Arc::new(AtomicU64::new(4));
+        let memory = Arc::new(AtomicU64::new(0));
+        let lander = {
+            let (finished, memory) = (finished.clone(), memory.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                // The landing: results into title memory, then the count.
+                memory.store(0xC0FFEE, Ordering::Relaxed);
+                finished.store(7, Ordering::Release);
+            })
+        };
+        let met = wait_until(
+            Duration::from_secs(5),
+            || finished.load(Ordering::Acquire) >= 7,
+            || false,
+            std::thread::sleep,
+        );
+        assert!(met);
+        assert_eq!(memory.load(Ordering::Relaxed), 0xC0FFEE);
+        lander.join().unwrap();
+    }
+
+    /// Nothing left in the air ends the wait; so does the time-out.
+    #[test]
+    fn the_flip_wait_ends_when_nothing_can_land_or_time_is_up() {
+        assert!(!wait_until(Duration::from_secs(5), || false, || true, |_| panic!("parked with nothing in the air")));
+        let began = std::time::Instant::now();
+        assert!(!wait_until(Duration::from_millis(20), || false, || false, std::thread::sleep));
+        assert!(began.elapsed() >= Duration::from_millis(20));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(wait_until(Duration::ZERO, || true, || false, |_| panic!("parked when done")));
+    }
+}
+
+/// The frame line's account of [`flip_landed`].
+fn flip_line(frames: f64) {
+    if !flip_landed() {
+        return;
+    }
+    let f: Vec<f64> = FLIP_STATS.iter().map(|f| f.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "the title's flip waits per frame (VICTORY_FLIP_LANDED=1): {:.2}, {:.2} of them found the frame before not landed \
+         and waited {:.2} ms for it, {:.2} gave up at the title's time-out",
+        f[0],
+        f[1],
+        f[2] / 1000.0,
+        f[3],
+    );
+}
+
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
@@ -4435,6 +4615,8 @@ fn late_line(frames: f64) {
             bytes / (1 << 20) as f64
         );
     }
+    crate::queue::behind_line(frames);
+    flip_line(frames);
 }
 
 #[cfg(test)]
@@ -6170,6 +6352,9 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // Behind what the queues were given before it and have not run
+        // yet (`crate::queue::behind`).
+        crate::queue::before_sync(crate::queue::BEFORE_OURS);
         let _ = self.submit(runs, false);
     }
 
