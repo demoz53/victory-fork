@@ -358,8 +358,11 @@ fn windows() -> bool {
 /// store to a buffer"; written here from that sentence, not from its code.)
 ///
 /// Not batched, and clamped as before: executions with a count buffer or of
-/// more than one record, and the dispatches of pipelines that run in parts
-/// (`VICTORY_INDIRECT_SPLIT`, `_AUTO`).
+/// more than one record; the dispatches of pipelines that run in parts
+/// (`VICTORY_INDIRECT_SPLIT`, `_AUTO`); and an execution that finds no batch
+/// with its record and would end its own at once ([`batch_opens`]: with `1`
+/// every dispatch after a dispatch), for which a pass of a batch would cost
+/// more than its own clamp.
 pub(crate) fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
@@ -399,6 +402,17 @@ fn batch_after(mode: u8, wrote: bool, met: Met) -> Option<bool> {
     }
 }
 
+/// Whether an execution that is met as `met` once it has run opens a batch
+/// for its record when none holds it: not if that batch would end with this
+/// very execution (in `mode` 1 a dispatch; a draw whose shaders store): its
+/// pass would clamp one record, and costs more than the clamp of one
+/// (11.0 ms against 8.3 for 2,400 on this card:
+/// `crate::indirect::tests::batch_costs_on_this_card`). Such an execution
+/// is clamped on its own, as without batches.
+fn batch_opens(mode: u8, met: Met) -> bool {
+    batch_after(mode, false, met).is_some()
+}
+
 /// The records clamped by the pass opened last ([`batches`]).
 struct Batch {
     table: crate::indirect::batch::Table,
@@ -428,7 +442,7 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
 
 /// Since the last frame-rate line, by the `B_` names: what indirect
 /// executions did with batches ([`batches`]).
-static BATCH_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static BATCH_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 const B_OPENED: usize = 0;
 const B_READ: usize = 1;
 const B_NOT_ONE: usize = 2;
@@ -437,6 +451,7 @@ const B_REFUSED: usize = 4;
 const B_END_WRITE: usize = 5;
 const B_END_STORE: usize = 6;
 const B_END_SYNC: usize = 7;
+const B_ALONE: usize = 8;
 
 fn batch_count(what: usize) {
     BATCH_STATS[what].fetch_add(1, Ordering::Relaxed);
@@ -452,14 +467,16 @@ pub(crate) fn batch_line(frames: f64) {
     tracing::info!(
         "indirect batches per frame (VICTORY_INDIRECT_BATCH={}): {:.0} passes clamped the records of {:.0} executions; \
          clamped on their own: {:.0} with a count buffer or of more than one record, {:.0} dispatches that run in \
-         parts, {:.0} a batch could not take; batches ended by {:.0} dispatches (=3: those whose shaders store), {:.0} \
-         draws whose shaders store, {:.0} waits of the title's or draws after dispatches (=2)",
+         parts, {:.0} a batch could not take, {:.0} whose own batch would have ended with them (dispatches; with 3, \
+         those whose shaders store; draws whose shaders store); batches ended by {:.0} dispatches (=3: those whose \
+         shaders store), {:.0} draws whose shaders store, {:.0} waits of the title's or draws after dispatches (=2)",
         batches(),
         b[B_OPENED],
         b[B_READ],
         b[B_NOT_ONE],
         b[B_PARTS],
         b[B_REFUSED],
+        b[B_ALONE],
         b[B_END_WRITE],
         b[B_END_STORE],
         b[B_END_SYNC],
@@ -3915,6 +3932,7 @@ impl State {
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
         (kind, stride): (u32, u32),
+        stores: bool,
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
@@ -3932,6 +3950,7 @@ impl State {
         // or records further apart than a place has room for: clamped on
         // its own, and the batch stays for the others.
         if !crate::indirect::batch::fits(offset, kind) || stride > crate::indirect::batch::STRIDE {
+            batch_count(B_REFUSED);
             return None;
         }
         // A dispatch's record is noted with its execution, as its own clamp
@@ -3952,11 +3971,26 @@ impl State {
             batch_count(B_READ);
             return Some((b.scratch.clone(), at));
         }
+        // A batch of its own would end with it (`batch_opens`): clamped on
+        // its own. (A batch that could not take it ends with it too, once
+        // it has run.)
+        let met = if kind == DISPATCH { Met::Dispatch { stores } } else { Met::Draw { stores } };
+        if !batch_opens(batches(), met) {
+            batch_count(B_ALONE);
+            return None;
+        }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        let opened = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args));
+        let Some((mut table, scratch)) = opened else {
+            batch_count(B_REFUSED);
+            return None;
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let at = table.place_noted(id, offset, kind, who, execution)?;
+        let Some(at) = table.place_noted(id, offset, kind, who, execution) else {
+            batch_count(B_REFUSED);
+            return None;
+        };
         batch_count(B_OPENED);
         batch_count(B_READ);
         self.batch = Some(Batch { table, scratch: scratch.clone(), list: host_list, wrote: false });
@@ -4079,10 +4113,8 @@ impl State {
             None
         } else {
             args.refresh(list, arguments, len);
-            let batch = self.batched(list, &args, arguments, (kind, stride));
-            if batch.is_none() {
-                batch_count(B_REFUSED);
-            } else if kind == DISPATCH {
+            let batch = self.batched(list, &args, arguments, (kind, stride), stores);
+            if batch.is_some() && kind == DISPATCH {
                 // (as the clamp of its own notes a watched pipeline's)
                 let this = self.pipeline as This;
                 crate::indirect::note_watched(|| crate::pipeline::shaders_label(this), arguments, count);
@@ -5067,7 +5099,24 @@ mod early_textures_tests {
 
 #[cfg(test)]
 mod batch_tests {
-    use super::{Met, batch_after};
+    use super::{Met, batch_after, batch_opens};
+
+    /// An execution opens a batch only if the batch outlives it: not a
+    /// dispatch with 1, not one whose shaders store with 3, never a draw
+    /// whose shaders store.
+    #[test]
+    fn an_execution_that_would_end_its_own_batch_opens_none() {
+        for mode in [1, 2, 3] {
+            assert!(batch_opens(mode, Met::Draw { stores: false }));
+            assert!(!batch_opens(mode, Met::Draw { stores: true }));
+        }
+        for stores in [false, true] {
+            assert!(!batch_opens(1, Met::Dispatch { stores }));
+            assert!(batch_opens(2, Met::Dispatch { stores }));
+        }
+        assert!(batch_opens(3, Met::Dispatch { stores: false }));
+        assert!(!batch_opens(3, Met::Dispatch { stores: true }));
+    }
 
     /// `VICTORY_INDIRECT_BATCH=1`: a batch ends at a dispatch and at a draw
     /// whose shaders store, and at nothing else.
@@ -5119,10 +5168,12 @@ mod batch_tests {
         Direct(Met),
     }
 
-    /// The passes of ours a list of `ops` takes in `mode`, by the order
-    /// `State::execute_indirect` and the direct calls meet things in: an
-    /// indirect draw waits first, an execution without a batch opens one,
-    /// and then it is met as a dispatch or draw itself.
+    /// The passes of ours a list of `ops` takes in `mode` (those of batches
+    /// and the clamps of executions that open none: `batch_opens`), by the
+    /// order `State::execute_indirect` and the direct calls meet things in:
+    /// an indirect draw waits first, an execution without a batch opens one
+    /// or is clamped on its own, and then it is met as a dispatch or draw
+    /// itself.
     fn passes(mode: u8, ops: &[Op]) -> u32 {
         let mut batch: Option<bool> = None;
         let mut passes = 0;
@@ -5143,7 +5194,9 @@ mod batch_tests {
                 }
                 if batch.is_none() {
                     passes += 1;
-                    batch = Some(false);
+                    if batch_opens(mode, met) {
+                        batch = Some(false);
+                    }
                 }
             }
             meet(&mut batch, met);
