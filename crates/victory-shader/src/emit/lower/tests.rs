@@ -128,6 +128,29 @@ fn packed_elements_behind_another_take_the_first_free_dword() {
     assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
 }
 
+/// A 16-bit operation's SDWA destination with the reserved dst_unused 3 is
+/// refused (`VICTORY_SDWA_SEXT`, upstream pull request #3124), and taken as
+/// before with the switch off.
+#[test]
+fn sdwa_16bit_reserved_dst_unused_is_refused() {
+    let was = super::TEST_SDWA_SEXT.replace(Some(true));
+    for dst_sel in [4u32, 5] {
+        // v_cvt_i16_f16_sdwa v1, v0 dst_sel:{WORD_0,WORD_1} dst_unused:3 (reserved);
+        // ds_write_b32 v0, v1 to keep v1 live.
+        let sdwa_ext = (dst_sel << 8) | (3 << 11) | (4 << 16);
+        let words = [0x7E02_A6F9, sdwa_ext, 0xD834_0000, 0x0000_0100, S_ENDPGM];
+        let err = lowers(&words, 1 << 15).expect_err("reserved dst_unused must fail");
+        assert!(
+            matches!(err, crate::ShaderError::Unsupported { what: "an SDWA destination of a 16-bit operation", .. }),
+            "unexpected error for dst_sel={dst_sel}: {err}"
+        );
+        super::TEST_SDWA_SEXT.set(Some(false));
+        assert!(lowers(&words, 1 << 15).is_ok(), "VICTORY_SDWA_SEXT=0: taken as before (dst_sel={dst_sel})");
+        super::TEST_SDWA_SEXT.set(Some(true));
+    }
+    super::TEST_SDWA_SEXT.set(was);
+}
+
 /// Whether a synthetic compute program translates with these input registers.
 fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
