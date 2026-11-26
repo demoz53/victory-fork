@@ -389,7 +389,10 @@ fn a_shuffle_across_the_halves_is_refused_with_the_switch_off() {
     lower::TEST_PERMUTE_HALVES.set(Some(true));
     let on = lowered(&native, &p, &HashSet::new());
     lower::TEST_PERMUTE_HALVES.set(was);
-    let why = off.err().expect("refused with the switch off").to_string();
+    let Err(why) = off else {
+        panic!("refused with the switch off");
+    };
+    let why = why.to_string();
     assert!(why.contains("a lane permute across two host waves"), "{why}");
     assert!(on.is_ok(), "taken with it on: {:?}", on.err());
 }

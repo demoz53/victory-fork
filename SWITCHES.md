@@ -267,3 +267,12 @@ switch.
   pass the validator and make pipelines on this card. Nothing else changes, nothing is lost.
 - Tests on the software adapter take turns through ONE lock, `crate::warp_alone` (test/avfix); test/clamps' own
   `warp_turn` was not taken over.
+
+## New in test/small3 (on top of all17)
+| Switch | Default | What | Shader |
+|---|---|---|---|
+| `VICTORY_CARD_FETCH_INFLIGHT=1` (+ `VICTORY_CARD_FETCH_INFLIGHT_MB`, 64) | off | with the relay, the pieces a flight's compare flags are copied to PC memory inside the flight's own compare list (no fetch on the copy queue beside later flights: no torn fetches); a landing that cannot use them fetches the old way on the main queue. fxceless 9376fd60c / PR #648 (Jonirulah). Works with `VICTORY_INDIRECT_WINDOW=1` (see the commit) | no |
+| `VICTORY_CARD_HASH_LEN=1` | off | the card's hash pass and compare of a title buffer's copy cover the title buffer's own bytes (16-byte steps) instead of the whole 64 KiB-rounded buffer; for small copies, pair with `VICTORY_CARD_BUFFERS_MIN_KB=64`. fxceless c36971b21. Our form of CARD_HASH_WIDE is the 64-lane CARD_COMPARE, always on (no switch) | no |
+| `VICTORY_RT_SKIP_RESOLVE=1` | off | while the structure builder does not run, pipelines whose compute container names `CS_RaytracingResolve` (about 1,000) are not made ahead and their dispatches (direct or indirect, before the clamp) are left out. Rule of lordon1a c7dc354e3 (after cool_fox 8cc31ab3); by name, no list, traced shadows kept, follows the builder (test/speed2's `VICTORY_SKIP_RT` is a 1,034-hash list, always). Frame line: "dispatches of the ray-tracing resolve programs ... left out per frame" | no |
+| `VICTORY_HEAP_FORGET` | **on** (`=0` the old way) | a dropped host view heap takes its entries out of the heap passes' caches keyed by its address (slot ranges, unordered spans, "same as sent" notes): a new heap at the same address no longer inherits stale buffer copies, and the old copies are let go. After fxceless PR #1276 (UwUCammie) | no |
+| `VICTORY_SDWA_SEXT` | **on** (`=0` the old way) | a 16-bit operation's SDWA destination WORD_0 with UNUSED_SEXT sign-extends bit 15 into bits 31:16 (was zero-filled); reserved dst_unused 3 refused. Upstream Marvisak/VIctory PR #3124 (KainanP). In the shader cache key's list | **yes** (warm) |

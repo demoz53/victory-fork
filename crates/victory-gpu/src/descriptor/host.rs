@@ -1306,6 +1306,17 @@ fn capped_dynamic_slots(guard: u32, window: Option<u32>, set: Option<u32>) -> u3
     set.unwrap_or(unset).clamp(DYNAMIC, most)
 }
 
+/// A view heap that goes takes its entries out of the heap passes' caches,
+/// which are keyed by its address (`crate::draw::forget_heap_ranges`,
+/// `VICTORY_HEAP_FORGET`; fxceless pull request #1276 by UwUCammie).
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if !self.sampler {
+            crate::draw::forget_heap_ranges(self);
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         // Whether the translator looks bindless views up in a heap map, as

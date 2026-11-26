@@ -923,6 +923,25 @@ pub(crate) struct CardSpan {
     pub(crate) skew: u32,
 }
 
+/// `VICTORY_CARD_HASH_LEN=1` (off by default): the card's hashes cover the
+/// title buffer's own bytes ([`Shadow::card_hashed`]).
+fn card_hash_len() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_HASH_LEN").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("the card's hashes and compares of title buffers' copies cover the title buffer's own bytes (VICTORY_CARD_HASH_LEN=1)");
+        }
+        on
+    })
+}
+
+/// [`Shadow::card_hashed`] for a title buffer of `len` bytes whose copy's
+/// buffer is `size` bytes.
+fn card_hashed_of(short: bool, len: u64, size: u64) -> u64 {
+    if short { len.next_multiple_of(16).min(size) } else { size }
+}
+
 /// [`CardSpan`] for offsets `[from, to)` (`from < to`) of a copy of title
 /// memory from `start` on.
 fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
@@ -946,7 +965,47 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs};
+
+    /// With `VICTORY_CARD_HASH_LEN=1` the hash covers the title buffer's own
+    /// bytes, in 16-byte steps, never past the copy's buffer; off, the whole
+    /// buffer as before. Every byte that can go back to the title is hashed.
+    #[test]
+    fn the_short_hash_covers_the_title_buffer() {
+        assert_eq!(card_hashed_of(false, 288, 65536), 65536);
+        assert_eq!(card_hashed_of(true, 288, 65536), 288);
+        assert_eq!(card_hashed_of(true, 289, 65536), 304);
+        assert_eq!(card_hashed_of(true, 65536, 65536), 65536);
+        assert_eq!(card_hashed_of(true, 65530, 65536), 65536);
+        assert_eq!(card_hashed_of(true, 3 * 65536 + 1, 4 * 65536), 3 * 65536 + 16);
+        for len in [1u64, 15, 16, 17, 4095, 70000] {
+            let size = len.next_multiple_of(65536);
+            assert!(card_hashed_of(true, len, size) >= len);
+        }
+    }
+
+    /// The fetch inside flights (`CARD_FETCH` in host.rs) copies each piece
+    /// from `inflight_piece_from` on: every part the merge takes of the
+    /// piece lies in that slot.
+    #[test]
+    fn a_piece_fetched_in_flight_fits_its_slot() {
+        let slot = crate::host::INFLIGHT_SLOT as usize;
+        for start in [0usize, 4096, 7, PIECE - 16, PIECE - 3, 3 * PIECE + 0x1f09, 0xd_b790_df00] {
+            let len = 5 * PIECE + 4096;
+            for (from, to) in [(0, len), (0, 1), (16, PIECE), (PIECE - 4, PIECE + 4), (2 * PIECE, len), (12345, 4 * PIECE + 7)] {
+                let span = card_span_of(start, from, to);
+                for i in 0..span.pieces {
+                    let at = crate::host::inflight_piece_from(&span, i);
+                    assert_eq!(at % 16, 0);
+                    let (lo, hi) = card_piece_of(start, len, &span, i);
+                    assert!(lo >= at && hi - at <= slot, "{start:#x} {from} {to} piece {i}: {lo}..{hi} from {at}");
+                    for (a, b) in super::card_piece_parts_of(start, len, &span, i, u32::MAX) {
+                        assert!(a >= at && b - at <= slot, "{start:#x} {from} {to} piece {i}: part {a}..{b} from {at}");
+                    }
+                }
+            }
+        }
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -1334,7 +1393,7 @@ mod back_block_tests {
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
-fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
     let mut at = from;
@@ -3744,6 +3803,23 @@ impl Shadow {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Some((card.staging.as_ref(), before, card.size))
+    }
+
+    /// The bytes of the copy the card's hashes and compares cover: with
+    /// `VICTORY_CARD_HASH_LEN=1` the title buffer's own, rounded up to the
+    /// hash's 16-byte step; else the copy's whole buffer, as before. A copy's
+    /// buffer is the title buffer rounded up to 64 KiB, and the compare's
+    /// lanes walk all of a piece: for a title buffer of 288 bytes, 64 lanes
+    /// of 64 loads where 18 loads hold everything that can go back to the
+    /// title (the parts fetched are cut to the title buffer anyway,
+    /// `card_piece_parts`). With every title buffer's copy on the card
+    /// (`VICTORY_CARD_BUFFERS_MIN_KB=64`) most copies are such. The hash pass
+    /// after a send and the compare after the lists take the same length, so
+    /// a piece's hash is always of the same bytes. Ported from
+    /// fxceless/victory-fork c36971b21 (fxceless).
+    pub(crate) fn card_hashed(&self) -> Option<u64> {
+        let size = self.card.as_ref()?.size;
+        Some(card_hashed_of(card_hash_len(), self.len, size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
