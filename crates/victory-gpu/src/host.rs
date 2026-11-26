@@ -274,6 +274,8 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // What `VICTORY_COPY_PLAIN=1` did, every ten seconds.
+    crate::guarded::tick();
     // Host copies of placed textures in memory the runtime remapped since
     // the last submission (`VICTORY_EVICT_LATER=1`).
     crate::resource::evict_noted();
@@ -8241,10 +8243,16 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// readable.
 /// The destination must be host memory (`crate::guarded`).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    if crate::guarded::on() {
+    // `VICTORY_COPY_PLAIN=1`: a small read, or one where a guarded read
+    // faulted lately, is the kernel's.
+    if crate::guarded::on() && !crate::guarded::kernel_first(src, len) {
         // SAFETY: the destination is mapped writable host memory of `len`
         // bytes; a source page that is not there stops the copy.
-        return unsafe { crate::guarded::copy(src, dst, len) };
+        let whole = unsafe { crate::guarded::copy(src, dst, len) };
+        if !whole {
+            crate::guarded::note_fault(src, len);
+        }
+        return whole;
     }
     read_kernel(src, dst, len)
 }
@@ -8306,7 +8314,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    // `VICTORY_COPY_PLAIN=1`: in place first (`crate::guarded::write`); a
+    // page that is not there or not writable leaves it to the kernel.
+    if len == 0 || crate::guarded::write(dst, src, len) || write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {

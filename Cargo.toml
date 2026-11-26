@@ -75,3 +75,15 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Thin link-time optimisation, to be measured against the two profiles
+# above before it is anyone's default (soldsawn/victory-nvidia-8gb builds
+# its release with it; lordon1a measured it slower): `--profile
+# release-lto`, or `--profile diag-lto -p victory --features diagnostics`.
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+
+[profile.diag-lto]
+inherits = "diag"
+lto = "thin"
