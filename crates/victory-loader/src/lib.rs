@@ -30,6 +30,8 @@ pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod sampler;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]
 mod threads;
@@ -50,6 +52,11 @@ pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use sampler::{final_report as profile_final_report, sample_threads};
+/// Without the diagnostics feature there is no sampler: nothing to report.
+#[cfg(all(windows, not(feature = "diagnostics")))]
+pub fn profile_final_report() {}
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
