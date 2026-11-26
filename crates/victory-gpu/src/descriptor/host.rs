@@ -5365,7 +5365,7 @@ mod tests {
         };
         assert!(make(&srv_placed, heap.cpu(2)).flatten().is_some());
         assert_eq!(
-            crate::resource::alias_of(srv_obj as crate::object::This),
+            crate::resource::alias_of(srv_obj as crate::object::This).map(|s| s.get()),
             Some(uav_obj as crate::object::This),
             "placed SRV must find the placed UAV texture in TARGETS_AT"
         );
