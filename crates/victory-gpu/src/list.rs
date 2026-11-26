@@ -2278,6 +2278,24 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // VICTORY_BARRIER_GROUPS=1: barriers on the textures named, or none.
+        // SAFETY: the title passes `count` groups at `groups`.
+        if barrier_groups_named()
+            && let Some(groups) = unsafe { read_groups(count, groups) }
+            && let Some(named) = named_targets(groups)
+        {
+            for texture in &named {
+                list.keep(texture);
+            }
+            let barriers: Vec<D3D12_RESOURCE_BARRIER> =
+                named.iter().map(crate::indirect::resource_uav_barrier).collect();
+            if !barriers.is_empty() {
+                // SAFETY: an open list; textures the list keeps.
+                unsafe { list.list.ResourceBarrier(&barriers) };
+            }
+            crate::waitstat::scoped(crate::waitstat::Cause::Groups, barriers.len() as u64);
+            return;
+        }
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
@@ -2285,7 +2303,65 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         crate::waitstat::global(crate::waitstat::Cause::Groups, 1);
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
+}
+
+/// Whether a call of the title's barrier groups becomes barriers on the
+/// textures it names instead of one on every shader write
+/// (`VICTORY_BARRIER_GROUPS=1`; off by default).
+///
+/// With the switch only the barriers that ask for an order of shader
+/// writes count ([`BarrierSync::orders_writes`]: something ran before,
+/// and a side has unordered access, a copy or resolve destination, stream
+/// output, an acceleration structure or video write, or `COMMON`). A call
+/// with none of them records nothing; one whose such barriers are all on
+/// textures with a host copy records an unordered access barrier on each
+/// (its colour and depth-plane twins for a depth texture), once each; any
+/// other (a global or buffer barrier among them, a texture with no host
+/// copy yet, groups that do not look like groups) one barrier on every
+/// shader write, as before. Layouts are not moved: every host use of a
+/// title texture moves its host copy to the state it needs first.
+///
+/// What is given up: a barrier on every write also ordered writes through
+/// views the call does not name: a texture's memory written as a buffer or
+/// through another placed texture at the same address, and anything of
+/// ours or the title's the host's state changes do not order. Buffers keep
+/// the full wait (one title buffer has several host copies and is written
+/// through views of the memory around it, the 174 MB heap's above all, so
+/// a barrier on one copy would not order the others).
+///
+/// After Marvisak/VIctory pull request #642 (nathanbzrr 6264e86a6,
+/// GPL-3.0): the group layouts and the rule that groups with no unordered
+/// access need no such barrier; its texture layout transitions are not
+/// taken.
+#[cfg(windows)]
+fn barrier_groups_named() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_GROUPS").is_some_and(|v| v == "1"))
+}
+
+/// The host textures the barriers of `groups` that order shader writes
+/// name, once each; `None` if one of those is not a texture with a host
+/// copy (then a barrier on every write is due).
+#[cfg(windows)]
+fn named_targets(groups: &[BarrierGroup]) -> Option<Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>> {
+    use windows::core::Interface;
+    const TEXTURE: u32 = 1;
+    let mut named: Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = Vec::new();
+    for g in groups {
+        // SAFETY: groups as `read_groups` passed them.
+        for (kind, resource) in unsafe { g.ordering() } {
+            if kind != TEXTURE {
+                return None;
+            }
+            for texture in crate::resource::uav_targets(resource)? {
+                if !named.iter().any(|n| n.as_raw() == texture.as_raw()) {
+                    named.push(texture);
+                }
+            }
+        }
+    }
+    Some(named)
 }
 
 /// An enhanced barrier group as the title passes it
@@ -2649,6 +2725,67 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// The title's barrier groups are read as the host's: which barriers
+    /// ask for an order of shader writes, and which resource each names
+    /// (`VICTORY_BARRIER_GROUPS`, `VICTORY_WAIT_STATS`).
+    #[test]
+    fn barrier_groups_are_read_by_what_they_order() {
+        const UAV: u32 = 0x10;
+        const SRV: u32 = 0x80;
+        const RT: u32 = 0x8;
+        const ALL: u32 = 0x1;
+        let sync = |before: u32, after: u32| BarrierSync {
+            sync_before: ALL,
+            sync_after: ALL,
+            access_before: before,
+            access_after: after,
+        };
+        assert!(sync(UAV, SRV).orders_writes());
+        assert!(sync(SRV, UAV).orders_writes());
+        assert!(sync(0, SRV).orders_writes(), "COMMON is any access");
+        assert!(sync(0x400, SRV).orders_writes(), "a copy destination");
+        assert!(!sync(RT, SRV).orders_writes(), "the host's state changes order render targets");
+        assert!(!sync(SRV, SRV).orders_writes());
+        assert!(!sync(ACCESS_NONE, ACCESS_NONE).orders_writes());
+        assert!(!BarrierSync { sync_before: 0, ..sync(UAV, UAV) }.orders_writes(), "nothing ran before");
+        let texture = 0x1234usize as This;
+        let textures = [
+            TextureBarrier {
+                sync: sync(UAV, SRV),
+                layout_before: 3,
+                layout_after: 6,
+                resource: texture,
+                subresources: [0; 6],
+                flags: 0,
+            },
+            TextureBarrier {
+                sync: sync(RT, SRV),
+                layout_before: 2,
+                layout_after: 6,
+                resource: 0x5678usize as This,
+                subresources: [0; 6],
+                flags: 0,
+            },
+        ];
+        let globals = [sync(SRV, SRV)];
+        let buffers = [BufferBarrier { sync: sync(UAV, UAV), resource: 0x9abcusize as This, offset: 0, size: u64::MAX }];
+        let groups = [
+            BarrierGroup { kind: 1, count: 2, barriers: textures.as_ptr().cast() },
+            BarrierGroup { kind: 0, count: 1, barriers: globals.as_ptr().cast() },
+            BarrierGroup { kind: 2, count: 1, barriers: buffers.as_ptr().cast() },
+        ];
+        // SAFETY: three groups of live barriers.
+        let read = unsafe { read_groups(3, groups.as_ptr().cast()) }.expect("groups");
+        // SAFETY: as read.
+        let ordering: Vec<Vec<(u32, This)>> = read.iter().map(|g| unsafe { g.ordering() }.collect()).collect();
+        assert_eq!(ordering, [vec![(1, texture)], vec![], vec![(2, 0x9abcusize as This)]]);
+        let odd = [BarrierGroup { kind: 7, count: 1, barriers: globals.as_ptr().cast() }];
+        // SAFETY: one group, of a kind there is none of.
+        assert!(unsafe { read_groups(1, odd.as_ptr().cast()) }.is_none());
+        // SAFETY: a null pointer is refused before it is read.
+        assert!(unsafe { read_groups(1, std::ptr::null()) }.is_none());
+    }
 
     /// Upstream #2604: memory that cannot be read meets a wait only by
     /// default; with the switch, only a comparison that reads nothing does.
