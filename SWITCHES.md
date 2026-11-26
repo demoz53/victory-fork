@@ -1,8 +1,9 @@
 # SWITCHES.md - every switch added since test/all14n, in test/all17
 
 `test/all17` = `test/all16` (fb98a3eda) + merges of test/avfix, test/slots, test/stream2 (to 5fe884eb9), test/res1,
-test/split, test/loops2 (its first commit 9e9272327 only), two commits of test/testkit (0600708fa, 5867481c7), the two
-new commits of test/speed1 (to 4e2e1f6e1) and test/clamps (d4b2d6324). `test/all16` = `test/all15b` (3b9488230) +
+test/split, test/loops2 (its first commit 9e9272327 only), five commits of test/testkit (0600708fa, 5867481c7,
+d59bd65f6, c3ec9f984, 2bf01ab20), the two new commits of test/speed1 (to 4e2e1f6e1), test/clamps (d4b2d6324) and
+one commit of test/all13y (95d04e060). `test/all16` = `test/all15b` (3b9488230) +
 test/lx, test/cxall, test/stream1 (holds test/fairq), test/shirt1, test/speed1 (to 625bc32b6), test/compose.
 One build, every feature behind its switch: set several in one run line.
 
@@ -25,9 +26,12 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | 9 | `VICTORY_ALIAS_ALWAYS` is on (a view of a texture the card wrote is copied from it even if the list already uploaded the view) | test/slots | `VICTORY_ALIAS_ALWAYS=0` |
 | 10 | `VICTORY_QUEUE_AGE` is on (log only: histogram of frames between a slot's write and its texture on the card) | test/stream2 | `VICTORY_QUEUE_AGE=0` |
 | 11 | `VICTORY_MAPPED_EXACT` is on (a texture with only pages in its middle mapped counts as there; looked at in turns) | test/stream2 5fe884eb9 | `VICTORY_MAPPED_EXACT=0` |
+| 12 | the translated-shader cache is keyed by the translator's fingerprint, not by the executable's hash (builds with the same translator share entries; no picture change) | test/testkit d59bd65f6 | `VICTORY_SHADER_CACHE_KEY=exe` |
 
 Everything restored (all15b behaviour, one line):
-`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0`
+`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_SHADER_CACHE_KEY=exe`
+(leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
+entries a build finds.)
 
 Always on, with no switch (no behaviour change, some cost): the "title memory remapped" work line every 5 s and the
 look it needs at every mapping call, whether the pages are there already (test/speed1 ec85139be); the "dstorage:
@@ -57,10 +61,20 @@ workers" line's two extra fields; a trace string built at each composed present.
 | `VICTORY_ALIAS_RUNS` | `1` | off | a copy of page mappings makes one view for a run of pages that follow one another, not one a page | test/speed1 ec85139be (Neptune) | no |
 | `VICTORY_IDLE_WITHOUT_RAYS` | `1` | off | the dispatches of compute program 39f0e9aeb156a61c (activates the screen probes' rays) are left out while the structure builder does not run (no `VICTORY_BVH_BUILDER=1`); the picture may change | test/speed1 4e2e1f6e1 (Belobug, Neptune) | no |
 | `VICTORY_INDIRECT_BATCH` | `1` exact batches; `2` the source fork's default (a dispatch does not end a batch: KNOWN stale-argument risk); `3` as 1, but a dispatch that stores to no buffer does not end a batch | off | argument clamps of indirect executions of one record are made in batches by one compute pass of ours | test/clamps (avatarmanz 037596241) | no |
+| `VICTORY_SECTION_MB` | MiB (`2` measured); unset or 0: one section a request, as before | off | the title's physical pages come from pagefile sections of that many MiB, not one section per request (6.1 GiB in one section, with views by the hundred thousand, stalls every map call) | test/all13y 95d04e060 (ka1qux 193d414c30) | no |
+| `VICTORY_REMAP_LEAN` | `1` | off | section pages committed once through a view of ours are not committed again | test/all13y 95d04e060 (ka1qux b1d7012a44) | no |
+| `VICTORY_SHADER_CACHE_KEY` | `exe` | the translator's fingerprint | what a build is known by in the translated-shader cache: `exe` = the executable's hash, as before (every new build translates everything again) | test/testkit d59bd65f6 | no (the cache only) |
 
 Not switches: build profiles `release-lto` and `diag-lto` (thin LTO; test/res1; the runner's `diag` profile is
 unchanged); `victory translate --digest` and `tools/shader-sweep.sh` (test/testkit: which programs a translation
-switch changes, offline).
+switch changes, offline); `victory shader-cache <cache>/shaders --list`, `--prune-older-than <days> [--yes]`.
+
+Warming offline (no game start): `victory.exe shader-cache <cache>/shaders --warm <folder of *.cdxil>... [--jobs N]
+[--limit N]` translates the containers through this build's part of the cache under the `VICTORY_*` translation
+switches of that process (set the same ones the run will have) and says how many were there already. Since the key
+is the translator's, a build that changes nothing in crates/victory-shader finds the entries of the build before it;
+entries keyed by executables (all16 and older) are read by no build from here on, so all17's first run with each
+set of shader switches translates once more.
 
 ## Came with all16 (merged on top of all15b)
 | Switch | Values | Default | What it does | From | Shader |
@@ -141,6 +155,11 @@ switch.
   - `VICTORY_TEXTURE_DROP_MIPS` with `VICTORY_COPY_KEEP=1`: a whole-texture copy made level by level (host copies
     that leave out different numbers of levels) is not kept: the keeper goes, as at a resolve.
   - `VICTORY_STREAM_PRIORITY=1` with the new mapping path: the scatter call lifts the thread itself.
+- `VICTORY_SECTION_MB` and `VICTORY_REMAP_LEAN` beside `VICTORY_REMAP_SAME` and `VICTORY_ALIAS_RUNS`: the cherry-pick
+  applied cleanly; pages are compared by section and index everywhere, so a run of pages or a view never crosses
+  a section, with any of the four on.
+- The shader cache's key list holds every translation switch the merges brought (GROUP_SPLIT, AFTER_LOOP added to
+  the new list by hand); the test `every_switch_the_translator_reads_is_accounted_for` fails if one is missing.
 - One of two is used: with `VICTORY_TEXTURE_KEEP=1`, `VICTORY_VRAM_IDLE_MS` is ignored (by test/stream2's design).
 - Streaming group judged safe together: `VICTORY_TEXTURE_KEEP=1 VICTORY_MATERIAL_TEXTURE_DEMAND=1
   VICTORY_TEXTURE_CATCH_UP_MS=2 VICTORY_STALE_KEEP_MS=10000`. Left out on purpose: STREAM_PRIORITY, DSTORAGE_* and
