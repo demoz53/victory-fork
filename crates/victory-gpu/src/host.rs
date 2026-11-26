@@ -3573,6 +3573,7 @@ fn late_helper() {
     let Some(host) = host() else {
         return;
     };
+    crate::cores::keep_on_fast_cores("victory-late-wait");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
@@ -3698,6 +3699,7 @@ fn relay_worker() {
     let Some(host) = host() else {
         return;
     };
+    crate::cores::keep_on_fast_cores("victory-relay");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));

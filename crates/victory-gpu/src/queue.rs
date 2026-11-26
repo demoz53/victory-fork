@@ -547,6 +547,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
+        crate::cores::keep_submitter_on_fast_cores();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         if cuts() && !this.is_null() {
