@@ -39,8 +39,6 @@ pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 
 struct Journal {
-    /// Numbers the askings; 0 is "never".
-    asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
@@ -70,7 +68,6 @@ struct Journal {
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
-    asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
@@ -80,6 +77,23 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     flying: Vec::new(),
     unpublished: Vec::new(),
 });
+
+/// Numbers the askings; 0 is "never". An atomic, so that an answer by the
+/// light refresh's bits takes its number with no lock ([`stamps_flat`]);
+/// every other number is still taken under the journal's lock.
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Journal {
+    /// The latest number given.
+    fn asked(&self) -> u64 {
+        ASKED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A new number, above every one given so far.
+    fn bump(&mut self) -> u64 {
+        ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+}
 
 /// Told when an asking in [`Journal::flying`] has noted what it found.
 static LANDED_ASKING: std::sync::Condvar = std::sync::Condvar::new();
@@ -170,7 +184,7 @@ fn settle(
     first: usize,
     last: usize,
 ) -> std::sync::MutexGuard<'static, Journal> {
-    let before = j.asked;
+    let before = j.asked();
     let overlapping = |j: &Journal| j.flying.iter().any(|&(a, b, n)| n <= before && a < last && first < b);
     if j.flying.is_empty() || !overlapping(&j) {
         return j;
@@ -450,8 +464,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if j.kept {
         return;
     }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
+    j.ahead_asked = j.bump();
     j.ahead.clear();
     let mut i = 0;
     while i < pieces.len() {
@@ -589,8 +602,7 @@ fn ask_lone(ranges: &[(usize, usize)]) {
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+        j.ahead_asked = j.bump();
     }
     // Other askings were made since `ask_ahead` numbered the standing
     // asking (the journal's lock was let go between): what is noted from
@@ -598,9 +610,8 @@ fn ask_lone(ranges: &[(usize, usize)]) {
     // took, written again since, would be noted below what its copy took
     // and never copied again (review finding, test/watch5). The answers
     // of the standing asking take the new number, as after [`wrote`].
-    if j.ahead_asked < j.asked {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+    if j.ahead_asked < j.asked() {
+        j.ahead_asked = j.bump();
     }
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
@@ -692,15 +703,13 @@ fn ask_views(ranges: &[(usize, usize)]) {
     // `ask_once` let its asking go if it held nothing: this one stands
     // under a number of its own.
     if !j.kept {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+        j.ahead_asked = j.bump();
         j.ahead.clear();
     }
     // Standing already, under a number other askings may have passed
     // since: noted under a new one (as in [`ask_lone`]).
-    if j.ahead_asked < j.asked {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+    if j.ahead_asked < j.asked() {
+        j.ahead_asked = j.bump();
     }
     let mut reach = 0;
     // Ranges the guards know to be views (their first block is guarded or
@@ -826,8 +835,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     if !j.kept || len == 0 {
         return;
     }
-    j.asked += 1;
-    let now = j.asked;
+    let now = j.bump();
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         note_written(&mut j, page, now, pieces_of(page, at, len));
@@ -975,9 +983,9 @@ fn writes_as(
     let vouched = guarded && light == 2 && published(j, first * PAGE, last * PAGE);
     if vouched && !check {
         light_count(0);
-        j.asked += 1;
+        let now = j.bump();
         return Some((
-            j.asked,
+            now,
             j.written
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
@@ -1035,8 +1043,7 @@ fn writes_as(
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    j.asked += 1;
-    let now = j.asked;
+    let now = j.bump();
     // A guard's block is a page: all of it.
     let pages: Vec<(usize, u16)> =
         by_page(&j.found[..count]).into_iter().chain(guarded.iter().map(|&page| (page, ALL_PIECES))).collect();
@@ -1094,8 +1101,7 @@ fn writes_as(
     let mut now = now;
     if !armed.is_empty() {
         let j = &mut *held;
-        j.asked += 1;
-        now = j.asked;
+        now = j.bump();
         for &page in &armed {
             note_written(j, page, now, ALL_PIECES);
         }
@@ -1122,11 +1128,10 @@ fn writes_unlocked(
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     if guarded && light == 2 && published(&held, first * PAGE, last * PAGE) {
         light_count(0);
-        held.asked += 1;
-        return Some((held.asked, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        let now = held.bump();
+        return Some((now, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
     }
-    held.asked += 1;
-    let now = held.asked;
+    let now = held.bump();
     held.flying.push((first, last, now));
     drop(held);
     #[cfg(test)]
@@ -1203,8 +1208,7 @@ fn writes_unlocked(
     // that the title wrote after that answer, and that this asking found;
     // noted under the number it was given in flight, below that answer's,
     // the page would never be taken again by that copy (found in test/watch6).
-    held.asked += 1;
-    let now = held.asked;
+    let now = held.bump();
     if found.is_none() && viewed.is_none() {
         return None;
     }
@@ -1959,8 +1963,7 @@ fn journal_written(at: usize, len: usize) {
         return;
     }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.asked += 1;
-    let now = j.asked;
+    let now = j.bump();
     // Answers from the journal stand at or above what it holds
     // ([`wrote`]).
     j.ahead_asked = now;
@@ -4550,8 +4553,7 @@ pub(crate) mod tests {
         let (first, last) = (p / PAGE, p / PAGE + PAGES);
         let other = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((first, last, n));
             n
         };
@@ -4593,8 +4595,7 @@ pub(crate) mod tests {
         forget_pages(one, one + SIZE);
         let other = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((one / PAGE, one / PAGE + 2, n));
             n
         };
@@ -4717,9 +4718,8 @@ pub(crate) mod tests {
         AT.store(view, Ordering::SeqCst);
         fn meanwhile() {
             let mut j = journal();
-            j.asked += 1;
-            j.ahead_asked = j.asked;
-            RAISED.store(j.asked, Ordering::SeqCst);
+            j.ahead_asked = j.bump();
+            RAISED.store(j.asked(), Ordering::SeqCst);
             drop(j);
             // The block is not read-only yet: no fault.
             // SAFETY: inside the test's view.
@@ -4912,11 +4912,9 @@ pub(crate) mod tests {
         // Both in flight, numbered as `writes_unlocked` numbers them.
         let (low, high) = {
             let mut j = journal();
-            j.asked += 1;
-            let low = j.asked;
+            let low = j.bump();
             j.flying.push((first, last, low));
-            j.asked += 1;
-            let high = j.asked;
+            let high = j.bump();
             j.flying.push((first, last, high));
             (low, high)
         };
@@ -4980,8 +4978,7 @@ pub(crate) mod tests {
         // Elsewhere: no wait.
         let away = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((last + 100, last + 101, n));
             n
         };
@@ -4989,8 +4986,7 @@ pub(crate) mod tests {
         // Over these pages: an asking in flight, numbered below the next.
         let early = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((first + 1, first + 2, n));
             n
         };
@@ -5617,7 +5613,6 @@ mod piece_tests {
     #[test]
     fn the_history_says_what_a_copy_needs_or_gives_up() {
         let mut j = super::Journal {
-            asked: 0,
             written: Default::default(),
             found: Vec::new(),
             ahead: Vec::new(),
