@@ -114,16 +114,41 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             // Before the driver sees it, for an offline warm of the library
             // (`super::warm`): a record for each pipeline a run makes.
             super::warm::record(&self.key, &self.shaders, self.graphics.as_deref());
             HostPipeline::new(&self.shaders, self.graphics.as_deref())
         });
+    }
+
+    /// Makes it with `build`: a panic there is a refused pipeline, its entry completed and its
+    /// waiters woken, and the worker goes on (fxceless PR #1353, Filip722, 70482241e; with
+    /// `VICTORY_PANIC_CATCH=0` the panic ends the worker and leaves the entry pending, as before).
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            if !panic_catch() {
+                return build();
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = %self.names(), "host pipeline build panicked: refused");
+                    None
+                }
+            }
+        });
         let (lock, done) = &self.completion;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Whether a panic while a pipeline or its shaders are made is caught (on;
+/// `VICTORY_PANIC_CATCH=0` lets it unwind, as before).
+pub(crate) fn panic_catch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PANIC_CATCH").is_none_or(|v| v != "0"))
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -703,6 +728,22 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build that panics is a refused pipeline and the worker goes on (fxceless PR #1353).
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let (failed, next) = (bad.clone(), good.clone());
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+        worker.join().expect("the pipeline worker survives");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+        bad.make_with(|| panic!("a refused pipeline stays complete"));
+    }
 
     #[test]
     fn old_frame_cannot_reset_newer_budget() {
