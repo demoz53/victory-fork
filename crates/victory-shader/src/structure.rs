@@ -46,8 +46,9 @@ pub enum Atom {
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// these values are the low and high dwords of (the low one twice in
+    /// wave32, and with `VICTORY_MASK_PAIR=0`: [`mask_pairs`]).
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -453,6 +454,31 @@ impl Structured {
         }
         .copied()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`mask_pairs`], for its thread only.
+    pub(crate) static TEST_MASK_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a wave64 lane mask the pass cannot see into names both dwords of its
+/// register pair ([`Atom::Opaque`]), so that lanes 32-63 test the high dword
+/// the pair holds. Before, it named the low dword and lowering guessed the high
+/// one as the register written beside it: a mask whose halves are written
+/// apart (LLVM's two `s_mov_b32` for a 64-bit constant it cannot inline,
+/// `vcc_lo` and `vcc_hi` set apart) had none, so lanes 32-63 tested the low
+/// dword's bits again, and a high dword rewritten after a 64-bit write was
+/// guessed stale. Port of Marvisak/VIctory PR #2836 (kotekompotek; issue
+/// JMAN730/project-flamingo #806 by pablogonz12). On; `VICTORY_MASK_PAIR=0`
+/// as before.
+pub fn mask_pairs() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_MASK_PAIRS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MASK_PAIR").is_none_or(|v| v != "0"))
 }
 
 /// Builds the per-lane form of `program`.
@@ -917,15 +943,20 @@ impl<'a> Lanes<'a> {
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
+                // The pair, not its low dword alone: lanes 32-63 test the
+                // high dword the pair holds, and two masks sharing a low
+                // dword with different high dwords are different masks
+                // ([`mask_pairs`]; off: named by the low dword, lowering
+                // guessing the high one written beside it, which halves
+                // written apart do not have).
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    if mask_pairs() {
+                        let born = self.born(k.0).max(self.born(k.1));
+                        self.b.atom(Atom::Opaque(k.0, k.1), born)
+                    } else {
+                        let born = self.born(k.0);
+                        self.b.atom(Atom::Opaque(k.0, k.0), born)
+                    }
                 });
                 (m, derived)
             }

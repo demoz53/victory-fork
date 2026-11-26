@@ -652,13 +652,16 @@ impl Ctx<'_> {
                     })
         };
         // A value defined in the loop or before it in "some bits" (`pre`).
-        let atom_in_region = |a: Atom| -> bool {
-            let v = match a {
-                Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) | Atom::Opaque(v) => v,
-                Atom::Constant(_) => return false,
-            };
+        let value_in_region = |v: Value| -> bool {
             self.def.get(&v).is_some_and(|&(b, _)| lp[b] || pre[b])
                 || (0..n).any(|b| (lp[b] || pre[b]) && p.blocks[b].phis.iter().any(|phi| phi.value == v))
+        };
+        let atom_in_region = |a: Atom| -> bool {
+            match a {
+                Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) => value_in_region(v),
+                Atom::Opaque(lo, hi) => value_in_region(lo) || value_in_region(hi),
+                Atom::Constant(_) => false,
+            }
         };
         // A lane mask whose lanes may differ from round to round (or that the pass cannot see).
         let mask_depends_on_region = |w: Value| -> bool {
@@ -692,7 +695,7 @@ impl Ctx<'_> {
                             && let Some(&m) = st.masks.get(&w)
                         {
                             for atom in st.bools.support(m) {
-                                if matches!(atom, Atom::Lane(v) | Atom::Quad(v) | Atom::Opaque(v) if v == w) {
+                                if matches!(atom, Atom::Lane(v) | Atom::Quad(v) | Atom::Opaque(v, _) if v == w) {
                                     non_body_masks.push(atom);
                                 }
                             }

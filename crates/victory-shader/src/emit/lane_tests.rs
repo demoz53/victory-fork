@@ -1241,3 +1241,59 @@ fn lds_atomics_in_a_lane_branch_keep_the_consoles_order() {
     }
     eprintln!("LDS atomics in a lane branch: every minimum before every add, as the model");
 }
+
+/// A wave64 lane mask held as a number, its two dwords written apart (LLVM's two `s_mov_b32`
+/// for a 64-bit constant it cannot inline; `vcc_lo` and `vcc_hi` set apart the same way), taken
+/// as EXEC: `s_and_saveexec_b64 s[20:21], s[12:13]`, then `v_mov_b32 v12, 1` in the lanes it
+/// holds, lanes 32-63 by the high dword's bits. Named by its low dword alone
+/// (`VICTORY_MASK_PAIR=0`), lowering guessed the high dword as the register written beside the
+/// low one: none for halves written apart (JMAN730/project-flamingo issue #806, pablogonz12;
+/// Marvisak/VIctory PR #2836, kotekompotek), and a stale one where the high dword is rewritten
+/// after a 64-bit write (the second form).
+#[test]
+fn a_mask_whose_halves_are_written_apart_tests_its_high_dword() {
+    const S_MOV_B32: u32 = 0x03;
+    const LO: u32 = 0x0F0F_00FF;
+    const HI: u32 = 0xA5A5_5A5A;
+    let under = |w: &mut Vec<u32>| {
+        w.extend([
+            sop1(S_AND_SAVEEXEC_B64, 20, 12),
+            vop1(V_MOV_B32, 12, int(1)),
+            sop1(S_MOV_B64, EXEC, 20),
+        ]);
+        epilogue(w);
+    };
+    let apart = {
+        let mut w = prologue();
+        w.extend([sop1(S_MOV_B32, 12, LITERAL), LO, sop1(S_MOV_B32, 13, LITERAL), HI]);
+        under(&mut w);
+        w
+    };
+    let rewritten = {
+        let mut w = prologue();
+        // s_mov_b64 s[12:13], s[0:1] (s0 = LO, s1 = 0), then s13 = HI
+        w.extend([sop1(S_MOV_B64, 12, 0), sop1(S_MOV_B32, 13, LITERAL), HI]);
+        under(&mut w);
+        w
+    };
+    let bits = u64::from(HI) << 32 | u64::from(LO);
+    let want: [u32; 64] = std::array::from_fn(|l| if bits >> l & 1 != 0 { 1 } else { DEAD });
+    let _one = one_at_a_time();
+    for (what, words) in [("a mask written in halves", &apart), ("a mask's high dword rewritten", &rewritten)] {
+        // with the switch off: lanes 32-63 wrong where the dwords' bits differ
+        let off = format!("{what}, named by its low dword");
+        let was = crate::structure::TEST_MASK_PAIRS.replace(Some(false));
+        let old = card_emitted(&off, words, |_| {});
+        crate::structure::TEST_MASK_PAIRS.set(was);
+        if let Some(card) = old {
+            let got = card.run([LO, 0, 0, 0]);
+            let wrong = (0..64).filter(|&l| got[l] != want[l]).count();
+            eprintln!("{off}: {wrong} lanes wrong");
+            assert!(wrong > 0, "{off}: the fault this test is for is not shown");
+        }
+        let Some(card) = card_emitted(what, words, |_| {}) else { return };
+        let got = card.run([LO, 0, 0, 0]);
+        compare(what, &got, &some(want));
+        eprintln!("{what}: every lane its bit of the pair, as the model");
+    }
+}

@@ -1202,7 +1202,7 @@ pub(super) fn with_lds_regions_approx<R>(f: impl FnOnce() -> R) -> R {
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 /// An LDS atomic is a read and a write ([`lds_atomics_read`]), except where a region's
-/// accesses are all one kind of order-free reduction ([`LDS_REDUCTIONS`]).
+/// accesses are all order-free reductions ([`LDS_REDUCTIONS`]), one kind to a word.
 /// Inside [`with_lds_regions_approx`] (`VICTORY_WAVE_LDS_REGIONS=approx`): a write and a read inside one
 /// region get the meetings around the region all the same, and their order inside it between
 /// the two host waves is left to the card.
@@ -1235,8 +1235,10 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // per region: LDS reads, LDS writes
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
-    // per region: the one kind of order-free reduction its accesses all are, if they are
-    let mut reduction: Vec<Option<Option<&str>>> = vec![None; n];
+    // per region: its order-free reductions (kind, address, byte offset, bytes), and whether
+    // it has any other access
+    let mut reductions: Vec<Vec<(&str, Option<crate::ir::Value>, u32, u32)>> = vec![Vec::new(); n];
+    let mut others = vec![false; n];
     let atomics_read = lds_atomics_read();
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
@@ -1256,17 +1258,32 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
                 // ordinary stores are write-only.
                 reads[r] |= atomics_read && !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
-            let kind = LDS_REDUCTIONS.contains(&name).then_some(name);
-            reduction[r] = match reduction[r] {
-                None => Some(kind),
-                Some(k) if k == kind => Some(k),
-                Some(_) => Some(None),
-            };
+            match &i.fields {
+                Fields::Ds { addr, offset0, offset1, .. } if LDS_REDUCTIONS.contains(&name) => {
+                    let at = match addr {
+                        Some(crate::gfx10::Operand::Vector { reg, .. }) => i.read(Reg::V(*reg)),
+                        _ => None,
+                    };
+                    let bytes = if name.ends_with("64") { 8 } else { 4 };
+                    reductions[r].push((name, at, u32::from(*offset0) | u32::from(*offset1) << 8, bytes));
+                }
+                _ => others[r] = true,
+            }
         }
     }
-    // A region whose accesses are all one kind of integer reduction with no result for any
-    // lane leaves each word the same whichever half of the console wave gets there first.
-    let ordered = |r: usize| reads[r] && writes[r] && !matches!(reduction[r], Some(Some(_)));
+    // A region whose accesses are all integer reductions with no result for any lane leaves
+    // each word the same whichever half of the console wave gets there first, as long as no
+    // word sees two kinds: two kinds go to one address register at offsets whose words differ
+    // (`CS_MinMax_*`: the minimum at +4, the maximum at +0).
+    let order_free = |r: usize| {
+        !others[r]
+            && reductions[r].iter().enumerate().all(|(k, &(na, aa, oa, ba))| {
+                reductions[r][..k].iter().all(|&(nb, ab, ob, bb)| {
+                    na == nb || aa.is_some() && aa == ab && (oa + ba <= ob || ob + bb <= oa)
+                })
+            })
+    };
+    let ordered = |r: usize| reads[r] && writes[r] && !order_free(r);
     if (0..n).any(ordered) && !lds_regions_approx() {
         return None;
     }
@@ -1286,7 +1303,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
 }
 
 /// The LDS atomics without a result whose final value at a word does not depend on the order
-/// of the lanes that change it: integer reductions of one kind ([`lds_meetings`]).
+/// of the lanes that change it, as long as the word sees one kind ([`lds_meetings`]).
 const LDS_REDUCTIONS: [&str; 18] = [
     "ds_add_u32",
     "ds_sub_u32",
@@ -1348,7 +1365,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
         }
         for a in st.bools.support(g) {
             match a {
-                Atom::Opaque(_) | Atom::Constant(_) => return true,
+                Atom::Opaque(..) | Atom::Constant(_) => return true,
                 Atom::Phi(id) if joins.insert(id) => {
                     if let Some(edges) = st.phi_masks.get(&id) {
                         work.extend(edges.iter().copied());
@@ -4512,8 +4529,11 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
+            Atom::Opaque(v, h) if self.console_lanes => {
+                // the pair's own high dword (`structure::mask_pairs`), else the
+                // register written beside the low one
+                let h = if self.x.native.wave64 && h != v { Some(h) } else { self.pair_high(v) };
+                let hi = match h {
                     Some(h) => Some(self.get(h)?),
                     None => None,
                 };
@@ -4531,7 +4551,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }

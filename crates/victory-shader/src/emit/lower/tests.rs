@@ -880,14 +880,15 @@ fn an_lds_write_and_read_in_one_lane_branch_meet_around_it_only_when_approximate
 /// LDS atomics in one lane branch: a minimum then an add to the same word give 33 on the
 /// console with 33 lanes, but 1 or 32 when one host wave gets through both before the other
 /// starts. An atomic reads the word too, so the region is refused there (and the program takes
-/// a form with the atomics where every lane runs); one kind of reduction without results is
-/// not. Ported from avatarmanz/VIctory-7900XTX PR #204 (feanorsun, 5e200817b).
+/// a form with the atomics where every lane runs); reductions without results are not, one
+/// kind to a word. Ported from avatarmanz/VIctory-7900XTX PR #204 (feanorsun, 5e200817b).
 #[test]
 fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
     const fn ds(op: u32, vdst: u32, addr: u32, data0: u32) -> [u32; 2] {
         [0x36 << 26 | op << 18, vdst << 24 | data0 << 8 | addr]
     }
-    let program = |first: u32, second: u32| {
+    // (the second at byte offset `at` from address register `addr`)
+    let program_at = |first: u32, second: u32, at: u32, addr: u32| {
         let mut w = vec![
             0x7E12_0280, // v_mov_b32 v9, 0 (address and minimum)
             0x7E04_0281, // v_mov_b32 v2, 1 (increment)
@@ -900,13 +901,15 @@ fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
             0xBF07_8001, // s_cmp_lg_u32 s1, 0
             0xBF85_0002, // s_cbranch_scc1 past the second
         ]);
-        w.extend(ds(second, 0, 9, 2));
+        let [lo, hi] = ds(second, 0, addr, 2);
+        w.extend([lo | at, hi]);
         w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
         w.extend(ds(0x36, 5, 9, 0)); // ds_read_b32 v5, v9
         w.push(S_ENDPGM);
         let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
         ir::build(&code, true, 16).expect("ir::build")
     };
+    let program = |first: u32, second: u32| program_at(first, second, 0, 9);
     let meets = |p: &ir::Program| {
         let st = structure::structure(p).expect("structure");
         let all = super::all_lane_blocks(&st).expect("all-lane blocks");
@@ -943,6 +946,13 @@ fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
     assert_eq!(meets(&p), ("ds_add_u32 ds_add_u32".into(), true));
     // ds_max_u32 then ds_add_u32: two kinds, refused
     let p = program(0x08, 0x00);
+    assert!(!meets(&p).1);
+    // ds_min_u32 at +0 and ds_max_u32 at +4 from one address (`CS_MinMax_*`): two words, each
+    // of one kind
+    let p = program_at(0x07, 0x08, 4, 9);
+    assert_eq!(meets(&p), ("ds_min_u32 ds_max_u32".into(), true));
+    // ... but from another address register, they may meet in one word: refused
+    let p = program_at(0x07, 0x08, 4, 2);
     assert!(!meets(&p).1);
     // two ds_write_b32: write-only as before
     let p = program(0x0D, 0x0D);
