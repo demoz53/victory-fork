@@ -7586,7 +7586,8 @@ fn refresh_union() -> bool {
 /// touch or lie within 64 KiB of each other, not the one range from the
 /// lowest to the highest. After upstream PRs #2349 (dcb4ac34, 7cfd3912) and
 /// #2428 (3a2279fd). Our default already keeps the exact union.
-/// Opting in can reduce the number of refresh operations, but also reads gap bytes.
+/// Opting in can reduce the number of refresh operations, but also reads gap
+/// bytes (gaps of up to 64 KiB only: [`RefreshRanges::add_near`]).
 fn refresh_ranges() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_RANGES").is_some_and(|v| v == "1"))
@@ -7647,6 +7648,11 @@ mod refresh_range_tests {
     }
 }
 
+/// How many ranges of one copy [`RefreshRanges::add_near`] keeps joined by
+/// nearness (in order, for [`add_range`]'s search); the ranges past them are
+/// kept as they were asked for.
+const NEAR_MOST: usize = 256;
+
 /// The ranges of a copy's pending refresh ([`refresh_union`]): one kept
 /// inline, more in a list merged before they are refreshed.
 enum RefreshRanges {
@@ -7655,29 +7661,41 @@ enum RefreshRanges {
 }
 
 impl RefreshRanges {
-    fn add(&mut self, (from, to): (usize, usize)) {
+    fn add(&mut self, range: (usize, usize)) {
         if refresh_ranges() {
-            match self {
-                Self::One(previous) => {
-                    let (a, b) = *previous;
-                    if from <= b.saturating_add(64 << 10) && a <= to.saturating_add(64 << 10) {
-                        *previous = (a.min(from), b.max(to));
-                    } else {
-                        let mut ranges = vec![*previous];
-                        add_range(&mut ranges, from, to);
-                        *self = Self::Many(ranges);
-                    }
-                }
-                Self::Many(ranges) => add_range(ranges, from, to),
-            }
-            return;
+            return self.add_near(range);
         }
+        let (from, to) = range;
         match self {
             Self::One((start, end)) if !refresh_union() || (from <= *end && *start <= to) => {
                 *start = (*start).min(from);
                 *end = (*end).max(to);
             }
             Self::One(previous) => *self = Self::Many(vec![*previous, (from, to)]),
+            Self::Many(ranges) => ranges.push((from, to)),
+        }
+    }
+
+    /// [`RefreshRanges::add`] with [`refresh_ranges`]: joined with the
+    /// ranges within 64 KiB of it ([`add_range`]). Past [`NEAR_MOST`] ranges
+    /// the next ones are kept as asked, as without the switch (joined where
+    /// they touch by [`RefreshRanges::merge`]), not made the one range that
+    /// covers them all: that range is what [`refresh_union`] did away with
+    /// (the title's 174 MB heap asked of the write watch whole and its gaps
+    /// copied over what the copy held there).
+    fn add_near(&mut self, (from, to): (usize, usize)) {
+        match self {
+            Self::One(previous) => {
+                let (a, b) = *previous;
+                if from <= b.saturating_add(64 << 10) && a <= to.saturating_add(64 << 10) {
+                    *previous = (a.min(from), b.max(to));
+                } else {
+                    let mut ranges = vec![*previous];
+                    add_range(&mut ranges, from, to);
+                    *self = Self::Many(ranges);
+                }
+            }
+            Self::Many(ranges) if ranges.len() < NEAR_MOST => add_range(ranges, from, to),
             Self::Many(ranges) => ranges.push((from, to)),
         }
     }
@@ -9733,6 +9751,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(r.meets(0x2fff, 0x5000));
         assert!(r.meets(0x7000, 0x8001));
         assert!(!r.meets(0xa000, 0xb000));
+    }
+
+    /// With `VICTORY_REFRESH_RANGES=1`: ranges within 64 KiB of each other
+    /// are one, and a copy asked for more ranges than are kept joined still
+    /// refreshes what was asked for, not everything from its lowest byte to
+    /// its highest.
+    #[test]
+    fn near_ranges_join_and_many_ranges_keep_their_gaps() {
+        use super::{NEAR_MOST, RefreshRanges};
+        let mut r = RefreshRanges::One((0x1000, 0x2000));
+        r.add_near((0x9000, 0xa000));
+        assert_eq!(r.as_slice(), &[(0x1000, 0xa000)], "within 64 KiB: joined");
+        let far = |i: usize| (i << 20, (i << 20) + 0x100);
+        let mut r = RefreshRanges::One(far(1));
+        for i in (2..=NEAR_MOST + 40).rev() {
+            r.add_near(far(i));
+        }
+        // Asked for again, and one that touches another.
+        r.add_near(far(NEAR_MOST + 40));
+        r.add_near(((3 << 20) + 0x100, (3 << 20) + 0x200));
+        r.merge();
+        let ranges = r.as_slice();
+        assert_eq!(ranges.len(), NEAR_MOST + 40, "each range as asked, none twice");
+        assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0), "in order and apart");
+        assert_eq!(ranges[2], (3 << 20, (3 << 20) + 0x200));
+        assert!(!r.meets((1 << 20) + 0x100, 2 << 20), "nothing asked for in a gap");
+        assert!(!r.meets((NEAR_MOST << 20) + 0x100, (NEAR_MOST + 1) << 20));
+        assert!(r.meets(far(NEAR_MOST + 40).0, far(NEAR_MOST + 40).1));
     }
 
     #[test]
