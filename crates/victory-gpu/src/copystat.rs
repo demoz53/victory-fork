@@ -1201,10 +1201,23 @@ fn places_text(mut places: Vec<(u32, u64, u64)>, frames: f64, most: usize) -> (f
     (total, text)
 }
 
-/// A list call on this thread, made at line `place` of `list.rs`, that began
-/// at `started` has returned.
-pub(crate) fn recorded(started: std::time::Instant, place: u32) {
-    let ns = started.elapsed().as_nanos() as u64;
+/// The timing of a list call about to be made: every call's, or with
+/// `VICTORY_TIMING_LEAN=1` one call's in 16 on each thread (counted 16
+/// times: the list-call times on the frame line, by thread and between a
+/// thread's submissions are then estimates; their call counts stay exact).
+/// Every call's with `VICTORY_FRAME_PARTS=1`, and the first after a present
+/// (for "until the first list call").
+pub(crate) fn record_timer() -> crate::timing::Timer {
+    if !crate::timing::lean() || frame_parts() || !RECORDED_SINCE.load(Relaxed) {
+        return crate::timing::Timer::always();
+    }
+    crate::timing::Timer::sampled()
+}
+
+/// A list call on this thread, made at line `place` of `list.rs`, timed by
+/// `started` ([`record_timer`]), has returned.
+pub(crate) fn recorded(started: crate::timing::Timer, place: u32) {
+    let ns = started.ns();
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
     if frame_parts() {

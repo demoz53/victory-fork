@@ -1621,8 +1621,9 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
+        // (The search is not timed with `VICTORY_TIMING_LEAN=1`.)
         #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
+        let started = crate::timing::Timer::stats();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = crate::lockstat::lock(&self.next, crate::lockstat::Lock::Ring);
@@ -1662,13 +1663,13 @@ impl HostHeap {
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+                add(C::DynamicNs, started.ns());
             }
             return None;
         };
         #[cfg(feature = "diagnostics")]
         {
-            crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+            crate::copystat::add(crate::copystat::C::DynamicNs, started.ns());
             crate::copystat::add(crate::copystat::C::DynamicTaken, n as u64);
         }
         taken[first..first + n].fill(true);

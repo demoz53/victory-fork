@@ -73,6 +73,11 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/trim1 (on all21: processor overhead of our own making)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_TIMING_LEAN` | `1` | off | fewer clock reads on the hot paths: list calls, title copies (submission steps), refreshed ranges and copy moves timed one call in 16 per thread and counted 16 times (counts exact, times estimates); per-slot heap-pass parts, dynamic-slot search, texture-alias time per bound view and wait checks not timed (print 0); `host::moment` (idle letting go) from the tick count. Untouched: VICTORY_FRAME_PARTS (timed in full), the frame line's GPU/copy-back/settle times, LOCK_STATS, WAIT_STATS | test/trim1 | no |
+
 ## New in all21 (merged on top of all20)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|

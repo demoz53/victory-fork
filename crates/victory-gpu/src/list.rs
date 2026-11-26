@@ -148,8 +148,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg_attr(feature = "diagnostics", track_caller)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    // With `VICTORY_TIMING_LEAN=1` one call in 16 is timed
+    // (`crate::copystat::record_timer`).
     #[cfg(feature = "diagnostics")]
-    let (started, place) = (std::time::Instant::now(), std::panic::Location::caller().line());
+    let (started, place) = (crate::copystat::record_timer(), std::panic::Location::caller().line());
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2073,14 +2075,15 @@ impl ValueWait {
     /// that thread in run 49 found it in this question).
     /// `VICTORY_WAIT_ASK=1` asks first, as before.
     pub(crate) fn met(&self) -> bool {
+        // (Not timed with `VICTORY_TIMING_LEAN=1`.)
         #[cfg(all(windows, feature = "diagnostics"))]
-        let started = std::time::Instant::now();
+        let started = crate::timing::Timer::stats();
         let met = self.holds();
         #[cfg(all(windows, feature = "diagnostics"))]
         {
             use crate::copystat::{C, add};
             add(C::WaitChecks, 1);
-            add(C::WaitCheckNs, started.elapsed().as_nanos() as u64);
+            add(C::WaitCheckNs, started.ns());
         }
         met
     }

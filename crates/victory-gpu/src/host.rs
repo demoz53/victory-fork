@@ -104,8 +104,13 @@ pub(crate) fn now_ms() -> u64 {
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
+///
+/// With `VICTORY_TIMING_LEAN=1` the tenths come from the system's tick
+/// count (`crate::timing::tick_ms`, steps of 10-16 ms), not a clock read:
+/// it is asked for every host copy and texture looked up.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    let ms = if crate::timing::lean() { crate::timing::tick_ms() } else { now_ms() };
+    (crate::frame::current() << 32) | ((ms / 100) & 0xffff_ffff)
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -8341,7 +8346,14 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            // With `VICTORY_TIMING_LEAN=1` one copy in 16 is timed (the
+            // "copies" time of the frame line is then an estimate), and
+            // the steps whose time nothing reads are not.
+            let started = match step {
+                Step::Copy(..) | Step::Fill(..) => crate::timing::Timer::sampled(),
+                Step::Run(_) | Step::Host(_) | Step::HostRead(..) => crate::timing::Timer::always(),
+                _ => crate::timing::Timer::stats(),
+            };
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8374,6 +8386,8 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) | Step::HostRead(_, _, work) => {
+                    #[cfg(feature = "diagnostics")]
+                    let ran = started.began().unwrap_or_else(std::time::Instant::now);
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
@@ -8386,7 +8400,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, ran.elapsed().as_micros() as u64);
                     }
                     continue;
                 }
@@ -8427,7 +8441,7 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[0].fetch_add(started.us(), Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
@@ -8723,9 +8737,10 @@ impl Batch {
             if from >= to {
                 continue;
             }
-            let started = std::time::Instant::now();
+            // One range in 16 timed with `VICTORY_TIMING_LEAN=1`.
+            let started = crate::timing::Timer::sampled();
             let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+            let us = started.us();
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -8933,8 +8948,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // The kernel writes the destination: it must not be guarded until the
     // copy is done (the end of this function).
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
+    // (Sampled with `VICTORY_TIMING_LEAN=1`.)
     #[cfg(feature = "diagnostics")]
-    let moved = std::time::Instant::now();
+    let moved = crate::timing::Timer::sampled();
     // Into title memory: through the kernel, which reports a destination
     // page that is not there (the guarded copy only survives the source's).
     let whole = if title_dst {
@@ -8943,7 +8959,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         read(src, dst, len)
     };
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    crate::copystat::add(crate::copystat::C::MoveUs, moved.us());
     if whole {
         return;
     }
@@ -8983,12 +8999,12 @@ pub(crate) fn copy_streamed(dst: *mut u8, src: *const u8, len: usize) {
 fn copy_streamed_one(dst: *mut u8, src: *const u8, len: usize) {
     if len >= crate::guarded::STREAM_FEW && crate::guarded::stream() && !crate::guarded::kernel_first(src, len) {
         #[cfg(feature = "diagnostics")]
-        let moved = std::time::Instant::now();
+        let moved = crate::timing::Timer::sampled();
         // SAFETY: the destination is a host copy's mapped CPU side of `len`
         // bytes; a source page that is not there fails the copy.
         let whole = unsafe { crate::guarded::copy_streaming(src, dst, len) };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.us());
         if whole {
             return;
         }
