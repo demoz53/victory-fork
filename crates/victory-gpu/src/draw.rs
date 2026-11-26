@@ -2213,6 +2213,9 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
+        // Textures the host copied into while an upload of title memory was
+        // on its way: from their keepers again (`VICTORY_COPY_KEEP=1`).
+        crate::hostcopy::restore_due(list);
         PASS_BUDGET.set(Some(budget));
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);

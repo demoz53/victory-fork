@@ -33,6 +33,8 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
+    /// The title texture it is of (`crate::hostcopy`'s trace names it).
+    resource: usize,
     buffer: ID3D12Resource,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
@@ -595,8 +597,8 @@ pub(crate) fn let_go_idle() {
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
 
-/// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
+/// A host copy or resolve writes `resource`. True if it is the first.
+pub(crate) fn host_written(resource: This) -> bool {
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
@@ -614,6 +616,7 @@ pub(crate) fn host_written(resource: This) {
                 .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
         }
     }
+    new
 }
 
 /// The title memory of textures the host copied into, by address: bytes
@@ -686,6 +689,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
+    drop(through);
+    crate::hostcopy::forget(resource);
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -709,6 +714,8 @@ pub(crate) static UPLOAD_PARTS: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    // Before the look at what the host has copied into (`crate::hostcopy`).
+    crate::hostcopy::asked(resource);
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -818,6 +825,12 @@ impl Staging {
     fn busy(&self) -> bool {
         let fence = self.last_upload.load(std::sync::atomic::Ordering::Relaxed);
         fence != 0 && host().is_some_and(|h| !h.staging_done(fence))
+    }
+
+    /// The title texture it is of, and that texture's console description
+    /// as text (`crate::hostcopy`'s trace).
+    pub(crate) fn of(&self) -> (usize, String) {
+        (self.resource, format!("{:?}", self.layout.desc))
     }
 
     /// The title memory the texture is read from: address and bytes.
@@ -1719,6 +1732,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
+        resource: resource as usize,
         buffer,
         #[cfg(feature = "diagnostics")]
         size: total,
