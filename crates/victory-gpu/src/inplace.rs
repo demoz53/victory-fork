@@ -1457,6 +1457,7 @@ mod tests {
     /// panic or reserve a page near the end.
     #[test]
     fn warp_place_part_refuses_a_span_past_the_address_space() {
+        let _turn = crate::indirect::tests::warp_turn();
         let Some(device) = warp() else { return };
         assert!(matches!(place_part(&device, u64::MAX, 1), Err(None)));
         assert!(matches!(place_part(&device, u64::MAX - 1, 2), Err(None)));
@@ -1487,6 +1488,7 @@ mod tests {
     /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let _turn = crate::indirect::tests::warp_turn();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
@@ -1510,6 +1512,7 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let _turn = crate::indirect::tests::warp_turn();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
