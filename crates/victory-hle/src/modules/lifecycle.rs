@@ -337,6 +337,8 @@ pub fn wait_for_previous() {
 fn end() {
     // VICTORY_PROFILE=<ms>: the sampler's report of the whole run.
     victory_loader::profile_final_report();
+    // VICTORY_METERS=1: the meters' summary of the run.
+    victory_gpu::meters_final_report();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

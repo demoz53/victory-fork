@@ -135,6 +135,11 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/meters (on all23)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_METERS` | `1` | off | log only, every build: lines `METERS ...` after the 5 s frame line and a summary of the run at the title's exit. `card`: every host submission runs between two timestamp lists of ours on the direct queue (recorded once, a ring of 256 pairs; a full ring leaves a submission out, counted): submissions a frame, the card's busy ms a frame (union of their intervals), idle ms a frame in the span they cover, the longest submission, and the top 5 by card time named by the first pipeline their first list binds (other work of ours on the queue counts as idle). `submitting thread`: each title `ExecuteCommandLists` and `PresentX` timed on its thread (wall, the thread's cycles, GetThreadTimes' kernel/user ratio): ms a frame between calls + inside each kind = our code + kernel + waiting (off a processor), adding up to the thread's time. `recording`: list calls through `with_state` timed with the time-stamp counter per thread: ms a frame each (top 8), threads recording at once on average | test/meters | no |
+
 ## New in all23 (merged on top of all22)
 From test/watch5 (holds test/watch4), test/async4 (holds test/async3), test/leak1, test/pic3, test/stream3 and
 test/stable1, test/trim2; each row's "From" names its source.

@@ -148,6 +148,8 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg_attr(feature = "diagnostics", track_caller)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    // VICTORY_METERS=1: the call's time on this thread.
+    let metered = crate::meters::record_begin();
     // With `VICTORY_TIMING_LEAN=1` one call in 16 is timed
     // (`crate::copystat::record_timer`).
     #[cfg(feature = "diagnostics")]
@@ -155,6 +157,7 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    crate::meters::record_end(metered);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started, place);
 }

@@ -1205,6 +1205,9 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The first pipeline the list binds (`VICTORY_METERS` names its
+    /// submission by it).
+    first_pipeline: Mutex<Option<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -6491,6 +6494,7 @@ impl Host {
                 plane_reset: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines: Mutex::default(),
+                first_pipeline: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -8575,6 +8579,13 @@ impl Host {
             lists.insert(0, list.cast().ok());
         }
         let prepared = std::time::Instant::now();
+        // VICTORY_METERS=1: the submission's card time, between a stamp list
+        // of ours ahead of its lists and one after them (and the compare).
+        let stamp = crate::meters::card(&self.device, &self.queue).and_then(|c| c.stamp().map(|s| (c, s)));
+        let meter_name = stamp.as_ref().and_then(|_| runs.iter().find_map(|r| r.first_pipeline()));
+        if let Some((_, s)) = &stamp {
+            lists.insert(0, Some(s.begin.clone()));
+        }
         // Waits for staging buffers a flight still copies from, inside this
         // preparing: counted as waiting for the card, as `settled` is.
         settled += std::time::Duration::from_micros(
@@ -8591,14 +8602,25 @@ impl Host {
                 }
             }
             *submitted += 1;
+            if let Some((_, s)) = &stamp
+                && check_alone.is_none()
+            {
+                lists.push(Some(s.end.clone()));
+            }
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 if let Some(check) = &check_alone {
-                    self.queue.ExecuteCommandLists(check);
+                    match &stamp {
+                        Some((_, s)) => self.queue.ExecuteCommandLists(&[check[0].clone(), Some(s.end.clone())]),
+                        None => self.queue.ExecuteCommandLists(check),
+                    }
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if let Some((card, s)) = stamp {
+                card.sent(s, &self.fence, *submitted, meter_name);
+            }
             awake::sent(&self.device);
             self.card_sent();
             if let Err(e) = signalled {
@@ -8675,6 +8697,11 @@ impl Host {
                 {
                     self.queue.ExecuteCommandLists(check);
                 }
+                if i + 1 == groups.len()
+                    && let Some((_, s)) = &stamp
+                {
+                    self.queue.ExecuteCommandLists(&[Some(s.end.clone())]);
+                }
                 awake::sent(&self.device);
                 self.card_sent();
                 let waited = self
@@ -8724,6 +8751,9 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        if let Some((card, s)) = stamp {
+            card.sent(s, &self.fence, *submitted, meter_name);
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -9178,6 +9208,7 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.plane_reset.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.first_pipeline.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // (A recording that was closed left none: one that was not never ran,
         // and its batches' buffers are as they were.)
         self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).1 = 0;
@@ -9743,8 +9774,16 @@ impl HostList {
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
+            if pipelines.is_empty() && crate::meters::on() {
+                *self.first_pipeline.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.to_owned());
+            }
             pipelines.insert(name.to_owned());
         }
+    }
+
+    /// The first pipeline the list binds (with `VICTORY_METERS`).
+    fn first_pipeline(&self) -> Option<String> {
+        self.first_pipeline.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -11980,6 +12019,12 @@ impl Meter {
                 // VICTORY_WAIT_STATS=1: the card's and the submitting
                 // thread's waits since the last line.
                 if let Some(line) = crate::waitstat::line((self.presented - presented_then).max(1) as f64) {
+                    tracing::info!("{line}");
+                }
+                // VICTORY_METERS=1: the card's, the submitting thread's and
+                // the recording threads' time since the last line.
+                let frames = (self.presented - presented_then).max(1) as f64;
+                for line in crate::meters::lines(frames, crate::meters::made_card()).into_iter().flatten() {
                     tracing::info!("{line}");
                 }
             }

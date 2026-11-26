@@ -787,6 +787,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         crate::cores::keep_submitter_on_fast_cores();
+        // VICTORY_METERS=1: this call's time on the calling thread.
+        let _inside = crate::meters::submission();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         if cuts() && !this.is_null() {
@@ -1255,6 +1257,9 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // VICTORY_METERS=1: this call's time on the calling thread.
+    #[cfg(windows)]
+    let _inside = crate::meters::present();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,

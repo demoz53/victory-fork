@@ -44,6 +44,8 @@ mod indirect;
 #[cfg(windows)]
 mod material_demand;
 mod lockstat;
+#[cfg(windows)]
+mod meters;
 mod waitstat;
 #[cfg(windows)]
 mod inplace;
@@ -138,4 +140,11 @@ pub(crate) fn total_system_ram_bytes() -> Option<u64> {
             None
         }
     })
+}
+
+/// `VICTORY_METERS=1`: the run's summary of the meters (card, submitting
+/// thread, recording threads), once; for the title's exit.
+#[cfg(windows)]
+pub fn meters_final_report() {
+    meters::final_report(meters::made_card());
 }
