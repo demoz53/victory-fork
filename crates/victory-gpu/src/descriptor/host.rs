@@ -558,6 +558,15 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::due`]; on unless
+/// `VICTORY_FAIR_DUE=0`). Ported from fxceless/victory-fork PR #1246
+/// (Exopus-0x65f7ad0).
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -596,10 +605,22 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     ///
+    /// With `VICTORY_FAIR_DUE` (on unless `=0`) the two kinds are served
+    /// in turns, a slot looked at before first, instead of all those
+    /// looked at before first: a backlog of thousands of slots streaming in
+    /// a part at a time filled every pass while slots never looked at
+    /// waited hundreds of frames (fxceless/victory-fork PR #1246).
+    ///
     /// Also counts all slots, as the frame line needs the whole backlog:
     /// queued, due, waiting for memory, partly uploaded, and the age in
     /// frames of the oldest due write.
     fn due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        self.due_in_order(frame, max, fair_due())
+    }
+
+    /// [`Self::due`] with the order chosen: `fair` serves the two kinds in
+    /// turns, otherwise all those looked at before come first.
+    fn due_in_order(&self, frame: u64, max: usize, fair: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
         let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
         let mut again = Vec::new();
         let mut fresh = Vec::new();
@@ -622,7 +643,13 @@ impl TextureQueue {
                 }
             }
         }
-        let retries = again.len().min(max);
+        let (retries, fresh_take) = if fair {
+            let (a, f) = (again.len(), fresh.len());
+            (a.min(max - f.min(max / 2)), f.min(max - a.min(max.div_ceil(2))))
+        } else {
+            let retries = again.len().min(max);
+            (retries, fresh.len().min(max - retries))
+        };
         let first_retry = again.len() - retries;
         let by_write = |&(write, _): &(u64, u32)| write;
         if first_retry > 0 {
@@ -630,12 +657,13 @@ impl TextureQueue {
         }
         let again = &mut again[first_retry..];
         again.sort_unstable_by_key(by_write);
-        let fresh_count = fresh.len().min(max - retries);
+        let fresh_count = fresh_take;
         let mut order = Vec::with_capacity(retries + fresh_count);
         order.extend(again.iter().rev().map(|&(write, index)| (index, write)));
         if fresh_count == 0 {
             return (order, counts);
         }
+        let again_order = std::mem::take(&mut order);
 
         // The write number gives the order. Only sort the ends we will
         // serve, leaving the middle of a large backlog unordered.
@@ -653,11 +681,26 @@ impl TextureQueue {
             fresh[newest_start..].sort_unstable_by_key(by_write);
         }
         let mut oldest = fresh[..oldest_count].iter();
+        let mut fresh_order = Vec::with_capacity(fresh_count);
         for &(write, index) in fresh[newest_start..].iter().rev() {
-            order.push((index, write));
+            fresh_order.push((index, write));
             if let Some(&(write, index)) = oldest.next() {
-                order.push((index, write));
+                fresh_order.push((index, write));
             }
+        }
+        if !fair {
+            order = again_order;
+            order.extend(fresh_order);
+            return (order, counts);
+        }
+        let (mut a, mut f) = (again_order.into_iter(), fresh_order.into_iter());
+        loop {
+            let (x, y) = (a.next(), f.next());
+            if x.is_none() && y.is_none() {
+                break;
+            }
+            order.extend(x);
+            order.extend(y);
         }
         (order, counts)
     }
@@ -3122,6 +3165,32 @@ mod tests {
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
     }
 
+    /// Slots looked at before and slots never looked at are served in
+    /// turns, one looked at before first (fxceless/victory-fork PR #1246).
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        for i in 0..10u32 {
+            let w = q.due_in_order(u64::MAX, 100, true).0.iter().find(|d| d.0 == 100 + i).unwrap().1;
+            q.later(100 + i, w, 1, 1);
+        }
+        for i in 1..4u32 {
+            q.written(i, 2, 0, false);
+        }
+        let order: Vec<u32> = q.due_in_order(10, 6, true).0.into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 6);
+        assert!(order[0] >= 100, "a slot looked at before comes first: {order:?}");
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3, "every fresh slot is reached: {order:?}");
+        // Short of one kind, the other fills the pass.
+        assert_eq!(q.due_in_order(10, 12, true).0.len(), 12);
+        // Off: all looked at before come first.
+        let old: Vec<u32> = q.due_in_order(10, 6, false).0.into_iter().map(|d| d.0).collect();
+        assert!(old.iter().all(|&i| i >= 100), "{old:?}");
+    }
+
     /// The queue of textures picked by index serves the slots looked at
     /// before first, then the newest write and the oldest in turns; a
     /// slot whose memory is not there is looked at again after
@@ -3209,7 +3278,7 @@ mod tests {
             (2, 6),
         ];
         for max in 0..=priority.len() + 1 {
-            let (ready, counts) = q.due(12, max);
+            let (ready, counts) = q.due_in_order(12, max, false);
             assert_eq!(ready, priority[..max.min(priority.len())], "max={max}");
             assert_eq!(counts, [12, 10, 2, 2, 12], "max={max}");
         }

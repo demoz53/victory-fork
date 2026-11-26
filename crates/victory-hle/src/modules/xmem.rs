@@ -646,6 +646,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    super::dstorage::lift_streaming_thread();
     let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and

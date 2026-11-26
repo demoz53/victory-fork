@@ -154,7 +154,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File::new(file));
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -269,6 +269,63 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// With `VICTORY_DSTORAGE_HANDLES=1`: a handle of its own for each
+    /// worker, made from `file` when the worker first reads ([`reopen`]).
+    others: Box<[OnceLock<Option<std::fs::File>>]>,
+}
+
+impl File {
+    fn new(file: std::fs::File) -> File {
+        let others = if handle_per_worker() { worker_count() } else { 0 };
+        File { file, others: (0..others).map(|_| OnceLock::new()).collect() }
+    }
+
+    /// Reads at `offset`; as [`FileExt::seek_read`]. The host does the
+    /// reads of one handle not opened for overlapped reads one after the
+    /// other, whichever thread asks: sixteen workers reading one archive
+    /// through the title's handle read in turns. With a handle each they
+    /// read side by side.
+    fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let other = match self.others.len() {
+            0 => None,
+            n => self.others[this_thread() % n].get_or_init(|| reopen(&self.file)).as_ref(),
+        };
+        other.unwrap_or(&self.file).seek_read(out, offset)
+    }
+}
+
+/// Whether each worker reads a file through a handle of its own
+/// (`VICTORY_DSTORAGE_HANDLES=1`; off: all through the handle the title
+/// opened, as before). From avatarmanz/VIctory-7900XTX fbc183085
+/// (`VICTORY_DSTORAGE_IO=handles`, its default).
+fn handle_per_worker() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HANDLES").is_some_and(|v| v == "1"))
+}
+
+/// A number for this thread: 0 for the first that asks, and so on.
+fn this_thread() -> usize {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static NUMBER: usize = NEXT.fetch_add(1, Ordering::Relaxed) as usize;
+    }
+    NUMBER.with(|n| *n)
+}
+
+/// Another handle to `file`, for reading; `None` if the host gives none
+/// (then the first one is used).
+fn reopen(file: &std::fs::File) -> Option<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, ReOpenFile};
+    // SAFETY: a file we hold open.
+    let handle = unsafe { ReOpenFile(file.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0) };
+    if handle == INVALID_HANDLE_VALUE {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "dstorage: a file could not be opened again");
+        return None;
+    }
+    // SAFETY: a handle just opened, ours alone.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -434,29 +491,40 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers =
-            dstorage_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let workers = worker_count();
+        let normal = workers_at_normal_priority();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| {
+                    .spawn(move || {
                         // Below the title's threads that record frames: a
                         // worker per logical processor at normal priority
                         // took the processor from them while it decoded.
+                        // (`VICTORY_DSTORAGE_PRIORITY=normal`: as the
+                        // title's own threads.)
                         #[cfg(windows)]
-                        // SAFETY: a plain call on our own thread.
-                        unsafe {
-                            use windows_sys::Win32::System::Threading::*;
-                            let _ =
-                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        if !normal {
+                            // SAFETY: a plain call on our own thread.
+                            unsafe {
+                                use windows_sys::Win32::System::Threading::*;
+                                let _ = SetThreadPriority(
+                                    GetCurrentThread(),
+                                    THREAD_PRIORITY_BELOW_NORMAL,
+                                );
+                            }
                         }
                         work(scheduler)
                     })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            normal_priority = normal,
+            handle_per_worker = handle_per_worker(),
+            "dstorage: workers"
+        );
     });
     Some(scheduler)
 }
@@ -465,6 +533,40 @@ fn scheduler() -> Option<&'static Scheduler> {
 /// `cores` logical processors.
 fn dstorage_worker_count(cores: usize) -> usize {
     cores.clamp(2, 16)
+}
+
+/// The workers started: [`dstorage_worker_count`] of this machine's logical
+/// processors, unless `VICTORY_DSTORAGE_WORKERS` says another number (1 to
+/// 64). The fork this is measured against starts one for each logical
+/// processor (32 here, against our 16): avatarmanz/VIctory-7900XTX
+/// `scheduler` (fbc183085 and before).
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        workers_from(
+            std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref(),
+            std::thread::available_parallelism().map_or(4, |n| n.get()),
+        )
+    })
+}
+
+/// [`worker_count`] from the setting's text and the logical processors.
+fn workers_from(setting: Option<&str>, cores: usize) -> usize {
+    match setting.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(workers) => workers.clamp(1, 64),
+        None => dstorage_worker_count(cores),
+    }
+}
+
+/// Whether the workers run at normal priority (`VICTORY_DSTORAGE_PRIORITY=normal`;
+/// otherwise below normal, as before). Below normal, a request waits for a
+/// processor behind every thread of the title's that spins, and what the
+/// title streams comes later the busier the frame is; the fork this is
+/// measured against leaves its workers at normal priority
+/// (avatarmanz/VIctory-7900XTX `scheduler`).
+fn workers_at_normal_priority() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_PRIORITY").is_some_and(|v| v == "normal"))
 }
 
 impl Scheduler {
@@ -979,7 +1081,43 @@ fn queue(this: QueueRef, command: Command) {
     }
 }
 
+/// The title's streaming thread runs at the lowest priorities; on the
+/// console nothing else wants its core. Here every processor is also wanted
+/// by the title's threads that spin and by our own workers, and a thread
+/// that low runs when they leave it one: what it loads comes late, and a
+/// shot of a few seconds is over before its models and textures are there.
+/// With `VICTORY_STREAM_PRIORITY=1`, called where that thread maps pages and
+/// submits its requests: a thread below normal priority is lifted above it.
+/// (Nothing of the title's code changes: it is the host's scheduling of one
+/// of its threads.) From avatarmanz/VIctory-7900XTX 49d71266b (`lift_thread`,
+/// on by default there).
+pub(crate) fn lift_streaming_thread() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_PRIORITY").is_some_and(|v| v == "1")) {
+        return;
+    }
+    #[cfg(windows)]
+    // SAFETY: plain calls on this thread.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        let thread = GetCurrentThread();
+        if lifts(GetThreadPriority(thread)) {
+            SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+}
+
+/// Whether a thread at host priority `priority` is lifted: "idle" (-15),
+/// "lowest" (-2) and "below normal" (-1); not one at normal or above, nor
+/// the value of a failed query.
+fn lifts(priority: i32) -> bool {
+    matches!(priority, -15 | -2 | -1)
+}
+
 extern "system" fn submit(this: QueueRef) {
+    lift_streaming_thread();
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -1189,16 +1327,14 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match file.read_at(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -1649,6 +1785,50 @@ mod tests {
         assert_eq!(started[1] + started[2], 300, "{started:?}");
         assert_eq!(started[0], 30, "{started:?}");
         assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
+    }
+
+    #[test]
+    fn only_threads_below_normal_priority_are_lifted() {
+        for low in [-15, -2, -1] {
+            assert!(lifts(low), "{low}");
+        }
+        // Normal and above stay; so does a failed query (0x7fffffff).
+        for kept in [0, 1, 2, 15, i32::MAX] {
+            assert!(!lifts(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn worker_count_follows_the_setting_within_bounds() {
+        assert_eq!(workers_from(None, 32), 16);
+        assert_eq!(workers_from(None, 1), 2);
+        assert_eq!(workers_from(Some("32"), 32), 32);
+        assert_eq!(workers_from(Some(" 8 "), 32), 8);
+        assert_eq!(workers_from(Some("0"), 32), 1);
+        assert_eq!(workers_from(Some("500"), 32), 64);
+        assert_eq!(workers_from(Some("many"), 32), 16);
+    }
+
+    #[test]
+    fn a_reopened_handle_reads_the_same_file_at_any_offset() {
+        let path = std::env::temp_dir().join(format!("victory-dstorage-reopen-{}.bin", std::process::id()));
+        let bytes: Vec<u8> = (0..8192u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let first = std::fs::File::open(&path).unwrap();
+        let second = reopen(&first).expect("the host opens a file again");
+        // A file with a handle for each of two workers, as the setting makes it.
+        let file = File { file: first, others: [OnceLock::from(Some(second)), OnceLock::new()].into() };
+        let mut out = [0u8; 300];
+        // Whichever handle this thread gets, and the title's own.
+        assert_eq!(file.read_at(&mut out, 5000).unwrap(), 300);
+        assert_eq!(out[..], bytes[5000..5300]);
+        assert_eq!(file.file.seek_read(&mut out, 100).unwrap(), 300);
+        assert_eq!(out[..], bytes[100..400]);
+        let other = file.others[0].get().unwrap().as_ref().unwrap();
+        assert_eq!(other.seek_read(&mut out, 7900).unwrap(), 292);
+        assert_eq!(out[..292], bytes[7900..]);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -1673,6 +1673,40 @@ pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64)
     a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
 }
 
+/// How long host copies of textures the title fills that nothing names are
+/// kept while the card has room, in milliseconds ([`let_go_idle`],
+/// `host::vram_keep`), with `VICTORY_TEXTURE_KEEP=1`; `None` without it:
+/// every one idle for five seconds goes, as before. Ten minutes unless
+/// `VICTORY_TEXTURE_KEEP_SECS` says another time (5 to 3,600).
+#[cfg(windows)]
+fn texture_keep_ms() -> Option<u64> {
+    static KEEP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        let keep = texture_keep_from(
+            std::env::var("VICTORY_TEXTURE_KEEP").ok().as_deref(),
+            std::env::var("VICTORY_TEXTURE_KEEP_SECS").ok().as_deref(),
+        );
+        if let Some(ms) = keep {
+            tracing::info!(
+                kept_ms = ms,
+                "host copies of textures the title fills are kept while the card has room (VICTORY_TEXTURE_KEEP=1)"
+            );
+        }
+        keep
+    })
+}
+
+/// [`texture_keep_ms`] from the two settings' texts.
+#[cfg(windows)]
+fn texture_keep_from(keep: Option<&str>, secs: Option<&str>) -> Option<u64> {
+    const KEPT_SECS: u64 = 600;
+    if keep.map(str::trim) != Some("1") {
+        return None;
+    }
+    let secs = secs.and_then(|v| v.trim().parse::<u64>().ok()).map_or(KEPT_SECS, |secs| secs.clamp(5, 3_600));
+    Some(secs * 1_000)
+}
+
 /// Whether [`let_go_idle`] and [`evict_placed_in`] let host copies go at
 /// all: `VICTORY_TEXTURE_SWEEP=0` keeps every one.
 #[cfg(windows)]
@@ -1915,12 +1949,41 @@ pub(crate) fn let_go_idle() {
     if !sweeping() {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    // With `VICTORY_TEXTURE_KEEP=1`: by the card's room (`host::vram_keep`),
+    // counted as `room` counts it.
+    let (idle_ms, most) = match (texture_keep_ms(), memory) {
+        (Some(kept_ms), Some([budget, used, ..])) => {
+            crate::host::vram_keep(budget, used.saturating_add(crate::shadow::card_reserve()), room_percent(), kept_ms)
+        }
+        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
+    // With a limit on the bytes, the longest idle first.
+    let by_age: Vec<usize> = if most == u64::MAX {
+        Vec::new()
+    } else {
+        let mut idle: Vec<(u64, usize)> = all
+            .iter()
+            .filter_map(|&at| {
+                // SAFETY: as below.
+                let r = unsafe { &*(at as *const Resource) };
+                let used = r.host.used.load(Relaxed);
+                (fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES))
+                    .then_some((used & 0xffff_ffff, at))
+            })
+            .collect();
+        idle.sort_unstable();
+        idle.into_iter().map(|(_, at)| at).collect()
+    };
+    let whole = if most == u64::MAX { Some(all.iter()) } else { None };
+    for &at in whole.into_iter().flatten().chain(by_age.iter()) {
+        if bytes >= most {
+            break;
+        }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
@@ -3107,6 +3170,22 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn texture_keep_is_opt_in_and_its_time_is_bounded() {
+        use super::texture_keep_from;
+        // Off unless asked for: every idle host copy goes after 5 s.
+        assert_eq!(texture_keep_from(None, None), None);
+        assert_eq!(texture_keep_from(Some("0"), Some("60")), None);
+        assert_eq!(texture_keep_from(Some("yes"), None), None);
+        // On: ten minutes, or the time asked for, within 5 s and an hour.
+        assert_eq!(texture_keep_from(Some("1"), None), Some(600_000));
+        assert_eq!(texture_keep_from(Some(" 1 "), Some(" 30 ")), Some(30_000));
+        assert_eq!(texture_keep_from(Some("1"), Some("1")), Some(5_000));
+        assert_eq!(texture_keep_from(Some("1"), Some("99999")), Some(3_600_000));
+        assert_eq!(texture_keep_from(Some("1"), Some("soon")), Some(600_000));
+    }
+
     use super::*;
     use crate::object::slot;
 
