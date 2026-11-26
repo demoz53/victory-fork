@@ -1489,6 +1489,171 @@ mod tests {
         }
     }
 
+    /// A clzero stub zeroes its line with ordinary stores, so into memory
+    /// that is kept from the title's stores it faults as any of them does:
+    /// an access violation on a read-only page (what the write watch's
+    /// guards make of a block of view memory; `victory_gpu::watch` takes
+    /// it by the address written, whatever code wrote), a guard-page
+    /// violation on a `PAGE_GUARD` page. A stand-in for such a handler
+    /// opens the page and lets the store run again: the fault is the
+    /// stub's own store, taken once, and registers, flags and memory end
+    /// exactly as without it. In write-watched memory the stores are
+    /// simply seen by the watch. (The exception path's `clzero` did none
+    /// of this itself: its handler wrote for it.)
+    #[test]
+    fn a_clzero_stub_writes_protected_memory_as_any_store_does() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE};
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, PAGE_GUARD, PAGE_READONLY, ResetWriteWatch};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 0x1000;
+        const PAGES: usize = 3;
+        static BASE: AtomicUsize = AtomicUsize::new(0);
+        // Write violations opened, guard pages passed; where and at what
+        // address the last of either was.
+        static TAKEN: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+        static LAST: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+        unsafe extern "system" fn opens(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            let (r, c) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+            let base = BASE.load(Relaxed);
+            if r.NumberParameters < 2
+                || r.ExceptionInformation[0] != 1
+                || !(base..base + PAGES * PAGE).contains(&r.ExceptionInformation[1])
+            {
+                return 0; // EXCEPTION_CONTINUE_SEARCH
+            }
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
+                let mut old = 0;
+                // SAFETY: a page of the test's own allocation.
+                unsafe { VirtualProtect((r.ExceptionInformation[1] & !(PAGE - 1)) as _, PAGE, PAGE_READWRITE, &mut old) };
+                TAKEN[0].fetch_add(1, Relaxed);
+            } else if r.ExceptionCode == EXCEPTION_GUARD_PAGE {
+                // The system took the guard off as it raised this.
+                TAKEN[1].fetch_add(1, Relaxed);
+            } else {
+                return 0;
+            }
+            LAST[0].store(c.Rip as usize, Relaxed);
+            LAST[1].store(r.ExceptionInformation[1], Relaxed);
+            -1 // EXCEPTION_CONTINUE_EXECUTION
+        }
+
+        // clzero with the title's `add rax, 40h`, and with a `mov` that
+        // leaves the flags for the test to see.
+        let clzero = [0x0f, 0x01, 0xfc];
+        let moved: [&[u8]; 2] = [&[0x48, 0x83, 0xc0, 0x40], &[0x48, 0x89, 0xc3]];
+        let codes: Vec<Vec<u8>> = moved.iter().map(|m| [&clzero[..], m].concat()).collect();
+        let mut lab = Lab::new();
+        let at: Vec<u32> = codes.iter().map(|code| lab.place(code)).collect();
+        let alone: Vec<u32> = moved.iter().map(|m| lab.place(m)).collect();
+        lab.seal();
+        let sites: Vec<Site<'_>> =
+            codes.iter().zip(&at).map(|(code, &rva)| Site { rva, ..row(Kind::Clzero, 3, code) }).collect();
+        let report = lab.rewrite(&sites);
+        assert_eq!(report.rewritten(), sites.len(), "{}", report.summary());
+        let (stubs_from, stubs_to) = report.arena.expect("two stubs");
+
+        // SAFETY: a fresh write-watched allocation, freed at the end, with
+        // the handler removed.
+        let (base, handler) = unsafe {
+            let base = VirtualAlloc(
+                std::ptr::null(),
+                PAGES * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(base, 0);
+            BASE.store(base, Relaxed);
+            (base, AddVectoredExceptionHandler(1, Some(opens)))
+        };
+        assert!(!handler.is_null());
+        let protect = |page: usize, how: u32| {
+            let mut old = 0;
+            // SAFETY: a page of the test's allocation.
+            assert_ne!(unsafe { VirtualProtect((base + page * PAGE) as _, PAGE, how, &mut old) }, 0);
+        };
+        let memory = || {
+            // SAFETY: the test's allocation, readable whatever its guards.
+            unsafe { std::slice::from_raw_parts(base as *const u8, PAGES * PAGE).to_vec() }
+        };
+        // The pages of the allocation the system saw written since the
+        // watch was last reset (and resets it).
+        let written = || {
+            let mut pages = [std::ptr::null_mut(); PAGES];
+            let (mut count, mut grain) = (PAGES, 0u32);
+            // SAFETY: the test's write-watched allocation; room for every page.
+            let failed = unsafe {
+                GetWriteWatch(1, base as _, PAGES * PAGE, pages.as_mut_ptr(), &mut count, &mut grain)
+            };
+            assert_eq!(failed, 0);
+            pages[..count].iter().map(|&p| (p as usize - base) / PAGE).collect::<Vec<_>>()
+        };
+
+        let mut rng = Rng(0x0bad_cafe_dead_beef);
+        // (page, its protection, which of the two faults it gives).
+        let kinds =
+            [(0usize, PAGE_READONLY, Some(0usize)), (1, PAGE_READWRITE | PAGE_GUARD, Some(1)), (2, PAGE_READWRITE, None)];
+        for (page, protection, fault) in kinds {
+            for i in 0..codes.len() {
+                for round in 0..6 {
+                    // Fresh contents, and the line: anywhere in the page.
+                    protect(page, PAGE_READWRITE);
+                    // SAFETY: the test's page, writable now.
+                    unsafe {
+                        let bytes = std::slice::from_raw_parts_mut((base + page * PAGE) as *mut u8, PAGE);
+                        bytes.iter_mut().for_each(|b| *b = rng.next() as u8 | 1);
+                    }
+                    let before = memory();
+                    let offset = page * PAGE + 64 * rng.below(64) as usize + [0, 63, 17][round % 3];
+                    let mut from = lab.random_state(&mut rng);
+                    from.gpr[RAX] = (base + offset) as u64;
+                    // What it must come to: the emulation's line, then the
+                    // moved instruction, with the page open.
+                    let (after_clzero, _) = emulated(&clzero, 0, &from);
+                    let want = lab.run(alone[i], &after_clzero);
+                    let want_memory = memory();
+                    assert_ne!(want_memory, before);
+                    // SAFETY: as above.
+                    unsafe { std::ptr::copy_nonoverlapping(before.as_ptr(), base as *mut u8, PAGES * PAGE) };
+                    // Kept from stores now; the stub runs into it.
+                    // SAFETY: the test's allocation.
+                    assert_eq!(unsafe { ResetWriteWatch(base as _, PAGES * PAGE) }, 0);
+                    protect(page, protection);
+                    let taken = [TAKEN[0].load(Relaxed), TAKEN[1].load(Relaxed)];
+                    let got = lab.run(at[i], &from);
+                    let what = format!("page {page}, {:02x?}, round {round}", codes[i]);
+                    assert_same(&got, &want, &what);
+                    assert_eq!(memory(), want_memory, "{what}: memory");
+                    let now = [TAKEN[0].load(Relaxed), TAKEN[1].load(Relaxed)];
+                    match fault {
+                        Some(which) => {
+                            // One fault, of the kind the page gives, at a
+                            // store of the stub's, at the line's first
+                            // byte; the other three stores found it open.
+                            let mut expected = taken;
+                            expected[which] += 1;
+                            assert_eq!(now, expected, "{what}: faults");
+                            assert!((stubs_from..stubs_to).contains(&LAST[0].load(Relaxed)), "{what}: in the stub");
+                            assert_eq!(LAST[1].load(Relaxed), (base + offset) & !63, "{what}: the line");
+                        }
+                        None => assert_eq!(now, taken, "{what}: no fault"),
+                    }
+                    // The watch saw the page written, and only it.
+                    assert_eq!(written(), [page], "{what}: the write watch");
+                }
+            }
+        }
+        // SAFETY: removes the handler and frees the allocation.
+        unsafe {
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(base as _, 0, MEM_RELEASE);
+        }
+    }
+
     #[test]
     fn clzero_loops_run_through_their_stubs_as_the_emulation_ends_them() {
         // The two loops compilers build around a clzero, with the title's

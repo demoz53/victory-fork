@@ -5061,6 +5061,86 @@ pub(crate) mod tests {
         drop_views(section, &[guarded, other], SIZE);
     }
 
+    /// The loader's rewrite of the title's `clzero` (`VICTORY_CPU_REWRITE`,
+    /// `victory_loader::rewrite`) zeroes the line with four 16-byte SSE2
+    /// stores from a stub of ours, outside the title's image; the exception
+    /// path wrote from inside its own handler. Into a guarded block those
+    /// stores fault as any store of the title's does: the handler goes by
+    /// the address written, not by the code that wrote, opens the block,
+    /// the store runs again, and the next check reports the block written.
+    #[test]
+    fn a_rewritten_clzero_writes_a_guarded_block_like_any_store() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READONLY, VirtualProtect, VirtualQuery,
+        };
+        // The stub's instructions as the loader writes them (its `stub`,
+        // the clzero arm), after `mov rax, rcx` (the title has the address
+        // in rax) and before a `ret` where the stub jumps back; the mask
+        // its `pand` reads is the 16 bytes before the code.
+        #[rustfmt::skip]
+        const STUB: [u8; 75] = [
+            0x48, 0x89, 0xc8,                               // mov rax, rcx
+            0x48, 0x8d, 0x64, 0x24, 0xe8,                   // lea rsp, [rsp - 24]
+            0x48, 0x89, 0x0c, 0x24,                         // mov [rsp], rcx
+            0xf3, 0x0f, 0x7f, 0x44, 0x24, 0x08,             // movdqu [rsp + 8], xmm0
+            0x66, 0x48, 0x0f, 0x6e, 0xc0,                   // movq xmm0, rax
+            0x66, 0x0f, 0xdb, 0x05, 0xd1, 0xff, 0xff, 0xff, // pand xmm0, [rip - 47]: the mask
+            0x66, 0x48, 0x0f, 0x7e, 0xc1,                   // movq rcx, xmm0
+            0x66, 0x0f, 0xef, 0xc0,                         // pxor xmm0, xmm0
+            0x66, 0x0f, 0x7f, 0x01,                         // movdqa [rcx], xmm0
+            0x66, 0x0f, 0x7f, 0x41, 0x10,                   // movdqa [rcx + 16], xmm0
+            0x66, 0x0f, 0x7f, 0x41, 0x20,                   // movdqa [rcx + 32], xmm0
+            0x66, 0x0f, 0x7f, 0x41, 0x30,                   // movdqa [rcx + 48], xmm0
+            0xf3, 0x0f, 0x6f, 0x44, 0x24, 0x08,             // movdqu xmm0, [rsp + 8]
+            0x48, 0x8b, 0x0c, 0x24,                         // mov rcx, [rsp]
+            0x48, 0x8d, 0x64, 0x24, 0x18,                   // lea rsp, [rsp + 24]
+            0xc3,                                           // ret
+        ];
+        // SAFETY: a fresh page of ours: the mask and the code written,
+        // then made read-and-execute.
+        let (stub, stub_page) = unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as *mut u8;
+            assert!(!at.is_null());
+            at.cast::<[u64; 2]>().write([!63, 0]);
+            std::ptr::copy_nonoverlapping(STUB.as_ptr(), at.add(16), STUB.len());
+            let mut old = 0;
+            assert_ne!(VirtualProtect(at.cast(), 4096, PAGE_EXECUTE_READ, &mut old), 0);
+            (std::mem::transmute::<*mut u8, extern "C" fn(usize) -> usize>(at.add(16)), at)
+        };
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by the query, of the right size.
+            unsafe {
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(VirtualQuery(at as *const _, &mut info, size_of_val(&info)), 0);
+                info.Protect
+            }
+        };
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+        // SAFETY: the view, not guarded yet.
+        unsafe { (guarded as *mut u8).write_bytes(0xaa, SIZE) };
+        assert!(guard(guarded, guarded + SIZE).is_some(), "the first check takes it in");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        assert_eq!(protection(guarded + BLOCK), PAGE_READONLY, "the block is guarded");
+        // A line in the second block, named by an address inside it, as
+        // the instruction takes it.
+        let line = guarded + BLOCK + 0x1c0;
+        assert_eq!(stub(line + 0x25), line + 0x25, "rax is left as it was");
+        assert_eq!(protection(guarded + BLOCK), PAGE_READWRITE, "the handler opened the block");
+        assert_eq!(protection(guarded), PAGE_READONLY, "and no other");
+        // SAFETY: the view, readable.
+        let bytes = unsafe { std::slice::from_raw_parts(guarded as *const u8, SIZE) };
+        let zeroed = line - guarded..line - guarded + 64;
+        assert!(bytes[zeroed.clone()].iter().all(|&b| b == 0), "the line is zeroed");
+        assert!(bytes[..zeroed.start].iter().chain(&bytes[zeroed.end..]).all(|&b| b == 0xaa), "and nothing else");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "the check reports the block written");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        drop_views(section, &[guarded, other], SIZE);
+        // SAFETY: the stub's page, no longer run.
+        unsafe { VirtualFree(stub_page.cast(), 0, MEM_RELEASE) };
+    }
+
     /// The runtime left a view as it was for a mapping of the pages it
     /// shows already (`VICTORY_REMAP_SAME=1`): its guarded blocks are
     /// read-write again and the next check takes all their pages as
