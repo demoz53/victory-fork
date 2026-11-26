@@ -613,17 +613,126 @@ pub(crate) fn pipeline(
 /// target rename.
 static SAVE_IO: Mutex<()> = Mutex::new(());
 
+/// The time between two saves of the library while a run adds pipelines
+/// (`VICTORY_LIBRARY_SAVE_SECS=<n>`; 300 s by default; `=20` as before;
+/// `=0`: none, only the save at a clean exit and the warm's). Each save
+/// writes the whole library: 3,053 MB by now, 3 GB written every 20 s
+/// while pipelines were made, and as much free space needed each time.
+fn save_period(value: Option<&str>) -> Option<std::time::Duration> {
+    let secs = value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(300);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Room for a library of `size` bytes on a volume with `free` bytes
+/// (`None`: not known, then a save goes ahead), with 1 GiB to spare;
+/// `reclaimed`: the bytes of a temporary file the save writes over.
+fn room_for(free: Option<u64>, size: u64, reclaimed: u64) -> bool {
+    free.is_none_or(|free| u128::from(free) + u128::from(reclaimed) >= u128::from(size) + (1u128 << 30))
+}
+
+/// The free bytes the caller may use on the volume of `dir`.
+fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let mut free = 0u64;
+    // SAFETY: a terminated path and one output; the others may be null.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free)
+}
+
+/// The one temporary file a library file is saved through
+/// (`host-pipelines.bin.tmp`): one that a run killed in the middle of a
+/// save left behind is written over by the next save, not added to (the
+/// names carried the process and a count, and each killed run left a whole
+/// library of its own: 3 GB). Only one process at a time saves through it
+/// ([`SaveTurn`]).
+fn fixed_tmp(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// The turn of this process to save the library in a folder, among all
+/// processes on the PC (a game and a warm, say, sharing a cache folder): a
+/// named mutex, which the system gives up when its process ends however it
+/// ends, so a killed run never keeps the turn. `None` inside: no mutex could
+/// be made, and the save goes through a file of this process's own name
+/// ([`unique_tmp`]), as before.
+struct SaveTurn(Option<windows_sys::Win32::Foundation::HANDLE>);
+
+impl SaveTurn {
+    /// The turn for `dir`, waiting at most `wait_ms`; `None` if another
+    /// process holds it that long.
+    fn take(dir: &std::path::Path, wait_ms: u32) -> Option<SaveTurn> {
+        use std::hash::{Hash, Hasher};
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        // Named by the folder (the same folder under any spelling of case).
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        dir.to_string_lossy().to_lowercase().hash(&mut hasher);
+        let name: Vec<u16> = format!("Local\\victory-pipeline-library-save-{:016x}", hasher.finish())
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: a terminated name; no security attributes.
+        let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if mutex.is_null() {
+            return Some(SaveTurn(None));
+        }
+        // SAFETY: our mutex.
+        match unsafe { WaitForSingleObject(mutex, wait_ms) } {
+            // (Abandoned: its holder died; the turn is ours.)
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(SaveTurn(Some(mutex))),
+            _ => {
+                // SAFETY: our handle.
+                unsafe { CloseHandle(mutex) };
+                None
+            }
+        }
+    }
+
+    /// The temporary file to save `path` through.
+    fn tmp(&self, path: &std::path::Path) -> std::path::PathBuf {
+        if self.0.is_some() { fixed_tmp(path) } else { unique_tmp(path) }
+    }
+}
+
+impl Drop for SaveTurn {
+    fn drop(&mut self) {
+        if let Some(mutex) = self.0 {
+            // SAFETY: a mutex this thread holds, and our handle.
+            unsafe {
+                windows_sys::Win32::System::Threading::ReleaseMutex(mutex);
+                windows_sys::Win32::Foundation::CloseHandle(mutex);
+            }
+        }
+    }
+}
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`). False when a write
-/// failed (true when there was nothing to write).
+/// last save and the save period ([`save_period`]) has passed (or `now`).
+/// False when a write failed (true when there was nothing to write, or a
+/// save was left out: then the added pipelines stay to be written).
 pub(crate) fn save(now: bool) -> bool {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    static PERIOD: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    let period = *PERIOD.get_or_init(|| save_period(std::env::var("VICTORY_LIBRARY_SAVE_SECS").ok().as_deref()));
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return true };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return true;
+        if !now {
+            // ("Too soon": not said, a save is asked after every pipeline.)
+            let Some(period) = period else { return true };
+            if last.is_some_and(|t| t.elapsed() < period) {
+                return true;
+            }
         }
         *last = Some(std::time::Instant::now());
     }
@@ -632,7 +741,14 @@ pub(crate) fn save(now: bool) -> bool {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return false;
     }
-    let tmp = unique_tmp(&dir.join(LIBRARY_FILE));
+    let began = std::time::Instant::now();
+    // Another process saving into the same folder: at a clean exit waited
+    // for, else left for the next period.
+    let Some(turn) = SaveTurn::take(dir, if now { 60_000 } else { 0 }) else {
+        tracing::info!("host pipeline library save skipped: another process is saving it");
+        return true;
+    };
+    let tmp = turn.tmp(&dir.join(LIBRARY_FILE));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -643,6 +759,7 @@ pub(crate) fn save(now: bool) -> bool {
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
         if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+            tracing::info!("host pipeline library save skipped: nothing added");
             return true;
         }
         if added == 0 {
@@ -650,15 +767,34 @@ pub(crate) fn save(now: bool) -> bool {
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
-            let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return false;
+            // Room for it and 1 GiB more (what the file written over holds
+            // is given back first): else not now, and the pipelines added
+            // stay to be written.
+            let reclaimed = std::fs::metadata(&tmp).map_or(0, |m| m.len());
+            let free = free_bytes(dir);
+            if !room_for(free, size as u64, reclaimed) {
+                static SAID: std::sync::Once = std::sync::Once::new();
+                let free = free.unwrap_or(0);
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        library_bytes = size,
+                        free_bytes = free,
+                        "host pipeline library not saved: its volume has less free space than the library and 1 GiB more (said once; it is saved when there is room)"
+                    );
+                });
+                tracing::info!(library_bytes = size, free_bytes = free, "host pipeline library save skipped: no space");
+                0
+            } else {
+                let _call = call("serialise", "the whole library");
+                if let Err(e) = serialise(&library.library, &tmp, size) {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    let _ = std::fs::remove_file(&tmp);
+                    return false;
+                }
+                library.added.store(0, Ordering::Relaxed);
+                SAVED.store(size as u64, Ordering::Relaxed);
+                size
             }
-            library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
         }
     };
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
@@ -683,6 +819,7 @@ pub(crate) fn save(now: bool) -> bool {
         Ok(()) => {
             tracing::info!(
                 bytes,
+                ms = began.elapsed().as_millis() as u64,
                 early = used.len(),
                 made = MADE.load(Ordering::Relaxed),
                 loaded = LOADED.load(Ordering::Relaxed),
@@ -711,14 +848,29 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
         // SAFETY: a buffer of the size the library asks for.
         return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
     }
-    let mut bytes = vec![0u8; size];
+    // A buffer the host has no memory for is left for a later save, not
+    // taken as fatal: an infallible allocation of the library's size (1.7 GB
+    // on NVIDIA there, 3 GB here) aborted the whole process mid-run
+    // ("memory allocation of 2650101862 bytes failed"; fxceless PR #1326,
+    // after upstream #2007). The pipelines stay counted as added.
+    let mut bytes = zeroed(size)
+        .ok_or_else(|| std::io::Error::other("no memory for the serialised host pipeline library; saved later"))?;
     // SAFETY: a buffer of the size the library asks for.
     unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
     std::fs::write(tmp, &bytes)
 }
 
+/// `n` zero bytes, or `None` when the host has no memory for them.
+fn zeroed(n: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v)
+}
+
 /// Unique staging path beside `path` so overlapping writes never share a
-/// temporary file name.
+/// temporary file name (the early list's; the library's only where no turn
+/// could be had, [`SaveTurn`]).
 fn unique_tmp(path: &std::path::Path) -> std::path::PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -944,6 +1096,96 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
+    }
+
+    /// A buffer the host cannot give is refused, not fatal; others are
+    /// zeros (fxceless PR #1326's test).
+    #[test]
+    fn a_save_buffer_the_host_cannot_give_is_refused() {
+        assert!(zeroed(usize::MAX / 2).is_none());
+        assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
+
+    /// `VICTORY_LIBRARY_SAVE_SECS`: 300 s unless set; `0` none; a number
+    /// as given.
+    #[test]
+    fn the_save_period_is_five_minutes_unless_set() {
+        use std::time::Duration;
+        assert_eq!(save_period(None), Some(Duration::from_secs(300)));
+        assert_eq!(save_period(Some("20")), Some(Duration::from_secs(20)));
+        assert_eq!(save_period(Some(" 600 ")), Some(Duration::from_secs(600)));
+        assert_eq!(save_period(Some("0")), None);
+        assert_eq!(save_period(Some("soon")), Some(Duration::from_secs(300)));
+    }
+
+    /// A save needs the library's bytes and 1 GiB free; the temporary file
+    /// it writes over counts as free; an unknown free space does not stop
+    /// it. And the volume of a real folder answers.
+    #[test]
+    fn a_save_needs_room_for_the_library_and_a_gibibyte() {
+        const GIB: u64 = 1 << 30;
+        assert!(room_for(None, 3 * GIB, 0));
+        assert!(room_for(Some(4 * GIB), 3 * GIB, 0));
+        assert!(!room_for(Some(4 * GIB - 1), 3 * GIB, 0));
+        assert!(room_for(Some(2 * GIB), 3 * GIB, 2 * GIB), "an orphan written over counts");
+        assert!(!room_for(Some(2 * GIB), 3 * GIB, 0), "C: at 2 GB, a 3 GB library");
+        assert!(room_for(Some(u64::MAX), u64::MAX, u64::MAX), "no overflow");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(free_bytes(dir.path()).is_some_and(|b| b > 0));
+    }
+
+    /// A library is saved through one fixed temporary file: an orphan of a
+    /// killed run there is written over by the next save (none is added
+    /// beside it), and the save leaves no temporary file.
+    #[test]
+    fn saves_go_through_one_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(LIBRARY_FILE);
+        let orphan = fixed_tmp(&target);
+        assert_eq!(orphan.file_name().unwrap(), "host-pipelines.bin.tmp");
+        std::fs::write(&orphan, vec![0xEEu8; 1 << 16]).unwrap();
+        for k in 0..3u8 {
+            let turn = SaveTurn::take(dir.path(), 0).expect("the turn, no one else saves");
+            let tmp = turn.tmp(&target);
+            assert_eq!(tmp, orphan, "the fixed name when the turn is had");
+            let mut file = Mapped::create(&tmp, 4096).expect("written over, mapped");
+            file.bytes_mut().fill(b'A' + k);
+            drop(file);
+            replace_library(dir.path(), &tmp).unwrap();
+            drop(turn);
+            let names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(names, [LIBRARY_FILE], "save {k}: only the library is left");
+            assert_eq!(std::fs::read(&target).unwrap(), vec![b'A' + k; 4096]);
+        }
+    }
+
+    /// One process's turn at a time per folder: while one thread holds it,
+    /// another asking without waiting is refused (a mutex is its holder
+    /// thread's; another process asks the same way); after it, the turn is
+    /// had again; another folder's turn is apart.
+    #[test]
+    fn the_save_turn_is_one_at_a_time_per_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let (held, release) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let holder = std::thread::spawn(move || {
+            let turn = SaveTurn::take(&path, 0).expect("the turn");
+            assert!(turn.0.is_some(), "a named mutex");
+            held.0.send(()).unwrap();
+            release.1.recv().unwrap();
+            drop(turn);
+        });
+        held.1.recv().unwrap();
+        assert!(SaveTurn::take(dir.path(), 0).is_none(), "refused while held");
+        assert!(SaveTurn::take(other.path(), 0).is_some(), "another folder's turn");
+        release.0.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(SaveTurn::take(dir.path(), 1000).is_some(), "had once given back");
     }
 
     #[test]
