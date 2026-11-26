@@ -381,9 +381,17 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+#[cfg_attr(test, derive(Default))]
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// How many entries of [`list`](Self::list) hold a constant buffer view
+    /// and how many a view of placed memory (freed ones included: they hold
+    /// their view until reused), kept as entries change for the memory
+    /// line: a walk over every entry took up to 49 ms at 30 million
+    /// (TaynanGT/Vice-Tay 40e9ea195).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    address_entries: [u64; 2],
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -391,16 +399,48 @@ struct Views {
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Entries of views that no resource releases (constant buffer views
+    /// and views of placed memory that did not fit a record), oldest first,
+    /// with the generation each was made at: past [`ownerless_cap`] the
+    /// oldest is freed, so they cannot grow for the whole run.
+    ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
+    #[cfg(all(windows, feature = "diagnostics"))]
+    address_entries: [0, 0],
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
+    ownerless: std::collections::VecDeque::new(),
 });
+
+/// How many table entries of views without a resource are kept
+/// ([`Views::ownerless`]; `VICTORY_OWNERLESS_VIEWS=<n>`, 1,048,576 by
+/// default; 0 keeps all, as before). Once the shapes of placed views are
+/// full every placed view the title writes becomes such an entry (some
+/// 15,000 a second at TaynanGT/Vice-Tay's frame rate): kept for the run
+/// they took 16.7 GB after 70 minutes. A descriptor names the view it was
+/// written with for a frame or a few, so the oldest of a million are long
+/// out of use; one naming a freed entry reads as stale (no view), as one
+/// naming a released resource's view does. After Vice-Tay d3626d257.
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_OWNERLESS_VIEWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1 << 20)
+    })
+}
+
+/// Since the start: shapes of placed views made, found again, refused
+/// because the shapes were full (the view then became a table entry), and
+/// ownerless table entries freed past [`ownerless_cap`].
+static SHAPE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -496,12 +536,16 @@ impl Views {
     /// The number of `shape`, a new one if it is not there yet; `None` when
     /// the shapes are full (the view is then a table entry).
     fn shape(&mut self, shape: Shape) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
         if let Some(&at) = self.shape_index.get(&shape) {
+            SHAPE_STATS[1].fetch_add(1, Relaxed);
             return Some(at);
         }
         if self.shapes.len() >= SHAPES {
+            SHAPE_STATS[2].fetch_add(1, Relaxed);
             return None;
         }
+        SHAPE_STATS[0].fetch_add(1, Relaxed);
         let at = self.shapes.len() as u32;
         self.shapes.push(shape);
         self.shape_index.insert(shape, at);
@@ -523,11 +567,63 @@ impl Views {
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
     fn entry(&mut self, view: View) -> [u32; 2] {
+        self.entry_kept(view, ownerless_cap())
+    }
+
+    /// [`entry`](Self::entry), keeping at most `cap` entries of views
+    /// without a resource (0: all).
+    fn entry_kept(&mut self, view: View, cap: usize) -> [u32; 2] {
+        let ownerless = view.resources() == [0, 0] && matches!(view, View::Constant(..) | View::Placed(..));
+        let fresh = !self.index.contains_key(&view);
+        let words = self.entry_made(view);
+        if ownerless && fresh {
+            self.ownerless.push_back((words[0], words[1]));
+            while cap != 0 && self.ownerless.len() > cap {
+                let Some((i, generation)) = self.ownerless.pop_front() else {
+                    break;
+                };
+                self.free_ownerless(i, generation);
+            }
+        }
+        words
+    }
+
+    /// Frees entry `i` if it still holds the view it had at `generation`
+    /// (it may have been freed and made again for another view since).
+    fn free_ownerless(&mut self, i: u32, generation: u32) {
+        let Some((view, current)) = self.list.get(i as usize).cloned() else {
+            return;
+        };
+        if current != generation || self.index.get(&view) != Some(&i) {
+            return;
+        }
+        self.index.remove(&view);
+        // (Below the bits that say a record is no table entry.)
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        self.free.push(i);
+        SHAPE_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Counts `view` in or out of [`address_entries`](Self::address_entries).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn count_address(&mut self, view: &View, added: bool) {
+        let kind = match view {
+            View::Constant(..) => 0,
+            View::Placed(..) => 1,
+            _ => return,
+        };
+        let n = &mut self.address_entries[kind];
+        *n = if added { *n + 1 } else { n.saturating_sub(1) };
+    }
+
+    fn entry_made(&mut self, view: View) -> [u32; 2] {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
                 let i = match self.free.pop() {
                     Some(i) => {
+                        #[cfg(all(windows, feature = "diagnostics"))]
+                        self.count_address(&self.list[i as usize].0.clone(), false);
                         self.list[i as usize].0 = view.clone();
                         i
                     }
@@ -536,6 +632,8 @@ impl Views {
                         self.list.len() as u32 - 1
                     }
                 };
+                #[cfg(all(windows, feature = "diagnostics"))]
+                self.count_address(&view, true);
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
                 }
@@ -589,14 +687,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
     let views = crate::lockstat::read_if(&VIEWS, crate::lockstat::Lock::Views, crate::lockstat::heap_locks());
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
-    for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
-        }
-    }
+    let [constants, placed] = views.address_entries;
     [
         views.list.len() as u64,
         views.free.len() as u64,
@@ -610,6 +701,39 @@ pub(crate) fn views_kept() -> [u64; 8] {
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
     ]
+}
+
+/// For the memory line: the shapes of placed views in use, made and found
+/// again a second since the last call, and since the start; the views that
+/// found the shapes full; the ownerless table entries kept and freed.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shape_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, [u64; 4])>> = std::sync::Mutex::new(None);
+    let now: [u64; 4] = std::array::from_fn(|k| SHAPE_STATS[k].load(Relaxed));
+    let (shapes, kept) = {
+        let views = crate::lockstat::read_if(&VIEWS, crate::lockstat::Lock::Views, crate::lockstat::heap_locks());
+        (views.shapes.len(), views.ownerless.len())
+    };
+    let (secs, before) = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let at = std::time::Instant::now();
+        let (secs, before) = last.map_or((0.0, [0; 4]), |(t, b)| (at.duration_since(t).as_secs_f64(), b));
+        *last = Some((at, now));
+        (secs, before)
+    };
+    let rate = |k: usize| if secs > 0.0 { now[k].saturating_sub(before[k]) as f64 / secs } else { 0.0 };
+    format!(
+        "placed-view shapes: {shapes} of {SHAPES} in use; {:.0} made and {:.0} found again a second since the last line ({} made, {} found again since the start); {} views found the shapes full (each a table entry); ownerless table entries {kept} kept of at most {} (VICTORY_OWNERLESS_VIEWS, 0: all), {} let go; padding words left out of the shapes: {} (VICTORY_PLACED_PADDING)",
+        rate(0),
+        rate(1),
+        now[0],
+        now[1],
+        now[2],
+        ownerless_cap(),
+        now[3],
+        if placed_padding() { "yes" } else { "no" },
+    )
 }
 
 impl View {
@@ -1274,6 +1398,73 @@ mod tests {
         let r = placed_resource_words(&resource).unwrap();
         assert_eq!((r[1], r[13]), (0, 0));
         assert_eq!(r[2..13], resource[2..13]);
+    }
+
+    /// Entries of views no resource releases stay under their cap: the
+    /// oldest go stale, the newest still name their views, entries are
+    /// reused rather than added, and views of resources are never dropped
+    /// (after TaynanGT/Vice-Tay d3626d257's test).
+    #[test]
+    fn ownerless_entries_are_capped() {
+        let mut views = Views::default();
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        let named = |views: &Views, words: [u32; 2], view: &View| {
+            views.list.get(words[0] as usize).is_some_and(|(v, g)| *g == words[1] && v == view)
+        };
+        let words: Vec<[u32; 2]> = (0..10).map(|n| views.entry_kept(placed(n), 4)).collect();
+        assert_eq!(views.index.len(), 4, "four kept");
+        assert!(views.list.len() <= 5, "entries reused, not added: {}", views.list.len());
+        for n in 0..6 {
+            assert!(!named(&views, words[n], &placed(n as u32)), "entry {n} stale");
+        }
+        for n in 6..10 {
+            assert!(named(&views, words[n], &placed(n as u32)), "entry {n} kept");
+        }
+        // The same view written again keeps its words.
+        assert_eq!(views.entry_kept(placed(9), 4), words[9]);
+        // A view of a resource is freed with the resource only.
+        let shader = View::Shader(0x1234, None);
+        let kept = views.entry_kept(shader.clone(), 4);
+        for n in 10..1_000 {
+            views.entry_kept(placed(n), 4);
+        }
+        assert!(named(&views, kept, &shader));
+        assert!(views.list.len() <= 6, "flat over 1,000 views: {}", views.list.len());
+        // 0 keeps them all.
+        for n in 1_000..1_020 {
+            views.entry_kept(placed(n), 0);
+        }
+        assert_eq!(views.index.len(), 1 + 4 + 20);
+    }
+
+    /// The counts of constant buffer and placed entries the memory line
+    /// reads follow the table as a walk over it would count (Vice-Tay
+    /// 40e9ea195's test).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn address_entry_counts_follow_the_table() {
+        let walk = |views: &Views| {
+            let count = |f: fn(&View) -> bool| views.list.iter().filter(|(v, _)| f(v)).count() as u64;
+            [count(|v| matches!(v, View::Constant(..))), count(|v| matches!(v, View::Placed(..)))]
+        };
+        let mut views = Views::default();
+        views.list.push((View::Shader(1, None), 2));
+        views.free.push(0);
+        let constant = View::Constant(0x1234, 256);
+        assert_eq!(views.entry_kept(constant.clone(), 0), [0, 2]);
+        assert_eq!(views.entry_kept(constant, 0), [0, 2]);
+        let placed = View::Placed(false, [0; 14], [0; 16]);
+        let index = views.entry_kept(placed.clone(), 0);
+        assert_eq!(views.entry_kept(placed, 0), index);
+        views.entry_kept(View::Unordered(1, 2, None), 0);
+        assert_eq!(views.address_entries, [1, 1]);
+        assert_eq!(views.address_entries, walk(&views));
+        for n in 1..6u32 {
+            views.entry_kept(View::Placed(false, [n; 14], [n; 16]), 2);
+            assert_eq!(views.address_entries, walk(&views), "after placed view {n}");
+        }
+        views.entry_kept(View::Constant(0x5678, 512), 2);
+        assert_eq!(views.address_entries, walk(&views), "a constant view in a freed entry");
     }
 
     #[test]
