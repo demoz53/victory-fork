@@ -776,6 +776,13 @@ pub(crate) fn queue_age_line() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_AGE").is_none_or(|v| v != "0"))
 }
 
+thread_local! {
+    /// This thread is making a slot whose texture was uploaded ahead
+    /// ([`HostHeap::publish_ahead`]): the slot's place in the queue of
+    /// textures picked by index was settled when that upload was recorded.
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -2145,6 +2152,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if PUBLISHING.get() {
+            return;
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -2448,12 +2458,47 @@ impl HostHeap {
         }
     }
 
+    /// Makes host slot `index` from the record at `handle` if that is still
+    /// the record `key` names, whose texture's upload is in the card's queue
+    /// now (`crate::heap_worker`, `VICTORY_HEAP_WORKER=1`). The slot's place
+    /// in the queue of textures picked by index was settled when the upload
+    /// was recorded and stays as it is. False if the title wrote the slot
+    /// again since (that write is queued and looked at in its own turn), or
+    /// the slot cannot be made.
+    pub(crate) fn publish_ahead(&self, index: u32, handle: u64, key: u64) -> bool {
+        struct Publishing;
+        impl Drop for Publishing {
+            fn drop(&mut self) {
+                PUBLISHING.set(false);
+            }
+        }
+        PUBLISHING.set(true);
+        let _publishing = Publishing;
+        // The record is read once, by the making itself: a write of the
+        // title's at this moment is either that record or not made here.
+        self.mirror_as(index, handle, true, Some(key)).is_some()
+    }
+
+    /// The key of the record title slot `index`'s host slot was made from
+    /// (0: not made, or made null).
+    #[cfg(test)]
+    fn made_key(&self, index: u32) -> u64 {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.host(index).map_or(0, |host| made.keys[host as usize])
+    }
+
     /// Makes title slot `index`'s host slot (its own, or with a heap map
     /// past the identity window its pool slot) from the record the title
     /// has at `handle` if it changed since, and returns the view recorded
     /// there. Buffer views are made only for draws (`for_draw`), which also
     /// copy their data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_as(index, handle, for_draw, None)
+    }
+
+    /// [`HostHeap::mirror`], only from the record `expect` names if one is
+    /// given (`None` returned for another).
+    fn mirror_as(&self, index: u32, handle: u64, for_draw: bool, expect: Option<u64>) -> Option<View> {
         let mirrored = if self.map.is_some() { self.title_count } else { self.count };
         if index >= mirrored {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -2483,6 +2528,9 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        if expect.is_some_and(|expect| tag != VIEW_TAG || expect != key) {
+            return None;
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -4508,6 +4556,59 @@ mod tests {
         let (_, current) = heap.texture_slots_due(u64::MAX, 1).0[0];
         assert!(heap.texture_slot_gone(slot, current));
         assert_eq!(shown(), 0);
+    }
+
+    /// `VICTORY_HEAP_WORKER=1`'s hand-off (`crate::heap_worker`): a slot
+    /// whose texture the worker uploaded is made when it is published, and
+    /// does not go back into the queue of textures picked by index for that,
+    /// nor when published twice; one the title wrote again after the worker
+    /// looked at it is refused, goes on showing what it showed, and is due
+    /// again for the new write.
+    #[test]
+    fn a_slot_uploaded_ahead_is_made_once_and_a_rewrite_is_looked_at_again() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let due = || -> Vec<u32> { heap.texture_slots_due(u64::MAX, 8).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, at addresses no test and no title uses.
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let title = [0u32; 8];
+        let handle = title.as_ptr() as u64;
+        crate::descriptor::record_for_test(handle, view(0x7fec_0000_0000));
+        let (first, key) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&first), false).is_empty());
+        let (index, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(index, 1);
+        // The worker recorded its upload: out of the queue, not made yet.
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(heap.made_key(1), 0);
+        assert_eq!(due(), [] as [u32; 0]);
+        // Its list is handed to a submission: made, and not queued again.
+        assert!(heap.publish_ahead(1, handle, key));
+        assert_eq!(heap.made_key(1), key);
+        assert_eq!(due(), [] as [u32; 0]);
+        assert!(heap.publish_ahead(1, handle, key));
+        assert_eq!(due(), [] as [u32; 0]);
+        // Written again after the worker looked at it, before its list was
+        // handed over: refused, the slot shows what it did, the write is due.
+        crate::descriptor::record_for_test(handle, view(0x7feb_0000_0000));
+        let (second, again) = crate::descriptor::view_and_key(handle).unwrap();
+        assert_ne!(again, key);
+        let _ = heap.note_buffer(1, Some(&second), false);
+        assert!(!heap.publish_ahead(1, handle, key));
+        assert_eq!(heap.made_key(1), key);
+        assert_eq!(due(), [1]);
+        // Its own turn: looked at, uploaded, published.
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(1, write, None);
+        assert!(heap.publish_ahead(1, handle, again));
+        assert_eq!(heap.made_key(1), again);
+        assert_eq!(due(), [] as [u32; 0]);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due
