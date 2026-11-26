@@ -54,7 +54,8 @@ Every command answers in the status file (`last_command`, `last_result`) and in 
 | `vehicle list` | `vehicle list` | Writes every vehicle model the game defines to `<status file>.vehicles.txt`: `#index hash name make` (names in the game's language). The panel's "List the game's vehicles" button fills its vehicle box from it. |
 | `spawn vehicle <name>` | `spawn vehicle infernus` | A vehicle 5 m in front of the player, facing the same way, on the ground there. The name is the game's display name (case and spaces ignored, with or without the make), else a name whose one-at-a-time hash is the model hash's low half. The model is asked for and the vehicle made when it has loaded (over several frames, never blocking; 10 s at most), then put in the world and its physics woken. One spawn at a time. |
 | `spawn vehicle 0x<hash>` / `#<n>` | `spawn vehicle #0` | By 64-bit model hash, or by line number of `vehicle list`. |
-| `vehicle enter` | `vehicle enter` | The player into the driver's seat of the vehicle the mod spawned last (at most 50 m away). |
+| `vehicle enter` | `vehicle enter` | The player into the driver's seat of the vehicle the mod spawned last (at most 50 m away). The result says when the game has him seated (5 s at most). While he is in a vehicle, position, teleports and `tp rel` use the vehicle. |
+| `vehicle exit` | `vehicle exit` | The player gets out (the game's leave-vehicle task, through the checked TASK_LEAVE_VEHICLE handler); it takes a second or two. |
 | `vehicle repair` | `vehicle repair` | The player's vehicle: the game's own full repair (applied the next frame), every part to full health, cleaned. |
 | `status` | `status` | Rewrite the status file now. |
 

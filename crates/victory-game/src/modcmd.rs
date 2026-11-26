@@ -65,6 +65,8 @@ pub enum Command {
     VehicleList,
     /// `vehicle enter`: the player into the driver's seat of the vehicle last spawned.
     Enter,
+    /// `vehicle exit`: the player gets out (the game's leave-vehicle task).
+    Exit,
     /// `native <target> [args...] [r:<n>]`: `results` slots asked for (0 to 8, default 3).
     Native { target: Target, args: Vec<Arg>, results: u32 },
     /// `status`: write the status file now.
@@ -321,7 +323,8 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
         ("vehicle", ["repair"]) => Command::Repair,
         ("vehicle", ["list"]) => Command::VehicleList,
         ("vehicle", ["enter"]) => Command::Enter,
-        ("vehicle", _) => return Err("vehicle wants repair, list or enter".into()),
+        ("vehicle", ["exit"]) => Command::Exit,
+        ("vehicle", _) => return Err("vehicle wants repair, list, enter or exit".into()),
         ("native", [t, args @ ..]) => {
             if args.len() > MOST_ARGS {
                 return Err(format!("native takes at most {MOST_ARGS} arguments"));
@@ -611,6 +614,7 @@ mod tests {
         assert_eq!(p("vehicle repair"), Command::Repair);
         assert_eq!(p("vehicle list"), Command::VehicleList);
         assert_eq!(p("vehicle enter"), Command::Enter);
+        assert_eq!(p("vehicle exit"), Command::Exit);
         assert_eq!(p("spawn vehicle #12"), Command::SpawnVehicle(Model::Index(12)));
         assert!(parse("spawn vehicle #x").is_err());
         assert!(parse("vehicle fly").is_err());

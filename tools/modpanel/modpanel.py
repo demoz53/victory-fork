@@ -215,6 +215,7 @@ class Panel:
         vb = ttk.Frame(wp)
         vb.grid(row=9, column=0, columnspan=3, sticky="w")
         ttk.Button(vb, text="Get in", command=lambda: self.send("vehicle enter")).pack(side="left")
+        ttk.Button(vb, text="Get out", command=lambda: self.send("vehicle exit")).pack(side="left")
         ttk.Button(vb, text="Repair", command=lambda: self.send("vehicle repair")).pack(side="left")
         ttk.Button(vb, text="List the game's vehicles", command=self.list_vehicles).pack(side="left")
         self.vehicle_box = wp.grid_slaves(row=8, column=1)[0]

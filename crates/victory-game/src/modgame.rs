@@ -183,6 +183,9 @@ pub mod sites {
     pub const EXCEPTION_TABLE: Site = Site { name: "EXCEPTION_TABLE", rva: 0xabcf000, bytes: &[0x00, 0x10, 0x00, 0x00, 0xec, 0x10, 0x00, 0x00, 0x58, 0x0d, 0x7a, 0x06, 0xf0, 0x10, 0x00, 0x00, 0x34, 0x11, 0x00, 0x00, 0xc4, 0x0c, 0x7a, 0x06] };
     /// `void EntityToScriptHandle(CEntity*, Handle16* out, int mode)`; the natives use mode 2.
     pub const ENTITY_TO_SCRIPT_HANDLE: Site = Site { name: "ENTITY_TO_SCRIPT_HANDLE", rva: 0x02a6520, bytes: &[0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x83, 0xec, 0x38, 0xc5, 0xf8, 0x57, 0xc0, 0x48, 0x89, 0xd6] };
+    /// `PedVehicleComponent* (u32 entityId)` without creating it: set at once by a seat change; flags bit 0x20 =
+    /// seated, +2200 = that `CVehicle*`.
+    pub const PED_COMPONENT_71: Site = Site { name: "PED_COMPONENT_71", rva: 0x4dd7540, bytes: &[0x89, 0xc8, 0x25, 0x00, 0x00, 0x3e, 0x00, 0x3d, 0x00, 0x00, 0x06, 0x00, 0x75, 0x3a, 0x81, 0xe1] };
     pub const VEHICLE_MODEL_POOL: Pin = Pin { site: VEHICLE_MODEL_HASH_AT, disp: 5, end: 9, target: 0x0a4b_9c40 };
     pub const MODEL_REQUEST_DEFAULTS: Pin = Pin { site: MODEL_REQUEST_DEFAULTS_READ, disp: 3, end: 7, target: 0x0aae_b6ec };
     pub const WORLD_ENTITY_MANAGER: Pin = Pin { site: WORLD_MANAGER_READ, disp: 3, end: 7, target: 0x099a_ad30 };
@@ -278,6 +281,8 @@ struct State {
     models: Option<Vec<VehicleModel>>,
     /// The vehicle last spawned and its pool slot (checked alive before use), or (0, 0).
     spawned: (usize, u32),
+    /// `vehicle enter` waiting for the game to have the player seated: (vehicle, since, line).
+    enter_check: Option<(usize, Instant, String)>,
     /// `wanted n` waiting for the game to show the level: (n, since, line).
     wanted_check: Option<(u32, Instant, String)>,
     /// Times never wanted was put back since it was set (said once, then counted).
@@ -349,6 +354,7 @@ pub fn configure(var: &dyn Fn(&str) -> Option<String>) -> bool {
         models: None,
         spawned: (0, 0),
         wanted_check: None,
+        enter_check: None,
         never_again: 0,
         handlers: None,
         native_result: None,
@@ -426,14 +432,37 @@ unsafe fn entity_id(ent: usize) -> u32 {
     unsafe { ((ent + ENTITY_ID) as *const u32).read_unaligned() }
 }
 
-/// The vehicle the player is in (its in-vehicle info and the generation-checked
-/// lookup), or 0. Needs PED_COMPONENT_51 and VEHICLE_FROM_ID checked.
+/// Whether the sites and the pool word [`ped_vehicle`] reads were checked ([`State::vehicle_reads`]).
+static VEHICLE_READS: AtomicBool = AtomicBool::new(false);
+
+/// The PED_VEHCOMP fields (VIper PED_VEHCOMP_FLAGS / _IN_VEHICLE / _VEHICLE).
+const PED_VEHCOMP_FLAGS: usize = 16;
+const PED_VEHCOMP_IN_VEHICLE: u32 = 0x20;
+const PED_VEHCOMP_VEHICLE: usize = 2200;
+
+/// The vehicle the player is in, or 0 (VIper `ped_vehicle`): first the ped's
+/// vehicle component, which a seat change sets at once (its vehicle checked
+/// to be a live vehicle pool slot), then the in-vehicle info and the
+/// generation-checked lookup. In the game a warp into the driver's seat
+/// showed in neither of the info route's fields for many frames, so the
+/// component comes first. 0 unless [`State::vehicle_reads`] passed.
 ///
 /// # Safety
 /// `ped` the live player, on its thread.
 unsafe fn ped_vehicle(base: usize, ped: usize) -> usize {
-    // SAFETY: the two title functions (checked by the caller) with an entity id; plain reads of what they return.
+    if !VEHICLE_READS.load(Ordering::Relaxed) {
+        return 0;
+    }
+    // SAFETY: the three title functions (checked, see VEHICLE_READS) with an entity id; plain reads of what they return.
     unsafe {
+        let comp71: extern "C" fn(u32) -> usize = std::mem::transmute(base + sites::PED_COMPONENT_71.rva as usize);
+        let vc = comp71(entity_id(ped));
+        if vc != 0 && ((vc + PED_VEHCOMP_FLAGS) as *const u32).read_unaligned() & PED_VEHCOMP_IN_VEHICLE != 0 {
+            let v = ((vc + PED_VEHCOMP_VEHICLE) as *const usize).read_unaligned() & !0xf;
+            if v != 0 && vehicle_slot(base, v).is_some() {
+                return v;
+            }
+        }
         let comp: extern "C" fn(u32) -> usize = std::mem::transmute(base + sites::PED_COMPONENT_51.rva as usize);
         let veh_of: extern "C" fn(u32) -> usize = std::mem::transmute(base + sites::VEHICLE_FROM_ID.rva as usize);
         let c = comp(entity_id(ped));
@@ -445,6 +474,30 @@ unsafe fn ped_vehicle(base: usize, ped: usize) -> usize {
             return 0;
         }
         veh_of(((info + VEHICLE_INFO_VEHICLE_ID) as *const u32).read_unaligned())
+    }
+}
+
+/// Where the player is and which way it faces: its vehicle's place when it
+/// is in one (a seated ped's own position is not where the game has it).
+///
+/// # Safety
+/// `ped` the live player, on its thread.
+unsafe fn player_place(base: usize, ped: usize) -> ([f32; 3], f32) {
+    // SAFETY: the caller's; a vehicle ped_vehicle returns is live.
+    unsafe {
+        match ped_vehicle(base, ped) {
+            0 => entity_place(ped),
+            v => entity_place(v),
+        }
+    }
+}
+
+impl State {
+    /// Checks what [`ped_vehicle`] reads (once each, kept) and says so to it.
+    fn vehicle_reads(&mut self, base: usize) -> Result<(), String> {
+        let r = self.need(base, &[sites::PED_COMPONENT_51, sites::PED_COMPONENT_71, sites::VEHICLE_FROM_ID]).and_then(|()| self.pin(base, sites::VEHICLE_POOL).map(|_| ()));
+        VEHICLE_READS.store(r.is_ok(), Ordering::Relaxed);
+        r
     }
 }
 
@@ -925,7 +978,7 @@ fn step_spawn(st: &mut State, base: usize, ped: usize, frame_no: u64) {
             };
             if loaded && ped != 0 {
                 // SAFETY: the live player, on its thread.
-                let (here, h) = unsafe { entity_place(ped) };
+                let (here, h) = unsafe { player_place(base, ped) };
                 let mut at = modcmd::relative(here, h, 5.0, 0.0);
                 let mut world = TitleWorld { base, ent: ped };
                 at[2] = modcmd::World::ground(&mut world, at[0], at[1], here[2] + 5.0).map_or(here[2] + 0.5, |g| g + 0.5);
@@ -982,7 +1035,14 @@ fn step_spawn(st: &mut State, base: usize, ped: usize, frame_no: u64) {
                     cleanup_params(base, p);
                 }
                 if *in_world && params.is_none() {
-                    finish = Some((true, format!("ok: {name} is in front of the player")));
+                    // SAFETY: the live player and the live vehicle we made.
+                    let (me, car) = unsafe { (player_place(base, ped).0, entity_place(veh).0) };
+                    let d = ((me[0] - car[0]).powi(2) + (me[1] - car[1]).powi(2)).sqrt();
+                    finish = Some(if ped != 0 && d <= 15.0 {
+                        (true, format!("ok: {name} is {d:.1} m from the player"))
+                    } else {
+                        (false, format!("{name} is made but {d:.0} m from the player (not in front of him)"))
+                    });
                     spawned_now = (veh, slot);
                 }
             }
@@ -1092,6 +1152,7 @@ pub const NATIVES: &[(&str, u64, u32, &str)] = &[
     ("SET_VEHICLE_ENGINE_ON", 0x3465d18749b305eb, 0x4a93160, "(Handle vehicle, bool on, bool instantly, bool stay_off)"),
     ("SET_VEHICLE_DIRT_LEVEL", 0xab0eae71bc5183fc, 0x4a95500, "(Handle vehicle, f32 dirt)"),
     ("MODIFY_VEHICLE_TOP_SPEED", 0x8b353295ca526c73, 0x4a8be20, "(Handle vehicle, f32 percent)"),
+    ("TASK_LEAVE_VEHICLE", 0x4cc61ed63bd62311, 0x44ca420, "(Handle ped, Handle vehicle, u32 flags, i32 delay ms (-1 or > 0))"),
     ("SET_TIMECYCLE_MODIFIER", 0xdf6b189febc2f881, 0x3c16530, "(u32 nameHash)"),
     ("CLEAR_TIMECYCLE_MODIFIER", 0x29cb6e04f1c0b50d, 0x3c066f0, "()"),
     ("GET_GAME_TIMER", 0x582c0998b0981713, 0x3e85810, "() -> i32"),
@@ -1327,8 +1388,10 @@ pub fn frame(base: usize, ped: usize, frame_no: u64) {
             st.queue.push_back(("keys", line));
         }
     }
+    let _ = st.vehicle_reads(base);
     step_warp(st, base, ped, frame_no);
     step_spawn(st, base, ped, frame_no);
+    step_enter(st, base, ped, frame_no);
     step_wanted(st, base, ped, frame_no);
     if ped != 0 && st.kept_at.is_none_or(|t| t.elapsed() >= KEEP_EVERY) {
         st.kept_at = Some(Instant::now());
@@ -1380,7 +1443,7 @@ fn run(st: &mut State, base: usize, ped: usize, frame_no: u64, line: &str, cmd: 
         Command::Teleport { x, y, z, heading } => start_warp(st, base, ped, frame_no, line, x, y, z, heading),
         Command::Relative { forward, up } => {
             // SAFETY: the live player, on its thread.
-            let (here, h) = unsafe { entity_place(ped) };
+            let (here, h) = unsafe { player_place(base, ped) };
             let t = modcmd::relative(here, h, forward, up);
             start_warp(st, base, ped, frame_no, line, t[0], t[1], Some(t[2]), None)
         }
@@ -1498,7 +1561,7 @@ fn run(st: &mut State, base: usize, ped: usize, frame_no: u64, line: &str, cmd: 
                 return Err("no vehicle spawned by the mod is there (spawn vehicle first)".into());
             }
             // SAFETY: the live player and the live vehicle we made (checked above).
-            let (me, car) = unsafe { (entity_place(ped).0, entity_place(veh).0) };
+            let (me, car) = unsafe { (player_place(base, ped).0, entity_place(veh).0) };
             let d = ((me[0] - car[0]).powi(2) + (me[1] - car[1]).powi(2) + (me[2] - car[2]).powi(2)).sqrt();
             if d > 50.0 {
                 return Err(format!("the vehicle spawned is {d:.0} m away (at most 50 m)"));
@@ -1510,7 +1573,22 @@ fn run(st: &mut State, base: usize, ped: usize, frame_no: u64, line: &str, cmd: 
             }
             // SAFETY: as above.
             let now = unsafe { ped_vehicle(base, ped) };
-            Ok(if now == veh { "the player is in the driver's seat".into() } else { "asked; the in-vehicle state shows it a frame or two later (see in_vehicle)".into() })
+            if now == veh {
+                return Ok("the player is in the driver's seat".into());
+            }
+            st.enter_check = Some((veh, Instant::now(), line.to_owned()));
+            Ok("asked; waiting until the game has him seated (watch in_vehicle)".into())
+        }
+        Command::Exit => {
+            // SAFETY: the live player, on its thread.
+            let veh = unsafe { ped_vehicle(base, ped) };
+            if veh == 0 {
+                return Err("the player is not in a vehicle".into());
+            }
+            st.enter_check = None;
+            let args = [modcmd::Arg::Player, modcmd::Arg::Vehicle, modcmd::Arg::Int(0), modcmd::Arg::Int(-1)];
+            native(st, base, ped, &modcmd::Target::Name("TASK_LEAVE_VEHICLE".into()), &args, 0)
+                .map(|_| "the game's leave-vehicle task is given (he gets out over the next second or two)".into())
         }
         Command::Native { target, args, results } => native(st, base, ped, &target, &args, results),
         Command::Status => unreachable!(),
@@ -1664,6 +1742,29 @@ unsafe fn keep_never_wanted(st: &mut State, base: usize, ped: usize, frame_no: u
     Ok(())
 }
 
+/// After `vehicle enter`: reports when the game has the player seated (5 s at most).
+fn step_enter(st: &mut State, base: usize, ped: usize, frame_no: u64) {
+    let Some((veh, since, line)) = st.enter_check.clone() else { return };
+    if ped == 0 {
+        st.enter_check = None;
+        return;
+    }
+    // SAFETY: the live player, on its thread.
+    let now = unsafe { ped_vehicle(base, ped) };
+    let text = if now == veh {
+        format!("ok: the player is in the driver's seat ({} ms after asking)", since.elapsed().as_millis())
+    } else if since.elapsed() >= Duration::from_secs(5) {
+        format!("refused: the game does not have the player seated 5 s after asking (in vehicle {now:#x})")
+    } else {
+        return;
+    };
+    st.enter_check = None;
+    say(text.starts_with("refused"), &format!("VICTORY_MOD: {line:?} (frame {frame_no}): {text}"));
+    if st.last.as_ref().is_some_and(|x| x.line == line) {
+        set_last_result(st, text);
+    }
+}
+
 /// After `wanted n`: the level the game shows over the next 3 s (it applies a set level a moment later).
 fn step_wanted(st: &mut State, base: usize, ped: usize, frame_no: u64) {
     let Some((n, since, line)) = st.wanted_check.clone() else { return };
@@ -1815,7 +1916,7 @@ fn start_warp(
     let vehicle = unsafe { ped_vehicle(base, ped) };
     let mut world = TitleWorld { base, ent: if vehicle != 0 { vehicle } else { ped } };
     // SAFETY: as above.
-    let (from, _) = unsafe { entity_place(ped) };
+    let (from, _) = unsafe { player_place(base, ped) };
     let (warp, step) = Warp::start(&mut world, x, y, z, heading, now_ms(st));
     let what = if vehicle != 0 { "the player's vehicle" } else { "the player" };
     let dist = ((from[0] - x).powi(2) + (from[1] - y).powi(2)).sqrt();
@@ -1877,7 +1978,7 @@ fn write_status(st: &mut State, base: usize, ped: usize, frame_no: u64) {
         s.put("player", 0);
     } else {
         // SAFETY: the live player, on its thread.
-        let (p, h) = unsafe { entity_place(ped) };
+        let (p, h) = unsafe { player_place(base, ped) };
         s.put("player", 1)
             .put("x", format!("{:.2}", p[0]))
             .put("y", format!("{:.2}", p[1]))
@@ -2014,6 +2115,7 @@ mod tests {
             models: None,
             spawned: (0, 0),
             wanted_check: None,
+        enter_check: None,
             never_again: 0,
             handlers: None,
             native_result: None,
