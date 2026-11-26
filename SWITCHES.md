@@ -135,6 +135,16 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/patch1 (title patches, in memory; on top of all23)
+Each is a title patch (in memory), opt-in: made in the mapped image before any title code runs, never in a file;
+every site's original bytes checked first, a group all or none (a mismatch: that group left out, one line
+"title patch none for the ... the title runs without it"); `VICTORY_TITLE_PATCHES=0` turns them off with the other two.
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_RT_FALLBACK` | `1`; `2` | off | title patch (in memory), opt-in. `1`: the title's test "is acceleration-structure set i there" (+0x4fd8570; its `jne` at +0x4fd857b a 6-byte nop) always answers no, so its lighting takes its own programs without rays (CS_ScreenProbes_TraceRays_Fallback, CS_PPR_RaytraceFallback, CS_LaserLightShadowRaytracingFallback) instead of the `_BVH` ones and leaves out the irradiance-cache and reflection trace dispatches. `2`: also its render feature mask 0xDE4F -> 0xDE43 (+0x1ca31f0: no near or far ray-tracing structure; unproven what else changes). Made, it stands `VICTORY_AMBIENT` (the stand-in) and `VICTORY_IDLE_WITHOUT_RAYS` down (said once in the log) | SonicRaT/XNW 2fa40fef6 `rtfallback`, `features_nort` | no (other title programs run: new pipelines, translated on first use) |
+| `VICTORY_NO_WATCHDOG` | `1` | off | title patch (in memory), opt-in. The title's hang watchdog (thread +0x2215a60, ~30 s without a thread's beat) no longer crashes the process on purpose: its handler call and fault (+0x2215c27) jumped over, the handler's write to 0 (+0x23cf683) a nop. A real hang then stays a hang instead of an exit | trustno1-coder/VIctory-NVIDIA afd84de12 (from vitutu1/victory-perf, ZigZagBoi1/ScarlettPort); also XNW `watchdog` | no |
+| `VICTORY_RESOLUTION` | `<w>x<h>`, 1280x720 to 3840x2160 | off | title patch (in memory), opt-in. The title's table of output sizes (.rdata +0x615c0c0, five `w, h, 60, 1` entries) has every entry larger than that capped to it (`1920x1080`: the 2560x1440 and 3840x2160 entries), so the Series X profile renders at that size; and the render-target budget assertion that then fires (`cmp rax, 0x1fffff; jbe; int3` at +0x247af25) steps over its int3 (a nop). Below 1920x1080 soldsawn saw FSR refuse it on a Series S | soldsawn/victory-nvidia-8gb 037ef5893 (DKTTT) | no |
+
 ## New in all23 (merged on top of all22)
 From test/watch5 (holds test/watch4), test/async4 (holds test/async3), test/leak1, test/pic3, test/stream3 and
 test/stable1, test/trim2; each row's "From" names its source.

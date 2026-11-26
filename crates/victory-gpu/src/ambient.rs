@@ -209,9 +209,11 @@ pub(crate) fn wanted() -> bool {
     set() != Set::Off
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Whether the stand-in is on: set, and the title's rays find nothing. Not
+/// while the title takes its own programs without rays
+/// (`VICTORY_RT_FALLBACK`): its resolve then has light of its own.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && !crate::pipeline::title_fallbacks() && !crate::pipeline::builder_runs()
 }
 
 /// The most a reflection may hold, as a part of the light around (the
