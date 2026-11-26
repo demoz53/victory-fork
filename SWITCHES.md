@@ -1,4 +1,9 @@
-# SWITCHES.md - every switch added since test/all14n, in test/all17
+# SWITCHES.md - every switch added since test/all14n, in test/all18
+
+`test/all18` = `test/all17` (8cc48702e) + merges, in this order, of test/bake2 (53231fab3), test/variants
+(69b26a019), test/ambient (8d5dd30df), test/speed2 (588ca3b52), test/light1 (987d937cb) and test/tables
+(322159026). Left out (their agents were still at work when the merges were made): test/scrub, test/meshclamp.
+The new switches are in "New in all18" below.
 
 `test/all17` = `test/all16` (fb98a3eda) + merges of test/avfix, test/slots, test/stream2 (to 5fe884eb9), test/res1,
 test/split, test/loops2 (to its tip 864343dff), five commits of test/testkit (0600708fa, 5867481c7,
@@ -31,16 +36,44 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | 14 | `VICTORY_LANE_MODULO` is on (v_readlane and v_writelane take a computed lane modulo the wave) | test/loops2 533f14c8a | `VICTORY_LANE_MODULO=0` (shader code) |
 | 15 | `VICTORY_THREAD_TICKET` is on (console threads of groups of several host waves come from a counter, not from rounding: four sky ambient programs had duplicate thread numbers) | test/loops2 864343dff | `VICTORY_THREAD_TICKET=0` (shader code) |
 | 16 | the translated-shader cache is keyed by the translator's fingerprint, not by the executable's hash (builds with the same translator share entries; no picture change) | test/testkit d59bd65f6 | `VICTORY_SHADER_CACHE_KEY=exe` |
+| 17 | `VICTORY_BAKE_WIDE` is full (the bake's care also goes to three more ped-bake pixel shaders, the ped baker's geometry stages and the bake's shape) | test/bake2 087bca876 (all18) | `VICTORY_BAKE_WIDE=0` |
+| 18 | `VICTORY_CLEAR_CHECKED` is on (a slot found unmapped is made null only while the write looked at is still the queued one) | test/bake2 53231fab3 (all18) | `VICTORY_CLEAR_CHECKED=0` |
+| 19 | `VICTORY_TARGET_VARIANTS` is on (a draw into render targets of other formats than its pipeline declares gets a host pipeline made for the bound formats) | test/variants 7c52fed2b (all18) | `VICTORY_TARGET_VARIANTS=0` |
 
-Everything restored (all15b behaviour, one line):
-`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_SHADER_CACHE_KEY=exe`
+Everything restored (all15b behaviour, one line; all18 added the last three before the cache key):
+`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_SHADER_CACHE_KEY=exe`
 (leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
 entries a build finds. Five of these change translated code - LOOP_EXITS and the four lane fixes of test/loops2,
 343 compute programs by its agent's count - so a run with them restored needs a warm of its own.)
 
 Always on, with no switch (no behaviour change, some cost): the "title memory remapped" work line every 5 s and the
 look it needs at every mapping call, whether the pages are there already (test/speed1 ec85139be); the "dstorage:
-workers" line's two extra fields; a trace string built at each composed present.
+workers" line's two extra fields; a trace string built at each composed present. Since all18, log and count only:
+the bake line (a line per pipeline recognised as a bake, a count at most every 5 s), the clears CLEAR_CHECKED left
+out (texture queue line), the first 16 of the title's pipeline syncs logged and all counted, the first 16 structured
+buffer views that cannot be made raw (they read zeros on NVIDIA) warned and all counted (frame line), the formats of
+the bound render targets kept at each set of targets (for TARGET_VARIANTS), and the skipped-pipeline test made once
+per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
+diagnostics-build switch).
+
+## New in all18 (merged on top of all17)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_BAKE_WIDE` | `0` the four pixel shaders known before; `lists` the pixel and geometry shader lists | ON (both lists and the shape: no depth target, 4+ render targets, the first square and at least 512) | which draws count as the title's texture bakes and get the bake's care (`VICTORY_BAKE_TEXTURES_MS`, `VICTORY_BAKE_SOURCES_FIRST`): three ped-bake pixel shaders the old list missed, the ped baker's vertex and mesh stages, the bake's shape | test/bake2 087bca876 (codec_d cool_fox f4b48ad766) | no |
+| `VICTORY_CLEAR_CHECKED` | `0` off | ON | the texture pass makes a slot found unmapped null only while the write it looked at is still the queued one (a texture mirrored in meanwhile was left black) | test/bake2 53231fab3 (fxceless PR #632, ryotdev) | no |
+| `VICTORY_TARGET_VARIANTS` | `0` off | ON | a draw whose bound render target view has another format than its pipeline declares for that slot gets a host pipeline of the same shaders and state for the bound formats (made at its first draw, logged once, counted in the frame line) | test/variants 7c52fed2b (fxceless a35c55739; Marvisak PR #3109) | no (host pipelines only, made at first use) |
+| `VICTORY_SYNC_BARRIER` | `1` | off | each of the title's pipeline syncs is one barrier on every shader write (copy lists skipped) | test/variants 70861a9cf (realblastex/flamingo a1178ce85) | no |
+| `VICTORY_AMBIENT` | a share of the estimate (`0.8` most faithful, `1` all); `constant:<level>`; `0`/`off` | off | a stand-in for the traced indirect light while the structure builder is off: after CS_ScreenProbes_TemporalResolve its diffuse light image is raised to an estimate from the frame's screen radiance (and what the title left there capped at 4x it) | test/ambient 8d5dd30df (avatarmanz 82ca13473, 7da523a9d; Belobug 06031237, 4f45ab88, cd9f78ce) | no (the title's shaders are untouched; it records compute passes of its own) |
+| `VICTORY_AMBIENT_SHADE` | `<strength>,<radius m>` | `1,0.6` (read only with `VICTORY_AMBIENT`) | the creases' shade of the stand-in | test/ambient | no |
+| `VICTORY_AMBIENT_AIR` | a multiple (`1.5` most faithful) | off | with `VICTORY_AMBIENT`: the scattered-light volume CS_AccumulateLocalLightInscatteringVolume writes is bounded by that multiple of the light around (the brown veil indoors) | test/ambient | no |
+| `VICTORY_SKIP_RT` | `1` | off | draws and dispatches of pipelines holding one of the 1,034 ray-tracing resolve and traced-shadow programs (`pipeline/rt_off.txt`) do not run, and such pipelines are not made ahead; the picture loses traced indirect light and traced shadows | test/speed2 588ca3b52 (trustno1-coder 77e13a974 list; fxceless PR #465 rule) | no |
+| `VICTORY_PRESENT_TRACE` | `1` | off | log only: a line a present (new, repeat or BACK, each display plane's last write) and a count every 32 presents | test/light1 987d937cb | no |
+| `VICTORY_PRESENT_NEWEST` | `1` | off | a present of a plane not written since it was last shown, while another plane holds a newer picture, shows the newer one (single-plane presents only: a composed present of several planes, `VICTORY_COMPOSE_PLANES`, is not changed) | test/light1 987d937cb | no |
+| `VICTORY_TABLE_CONSTANTS_IN_PLACE` | `1` | off | translated shaders read a constant buffer that comes through a descriptor table as a raw buffer, and the title's heap slot of a constant buffer is a raw view of its host copy: a table holding a constant takes no dynamic slots (a constant no host copy holds on 16 bytes is copied to list scratch) | test/tables 322159026 (Marvisak 683ad7a99; CuteBooty b472495fb, 7a547593b) | YES (in the cache key: the first run with it translates again) |
+
+Not in all18, for the next pass: `VICTORY_NAN_GUARD=scrub`/`scrub-exports` (test/scrub b9ebab139, shader),
+`VICTORY_MESH_CLAMP_IN_DRAW` (test/meshclamp 9e5d01b28, shader). Both merge onto all18 with one small conflict
+each at most (the cache key's switch list in shader_cache.rs for meshclamp; none for scrub).
 
 ## New in all17 (merged on top of all16)
 | Switch | Values | Default | What it does | From | Shader |
@@ -159,6 +192,23 @@ switch.
   `watch::tests::a_write_through_another_view_is_reported_at_the_guarded_one`) fail by design: a resting block is
   told as written at every asking. Run `cargo test` with no `VICTORY_*` switch exported.
 
+## Combining them in all18
+- No pair refuses at start-up; none has to stay apart. Merge resolutions that matter for pairs:
+  - `VICTORY_CLEAR_CHECKED` with `VICTORY_STALE_KEEP_MS`: a slot found unmapped is first checked for its write
+    (written again since the look: nothing is done, not even kept), then kept on if STALE_KEEP_MS asks, else made
+    null. The pass then tells the queue the slot is away (all17's `texture_slot_away`), as before.
+  - `VICTORY_SYNC_BARRIER` with `VICTORY_INDIRECT_BATCH=2`: a sync both ends the batch window (`State::synced`, as
+    in all17) and, with the barrier switch, records the barrier.
+  - `VICTORY_SKIP_RT` with `VICTORY_IDLE_WITHOUT_RAYS` and `VICTORY_SKIP_PIPELINES`: independent; a dispatch is left
+    out if any of them names its pipeline. SKIP_RT's list holds none of the three programs `VICTORY_AMBIENT`
+    follows, nor IDLE_WITHOUT_RAYS's 39f0e9aeb156a61c, so `VICTORY_AMBIENT` works beside `VICTORY_SKIP_RT=1`.
+  - `VICTORY_AMBIENT` does nothing with `VICTORY_BVH_BUILDER=1` (the title's rays then find a structure).
+  - `VICTORY_PRESENT_NEWEST` acts only on single-plane presents; composed presents (`VICTORY_COMPOSE_PLANES`,
+    default on: the Series S interface over the game) pass through unchanged.
+- One shader-changing switch came with all18, `VICTORY_TABLE_CONSTANTS_IN_PLACE` (opt-in; added to the cache key's
+  list). Its lowering is in the translator, so the translator's fingerprint, and with it the cache's key folder,
+  differ from all17's even with nothing set: the first run of this build translates everything (warmed offline).
+
 ## Combining them in all17
 - No pair has to stay apart, and nothing refuses at startup. Four pairs needed care in the merge:
   - `VICTORY_WAVE_PAIRS=1` with `VICTORY_GROUP_SPLIT=1`: THE PAIRED FORM WINS for a program both could take (it is
@@ -180,7 +230,7 @@ switch.
   VICTORY_TEXTURE_CATCH_UP_MS=2 VICTORY_STALE_KEEP_MS=10000`. Left out on purpose: STREAM_PRIORITY, DSTORAGE_* and
   PARTIAL_PROMPT (cs-all1's culprit is among them), VRAM_IDLE_MS (ignored beside TEXTURE_KEEP), DROP_MIPS (softer
   picture; for 8 GB cards), REMAP_SAME and ALIAS_RUNS (runtime mapping: a line of their own).
-- Shader-changing switches now: LOOP_EXITS, NORM_EXACT, HEAP_BELOW_ZERO, LOCAL_LDS_SYNC, NAN_GUARD, GROUP_SPLIT,
+- Shader-changing switches now (all18 adds TABLE_CONSTANTS_IN_PLACE): LOOP_EXITS, NORM_EXACT, HEAP_BELOW_ZERO, LOCAL_LDS_SYNC, NAN_GUARD, GROUP_SPLIT,
   AFTER_LOOP, WAVE_PAIRS (and its two lists), PERMUTE_HALVES, SHORT_WAVE_LAST, LANE_MODULO, THREAD_TICKET. `tools/shader-sweep.sh` says offline which programs one of them changes.
 - Swept offline (tools/shader-sweep.sh, the 3,605 programs of shaders-save-boat, VICTORY_HOST_MAX_WAVE=32):
   `VICTORY_GROUP_SPLIT=1 VICTORY_AFTER_LOOP=1` together change 3 compute programs (20b78ee12ecdb57d,
