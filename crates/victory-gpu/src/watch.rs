@@ -1552,9 +1552,34 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
     Some(Reading(Held::Bytes(s.read(at, end))))
 }
 
+/// Whether [`title_memory_remapped`] gives write access back to the blocks
+/// of its range that a guard made read-only, not only forgets them
+/// (`VICTORY_REMAP_REOPEN=0`: forgets them, as before). On by default.
+///
+/// The runtime tells of a new mapping after it has made it (`xmem`'s `map`:
+/// the view is mapped and committed, then told), and a guard check runs on
+/// another thread under no lock the runtime holds (`writes` for a host copy
+/// over the range). A check that fell between the two made the new view
+/// read-only and noted it guarded; the notice then only forgot the blocks.
+/// They stayed read-only with no guard that knew them: the title's next
+/// write there was an access violation our handler passed on (`open` found
+/// no guarded block, `writable` said no), and a kernel read into them
+/// failed, until some later check guarded them again. The same for a view
+/// told before it is unmapped and written in between.
+///
+/// What it costs: one protection call for each run of blocks the range
+/// still holds guarded (none for a range no check has guarded since its
+/// last notice).
+fn reopen_remapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_REOPEN").is_none_or(|v| v != "0"))
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
-/// unmapped).
+/// unmapped). Blocks of it that a guard made read-only are made writable
+/// again ([`reopen_remapped`]): the check that guarded them may have come
+/// after the mapping this tells of.
 pub fn title_memory_remapped(at: usize, len: usize) {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -1576,6 +1601,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     g.absent.remove_range(range.clone());
+    if reopen_remapped() {
+        // Forgotten and writable again (a block whose memory is gone has
+        // no protection to change: the call fails and nothing is lost).
+        open_here(&mut g, at, at.saturating_add(len));
+    }
     g.protected.remove_range(range.clone());
     g.clean.remove_range(range.clone());
     // A write through the kernel announced there wrote what the memory
@@ -2304,6 +2334,36 @@ mod tests {
         title_memory_written(section, (BLOCK / 2) as u64, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         drop_views(section, &[guarded, _unused], SIZE);
+    }
+
+    /// The runtime's notice of a new mapping comes after the mapping itself
+    /// (`xmem`'s `map`), and a guard check of another thread can fall
+    /// between the two: it makes the new view read-only and notes it
+    /// guarded. The notice gives the write access back. Before, it only
+    /// forgot the blocks: they stayed read-only with no guard to open them,
+    /// and the title's next write there was an access violation nothing
+    /// took.
+    #[test]
+    fn a_notice_after_a_guard_check_leaves_the_view_writable() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        // The check that fell between the mapping and its notice.
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1)]));
+        assert!(!writable(view) && !writable(view + BLOCK), "guarded: read-only");
+        // The notice, and what `xmem` tells after it.
+        title_memory_remapped(view, SIZE);
+        if reopen_remapped() {
+            assert!(writable(view) && writable(view + BLOCK), "left read-only with no guard to open it");
+            // SAFETY: the view, read-write again; no fault to take.
+            unsafe { ((view + BLOCK + 8) as *mut u8).write_volatile(1) };
+        }
+        assert!(!guards().protected.contains(&(view / BLOCK)), "forgotten");
+        crate::inplace::title_memory_view(view, SIZE, section, 0);
+        // Not guarded any more: the next check takes all of it again.
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        drop_views(section, &[view, other], SIZE);
     }
 
     /// A write or mapping that runs past the end of the address space (a
