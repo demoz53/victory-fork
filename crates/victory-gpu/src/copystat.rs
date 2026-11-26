@@ -582,7 +582,7 @@ mod heap_tests {
 
 #[cfg(test)]
 mod own_tests {
-    use super::{block_class, own_total};
+    use super::{block_class, own_total, stripe};
     use std::sync::atomic::Ordering::Relaxed;
 
     #[test]
@@ -649,13 +649,32 @@ mod own_tests {
     /// A big block shows in the counters while it lives (other tests
     /// allocate small blocks meanwhile: only the big class is looked at,
     /// and only for at least this block).
+    ///
+    /// The sum over all stripes is not a snapshot: a big block another test
+    /// makes on one thread and lets go on another can be read with its
+    /// release counted and its making not yet, and the sum then falls short
+    /// by that block (seen once in a full run). So the test looks at this
+    /// thread's own stripe, which no other thread writes, when it has one
+    /// alone; on a shared stripe it asks the sum again a few times.
     #[test]
     fn a_block_is_counted_while_it_lives() {
+        let (mine, alone) = stripe();
+        let before = (mine[3].load(Relaxed), mine[7].load(Relaxed));
         let block = vec![1u8; 8 << 20];
-        assert!(own_total(3) >= 8 << 20);
-        assert!(own_total(7) >= 1);
+        if alone {
+            assert_eq!(mine[3].load(Relaxed).wrapping_sub(before.0), 8 << 20);
+            assert_eq!(mine[7].load(Relaxed).wrapping_sub(before.1), 1);
+        } else {
+            let seen = (0..1000).any(|_| {
+                std::thread::yield_now();
+                own_total(3) >= 8 << 20 && own_total(7) >= 1
+            });
+            assert!(seen, "the block was never counted");
+        }
         drop(block);
-        assert!(own_total(7) < u64::MAX / 2, "no count below zero");
+        if alone {
+            assert_eq!(mine[3].load(Relaxed), before.0, "its release takes it off again");
+        }
     }
 }
 
