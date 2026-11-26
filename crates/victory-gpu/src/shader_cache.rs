@@ -91,6 +91,7 @@ fn build() -> &'static [u8; 32] {
                     // holds the executable's hash, so a cache made with the
                     // old (off) default is not served to this build.
                     "VICTORY_LOOP_EXITS",
+                    "VICTORY_AFTER_LOOP",
                     "VICTORY_VCC_LOOP_POLARITY",
                     "VICTORY_SKIP_DESCRIPTORS",
                     "VICTORY_DIV_FIXUP",

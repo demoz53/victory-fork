@@ -25,6 +25,12 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// The loops a per-lane branch leaves, for [`lane_regions`] (`VICTORY_AFTER_LOOP=1`).
+mod loop_regions;
+#[cfg(test)]
+pub(super) use loop_regions::TEST_AFTER_LOOP;
+pub(super) use loop_regions::scope as after_loop_scope;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -570,6 +576,8 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             }
         }
     }
+    // (`VICTORY_AFTER_LOOP=1`: with the loops the branch leaves; none otherwise)
+    let left = loop_regions::loops(&succ);
     let mut regions = Vec::new();
     for (d, e) in st.exits.iter().enumerate() {
         let LaneExit::Branch { when, .. } = *e else { continue };
@@ -593,6 +601,7 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             seen[b] = true;
             stack.extend(succ[b].iter().copied());
         }
+        loop_regions::add_left(d, &succ, &left, &mut seen);
         regions.push((d, seen));
     }
     Some(regions)
