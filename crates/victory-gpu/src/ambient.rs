@@ -67,6 +67,9 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the title's reflections for the last time in a frame
+    /// (`CS_UpdateHistory_*`; `VICTORY_AMBIENT_REFLECT`).
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -78,6 +81,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -91,6 +96,9 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where `CS_UpdateHistory_*` writes the reflections (R9G9B9E5 as 32-bit
+/// integers); the lighting programs read that image next.
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -121,6 +129,27 @@ pub(crate) fn wanted() -> bool {
 /// Whether the stand-in is on: set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
     set() != Set::Off && !crate::pipeline::builder_runs()
+}
+
+/// The most a reflection may hold, as a part of the light around (the
+/// stand-in's slow mean times its level, or its constant):
+/// `VICTORY_AMBIENT_REFLECT=<part>` (unset or 0: the title's reflections as
+/// they are). Without rays the reflections are the sky's, unoccluded,
+/// wherever a surface is glossy: indoors a wooden floor and counters wore a
+/// glaze five to ten times brighter than the room. Belobug's
+/// VIctory-Belobug-AMD 44dcd4371 (GPL-3.0-or-later) found the program and
+/// the image and holds them to 0.5 of its constant; here the light around
+/// is the estimate's, and the switch is opt-in.
+fn reflect() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default();
+        parse_reflect(&set)
+    })
+}
+
+fn parse_reflect(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -256,7 +285,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float held;
     float jump; float fresh; float dt;
 };
 Texture2D<float> depth : register(t0);
@@ -375,7 +404,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(HOLD)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -389,6 +418,23 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef HOLD
+// Reflections: no brighter than a part of the light around.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float3 around = constant > 0.0 ? float3(1.0, 0.98, 0.94) * constant : cells[CELLS].rgb * level;
+    float top = max(dot(around, LUMA) * held, 1e-6);
+    float3 c = unpack(light[at.xy]);
+    float has = dot(c, LUMA);
+    if (has > top) light[at.xy] = pack(c * (top / has));
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -474,6 +520,7 @@ struct Pass {
     place: ID3D12PipelineState,
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
+    hold: ID3D12PipelineState,
     air: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
@@ -505,6 +552,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
+    let hold = pipeline("HOLD", s!("hold"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
@@ -514,6 +562,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         place,
         gather,
         raise,
+        hold,
         air,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
@@ -571,6 +620,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::Reflect && reflect() == 0.0 {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -593,6 +645,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = follow(role, dt).to_bits();
     words[9] = most().to_bits();
     words[10] = air().to_bits();
+    words[11] = reflect().to_bits();
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (dt / 1000.0).to_bits();
@@ -619,6 +672,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
+            Role::Reflect => run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
@@ -649,6 +703,9 @@ mod tests {
         assert_eq!(parse_most("1.5"), 1.5);
         assert_eq!(parse_most("-1"), 4.0);
         assert_eq!(parse_most("inf"), 4.0);
+        assert_eq!(parse_reflect(""), 0.0);
+        assert_eq!(parse_reflect("0.5"), 0.5);
+        assert_eq!(parse_reflect("-1"), 0.0);
         assert_eq!(parse_settle(None), Some(Settle { ms: 250.0, jump: 3.0, fresh: 0.0 }));
         assert_eq!(parse_settle(Some("0")), None);
         assert_eq!(parse_settle(Some("500,0,2")), Some(Settle { ms: 500.0, jump: 0.0, fresh: 2.0 }));
@@ -660,6 +717,7 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_UpdateHistory_e877ef6e_Wrapped.."), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
         // The name the resolve has in the containers this title gives us.
         assert_eq!(role(b"CS_ScreenProbes_TemporalResolve_ReflectiveCaustics_a911b49c_Wrapped"), Some(Role::Resolve));
