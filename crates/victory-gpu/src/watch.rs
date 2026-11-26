@@ -39,8 +39,6 @@ pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 
 struct Journal {
-    /// Numbers the askings; 0 is "never".
-    asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
@@ -70,7 +68,6 @@ struct Journal {
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
-    asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
@@ -80,6 +77,212 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     flying: Vec::new(),
     unpublished: Vec::new(),
 });
+
+/// Pages of a piece of [`Stamps`]: 4 GiB of title addresses.
+const STAMP_PAGES: usize = 1 << 16;
+/// Pieces of [`Stamps`]: 128 TiB, what a process has.
+const STAMP_PIECES: usize = 1 << 15;
+
+/// Per 64 KiB page, the asking that last found it written (0: never), as
+/// `Journal::written` holds it, in a flat table read with no lock
+/// ([`stamps_flat`]); in pieces made when first written and never let go.
+/// Written only under the journal's lock, by [`note_written`], always
+/// raising (a stamp never falls).
+struct Stamps([std::sync::atomic::AtomicPtr<StampsPiece>; STAMP_PIECES]);
+
+type StampsPiece = [std::sync::atomic::AtomicU64; STAMP_PAGES];
+
+impl Stamps {
+    const fn new() -> Stamps {
+        Stamps([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; STAMP_PIECES])
+    }
+
+    fn piece(&self, page: usize) -> Option<&StampsPiece> {
+        let piece = self.0.get(page / STAMP_PAGES)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: null, or a piece made by `raise`, which is never freed.
+        unsafe { piece.as_ref() }
+    }
+
+    /// The page's stamp (0 for none).
+    #[cfg(test)]
+    fn get(&self, page: usize) -> u64 {
+        self.piece(page).map_or(0, |p| p[page % STAMP_PAGES].load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Raises the page's stamp to `stamp` (never lowers it).
+    fn raise(&self, page: usize, stamp: u64) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+        let Some(place) = self.0.get(page / STAMP_PAGES) else {
+            return;
+        };
+        if place.load(Acquire).is_null() {
+            let made: *mut StampsPiece = Box::into_raw(
+                (0..STAMP_PAGES)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("a piece's length")),
+            );
+            if place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire).is_err() {
+                // SAFETY: made above and shown to nobody.
+                drop(unsafe { Box::from_raw(made) });
+            }
+        }
+        if let Some(piece) = self.piece(page) {
+            piece[page % STAMP_PAGES].fetch_max(stamp, SeqCst);
+        }
+    }
+
+    /// Tests: the stamps of `[first, last)` forgotten ([`forget_pages`]).
+    #[cfg(test)]
+    fn forget(&self, first: usize, last: usize) {
+        for page in first..last {
+            if let Some(piece) = self.piece(page) {
+                piece[page % STAMP_PAGES].store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// The pages of `[first, last)` that have a stamp, with it, in order:
+    /// what `Journal::written.range` gives.
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        let mut page = first;
+        while page < last {
+            let Some(piece) = self.piece(page) else {
+                page = (page / STAMP_PAGES + 1) * STAMP_PAGES;
+                continue;
+            };
+            let until = ((page / STAMP_PAGES + 1) * STAMP_PAGES).min(last);
+            for at in page..until {
+                let stamp = piece[at % STAMP_PAGES].load(std::sync::atomic::Ordering::SeqCst);
+                if stamp != 0 {
+                    out.push((at, stamp));
+                }
+            }
+            page = until;
+        }
+        out
+    }
+}
+
+static STAMPS: Stamps = Stamps::new();
+
+/// Whether the journal's "last written" stamps are kept in a flat table
+/// as well, read with no lock (`VICTORY_STAMPS_FLAT=1`; off by default):
+/// an asking the light refresh's bits answer ([`writes`]) and a refresh
+/// they show has nothing new ([`nothing_new`]) then take no lock at all
+/// (they took the journal's twice a refresh), and every answer reads the
+/// table. The journal's lock was taken some 45,000 times a frame on the
+/// Series S scene (all22 with today's set).
+///
+/// Why an answer read with no lock is right: a block's bit is set only
+/// after the stamps of what the asking that cleaned it found are in the
+/// table ([`publish`] after [`note_written`], both sequentially
+/// consistent), and cleared before the block can be written; a reader
+/// looks at the bits, then reads the stamps. Every stamp is noted under a
+/// number taken after the look that found the write (the kernel's call,
+/// the guards' check), so an answer numbered in between sees no write it
+/// missed noted below its number.
+fn stamps_flat() -> bool {
+    #[cfg(test)]
+    if STAMPS_FLAT_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_STAMPS_FLAT").is_some_and(|v| v == "1") || stamps_check()
+    })
+}
+
+/// Tests: [`stamps_flat`] on, whatever the switch says.
+#[cfg(test)]
+pub(crate) static STAMPS_FLAT_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `VICTORY_STAMPS_CHECK=1` (sets [`stamps_flat`]): every answer is made
+/// from the journal's map as well and compared; an answer read with no
+/// lock is compared with what the journal holds a moment later (a stamp
+/// there may have risen since, never fallen). Differences counted on the
+/// journal-lock line and warned (the first 16, then at powers of two).
+fn stamps_check() -> bool {
+    #[cfg(test)]
+    if STAMPS_FLAT_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAMPS_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// [`stamps_check`]: answers compared, differences found; answers made
+/// with no lock.
+static STAMP_CHECKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The pages of `[first, last)` as last written: from the flat table with
+/// [`stamps_flat`] (compared with the map with [`stamps_check`]), else from
+/// the map.
+fn answer(j: &Journal, first: usize, last: usize) -> Vec<(usize, u64)> {
+    if !stamps_flat() {
+        return map_answer(j, first, last);
+    }
+    let flat = STAMPS.range(first, last);
+    if stamps_check() {
+        let map = map_answer(j, first, last);
+        stamp_compared(first, map != flat);
+    }
+    flat
+}
+
+/// [`answer`] from the journal's map.
+fn map_answer(j: &Journal, first: usize, last: usize) -> Vec<(usize, u64)> {
+    j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+}
+
+fn stamp_compared(first: usize, differs: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    STAMP_CHECKS[0].fetch_add(1, Relaxed);
+    if differs {
+        let n = STAMP_CHECKS[1].fetch_add(1, Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::warn!(
+                n,
+                address = format_args!("{:#x}", first * PAGE),
+                "the flat stamps differ from the journal's (VICTORY_STAMPS_CHECK)"
+            );
+        }
+    }
+}
+
+/// [`stamps_check`] of an answer read with no lock: each of its stamps is
+/// at most what the journal holds now, and the journal holds none the
+/// table did not show but above it.
+fn stamps_checked_later(first: usize, last: usize, flat: &[(usize, u64)]) {
+    if !stamps_check() {
+        return;
+    }
+    let j = journal();
+    let map = map_answer(&j, first, last);
+    drop(j);
+    let fell = flat.iter().any(|&(page, stamp)| map.iter().find(|m| m.0 == page).is_none_or(|m| m.1 < stamp));
+    stamp_compared(first, fell);
+}
+
+/// Numbers the askings; 0 is "never". An atomic, so that an answer by the
+/// light refresh's bits takes its number with no lock ([`stamps_flat`]);
+/// every other number is still taken under the journal's lock.
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Journal {
+    /// The latest number given.
+    fn asked(&self) -> u64 {
+        ASKED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A new number, above every one given so far.
+    fn bump(&mut self) -> u64 {
+        ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+}
 
 /// Told when an asking in [`Journal::flying`] has noted what it found.
 static LANDED_ASKING: std::sync::Condvar = std::sync::Condvar::new();
@@ -149,10 +352,15 @@ pub(crate) fn journal_line(frames: f64) -> String {
     format!(
         "the write watch's journal lock (VICTORY_JOURNAL_UNLOCKED {}): per frame {takes:.0} takes by askings, {held:.0} of \
          them found it held, {:.1} ms waiting for it (all threads); {settles:.0} waits for an overlapping asking in flight \
-         {:.1} ms",
+         {:.1} ms; flat stamps (VICTORY_STAMPS_FLAT {}): {:.0} answers with no lock, check {:.0} compared, {} differences \
+         (all since the start)",
         if unlocked() { "on" } else { "off" },
         wait_us / 1e3,
         settle_us / 1e3,
+        if stamps_flat() { "on" } else { "off" },
+        STAMP_CHECKS[2].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / f,
+        STAMP_CHECKS[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / f,
+        STAMP_CHECKS[1].load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -170,7 +378,7 @@ fn settle(
     first: usize,
     last: usize,
 ) -> std::sync::MutexGuard<'static, Journal> {
-    let before = j.asked;
+    let before = j.asked();
     let overlapping = |j: &Journal| j.flying.iter().any(|&(a, b, n)| n <= before && a < last && first < b);
     if j.flying.is_empty() || !overlapping(&j) {
         return j;
@@ -205,6 +413,11 @@ fn land(j: &mut Journal, asking: u64) {
         publish(j, &again);
     }
 }
+
+/// Tests: called once by the next unlocked asking from the page given,
+/// right after it is in flight, before its kernel call or guards' check.
+#[cfg(test)]
+static AFTER_REGISTER: Mutex<Option<(usize, fn())>> = Mutex::new(None);
 
 thread_local! {
     /// [`unlocked`]: room for a kernel answer asked with the journal's
@@ -287,6 +500,10 @@ fn note_pieces(j: &mut Journal, page: usize, asking: u64, mask: u16) {
 fn note_written(j: &mut Journal, page: usize, asking: u64, mask: u16) {
     let stamp = j.written.entry(page).or_insert(asking);
     *stamp = (*stamp).max(asking);
+    // (Kept in tests whatever the switch says: tests turn it on for a while.)
+    if stamps_flat() || cfg!(test) {
+        STAMPS.raise(page, *stamp);
+    }
     if pieces() {
         note_pieces(j, page, asking, mask);
     }
@@ -445,8 +662,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if j.kept {
         return;
     }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
+    j.ahead_asked = j.bump();
     j.ahead.clear();
     let mut i = 0;
     while i < pieces.len() {
@@ -584,8 +800,7 @@ fn ask_lone(ranges: &[(usize, usize)]) {
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+        j.ahead_asked = j.bump();
     }
     // Other askings were made since `ask_ahead` numbered the standing
     // asking (the journal's lock was let go between): what is noted from
@@ -593,9 +808,8 @@ fn ask_lone(ranges: &[(usize, usize)]) {
     // took, written again since, would be noted below what its copy took
     // and never copied again (review finding, test/watch5). The answers
     // of the standing asking take the new number, as after [`wrote`].
-    if j.ahead_asked < j.asked {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+    if j.ahead_asked < j.asked() {
+        j.ahead_asked = j.bump();
     }
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
@@ -687,15 +901,13 @@ fn ask_views(ranges: &[(usize, usize)]) {
     // `ask_once` let its asking go if it held nothing: this one stands
     // under a number of its own.
     if !j.kept {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+        j.ahead_asked = j.bump();
         j.ahead.clear();
     }
     // Standing already, under a number other askings may have passed
     // since: noted under a new one (as in [`ask_lone`]).
-    if j.ahead_asked < j.asked {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
+    if j.ahead_asked < j.asked() {
+        j.ahead_asked = j.bump();
     }
     let mut reach = 0;
     // Ranges the guards know to be views (their first block is guarded or
@@ -768,6 +980,13 @@ fn guard_ahead(j: &mut Journal, first: usize, last: usize) -> bool {
     let Some(written) = written else {
         return false;
     };
+    // With [`stamps_flat`] an answer by the bits takes its number with no
+    // lock, perhaps after the standing asking's: what the guards found
+    // here goes under a number taken after their look, which the standing
+    // asking takes too.
+    if stamps_flat() && !written.is_empty() {
+        j.ahead_asked = j.bump();
+    }
     let now = j.ahead_asked;
     // A guard's block is a page: all of it.
     for &page in &written {
@@ -810,6 +1029,7 @@ pub(crate) fn forget_pages(start: usize, end: usize) {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     j.written.retain(|&page, _| !(first..last).contains(&page));
+    STAMPS.forget(first, last);
     j.pieces.retain(|&page, _| !(first..last).contains(&page));
 }
 
@@ -821,8 +1041,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     if !j.kept || len == 0 {
         return;
     }
-    j.asked += 1;
-    let now = j.asked;
+    let now = j.bump();
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         note_written(&mut j, page, now, pieces_of(page, at, len));
@@ -900,7 +1119,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     }
     let now = j.ahead_asked;
     let j = settle(j, first, last);
-    Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    Some((now, answer(&j, first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -940,6 +1159,18 @@ fn writes_as(
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // With [`stamps_flat`]: a range the bits vouch for is answered with no
+    // lock (a new number, the table's stamps).
+    if light == 2 && guarded && !check && stamps_flat() && first < last
+        && PUBLISHED.all(first * PAGE / BLOCK, (last * PAGE).div_ceil(BLOCK))
+    {
+        light_count(0);
+        STAMP_CHECKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let flat = STAMPS.range(first, last);
+        stamps_checked_later(first, last, &flat);
+        return Some((now, flat));
+    }
     let mut held = journal();
     // Asked ahead with the submission's other ranges: the journal has it.
     // View memory asked ahead ([`views_once`]) answers only an asker that
@@ -949,10 +1180,7 @@ fn writes_as(
         let held = settle(held, first, last);
         return Some((
             now,
-            held.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
+            answer(&held, first, last),
         ));
     }
     // (The light refresh's self-check asks with the lock held throughout:
@@ -970,13 +1198,10 @@ fn writes_as(
     let vouched = guarded && light == 2 && published(j, first * PAGE, last * PAGE);
     if vouched && !check {
         light_count(0);
-        j.asked += 1;
+        let now = j.bump();
         return Some((
-            j.asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
+            now,
+            answer(j, first, last),
         ));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -1030,8 +1255,7 @@ fn writes_as(
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    j.asked += 1;
-    let now = j.asked;
+    let now = j.bump();
     // A guard's block is a page: all of it.
     let pages: Vec<(usize, u16)> =
         by_page(&j.found[..count]).into_iter().chain(guarded.iter().map(|&page| (page, ALL_PIECES))).collect();
@@ -1057,10 +1281,7 @@ fn writes_as(
     if !overlapping && arming.0.is_empty() {
         let answer = (
             now,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
+            answer(j, first, last),
         );
         drop(held);
         return Some(answer);
@@ -1089,8 +1310,7 @@ fn writes_as(
     let mut now = now;
     if !armed.is_empty() {
         let j = &mut *held;
-        j.asked += 1;
-        now = j.asked;
+        now = j.bump();
         for &page in &armed {
             note_written(j, page, now, ALL_PIECES);
         }
@@ -1098,7 +1318,7 @@ fn writes_as(
             publish(j, &armed);
         }
     }
-    Some((now, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    Some((now, answer(&held, first, last)))
 }
 
 /// [`writes_as`] with [`unlocked`], from where the journal could not answer
@@ -1117,13 +1337,23 @@ fn writes_unlocked(
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     if guarded && light == 2 && published(&held, first * PAGE, last * PAGE) {
         light_count(0);
-        held.asked += 1;
-        return Some((held.asked, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        let now = held.bump();
+        return Some((now, answer(&held, first, last)));
     }
-    held.asked += 1;
-    let now = held.asked;
+    let now = held.bump();
     held.flying.push((first, last, now));
     drop(held);
+    #[cfg(test)]
+    {
+        let mut hook = AFTER_REGISTER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((page, run)) = *hook
+            && page == first
+        {
+            *hook = None;
+            drop(hook);
+            run();
+        }
+    }
     // The lock let go: the kernel, else the guards.
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -1181,6 +1411,13 @@ fn writes_unlocked(
     }
     let mut held = journal();
     land(&mut held, now);
+    // What it found is noted, and answered, under a number taken now, above
+    // every one given while it was in flight: an answer given meanwhile
+    // without waiting for it (by the light refresh's bits) may hold a page
+    // that the title wrote after that answer, and that this asking found;
+    // noted under the number it was given in flight, below that answer's,
+    // the page would never be taken again by that copy (found in test/watch6).
+    let now = held.bump();
     if found.is_none() && viewed.is_none() {
         return None;
     }
@@ -1208,7 +1445,7 @@ fn writes_unlocked(
         publish(j, viewed);
     }
     let held = settle(held, first, last);
-    Some((now, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    Some((now, answer(&held, first, last)))
 }
 
 /// Guarded blocks of view memory.
@@ -1590,7 +1827,41 @@ fn published(_held: &Journal, start: usize, end: usize) -> bool {
 /// have the copy take no page. `false` if something would have to be
 /// asked, and always without the light refresh ([`light`]).
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
-    light() && nothing_noted(start, end, base, copied)
+    if !light() {
+        return false;
+    }
+    if stamps_flat() && nothing_flat(start, end, base, copied) {
+        return true;
+    }
+    nothing_noted(start, end, base, copied)
+}
+
+/// [`nothing_new`] with [`stamps_flat`]: true when the bits vouch for the
+/// range and the table shows nothing the copy does not hold, read with no
+/// lock; false when the journal must be asked.
+fn nothing_flat(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
+    {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        if start < end
+            && let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base))
+            && !taken.contains(&0)
+            && PUBLISHED.all(first * PAGE / BLOCK, (last * PAGE).div_ceil(BLOCK))
+        {
+            let flat = STAMPS.range(first, last);
+            let same = flat.iter().all(|&(page, write)| write <= taken[page - first]);
+            if same {
+                if light_check_due() {
+                    FORCE_CHECK.with(|f| f.set(true));
+                    return false;
+                }
+                light_count(2);
+                STAMP_CHECKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stamps_checked_later(first, last, &flat);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// [`nothing_new`], whatever the switch says.
@@ -1616,7 +1887,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     if !by_bits {
         j = settle(j, first, last);
     }
-    let same = j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]);
+    let same = answer(&j, first, last).iter().all(|&(page, write)| write <= taken[page - first]);
     if same && by_bits {
         // The self-check takes this one: [`writes`] asks the guards.
         if light_check_due() {
@@ -1935,8 +2206,7 @@ fn journal_written(at: usize, len: usize) {
         return;
     }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.asked += 1;
-    let now = j.asked;
+    let now = j.bump();
     // Answers from the journal stand at or above what it holds
     // ([`wrote`]).
     j.ahead_asked = now;
@@ -3838,6 +4108,8 @@ pub(crate) mod tests {
     /// of the asking. After fxceless PR #995 (tunczzz).
     #[test]
     fn view_ranges_asked_once_answer_from_the_journal() {
+        // (The journal's way, `writes_as` with no light refresh: with its
+        // bits and the flat stamps an asking may be answered by the bits.)
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
         };
@@ -3873,17 +4145,21 @@ pub(crate) mod tests {
                 ((b(5) + 9) as *mut u8).write_volatile(1);
             }
             ask_views(&ranges);
-            let (now, written) = writes(view, view + SIZE, true).expect("the union was asked");
-            let fresh: Vec<usize> = written.iter().filter(|&&(_, w)| w == now).map(|&(p, _)| p).collect();
-            let journal = ranges.iter().all(|&(a, e)| writes(a, e, true).map(|w| w.0) == Some(now))
+            let (now, written) = writes_as(view, view + SIZE, true, 0, false, unlocked()).expect("the union was asked");
+            // Written since the first asking took the range in (with the
+            // flat stamps each block the guards ask about alone is noted
+            // under a number of its own, all above that one).
+            let first_taken = written.iter().map(|w| w.1).min().unwrap_or(0);
+            let fresh: Vec<usize> = written.iter().filter(|&&(_, w)| w > first_taken).map(|&(p, _)| p).collect();
+            let journal = ranges.iter().all(|&(a, e)| writes_as(a, e, true, 0, false, unlocked()).map(|w| w.0) == Some(now))
                 && asked(b(2), b(3)).map(|w| w.0) == Some(now);
             // Not write-watched: an asker that would not ask the guards
             // hears so, asking ahead or not.
-            let unwatched = writes(b(2), b(3), false).is_none();
+            let unwatched = writes_as(b(2), b(3), false, 0, false, unlocked()).is_none();
             // A remap there: the refreshes ask the guards again.
             forget_views_ahead(b(4), BLOCK);
             let after = asked(b(0), b(1));
-            let again = writes(b(0), b(1), true).map(|w| w.0);
+            let again = writes_as(b(0), b(1), true, 0, false, unlocked()).map(|w| w.0);
             ask_once_end();
             if !journal || after.is_some() || again.is_none_or(|w| w <= now) {
                 std::thread::yield_now();
@@ -4407,6 +4683,12 @@ pub(crate) mod tests {
     /// and with it let go; for write-watched memory (the kernel) and for
     /// view memory (the guards and their faults).
     fn copies_under_contention_stay_true(memory: usize, pages: usize, guarded: bool, unlocked: bool) {
+        copies_under_contention_stay_true_as(memory, pages, guarded, unlocked, 0);
+    }
+
+    /// [`copies_under_contention_stay_true`] with the light refresh as
+    /// `light` says (as [`writes_as`] takes it).
+    fn copies_under_contention_stay_true_as(memory: usize, pages: usize, guarded: bool, unlocked: bool, light: u8) {
         use std::sync::atomic::{AtomicBool, Ordering};
         const ASKERS: usize = 6;
         const WRITERS: usize = 2;
@@ -4445,7 +4727,7 @@ pub(crate) mod tests {
                     let mut taken = vec![0u64; pages];
                     let refresh = |copy: &mut Vec<[u64; WRITERS]>, taken: &mut Vec<u64>| {
                         let (now, written) =
-                            writes_as(word(from, 0) as usize, word(to, 0) as usize, guarded, 0, false, unlocked)
+                            writes_as(word(from, 0) as usize, word(to, 0) as usize, guarded, light, false, unlocked)
                                 .expect("tracked memory");
                         for page in from..to {
                             let stamp = written.iter().find(|w| w.0 == memory / PAGE + page).map_or(0, |w| w.1);
@@ -4526,8 +4808,7 @@ pub(crate) mod tests {
         let (first, last) = (p / PAGE, p / PAGE + PAGES);
         let other = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((first, last, n));
             n
         };
@@ -4569,8 +4850,7 @@ pub(crate) mod tests {
         forget_pages(one, one + SIZE);
         let other = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((one / PAGE, one / PAGE + 2, n));
             n
         };
@@ -4693,9 +4973,8 @@ pub(crate) mod tests {
         AT.store(view, Ordering::SeqCst);
         fn meanwhile() {
             let mut j = journal();
-            j.asked += 1;
-            j.ahead_asked = j.asked;
-            RAISED.store(j.asked, Ordering::SeqCst);
+            j.ahead_asked = j.bump();
+            RAISED.store(j.asked(), Ordering::SeqCst);
             drop(j);
             // The block is not read-only yet: no fault.
             // SAFETY: inside the test's view.
@@ -4825,6 +5104,120 @@ pub(crate) mod tests {
         unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// `VICTORY_JOURNAL_UNLOCKED` with the light refresh: an asking in flight
+    /// finds a write made after an answer the bits gave meanwhile (with no
+    /// wait for it); it notes the page above that answer's number, so that
+    /// copy takes it again.
+    #[test]
+    fn a_write_after_an_answer_by_the_bits_is_noted_above_it() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        static AT: AtomicUsize = AtomicUsize::new(0);
+        static ANSWERED: AtomicU64 = AtomicU64::new(0);
+        let _turn = light_turn();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        forget_pages(one, one + SIZE);
+        // Guarded, clean, known by the bits.
+        assert!(writes_as(one, one + SIZE, true, 2, false, false).is_some());
+        assert!(known(one, one + SIZE));
+        AT.store(one, Ordering::SeqCst);
+        fn meanwhile() {
+            let at = AT.load(Ordering::SeqCst);
+            let (n, _) = writes_as(at, at + 2 * BLOCK, true, 2, false, false).expect("a view");
+            ANSWERED.store(n, Ordering::SeqCst);
+            // The title writes the block after that answer.
+            // SAFETY: inside the test's view; the write faults and opens it.
+            unsafe { ((at + 8) as *mut u8).write_volatile(1) };
+        }
+        *AFTER_REGISTER.lock().unwrap_or_else(|e| e.into_inner()) = Some((one / PAGE, meanwhile));
+        assert!(writes_as(one, one + SIZE, true, 0, false, true).is_some());
+        let stamp = journal().written.get(&(one / PAGE)).copied().unwrap_or(0);
+        drop_views(section, &[one, two], SIZE);
+        forget_pages(one, one + SIZE);
+        forget_pages(two, two + SIZE);
+        let answered = ANSWERED.load(Ordering::SeqCst);
+        assert!(answered != 0, "the hook ran");
+        assert!(stamp > answered, "noted at {stamp}, an answer by the bits gave {answered}");
+    }
+
+    /// `VICTORY_STAMPS_FLAT` (with its check): copies of write-watched and of
+    /// view memory kept beside writers stay true, the journal's lock held or
+    /// let go, the light refresh's bits asked (answers with no lock) or not;
+    /// and the table answered as the journal's map every time it was
+    /// compared.
+    #[test]
+    fn flat_stamps_answer_as_the_journal_under_contention() {
+        use std::sync::atomic::Ordering;
+        let _turn = light_turn();
+        const PAGES: usize = 16;
+        STAMPS_FLAT_TEST.store(true, Ordering::Relaxed);
+        let differences = STAMP_CHECKS[1].load(Ordering::Relaxed);
+        let lock_free = STAMP_CHECKS[2].load(Ordering::Relaxed);
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        forget_pages(p, p + PAGES * PAGE);
+        for unlocked in [false, true] {
+            copies_under_contention_stay_true(p, PAGES, false, unlocked);
+        }
+        forget_pages(p, p + PAGES * PAGE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        let (section, one, two) = two_views(PAGES * BLOCK);
+        forget_pages(one, one + PAGES * BLOCK);
+        for (unlocked, light) in [(false, 0), (true, 0), (false, 2), (true, 2)] {
+            copies_under_contention_stay_true_as(one, PAGES, true, unlocked, light);
+        }
+        drop_views(section, &[one, two], PAGES * BLOCK);
+        forget_pages(one, one + PAGES * BLOCK);
+        forget_pages(two, two + PAGES * BLOCK);
+        STAMPS_FLAT_TEST.store(false, Ordering::Relaxed);
+        assert_eq!(STAMP_CHECKS[1].load(Ordering::Relaxed), differences, "the table and the map differed");
+        assert!(STAMP_CHECKS[2].load(Ordering::Relaxed) > lock_free, "some answers came with no lock");
+    }
+
+    /// `VICTORY_STAMPS_FLAT`: the table holds what the journal's map holds,
+    /// stamp for stamp, and never lowers one; a refresh the bits and the
+    /// table show has nothing new is answered with no lock, one with a
+    /// newer page is not.
+    #[test]
+    fn the_flat_table_is_the_map() {
+        let _turn = light_turn();
+        let base = (1 << 26) + 77;
+        // Far from any memory of ours: only the table and the map.
+        {
+            let mut j = journal();
+            note_written(&mut j, base, 10, ALL_PIECES);
+            note_written(&mut j, base + 3, 12, ALL_PIECES);
+            note_written(&mut j, base + 3, 11, ALL_PIECES);
+            note_written(&mut j, base + STAMP_PAGES, 9, ALL_PIECES);
+            let map: Vec<(usize, u64)> =
+                j.written.range(base..base + STAMP_PAGES + 1).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(map, STAMPS.range(base, base + STAMP_PAGES + 1));
+            assert_eq!(STAMPS.get(base + 3), 12, "never lowered");
+        }
+        forget_pages(base * PAGE, (base + STAMP_PAGES + 1) * PAGE);
+        assert!(STAMPS.range(base, base + STAMP_PAGES + 1).is_empty());
+        // A view known by its bits: nothing new for a copy that holds it.
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        forget_pages(one, one + SIZE);
+        let (taken, _) = writes_as(one, one + SIZE, true, 2, false, false).expect("a view");
+        assert!(known(one, one + SIZE));
+        let first = one / PAGE;
+        assert!(nothing_flat(one, one + SIZE, first, &[taken, taken]));
+        assert!(!nothing_flat(one, one + SIZE, first, &[taken, taken - 1]), "a page written after the copy took it");
+        assert!(!nothing_flat(one, one + SIZE, first, &[0, taken]), "a page never taken");
+        // SAFETY: inside the view; the write faults and opens the block.
+        unsafe { ((one + 8) as *mut u8).write_volatile(1) };
+        assert!(!nothing_flat(one, one + SIZE, first, &[taken, taken]), "written since: the bits are gone");
+        drop_views(section, &[one, two], SIZE);
+        forget_pages(one, one + SIZE);
+        forget_pages(two, two + SIZE);
+    }
+
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
     /// askings of one range, the lower-numbered one (`low`) started first,
     /// the higher (`high`) reaching the kernel first. `high` resets the
@@ -4852,11 +5245,9 @@ pub(crate) mod tests {
         // Both in flight, numbered as `writes_unlocked` numbers them.
         let (low, high) = {
             let mut j = journal();
-            j.asked += 1;
-            let low = j.asked;
+            let low = j.bump();
             j.flying.push((first, last, low));
-            j.asked += 1;
-            let high = j.asked;
+            let high = j.bump();
             j.flying.push((first, last, high));
             (low, high)
         };
@@ -4881,7 +5272,7 @@ pub(crate) mod tests {
         let written = std::thread::scope(|scope| {
             let answer = scope.spawn(|| {
                 let held = settle(journal(), first, last);
-                let written: Vec<(usize, u64)> = held.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+                let written: Vec<(usize, u64)> = answer(&held, first, last);
                 answered.store(true, Ordering::SeqCst);
                 written
             });
@@ -4920,8 +5311,7 @@ pub(crate) mod tests {
         // Elsewhere: no wait.
         let away = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((last + 100, last + 101, n));
             n
         };
@@ -4929,8 +5319,7 @@ pub(crate) mod tests {
         // Over these pages: an asking in flight, numbered below the next.
         let early = {
             let mut j = journal();
-            j.asked += 1;
-            let n = j.asked;
+            let n = j.bump();
             j.flying.push((first + 1, first + 2, n));
             n
         };
@@ -5557,7 +5946,6 @@ mod piece_tests {
     #[test]
     fn the_history_says_what_a_copy_needs_or_gives_up() {
         let mut j = super::Journal {
-            asked: 0,
             written: Default::default(),
             found: Vec::new(),
             ahead: Vec::new(),

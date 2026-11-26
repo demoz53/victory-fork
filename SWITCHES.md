@@ -135,6 +135,13 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/watch6 (on top of all23)
+A fix with no switch of its own (eacb24c8b): with `VICTORY_JOURNAL_UNLOCKED`, an asking in flight notes what it found under a number taken when it lands (it noted under the number it went in flight with, below an answer the light refresh's bits gave meanwhile: that copy could miss a write; all23's play set has the hole).
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_STAMPS_FLAT` | `1` | off | the journal's "last written" stamps are kept in a flat table as well (an atomic per 64 KiB page, in 512 KiB pieces made when first written), and every answer reads it; an asking the light refresh's bits vouch for, and a refresh they show has nothing new, take no lock at all (they took the journal's twice a refresh). Stamps only rise; noted under the journal's lock before the bits are set; the standing asking's guard notes go under a number taken after the guards' look. Counted on the journal-lock line (answers with no lock) | ours (test/watch6) | no |
+| `VICTORY_STAMPS_CHECK` | `1` (sets STAMPS_FLAT) | off | every answer made from the journal's map as well and compared; an answer made with no lock compared with the map a moment later (a stamp may have risen, never fallen); differences counted on the journal-lock line and warned (first 16, then powers of two) | ours (test/watch6) | no |
+
 ## New in all23 (merged on top of all22)
 From test/watch5 (holds test/watch4), test/async4 (holds test/async3), test/leak1, test/pic3, test/stream3 and
 test/stable1, test/trim2; each row's "From" names its source.
