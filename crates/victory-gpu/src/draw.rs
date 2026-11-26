@@ -5418,6 +5418,20 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+/// Whether a bound texture view skips the diagnostics' look-up of its host
+/// texture and description when debug lines are off (`VICTORY_BIND_LEAN=1`;
+/// off by default). Every shader view of a texture a draw bound looked the
+/// host texture up again (its table lock, a reference counted and let go,
+/// a clock read) and asked for its description, only for a debug line
+/// about textures the title fills: one look-up and one `GetDesc` per view
+/// bound, in diagnostics builds. The line is written as before when debug
+/// lines are on.
+#[cfg(feature = "diagnostics")]
+fn bind_lean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_LEAN").is_some_and(|v| v == "1"))
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -5469,8 +5483,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // With `VICTORY_BIND_LEAN=1` the host texture and its description
+            // are only looked up when the debug line below can be written.
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if (!bind_lean() || tracing::enabled!(tracing::Level::DEBUG))
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
