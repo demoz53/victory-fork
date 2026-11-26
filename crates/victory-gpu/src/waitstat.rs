@@ -30,18 +30,36 @@ pub(crate) enum Cause {
     Batch,
     /// A pipeline sync of the title's (`VICTORY_SYNC_BARRIER=1`).
     Sync,
+    /// A root constant view copied on the card (`HostList::card_constants`
+    /// from `draw.rs` `root_view`).
+    ConstantsRoot,
+    /// A table constant view copied on the card (`card_constants` from a
+    /// table's views).
+    ConstantsTable,
     /// Passes of ours: the launch wait, card compares and fills, the
     /// stand-in light.
     Ours,
 }
 
-const CAUSES: usize = 7;
-const CAUSE_NAMES: [&str; CAUSES] =
-    ["title groups", "title barriers", "clamps before", "clamps after", "batched clamps", "syncs", "ours"];
+const CAUSES: usize = 9;
+const CAUSE_NAMES: [&str; CAUSES] = [
+    "title groups",
+    "title barriers",
+    "clamps before",
+    "clamps after",
+    "batched clamps",
+    "syncs",
+    "root constants copied on the card",
+    "table constants copied on the card",
+    "ours",
+];
 
 /// Per cause: global barriers, and barriers on one resource instead.
 static GLOBAL: [AtomicU64; CAUSES] = [const { AtomicU64::new(0) }; CAUSES];
 static SCOPED: [AtomicU64; CAUSES] = [const { AtomicU64::new(0) }; CAUSES];
+/// Per cause: such waits left out, nothing having stored since the list's
+/// last one (`VICTORY_CONSTANT_WAITS=lazy`).
+static LEFT_OUT: [AtomicU64; CAUSES] = [const { AtomicU64::new(0) }; CAUSES];
 
 /// The title's barrier groups: calls, groups of each kind (global,
 /// texture, buffer, other), barriers in them, barriers whose accesses ask
@@ -89,6 +107,13 @@ pub(crate) fn global(cause: Cause, n: u64) {
 pub(crate) fn scoped(cause: Cause, n: u64) {
     if on() {
         SCOPED[cause as usize].fetch_add(n, Relaxed);
+    }
+}
+
+/// `n` waits for every shader write left out for `cause`.
+pub(crate) fn left_out(cause: Cause, n: u64) {
+    if on() {
+        LEFT_OUT[cause as usize].fetch_add(n, Relaxed);
     }
 }
 
@@ -175,6 +200,7 @@ pub(crate) fn line(frames: f64) -> Option<String> {
     let per = |a: &AtomicU64| a.swap(0, Relaxed) as f64 / f;
     let global: Vec<f64> = GLOBAL.iter().map(per).collect();
     let scoped: Vec<f64> = SCOPED.iter().map(per).collect();
+    let left_out: Vec<f64> = LEFT_OUT.iter().map(per).collect();
     let causes = |v: &[f64]| -> String {
         v.iter().zip(CAUSE_NAMES).map(|(n, name)| format!("{name} {n:.0}")).collect::<Vec<_>>().join(", ")
     };
@@ -191,7 +217,8 @@ pub(crate) fn line(frames: f64) -> Option<String> {
     let stood_n: Vec<f64> = STOOD_N.iter().map(per).collect();
     let stood_ms: Vec<f64> = STOOD_US.iter().map(|a| per(a) / 1000.0).collect();
     Some(format!(
-        "waits per frame (VICTORY_WAIT_STATS=1): barriers on every shader write {:.0} ({}); on one resource instead {:.0} ({}); \
+        "waits per frame (VICTORY_WAIT_STATS=1): barriers on every shader write {:.0} ({}); on one resource instead {:.0} ({}); left out, nothing having stored since \
+         the list's last one (VICTORY_CONSTANT_WAITS=lazy) {:.0} ({}); \
          the title's barrier groups: {:.0} calls, {:.0} global / {:.0} texture / {:.0} buffer / {:.0} other groups, {:.0} barriers, \
          {:.0} asking an order of shader writes, {:.0} calls asking none, {:.0} calls that fell back to the full wait under VICTORY_BARRIER_GROUPS (a global or buffer barrier, or a texture with no \
          host copy made for unordered access);settles {:.1}, {:.1} ms standing (by why: {}; title memory \
@@ -201,6 +228,8 @@ pub(crate) fn line(frames: f64) -> Option<String> {
         causes(&global),
         scoped.iter().sum::<f64>(),
         causes(&scoped),
+        left_out.iter().sum::<f64>(),
+        causes(&left_out),
         g[0],
         g[1],
         g[2],

@@ -1033,6 +1033,11 @@ pub(crate) struct HostList {
     /// the buffer, the bytes used, and whether it is in the constant buffer
     /// state (it decays to the common state when a submission has run).
     card_constants: Mutex<Option<(ID3D12Resource, u64, bool)>>,
+    /// With [`lazy_constant_waits`]: work that can store to buffer memory
+    /// (or whose code is not known) may have been recorded since the list's
+    /// last wait for every shader write. A list starts so (earlier lists
+    /// may have written).
+    stored: std::sync::atomic::AtomicBool,
     /// The title's display planes the list writes ([`crate::shown`]): told
     /// when it is submitted. Empty unless planes are followed.
     planes: Mutex<Vec<usize>>,
@@ -3478,6 +3483,48 @@ pub(crate) fn fill_on_card() -> bool {
     fill_on_card_mode() > 0
 }
 
+/// Whether a table or root constant view copied on the card
+/// ([`HostList::card_constants`]) waits for every earlier shader write only
+/// when the list may have stored to buffer memory since its last such wait
+/// (`VICTORY_CONSTANT_WAITS=lazy`; off by default: one wait per copy).
+///
+/// The wait is there so that the copy reads what this list's shaders wrote
+/// to the host copy before it. Only a draw or dispatch whose shaders can
+/// store to buffer memory (or whose code is not known) writes a buffer's
+/// host copy within a title list (the title's buffer copies are done in
+/// title memory; refreshes go in lists before it; our passes in the list
+/// write only their own buffers), and every wait for every shader write
+/// recorded into the list (by the copies, the title's barriers, groups and
+/// syncs, the clamps, the batched passes, the launch wait) orders all of
+/// those before what follows. So with nothing that can store recorded
+/// since such a wait, the wait has nothing to order: copies between two
+/// draws that store share one wait, and copies after draws that only read
+/// need none. The copy writes only the list's own constant buffer, which
+/// its state changes order against the draws that read it, so no wait is
+/// owed for later. A list starts as if it had stored.
+///
+/// The rule of fxceless/victory-fork pull request #995's
+/// `VICTORY_BARRIER_LAZY_UAV` (tunczzz, GPL-3.0; its tracking in
+/// barstat.rs: "a barrier between two draws costs the card 4-6 us on an
+/// RTX 5070 Ti whatever it names"), for this wait only: the title's own
+/// waits also order reads before later writes, which #995 keeps by owing
+/// them to the next writer; this one does not need that.
+pub(crate) fn lazy_constant_waits() -> bool {
+    #[cfg(test)]
+    match TEST_LAZY_CONSTANTS.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CONSTANT_WAITS").is_ok_and(|v| v.trim() == "lazy"))
+}
+
+/// Tests: [`lazy_constant_waits`] as set here (0: as the environment says,
+/// 1: off, 2: on). Both are correct for every caller.
+#[cfg(test)]
+pub(crate) static TEST_LAZY_CONSTANTS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// `VICTORY_FILL_ON_CARD`: 0 (fills as before), 1 (the default: a constant
 /// buffer view over what flights write when it is recorded is copied on the
 /// card, [`fill_on_card`]), 2 (and one over a host copy shaders have ever
@@ -5738,6 +5785,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
                 card_constants: Mutex::default(),
+                stored: std::sync::atomic::AtomicBool::new(true),
                 planes: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -8169,6 +8217,7 @@ impl HostList {
             // in the common state again.
             (c.1, c.2) = (0, false);
         }
+        self.stored.store(true, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -8705,7 +8754,18 @@ impl HostList {
     /// constant buffer of 512 bytes). Read on the card, behind the flight on
     /// the same queue, those bytes are what the shaders wrote without the
     /// wait; title writes to them reach the copy first, through its refresh.
-    pub(crate) fn card_constants(&self, shadow: &crate::shadow::Shadow, address: u64, len: u64) -> Option<u64> {
+    ///
+    /// `site`: who asked (`crate::waitstat`'s count of the wait, by site).
+    /// With [`lazy_constant_waits`] the wait for every shader write before
+    /// the copy is recorded only if work that can store may have been
+    /// recorded since the list's last such wait ([`HostList::may_store`]).
+    pub(crate) fn card_constants(
+        &self,
+        shadow: &crate::shadow::Shadow,
+        address: u64,
+        len: u64,
+        site: crate::waitstat::Cause,
+    ) -> Option<u64> {
         const SIZE: u64 = 1 << 20;
         let host = host()?;
         let offset = shadow.offset_in(address)?;
@@ -8733,17 +8793,44 @@ impl HostList {
             if *readable {
                 self.list.ResourceBarrier(&[transition(buffer, constants, D3D12_RESOURCE_STATE_COPY_DEST)]);
             }
-            // What shaders of this list wrote to the copy before, first.
-            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                ..Default::default()
-            }]);
-            crate::waitstat::global(crate::waitstat::Cause::Ours, 1);
+            // What shaders of this list wrote to the copy before, first (with
+            // VICTORY_CONSTANT_WAITS=lazy only if something since the last
+            // such wait can have written it).
+            if self.constant_wait_due() {
+                self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    ..Default::default()
+                }]);
+                self.waited_all();
+                crate::waitstat::global(site, 1);
+            } else {
+                crate::waitstat::left_out(site, 1);
+            }
             self.list.CopyBufferRegion(buffer, at, &shadow.buffer, offset, len);
             self.list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COPY_DEST, constants)]);
             *readable = true;
             Some(buffer.GetGPUVirtualAddress() + at)
         }
+    }
+
+    /// A draw or dispatch was recorded whose shaders can (`stores`) store to
+    /// buffer memory, or not ([`lazy_constant_waits`]).
+    pub(crate) fn may_store(&self, stores: bool) {
+        if stores {
+            self.stored.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A wait for every earlier shader write was recorded into the list:
+    /// nothing stored since ([`lazy_constant_waits`]).
+    pub(crate) fn waited_all(&self) {
+        self.stored.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether a constant view copied on the card now waits for every
+    /// earlier shader write first ([`HostList::card_constants`]).
+    fn constant_wait_due(&self) -> bool {
+        !lazy_constant_waits() || self.stored.load(Ordering::Relaxed)
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -12095,8 +12182,8 @@ mod fill_on_card_tests {
         host.execute(&[&flight]);
         // The next list fills two constant buffers from it on the card.
         let list = host.new_list().unwrap();
-        let first = list.card_constants(&shadow, start + 64, 512).expect("room");
-        let second = list.card_constants(&shadow, start + 64 + 512, 300).expect("room");
+        let first = list.card_constants(&shadow, start + 64, 512, crate::waitstat::Cause::ConstantsTable).expect("room");
+        let second = list.card_constants(&shadow, start + 64 + 512, 300, crate::waitstat::Cause::ConstantsTable).expect("room");
         assert_eq!(first % 256, 0);
         assert_eq!(second % 256, 0);
         let constants = list.card_constants.lock().unwrap().as_ref().unwrap().0.clone();
@@ -12126,6 +12213,80 @@ mod fill_on_card_tests {
         assert_eq!(read[512..812], pattern[512..812], "the second fill");
         // The title's memory was never read: it still holds 0xAA.
         assert!(title[64..1088].iter().all(|&b| b == 0xAA));
+        crate::shadow::unregister(resource, start);
+    }
+
+    /// `VICTORY_CONSTANT_WAITS=lazy`: a list waits before its first constant
+    /// copied on the card, not before the next ones while nothing that can
+    /// store was recorded, and again after something that can; the copies
+    /// read what an earlier list wrote, and the list closes and runs.
+    #[test]
+    fn constants_on_the_card_wait_only_after_what_can_store() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        super::TEST_LAZY_CONSTANTS.store(2, Ordering::Relaxed);
+        const LEN: usize = 1 << 16;
+        let title: &'static mut [u8] = Box::leak(vec![0x55u8; LEN].into_boxed_slice());
+        let start = title.as_ptr() as u64;
+        let resource = 0x7e57_0002usize;
+        crate::shadow::register(resource, start, LEN as u64);
+        let shadow = crate::shadow::find(start + 64, 512).expect("a host copy");
+        let offset = shadow.offset_in(start).expect("the copy starts at the buffer");
+        let pattern: Vec<u8> = (0..1024u32).map(|i| (i * 13 + 5) as u8).collect();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        // SAFETY: the upload buffer holds 1024 mapped bytes.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 1024) };
+        let flight = host.new_list().unwrap();
+        // SAFETY: an open list; live buffers, ranges inside them.
+        unsafe { flight.list.CopyBufferRegion(&shadow.buffer, offset + 64, &upload, 0, 1024) };
+        flight.close();
+        host.execute(&[&flight]);
+
+        let list = host.new_list().unwrap();
+        let site = crate::waitstat::Cause::ConstantsTable;
+        assert!(list.constant_wait_due(), "a list starts as if it had stored");
+        let first = list.card_constants(&shadow, start + 64, 512, site).expect("room");
+        assert!(!list.constant_wait_due(), "the copy's wait was the last");
+        let second = list.card_constants(&shadow, start + 64 + 512, 300, site).expect("room");
+        list.may_store(false);
+        assert!(!list.constant_wait_due(), "a draw that only reads");
+        list.may_store(true);
+        assert!(list.constant_wait_due(), "a draw that can store");
+        let third = list.card_constants(&shadow, start + 64, 256, site).expect("room");
+        assert!(!list.constant_wait_due());
+        let constants = list.card_constants.lock().unwrap().as_ref().unwrap().0.clone();
+        // SAFETY: a live buffer.
+        let base = unsafe { constants.GetGPUVirtualAddress() };
+        let back = readback(host, 1024);
+        // SAFETY: an open list; the constants buffer is in the constant
+        // buffer state after the fills; ranges inside both buffers.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &constants,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&back, 0, &constants, first - base, 512);
+            list.list.CopyBufferRegion(&back, 512, &constants, second - base, 300);
+            list.list.CopyBufferRegion(&back, 812, &constants, third - base, 200);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); 1024 bytes.
+        let read = unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024).to_vec()
+        };
+        assert_eq!(read[..512], pattern[..512], "the first fill (after a wait)");
+        assert_eq!(read[512..812], pattern[512..812], "the second fill (no wait)");
+        assert_eq!(read[812..1012], pattern[..200], "the third fill (after a wait again)");
+        // SAFETY: a plain query: the list closed and ran without the device going.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        list.reset();
+        assert!(list.constant_wait_due(), "a reset list starts as if it had stored");
+        super::TEST_LAZY_CONSTANTS.store(0, Ordering::Relaxed);
         crate::shadow::unregister(resource, start);
     }
 
