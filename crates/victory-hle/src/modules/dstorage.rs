@@ -1081,7 +1081,43 @@ fn queue(this: QueueRef, command: Command) {
     }
 }
 
+/// The title's streaming thread runs at the lowest priorities; on the
+/// console nothing else wants its core. Here every processor is also wanted
+/// by the title's threads that spin and by our own workers, and a thread
+/// that low runs when they leave it one: what it loads comes late, and a
+/// shot of a few seconds is over before its models and textures are there.
+/// With `VICTORY_STREAM_PRIORITY=1`, called where that thread maps pages and
+/// submits its requests: a thread below normal priority is lifted above it.
+/// (Nothing of the title's code changes: it is the host's scheduling of one
+/// of its threads.) From avatarmanz/VIctory-7900XTX 49d71266b (`lift_thread`,
+/// on by default there).
+pub(crate) fn lift_streaming_thread() {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_PRIORITY").is_some_and(|v| v == "1")) {
+        return;
+    }
+    #[cfg(windows)]
+    // SAFETY: plain calls on this thread.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        let thread = GetCurrentThread();
+        if lifts(GetThreadPriority(thread)) {
+            SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
+}
+
+/// Whether a thread at host priority `priority` is lifted: "idle" (-15),
+/// "lowest" (-2) and "below normal" (-1); not one at normal or above, nor
+/// the value of a failed query.
+fn lifts(priority: i32) -> bool {
+    matches!(priority, -15 | -2 | -1)
+}
+
 extern "system" fn submit(this: QueueRef) {
+    lift_streaming_thread();
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
@@ -1749,6 +1785,17 @@ mod tests {
         assert_eq!(started[1] + started[2], 300, "{started:?}");
         assert_eq!(started[0], 30, "{started:?}");
         assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
+    }
+
+    #[test]
+    fn only_threads_below_normal_priority_are_lifted() {
+        for low in [-15, -2, -1] {
+            assert!(lifts(low), "{low}");
+        }
+        // Normal and above stay; so does a failed query (0x7fffffff).
+        for kept in [0, 1, 2, 15, i32::MAX] {
+            assert!(!lifts(kept), "{kept}");
+        }
     }
 
     #[test]
