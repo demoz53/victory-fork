@@ -3610,7 +3610,7 @@ impl State {
     /// bound with, checks their formats and sizes, and records the passes.
     /// Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3655,19 +3655,20 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflect => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
-        // R32_UINT holding R9G9B9E5 for the resolve; R11G11B10_FLOAT for the
-        // radiance and the air.
-        let format = if role == Role::Resolve {
+        // R32_UINT holding R9G9B9E5 for the resolve and the reflections;
+        // R11G11B10_FLOAT for the radiance and the air.
+        let format = if matches!(role, Role::Resolve | Role::Reflect) {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT
         } else {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT
