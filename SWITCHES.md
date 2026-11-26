@@ -84,6 +84,16 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/stream4 (on top of test/stream3; black faces after a read)
+One new DEFAULT-ON change (a bug fix with a test); `VICTORY_PAGE_WRITES=0` restores stream3. No shader change.
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_PAGE_WRITES` | `0` restores | ON | when a DirectStorage read to a plain address (not physical pages) has landed, the placed textures picked by index under its bytes that were uploaded BEFORE it landed (out of the queue, or in it after an upload: in part, or whole and waiting for a recheck) are due again 2 frames on. The read made them due before it began (`watch::writing`), so a texture pass could upload them mid-read from memory without the bytes and nothing asked again: black faces (fxceless: 282 such slots at the opening cutscene). A slot still waiting for its first upload is left alone; the texture that ends where the read starts is not named. Reads into physical pages (with or without `VICTORY_XMEM_PERSISTENT_VIEW`) already told the texture pass after landing in our tree (`watch::title_memory_written` -> every slot there due again) and are unchanged. Counter on the "dstorage views" line (since the start): `read_ranges`, `slots_under_reads`, `slots_uploaded_again_after_read` | fxceless/victory-fork e4245f3c1 (fxceless; its bit 8, `page_written` / `slots_holding` / `slots_written_under`) | no |
+Not ported from e4245f3c1: `VICTORY_CARD_HASH_WIDE`. Its wide compare replaces fxceless's thread-a-piece compare with a
+64-thread group a 64 KiB piece; our `CARD_COMPARE` already is one 64-thread group a piece (four lanes a 4 KiB part,
+Noname0202 e3962cc18 / d9a17da56) and also gives per-part masks, which the wide form would lose. Nothing to gain.
+Also not taken: card hashing alt mode, `VICTORY_DIRTY_4K`, `VICTORY_GATHER_SEGMENTS`, the translator changes.
+
 ## New in test/stream3 (on top of all22; late assets and streaming stalls)
 All three opt-in; none changes translated shader code. A run with nothing set behaves as all22, but for one new
 log-only line, "dstorage views" (below).
