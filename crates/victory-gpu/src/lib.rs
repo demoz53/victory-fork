@@ -40,6 +40,8 @@ mod indirect;
 #[cfg(windows)]
 mod material_demand;
 #[cfg(windows)]
+mod lockstat;
+#[cfg(windows)]
 mod inplace;
 pub mod list;
 pub mod object;

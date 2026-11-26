@@ -1824,7 +1824,7 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = crate::lockstat::lock(&PLACED_TEXTURES, crate::lockstat::Lock::Placed);
     map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
 }
 
@@ -2373,7 +2373,7 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    crate::lockstat::lock(&PLACED_TEXTURES, crate::lockstat::Lock::Placed).len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -2969,7 +2969,7 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = crate::lockstat::lock(&PLACED_TEXTURES, crate::lockstat::Lock::Placed);
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
 }
@@ -2996,7 +2996,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let raw = *desc;
     let key = placed_desc_key(desc);
     let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockstat::lock(&PLACED_TEXTURES, crate::lockstat::Lock::Placed);
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
     if raw != key {
@@ -3108,7 +3108,7 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
             r[8] = wanted;
         }
     }
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = crate::lockstat::lock(&PLACED_TEXTURES, crate::lockstat::Lock::Placed);
     if let Some(&existing) = map.get(&(address, r)) {
         return Some(existing as This);
     }
