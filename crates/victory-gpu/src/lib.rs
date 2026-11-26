@@ -24,6 +24,8 @@ mod compose;
 pub mod console;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+mod spread;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
