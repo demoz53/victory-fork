@@ -8257,7 +8257,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into title memory: through the kernel, which reports a destination
     // page that is not there (the guarded copy only survives the source's).
-    let whole = if title_dst { read_kernel(src, dst, len) } else { read(src, dst, len) };
+    let whole = if title_dst {
+        crate::guarded::copy_title(dst, src, len) || read_kernel(src, dst, len)
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {

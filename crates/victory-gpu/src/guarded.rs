@@ -182,11 +182,13 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // The guarded write: a destination page that is not there, not
-        // writable, or a guard page (the system has taken its guard off).
+        // writable, or a guard page (the system has taken its guard off);
+        // with `VICTORY_TITLE_COPY_PLAIN=1` ([`copy_title`]) also a source
+        // page that is not there (the source is title memory then).
         const WRITE: usize = 1;
         let violation = r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.NumberParameters >= 2
-            && r.ExceptionInformation[0] == WRITE;
+            && (r.ExceptionInformation[0] == WRITE || r.ExceptionInformation[0] == READ);
         if c.Rip == std::ptr::addr_of!(victory_guarded_write_at) as u64
             && (violation || r.ExceptionCode == EXCEPTION_GUARD_PAGE as NTSTATUS)
         {
@@ -367,6 +369,32 @@ pub(crate) fn write(dst: *mut u8, src: *const u8, len: usize) -> bool {
     whole
 }
 
+/// `VICTORY_TITLE_COPY_PLAIN=1` (off by default; needs the guarded reads):
+/// a title buffer copy done on the CPU at submission (title memory into
+/// title memory, some 16,000 a frame of about 500 bytes in the open world)
+/// is made in place, not through the kernel (`ReadProcessMemory`, about a
+/// microsecond a call whatever the size: 2.4 GB/s at 4 KiB against 5-8
+/// GB/s for the copy in place on this PC). A page of either side that is
+/// not there, or a destination that is not writable, stops it, and the
+/// caller then copies through the kernel as before.
+pub(crate) fn title_plain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_TITLE_COPY_PLAIN").is_some_and(|v| v == "1"))
+}
+
+/// With [`title_plain`]: copies `len` bytes of title memory at `src` into
+/// title memory at `dst` in place; false if it is off or a page of either
+/// side stopped it (the bytes before are copied then).
+pub(crate) fn copy_title(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    if !title_plain() {
+        return false;
+    }
+    // SAFETY: a page of either side that cannot be read or written stops
+    // the copy ([`install`], which `on` has run); the caller opened the
+    // destination's guards.
+    unsafe { victory_guarded_write(dst, src, len) != 0 }
+}
+
 /// Once a second (`crate::host` `sweep`): every ten, what [`plain`] did.
 pub(crate) fn tick() {
     static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -385,6 +413,37 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The in-place copy of title memory ([`copy_title`]) stops at a source
+    /// page that is not there, having copied the bytes before it, and the
+    /// process lives on; whole, it copies every byte.
+    #[test]
+    fn a_title_copy_stops_at_a_source_page_that_is_not_there() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if !on() {
+            return;
+        }
+        const P: usize = 4096;
+        // SAFETY: our own fresh pages.
+        unsafe {
+            let a = VirtualAlloc(std::ptr::null(), 2 * P, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            let b = VirtualAlloc(std::ptr::null(), 2 * P, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!a.is_null() && !b.is_null());
+            a.write_bytes(9, 2 * P);
+            assert!(victory_guarded_write(b, a, 2 * P) != 0);
+            assert_eq!((b.read(), b.add(2 * P - 1).read()), (9, 9));
+            b.write_bytes(0, 2 * P);
+            VirtualFree(a.add(P).cast(), P, MEM_DECOMMIT);
+            assert!(victory_guarded_write(b, a, 2 * P) == 0);
+            assert_eq!((b.add(P - 1).read(), b.add(P).read()), (9, 0));
+            // Off unless the switch is set.
+            assert_eq!(copy_title(b, a, P), title_plain());
+            VirtualFree(a.cast(), 0, MEM_RELEASE);
+            VirtualFree(b.cast(), 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn the_stream_switch_is_opt_in() {
