@@ -713,6 +713,7 @@ fn clamp_into(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
+    list.meter_ours(crate::meters::Kind::Clamps);
     let before = list.indirect_state(dst);
     let budget = (budget, list.budget_resource());
     let recorded = record_clamp_scoped(c, &list.list, (dst, before, at), budget, src, count, spec, ahead);
@@ -964,6 +965,7 @@ pub(crate) fn open_batch(
     source: (u64, &ID3D12Resource),
     recent: &[(u64, ID3D12Resource)],
 ) -> Option<(batch::Table, ID3D12Resource)> {
+    list.meter_ours(crate::meters::Kind::Clamps);
     let c = batch_clamp()?;
     let gpu = |b: &ID3D12Resource| {
         // SAFETY: a live buffer.
