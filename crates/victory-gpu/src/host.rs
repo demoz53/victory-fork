@@ -10872,6 +10872,9 @@ impl Meter {
                 // `VICTORY_JOURNAL_UNLOCKED`: the journal's lock as the
                 // askings take it, with the switch or without.
                 tracing::info!("{}", crate::watch::journal_line(frames));
+                // The write watch's kernel calls by kind
+                // (`VICTORY_ASK_SKIP_VIEWS`, `VICTORY_HOLES_KNOWN`).
+                tracing::info!("{}", crate::watch::kernel_line(frames));
             }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
