@@ -1653,6 +1653,41 @@ fn reopen_remapped() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_REOPEN").is_none_or(|v| v != "0"))
 }
 
+/// Whether textures uploaded from memory the runtime maps anew are uploaded
+/// again (`VICTORY_REMAP_REUPLOAD=0`: not).
+fn remap_reupload() -> bool {
+    static REUPLOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REUPLOAD.get_or_init(|| std::env::var_os("VICTORY_REMAP_REUPLOAD").is_none_or(|v| v != "0"))
+}
+
+/// The title asked the runtime to map at `[at, at + len)` the very pages
+/// that are shown there already, and the runtime left the view as it is
+/// (`VICTORY_REMAP_SAME=1`, `victory-hle`'s `xmem`): the bytes and the
+/// mapping are what they were, but all that [`title_memory_remapped`] said
+/// of the BYTES is said here too, so that nothing over them stays "known
+/// unchanged" across the call, as nothing did when the view was made anew:
+///
+/// - guarded blocks there are opened (read-write again, here and at the
+///   other views of their pages) and taken as written at the next guard
+///   check, whole ([`writing`], a write through the kernel that is done at
+///   once). After a real mapping the fresh view was read-write and the
+///   guards over it forgotten: the same state, reached without leaving a
+///   block read-only that the guards no longer know (a write to such a
+///   block would be a fault nobody takes). The journal is not written to:
+///   it hears of view memory from the guards' answers, as after a mapping;
+/// - placed textures there are looked at again (in [`writing`]);
+/// - textures uploaded from there are uploaded again ([`remap_reupload`]).
+///
+/// Left out is only what told of the MAPPING, which did not change: the
+/// views the runtime told us of stay, what is placed in place stays, host
+/// copies of placed textures keep their memory, and nothing was unmapped.
+pub fn title_memory_same(at: usize, len: usize) {
+    drop(writing(at, len));
+    if remap_reupload() {
+        crate::texture::remapped(at, len);
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped). Blocks of it that a guard made read-only are made writable
@@ -1668,8 +1703,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // Textures already uploaded from there must be uploaded again, or the
     // next list that samples them reads their old contents
     // (`VICTORY_REMAP_REUPLOAD=0`: not, as before fxceless #606).
-    static REUPLOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *REUPLOAD.get_or_init(|| std::env::var_os("VICTORY_REMAP_REUPLOAD").is_none_or(|v| v != "0")) {
+    if remap_reupload() {
         crate::texture::remapped(at, len);
     }
     // The views the runtime told us of there are no longer what it shows.
@@ -2288,6 +2322,28 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// The runtime left a view as it was for a mapping of the pages it
+    /// shows already (`VICTORY_REMAP_SAME=1`): its guarded blocks are
+    /// read-write again and the next check takes all their pages as
+    /// written, as after a view made anew; no block stays read-only behind
+    /// the guards' back.
+    #[test]
+    fn a_mapping_of_what_is_shown_already_opens_the_guards_and_reports_the_pages() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        let all: Vec<usize> = (view / PAGE..(view + SIZE) / PAGE).collect();
+        assert_eq!(guard(view, view + SIZE), Some(all.clone()));
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()), "nothing written since");
+        assert!(!writable(view), "guarded: read-only");
+        title_memory_same(view, SIZE);
+        assert!(writable(view) && writable(view + BLOCK), "opened, not left read-only");
+        // SAFETY: the view, read-write again; no fault is needed for this.
+        unsafe { ((view + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(view, view + SIZE), Some(all), "taken as written, as after a mapping");
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        drop_views(section, &[view, other], SIZE);
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

@@ -8657,6 +8657,13 @@ impl Meter {
         if crate::indirect::splitting() {
             tracing::info!("indirect dispatches run in parts (VICTORY_INDIRECT_SPLIT, _AUTO) so far: {}", crate::draw::split_parts());
         }
+        let left = crate::pipeline::LEFT_WITHOUT_RAYS.swap(0, Ordering::Relaxed);
+        if left > 0 {
+            tracing::info!(
+                "dispatches of the program that activates the screen probes' rays left out per frame (the structure builder does not run; VICTORY_IDLE_WITHOUT_RAYS=1): {:.1}",
+                left as f64 / frames
+            );
+        }
         if std::env::var_os("VICTORY_INDIRECT_WATCH").is_some() {
             let watched = WATCHED_GROUPS.swap(0, Ordering::Relaxed) as f64 / frames;
             tracing::info!("indirect compute dispatches of VICTORY_INDIRECT_WATCH's pipelines: {watched:.1} groups run per frame");
