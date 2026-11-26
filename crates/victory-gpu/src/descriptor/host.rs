@@ -535,6 +535,38 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Since the last line in the log: first uploads of textures picked by
+/// index, by the frames between the slot's write and the upload
+/// ([`age_bucket`]: 0, 1, 2, 3-5, 6-15, 16-63, more). Until the upload a
+/// shader that picks the slot reads nothing. Row 0: slots whose memory was
+/// there at every look (they waited for the queue and for the host copy
+/// alone); row 1: slots a look found unmapped (they waited for the title's
+/// own streaming too, which no queue order shortens).
+/// Ported from zm0kiemedia/Neptune_VI main b900c6467 (`QUEUE_AGE`; Traffic
+/// and imgone's Neptune); the split in two rows is ours.
+pub(crate) static QUEUE_AGE: [[std::sync::atomic::AtomicU64; 7]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 7] }; 2];
+
+/// The bucket of [`QUEUE_AGE`] for an upload `age` frames after the write.
+pub(crate) fn age_bucket(age: u64) -> usize {
+    match age {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=5 => 3,
+        6..=15 => 4,
+        16..=63 => 5,
+        _ => 6,
+    }
+}
+
+/// Whether the frame line tells of [`QUEUE_AGE`] (on unless
+/// `VICTORY_QUEUE_AGE=0`; the counting is two atomics an upload).
+pub(crate) fn queue_age_line() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_AGE").is_none_or(|v| v != "0"))
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -556,6 +588,8 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// A look found none of its memory mapped ([`TextureQueue::away`]).
+    away: bool,
 }
 
 /// Whether due texture slots are served in turns, a slot looked at before
@@ -587,7 +621,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false });
     }
 
     fn remove(&mut self, index: u32) {
@@ -760,7 +794,24 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false });
+    }
+
+    /// A look at slot `index` found none of its memory mapped.
+    fn away(&mut self, index: u32, write: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.away = true;
+        }
+    }
+
+    /// For [`QUEUE_AGE`], asked before the pass says what it did with slot
+    /// `index`: if this upload at `frame` is the first since the slot was
+    /// written (nothing of it was uploaded before, and it is not a look
+    /// after an upload), the frames since the write, and whether a look
+    /// found its memory unmapped meanwhile.
+    fn first_upload(&self, index: u32, write: u64, frame: u64) -> Option<(u64, bool)> {
+        let w = self.slots.get(&index).filter(|w| w.write == write)?;
+        (w.mapped == 0 && w.checked.2 == 0).then(|| (frame.saturating_sub(w.written), w.away))
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1434,6 +1485,24 @@ impl HostHeap {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
             None => textures.done(index, write),
         }
+    }
+
+    /// The texture of title slot `index` (as handed out with `write`) is on
+    /// the card, whole or in part: counted in [`QUEUE_AGE`] if that is the
+    /// first time since the slot was written. Called before
+    /// [`HostHeap::texture_slot_done`] or [`HostHeap::texture_slot_recheck`]
+    /// say what becomes of the slot.
+    pub(crate) fn texture_slot_uploaded(&self, index: u32, write: u64, frame: u64) {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((age, away)) = textures.first_upload(index, write, frame) {
+            QUEUE_AGE[usize::from(away)][age_bucket(age)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A look at title slot `index` found none of its memory mapped: see
+    /// [`TextureQueue::away`].
+    pub(crate) fn texture_slot_away(&self, index: u32, write: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).away(index, write);
     }
 
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
@@ -3196,6 +3265,50 @@ mod tests {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    /// The age histogram's buckets: 0, 1, 2, 3-5, 6-15, 16-63, more.
+    #[test]
+    fn upload_ages_fall_into_the_histograms_buckets() {
+        let buckets: Vec<usize> = [0, 1, 2, 3, 5, 6, 15, 16, 63, 64, u64::MAX].map(age_bucket).to_vec();
+        assert_eq!(buckets, [0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6]);
+        assert_eq!(QUEUE_AGE.len(), 2);
+        assert!(QUEUE_AGE.iter().all(|row| row.len() == 7));
+    }
+
+    /// Only the first upload since a slot's write is counted, with the
+    /// frames since that write, and apart if a look found its memory away.
+    #[test]
+    fn the_first_upload_after_a_write_has_an_age() {
+        let mut q = TextureQueue::default();
+        q.written(7, 10, 0, false);
+        q.written(8, 10, 0, false);
+        q.written(9, 10, 0, false);
+        let write = |q: &TextureQueue, index: u32| q.slots[&index].write;
+        let (w7, w8, w9) = (write(&q, 7), write(&q, 8), write(&q, 9));
+        // The same frame, and three frames later; not for another write.
+        assert_eq!(q.first_upload(7, w7, 10), Some((0, false)));
+        assert_eq!(q.first_upload(7, w7, 13), Some((3, false)));
+        assert_eq!(q.first_upload(7, w7 + 100, 13), None);
+        assert_eq!(q.first_upload(6, 1, 13), None);
+        // Uploaded in part: the uploads of the rest are not first ones.
+        q.partly(7, w7, 14, 4096);
+        assert_eq!(q.first_upload(7, w7, 14), None);
+        // A look found slot 8's memory unmapped; it arrives 20 frames on.
+        q.away(8, w8);
+        q.later(8, w8, 10, 4);
+        assert_eq!(q.first_upload(8, w8, 30), Some((20, true)));
+        // A wait for its host copy alone is the queue's own time.
+        q.later(9, w9, 10, 1);
+        assert_eq!(q.first_upload(9, w9, 11), Some((1, false)));
+        // Uploaded whole and looked at again: an upload then is not a first.
+        q.recheck(9, w9, 12, (0x1000, 64), 5, 0, 11);
+        assert_eq!(q.first_upload(9, w9, 12), None);
+        // Written again (or its memory changed): counted from that write.
+        q.written(7, 20, 0, false);
+        assert_eq!(q.first_upload(7, write(&q, 7), 22), Some((2, false)));
+        q.changed(8, 40, 41);
+        assert_eq!(q.first_upload(8, write(&q, 8), 41), Some((1, false)));
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();

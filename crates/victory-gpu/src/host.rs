@@ -8592,6 +8592,20 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                // How long after its slot was written a texture was there
+                // (zm0kiemedia/Neptune_VI b900c6467's QUEUE_AGE line).
+                let ages = crate::descriptor::host::QUEUE_AGE
+                    .each_ref()
+                    .map(|row| row.each_ref().map(|a| a.swap(0, Ordering::Relaxed)));
+                if crate::descriptor::host::queue_age_line() && ages.iter().flatten().any(|&n| n != 0) {
+                    let [ours, theirs] = ages;
+                    let late = |row: &[u64; 7]| row[2..].iter().sum::<u64>();
+                    tracing::info!(
+                        "textures picked by index, first uploads since the last line, by the frames after their slot was                          written (same frame, 1, 2, 3-5, 6-15, 16-63, more): {ours:?} with their memory there at every look                          ({} two frames or more late), {theirs:?} after a look that found it unmapped ({} two or more late)                          (VICTORY_QUEUE_AGE=0: no line)",
+                        late(&ours),
+                        late(&theirs)
+                    );
+                }
             }
             #[cfg(feature = "diagnostics")]
             {

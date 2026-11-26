@@ -2493,6 +2493,7 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
+                    host.texture_slot_away(index, write);
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
@@ -2619,6 +2620,9 @@ impl State {
                     RESENT[4].fetch_add(1, Ordering::Relaxed);
                     RESENT[5].fetch_add(len, Ordering::Relaxed);
                     resent_line();
+                    // The card holds these bytes already: there, for the
+                    // age histogram.
+                    host.texture_slot_uploaded(index, write, frame);
                     HEAP_PASS_PARTS[6].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
                     if heap_recheck() {
                         let print = crate::texture::fingerprint(address, len);
@@ -2647,6 +2651,10 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
+            // On the card now (or by the draws that read it through a
+            // table): how long after its slot was written
+            // (`descriptor::host::QUEUE_AGE`).
+            host.texture_slot_uploaded(index, write, frame);
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
