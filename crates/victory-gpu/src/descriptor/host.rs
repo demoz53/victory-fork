@@ -92,6 +92,9 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// Title slots that go on showing a texture past their view
+    /// ([`stale_keep`]). Locked after `made`.
+    kept_past: Mutex<KeptPast>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -614,6 +617,165 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Whether the card had room for more host copies of textures at the last
+/// texture pass (`draw.rs` `heap_textures` stores it): slots go on showing
+/// a texture past their view only then ([`stale_keep`]).
+pub(crate) static CARD_ROOM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Since the last line in the log: slots that went on showing their texture
+/// where they would have been made null ([`stale_keep`]), kept slots whose
+/// time was up or that had to make room (made null), and kept slots made
+/// again with their new texture.
+pub(crate) static STALE_KEPT: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether a slot that shows a texture goes on showing it where it was made
+/// null at once, and for how many milliseconds at most
+/// (`VICTORY_STALE_KEEP_MS`, off unless set and not 0; the cap is
+/// `VICTORY_STALE_KEEP_MAX_MS`, 120,000 unless said, and never less than
+/// the first):
+/// - a slot the title writes with a view of another texture: until the
+///   texture pass has made the new one (it read as nothing from the write
+///   until the upload, seconds at times: a torso or a wall black, then
+///   back);
+/// - a slot whose texture's memory a look finds unmapped: until it is
+///   mapped again and uploaded (the title unmaps and maps a texture's pages
+///   while it moves them).
+///
+/// Only while the card has room ([`CARD_ROOM`]): what a kept slot shows is
+/// a host copy that could be let go, and with no room all kept slots are
+/// made null at the next pass.
+///
+/// Ported from zm0kiemedia/Neptune_VI main b900c6467 (GPL-3.0-or-later;
+/// Traffic and imgone's Neptune): its `stale_kept` / `stale_expire` and its
+/// keeping of a slot written with another texture's view
+/// (`VICTORY_KEEP_OTHER_VIEWS` there). As there, the first variable is the
+/// switch and the second the cap. Not ported: keeping the slots a newer
+/// view of other memory makes stale; theirs finds those again with a look
+/// over the whole heap that ours does not have.
+fn stale_keep() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let max = stale_keep_from(
+            std::env::var("VICTORY_STALE_KEEP_MS").ok().as_deref(),
+            std::env::var("VICTORY_STALE_KEEP_MAX_MS").ok().as_deref(),
+        );
+        if let Some(max) = max {
+            tracing::info!(
+                at_most_ms = max,
+                "slots go on showing their texture until the new one is made, while the card has room (VICTORY_STALE_KEEP_MS)"
+            );
+        }
+        max
+    })
+}
+
+/// [`stale_keep`] from the two variables' values.
+fn stale_keep_from(keep: Option<&str>, max: Option<&str>) -> Option<u64> {
+    let keep = keep?.trim().parse::<u64>().ok().filter(|&ms| ms != 0)?;
+    let max = max.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(120_000);
+    Some(max.max(keep))
+}
+
+/// The title slots that go on showing a texture past their view
+/// ([`stale_keep`]): since when (milliseconds), the view each shows (its
+/// key), and whether the title has written the slot with a view of another
+/// texture since (else the slot shows its own view's texture, whose memory
+/// was found unmapped). No host heap needed, so it is tested without one.
+#[derive(Default)]
+struct KeptPast {
+    slots: std::collections::BTreeMap<u32, (u64, u64, bool)>,
+}
+
+impl KeptPast {
+    /// Slot `index`, which shows the view `key`, would be made null at
+    /// `now` (`rewritten`: because the title wrote it with a view of
+    /// another texture): whether it goes on showing it instead, which it
+    /// does for `max` milliseconds from the first time this was asked of
+    /// that view. Returns that, and whether this is that first time.
+    fn keep(&mut self, index: u32, key: u64, now: u64, max: u64, rewritten: bool) -> (bool, bool) {
+        match self.slots.get_mut(&index) {
+            Some(kept) if kept.1 == key => {
+                kept.2 |= rewritten;
+                let keep = now.saturating_sub(kept.0) < max;
+                if !keep {
+                    self.slots.remove(&index);
+                }
+                (keep, false)
+            }
+            _ => {
+                self.slots.insert(index, (now, key, rewritten));
+                (max > 0, true)
+            }
+        }
+    }
+
+    /// Slot `index` was made, or made null: no longer kept. True if it was.
+    fn forget(&mut self, index: u32) -> bool {
+        self.slots.remove(&index).is_some()
+    }
+
+    /// Takes out the slots kept for `max` milliseconds or more at `now`
+    /// (`all`: every one), each with the view it was kept showing and
+    /// whether the title wrote it with another texture's view.
+    fn expired(&mut self, now: u64, max: u64, all: bool) -> Vec<(u32, u64, bool)> {
+        let due: Vec<(u32, u64, bool)> = self
+            .slots
+            .iter()
+            .filter(|&(_, &(since, ..))| all || now.saturating_sub(since) >= max)
+            .map(|(&index, &(_, key, rewritten))| (index, key, rewritten))
+            .collect();
+        for (index, ..) in &due {
+            self.slots.remove(index);
+        }
+        due
+    }
+}
+
+/// Slots the title wrote with a texture view that is due at once, since a
+/// pass over textures picked by index last took the due ones (`draw.rs`
+/// `heap_textures`): what a pass within the frame catches up with
+/// (`VICTORY_TEXTURE_CATCH_UP_MS`). (zm0kiemedia/Neptune_VI b900c6467.)
+pub(crate) static FRESH_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last line in the log: first uploads of textures picked by
+/// index, by the frames between the slot's write and the upload
+/// ([`age_bucket`]: 0, 1, 2, 3-5, 6-15, 16-63, more). Until the upload a
+/// shader that picks the slot reads nothing. Row 0: slots whose memory was
+/// there at every look (they waited for the queue and for the host copy
+/// alone); row 1: slots a look found unmapped (they waited for the title's
+/// own streaming too, which no queue order shortens).
+/// Ported from zm0kiemedia/Neptune_VI main b900c6467 (`QUEUE_AGE`; Traffic
+/// and imgone's Neptune); the split in two rows is ours.
+pub(crate) static QUEUE_AGE: [[std::sync::atomic::AtomicU64; 7]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 7] }; 2];
+
+/// The bucket of [`QUEUE_AGE`] for an upload `age` frames after the write.
+pub(crate) fn age_bucket(age: u64) -> usize {
+    match age {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=5 => 3,
+        6..=15 => 4,
+        16..=63 => 5,
+        _ => 6,
+    }
+}
+
+/// Of a row of [`QUEUE_AGE`]: all its uploads, and those in the same frame
+/// as the write or the one after it.
+pub(crate) fn age_shares(row: &[u64; 7]) -> (u64, u64) {
+    (row.iter().sum(), row[0] + row[1])
+}
+
+/// Whether the frame line tells of [`QUEUE_AGE`] (on unless
+/// `VICTORY_QUEUE_AGE=0`; the counting is two atomics an upload).
+pub(crate) fn queue_age_line() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_AGE").is_none_or(|v| v != "0"))
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -635,6 +797,8 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// A look found none of its memory mapped ([`TextureQueue::away`]).
+    away: bool,
 }
 
 /// Whether due texture slots are served in turns, a slot looked at before
@@ -666,7 +830,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false });
     }
 
     fn remove(&mut self, index: u32) {
@@ -839,7 +1003,24 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false });
+    }
+
+    /// A look at slot `index` found none of its memory mapped.
+    fn away(&mut self, index: u32, write: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.away = true;
+        }
+    }
+
+    /// For [`QUEUE_AGE`], asked before the pass says what it did with slot
+    /// `index`: if this upload at `frame` is the first since the slot was
+    /// written (nothing of it was uploaded before, and it is not a look
+    /// after an upload), the frames since the write, and whether a look
+    /// found its memory unmapped meanwhile.
+    fn first_upload(&self, index: u32, write: u64, frame: u64) -> Option<(u64, bool)> {
+        let w = self.slots.get(&index).filter(|w| w.write == write)?;
+        (w.mapped == 0 && w.checked.2 == 0).then(|| (frame.saturating_sub(w.written), w.away))
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1256,6 +1437,7 @@ impl HostHeap {
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
+            kept_past: Mutex::default(),
             tabled: (0..if sampler { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1614,6 +1796,30 @@ impl HostHeap {
         }
     }
 
+    /// The texture of title slot `index` (as handed out with `write`) is on
+    /// the card, whole or in part: counted in [`QUEUE_AGE`] if that is the
+    /// first time since the slot was written. Called before
+    /// [`HostHeap::texture_slot_done`] or [`HostHeap::texture_slot_recheck`]
+    /// say what becomes of the slot.
+    pub(crate) fn texture_slot_uploaded(&self, index: u32, write: u64, frame: u64) {
+        {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((age, away)) = textures.first_upload(index, write, frame) {
+                QUEUE_AGE[usize::from(away)][age_bucket(age)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // Up to date: no longer one that shows a texture past its view.
+        if stale_keep().is_some() && self.kept_past.lock().unwrap_or_else(|e| e.into_inner()).forget(index) {
+            STALE_KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A look at title slot `index` found none of its memory mapped: see
+    /// [`TextureQueue::away`].
+    pub(crate) fn texture_slot_away(&self, index: u32, write: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).away(index, write);
+    }
+
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn texture_slot_recheck(
@@ -1730,9 +1936,78 @@ impl HostHeap {
         {
             return false;
         }
+        // With `VICTORY_STALE_KEEP_MS`: it goes on showing its host copy
+        // for a while, until its memory is back and uploaded.
+        if self.kept_on(&made, index, false) {
+            return false;
+        }
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Title slot `index` shows a texture and would be made null (`made`
+    /// locked; `rewritten`: the title wrote it with a view of another
+    /// texture): whether it goes on showing it instead ([`stale_keep`]).
+    fn kept_on(&self, made: &Made, index: u32, rewritten: bool) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(max) = stale_keep() else {
+            return false;
+        };
+        let Some(host) = made.host(index) else {
+            return false;
+        };
+        let key = made.keys.get(host as usize).copied().unwrap_or(0);
+        let mut kept_past = self.kept_past.lock().unwrap_or_else(|e| e.into_inner());
+        let shows = key != 0
+            && CARD_ROOM.load(Relaxed)
+            && view_at(key as u32, (key >> 32) as u32).as_ref().is_some_and(is_texture_view)
+            && self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(host as usize).is_some_and(Option::is_some);
+        if !shows {
+            kept_past.forget(index);
+            return false;
+        }
+        let (keep, first) = kept_past.keep(index, key, crate::host::now_ms(), max, rewritten);
+        if keep && first {
+            STALE_KEPT[0].fetch_add(1, Relaxed);
+        }
+        keep
+    }
+
+    /// Makes the kept slots null whose time is up, or all of them when the
+    /// card has no `room` ([`stale_keep`]): once a texture pass.
+    pub(crate) fn stale_expire(&self, room: bool) {
+        let Some(max) = stale_keep() else {
+            return;
+        };
+        if self.kept_past.lock().unwrap_or_else(|e| e.into_inner()).slots.is_empty() {
+            return;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let due = self.kept_past.lock().unwrap_or_else(|e| e.into_inner()).expired(crate::host::now_ms(), max, !room);
+        for (index, key, rewritten) in due {
+            // Made again since, or made null: not this entry's.
+            let shown = made.host(index).and_then(|host| made.keys.get(host as usize).copied());
+            if shown != Some(key) {
+                continue;
+            }
+            // A slot that shows its own view's texture, whose memory is
+            // back: nothing stale about it (a look that found the memory
+            // as it was uploads nothing and says nothing).
+            let back = !rewritten
+                && matches!(
+                    view_at(key as u32, (key >> 32) as u32),
+                    Some(View::Placed(false, resource, desc)) if resource[0] != 1 && {
+                        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                        let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                        crate::texture::mapped_bytes(address as *const u8, len as usize) != 0
+                    }
+                );
+            if !back {
+                self.unmake(&mut made, index);
+                STALE_KEPT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Makes title slot `index`'s host slot null again, as it is before its
@@ -1823,6 +2098,9 @@ impl HostHeap {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
             } else {
+                if !seen {
+                    FRESH_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 0
             };
             textures.written(index, frame, due, seen);
@@ -2191,13 +2469,24 @@ impl HostHeap {
             // read as nothing for as long as it waited in the queue, every
             // time it got sharper.
             let old = made.keys[host as usize];
-            if later
-                && keep_views()
-                && view_at(old as u32, (old >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
-            {
+            let same = view_at(old as u32, (old >> 32) as u32).is_some_and(|old| same_placed_texture(&old, &view));
+            if later && keep_views() && same {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
+            }
+            // And a view of another texture, with `VICTORY_STALE_KEEP_MS`:
+            // the title streams a material's texture in as a new texture at
+            // another address and writes the slot with it. The slot goes
+            // on showing the host copy it holds until the texture pass has
+            // made the new one (zm0kiemedia/Neptune_VI b900c6467).
+            if later && !same && !taken && is_texture_view(&view) && self.kept_on(&made, index, true) {
+                return Some(view);
+            }
+            if !later
+                && stale_keep().is_some()
+                && self.kept_past.lock().unwrap_or_else(|e| e.into_inner()).forget(index)
+            {
+                STALE_KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             made.keys[host as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -3374,6 +3663,97 @@ mod tests {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    /// `VICTORY_STALE_KEEP_MS`: off unless set and not 0; the cap is the
+    /// second variable's, 120 s unless said, and never less than the first.
+    #[test]
+    fn stale_keep_is_opt_in_and_capped() {
+        assert_eq!(stale_keep_from(None, None), None);
+        assert_eq!(stale_keep_from(None, Some("5000")), None);
+        assert_eq!(stale_keep_from(Some("0"), None), None);
+        assert_eq!(stale_keep_from(Some("x"), None), None);
+        assert_eq!(stale_keep_from(Some("10000"), None), Some(120_000));
+        assert_eq!(stale_keep_from(Some(" 10000 "), Some("30000")), Some(30_000));
+        assert_eq!(stale_keep_from(Some("10000"), Some("500")), Some(10_000));
+    }
+
+    /// A slot goes on showing a view from the first time it would have
+    /// been made null until the cap, or until it is made again; a slot kept
+    /// showing another view starts anew.
+    #[test]
+    fn a_slot_is_kept_past_its_view_for_a_time() {
+        let mut kept = KeptPast::default();
+        // First asked at 1,000 ms: kept, and counted once.
+        assert_eq!(kept.keep(4, 0x1_0007, 1_000, 5_000, true), (true, true));
+        assert_eq!(kept.keep(4, 0x1_0007, 3_000, 5_000, false), (true, false));
+        assert_eq!(kept.keep(4, 0x1_0007, 5_999, 5_000, false), (true, false));
+        // The cap: null, and no longer kept.
+        assert_eq!(kept.keep(4, 0x1_0007, 6_000, 5_000, false), (false, false));
+        assert!(!kept.forget(4));
+        // Made again with its new texture before the cap.
+        assert_eq!(kept.keep(5, 0x1_0008, 1_000, 5_000, true), (true, true));
+        assert!(kept.forget(5));
+        assert!(!kept.forget(5));
+        // Kept showing one view, then asked for another: from that time.
+        assert_eq!(kept.keep(6, 0x1_0001, 1_000, 5_000, false), (true, true));
+        assert_eq!(kept.keep(6, 0x2_0001, 5_500, 5_000, false), (true, true));
+        // Its memory was away; then the title wrote it with another
+        // texture's view: the same time goes on, and it counts as rewritten.
+        assert_eq!(kept.keep(6, 0x2_0001, 9_000, 5_000, true), (true, false));
+        // The pass takes out those whose time is up; all, without room.
+        assert_eq!(kept.keep(7, 0x1_0002, 9_000, 5_000, false), (true, true));
+        assert_eq!(kept.expired(10_400, 5_000, false), []);
+        assert_eq!(kept.expired(10_500, 5_000, false), [(6, 0x2_0001, true)]);
+        assert_eq!(kept.expired(10_500, 5_000, true), [(7, 0x1_0002, false)]);
+        assert!(kept.slots.is_empty());
+    }
+
+    /// The age histogram's buckets: 0, 1, 2, 3-5, 6-15, 16-63, more.
+    #[test]
+    fn upload_ages_fall_into_the_histograms_buckets() {
+        let buckets: Vec<usize> = [0, 1, 2, 3, 5, 6, 15, 16, 63, 64, u64::MAX].map(age_bucket).to_vec();
+        assert_eq!(buckets, [0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6]);
+        assert_eq!(QUEUE_AGE.len(), 2);
+        assert!(QUEUE_AGE.iter().all(|row| row.len() == 7));
+        // All of a row, and the part within one frame of the write.
+        assert_eq!(age_shares(&[5, 3, 2, 1, 0, 0, 9]), (20, 8));
+        assert_eq!(age_shares(&[0; 7]), (0, 0));
+    }
+
+    /// Only the first upload since a slot's write is counted, with the
+    /// frames since that write, and apart if a look found its memory away.
+    #[test]
+    fn the_first_upload_after_a_write_has_an_age() {
+        let mut q = TextureQueue::default();
+        q.written(7, 10, 0, false);
+        q.written(8, 10, 0, false);
+        q.written(9, 10, 0, false);
+        let write = |q: &TextureQueue, index: u32| q.slots[&index].write;
+        let (w7, w8, w9) = (write(&q, 7), write(&q, 8), write(&q, 9));
+        // The same frame, and three frames later; not for another write.
+        assert_eq!(q.first_upload(7, w7, 10), Some((0, false)));
+        assert_eq!(q.first_upload(7, w7, 13), Some((3, false)));
+        assert_eq!(q.first_upload(7, w7 + 100, 13), None);
+        assert_eq!(q.first_upload(6, 1, 13), None);
+        // Uploaded in part: the uploads of the rest are not first ones.
+        q.partly(7, w7, 14, 4096);
+        assert_eq!(q.first_upload(7, w7, 14), None);
+        // A look found slot 8's memory unmapped; it arrives 20 frames on.
+        q.away(8, w8);
+        q.later(8, w8, 10, 4);
+        assert_eq!(q.first_upload(8, w8, 30), Some((20, true)));
+        // A wait for its host copy alone is the queue's own time.
+        q.later(9, w9, 10, 1);
+        assert_eq!(q.first_upload(9, w9, 11), Some((1, false)));
+        // Uploaded whole and looked at again: an upload then is not a first.
+        q.recheck(9, w9, 12, (0x1000, 64), 5, 0, 11);
+        assert_eq!(q.first_upload(9, w9, 12), None);
+        // Written again (or its memory changed): counted from that write.
+        q.written(7, 20, 0, false);
+        assert_eq!(q.first_upload(7, write(&q, 7), 22), Some((2, false)));
+        q.changed(8, 40, 41);
+        assert_eq!(q.first_upload(8, write(&q, 8), 41), Some((1, false)));
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();

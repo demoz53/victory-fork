@@ -108,6 +108,12 @@ impl Heap {
         (index < self.desc.count).then(|| self.start + u64::from(index) * step)
     }
 
+    /// How many descriptors the heap holds.
+    #[cfg(windows)]
+    pub(crate) fn count(&self) -> u32 {
+        self.desc.count
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);

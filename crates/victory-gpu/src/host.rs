@@ -143,13 +143,59 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         return NORMAL_MS;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
+    let [normal, moderate, high] = vram_idle_times([NORMAL_MS, MODERATE_MS, HIGH_MS]);
     if used_pct >= 85 {
-        HIGH_MS
+        high
     } else if used_pct >= 75 {
-        MODERATE_MS
+        moderate
     } else {
-        NORMAL_MS
+        normal
     }
+}
+
+/// `VICTORY_VRAM_IDLE_MS=<normal>[,<moderate>[,<high>]]`: other idle times
+/// than `usual` for [`vram_idle_ms`] (Neptune runs "15000,2500,1000"). A
+/// host copy let go after five seconds out of sight is made and uploaded
+/// again when the camera turns back, through the texture queue: black until
+/// then. Unset: the usual times, as before.
+///
+/// This and `VICTORY_TEXTURE_KEEP=1` (`resource::texture_keep_ms`,
+/// [`vram_keep`]) answer the same question, how long an idle host copy of a
+/// texture stays, and only one of them is asked (`resource::let_go_idle`):
+/// with `VICTORY_TEXTURE_KEEP=1` that one, which goes by the card's room,
+/// and these times are not used; without it, these.
+///
+/// Ported from zm0kiemedia/Neptune_VI main b900c6467 `vram_idle_times`
+/// (GPL-3.0-or-later; Traffic and imgone's Neptune). Its
+/// `vram_idle_ms_by_room` (the normal time for as long as the queue has
+/// room) is not ported: `VICTORY_TEXTURE_KEEP=1` is that rule here.
+fn vram_idle_times(usual: [u64; 3]) -> [u64; 3] {
+    static TIMES: OnceLock<[u64; 3]> = OnceLock::new();
+    *TIMES.get_or_init(|| {
+        let value = std::env::var("VICTORY_VRAM_IDLE_MS").ok();
+        let times = vram_idle_times_from(value.as_deref(), usual);
+        if times != usual {
+            tracing::info!(
+                ?times,
+                "idle host copies of textures are let go after these milliseconds, by the card's memory in use: under 75 %, \
+                 75-85 %, more (VICTORY_VRAM_IDLE_MS; not used with VICTORY_TEXTURE_KEEP=1)"
+            );
+        }
+        times
+    })
+}
+
+/// [`vram_idle_times`] from the variable's value: a time that is missing or
+/// no number stays the usual one, and none is shorter than the shortest
+/// usual one (what protects a handle not yet recorded into a list or slot).
+fn vram_idle_times_from(value: Option<&str>, usual: [u64; 3]) -> [u64; 3] {
+    let mut times = usual;
+    for (to, part) in times.iter_mut().zip(value.unwrap_or("").split(',')) {
+        if let Ok(ms) = part.trim().parse::<u64>() {
+            *to = ms.max(usual[2]);
+        }
+    }
+    times
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -8791,6 +8837,60 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                if crate::material_demand::enabled() {
+                    let [read, named, ahead, passes] =
+                        crate::material_demand::SEEN.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    tracing::info!(
+                        "material records, since the start: {read} read when their draw was bound, {named} of them named \
+                         textures that were due, {ahead} slots went ahead in {passes} texture passes \
+                         (VICTORY_MATERIAL_TEXTURE_DEMAND=1)"
+                    );
+                }
+                let [kept, nulled, again] =
+                    crate::descriptor::host::STALE_KEPT.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if kept + nulled + again != 0 {
+                    tracing::info!(
+                        "slots that would have been made null, since the last line: {kept} went on showing their texture \
+                         (VICTORY_STALE_KEEP_MS), {again} kept ones were made again with their new texture, {nulled} were \
+                         made null at the cap or to make room (VICTORY_STALE_KEEP_MAX_MS)"
+                    );
+                }
+                let [catch_ups, catch_up_micros] =
+                    crate::draw::CATCH_UPS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if catch_ups != 0 {
+                    tracing::info!(
+                        "textures picked by index: {:.1} passes a frame caught up with slots written since the last pass, \
+                         {:.2} ms a frame (VICTORY_TEXTURE_CATCH_UP_MS)",
+                        catch_ups as f64 / frames,
+                        catch_up_micros as f64 / 1e3 / frames
+                    );
+                }
+                // How long after its slot was written a texture was there
+                // (zm0kiemedia/Neptune_VI b900c6467's QUEUE_AGE line).
+                let ages = crate::descriptor::host::QUEUE_AGE
+                    .each_ref()
+                    .map(|row| row.each_ref().map(|a| a.swap(0, Ordering::Relaxed)));
+                if crate::descriptor::host::queue_age_line() && ages.iter().flatten().any(|&n| n != 0) {
+                    // Since the start, for one number a run: the uploads of
+                    // each row, and those within one frame of the write.
+                    static SO_FAR: [[std::sync::atomic::AtomicU64; 2]; 2] =
+                        [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 2];
+                    let [ours, theirs] = ages;
+                    let so_far = |i: usize, row: &[u64; 7]| {
+                        let (all, soon) = crate::descriptor::host::age_shares(row);
+                        let all = SO_FAR[i][0].fetch_add(all, Ordering::Relaxed) + all;
+                        let soon = SO_FAR[i][1].fetch_add(soon, Ordering::Relaxed) + soon;
+                        (all, if all == 0 { 100.0 } else { soon as f64 * 100.0 / all as f64 })
+                    };
+                    let ((all_ours, soon_ours), (all_theirs, soon_theirs)) = (so_far(0, &ours), so_far(1, &theirs));
+                    tracing::info!(
+                        "textures picked by index, first uploads since the last line, by the frames after their slot was \
+                         written (same frame, 1, 2, 3-5, 6-15, 16-63, more): {ours:?} with their memory there at every look, \
+                         {theirs:?} after a look that found it unmapped; since the start {all_ours} and {all_theirs} uploads, \
+                         {soon_ours:.1} % and {soon_theirs:.1} % of them within one frame of the write (VICTORY_QUEUE_AGE=0: no \
+                         line)"
+                    );
+                }
             }
             #[cfg(feature = "diagnostics")]
             {
@@ -9986,6 +10086,20 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    /// `VICTORY_VRAM_IDLE_MS`: unset, the usual times; each time given
+    /// replaces its own, and none goes under the shortest usual one.
+    #[test]
+    fn vram_idle_times_are_the_usual_ones_unless_said() {
+        use super::vram_idle_times_from;
+        let usual = [5_000, 2_500, 1_000];
+        assert_eq!(vram_idle_times_from(None, usual), usual);
+        assert_eq!(vram_idle_times_from(Some(""), usual), usual);
+        assert_eq!(vram_idle_times_from(Some("15000,2500,1000"), usual), [15_000, 2_500, 1_000]);
+        assert_eq!(vram_idle_times_from(Some(" 15000 "), usual), [15_000, 2_500, 1_000]);
+        assert_eq!(vram_idle_times_from(Some("x, 4000"), usual), [5_000, 4_000, 1_000]);
+        assert_eq!(vram_idle_times_from(Some("0,10,20,99999"), usual), [1_000, 1_000, 1_000]);
     }
 
     #[test]
