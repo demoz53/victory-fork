@@ -140,13 +140,59 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         return NORMAL_MS;
     }
     let used_pct = (u128::from(used) * 100) / u128::from(budget);
+    let [normal, moderate, high] = vram_idle_times([NORMAL_MS, MODERATE_MS, HIGH_MS]);
     if used_pct >= 85 {
-        HIGH_MS
+        high
     } else if used_pct >= 75 {
-        MODERATE_MS
+        moderate
     } else {
-        NORMAL_MS
+        normal
     }
+}
+
+/// `VICTORY_VRAM_IDLE_MS=<normal>[,<moderate>[,<high>]]`: other idle times
+/// than `usual` for [`vram_idle_ms`] (Neptune runs "15000,2500,1000"). A
+/// host copy let go after five seconds out of sight is made and uploaded
+/// again when the camera turns back, through the texture queue: black until
+/// then. Unset: the usual times, as before.
+///
+/// This and `VICTORY_TEXTURE_KEEP=1` (`resource::texture_keep_ms`,
+/// [`vram_keep`]) answer the same question, how long an idle host copy of a
+/// texture stays, and only one of them is asked (`resource::let_go_idle`):
+/// with `VICTORY_TEXTURE_KEEP=1` that one, which goes by the card's room,
+/// and these times are not used; without it, these.
+///
+/// Ported from zm0kiemedia/Neptune_VI main b900c6467 `vram_idle_times`
+/// (GPL-3.0-or-later; Traffic and imgone's Neptune). Its
+/// `vram_idle_ms_by_room` (the normal time for as long as the queue has
+/// room) is not ported: `VICTORY_TEXTURE_KEEP=1` is that rule here.
+fn vram_idle_times(usual: [u64; 3]) -> [u64; 3] {
+    static TIMES: OnceLock<[u64; 3]> = OnceLock::new();
+    *TIMES.get_or_init(|| {
+        let value = std::env::var("VICTORY_VRAM_IDLE_MS").ok();
+        let times = vram_idle_times_from(value.as_deref(), usual);
+        if times != usual {
+            tracing::info!(
+                ?times,
+                "idle host copies of textures are let go after these milliseconds, by the card's memory in use: under 75 %, \
+                 75-85 %, more (VICTORY_VRAM_IDLE_MS; not used with VICTORY_TEXTURE_KEEP=1)"
+            );
+        }
+        times
+    })
+}
+
+/// [`vram_idle_times`] from the variable's value: a time that is missing or
+/// no number stays the usual one, and none is shorter than the shortest
+/// usual one (what protects a handle not yet recorded into a list or slot).
+fn vram_idle_times_from(value: Option<&str>, usual: [u64; 3]) -> [u64; 3] {
+    let mut times = usual;
+    for (to, part) in times.iter_mut().zip(value.unwrap_or("").split(',')) {
+        if let Ok(ms) = part.trim().parse::<u64>() {
+            *to = ms.max(usual[2]);
+        }
+    }
+    times
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -9792,6 +9838,20 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    /// `VICTORY_VRAM_IDLE_MS`: unset, the usual times; each time given
+    /// replaces its own, and none goes under the shortest usual one.
+    #[test]
+    fn vram_idle_times_are_the_usual_ones_unless_said() {
+        use super::vram_idle_times_from;
+        let usual = [5_000, 2_500, 1_000];
+        assert_eq!(vram_idle_times_from(None, usual), usual);
+        assert_eq!(vram_idle_times_from(Some(""), usual), usual);
+        assert_eq!(vram_idle_times_from(Some("15000,2500,1000"), usual), [15_000, 2_500, 1_000]);
+        assert_eq!(vram_idle_times_from(Some(" 15000 "), usual), [15_000, 2_500, 1_000]);
+        assert_eq!(vram_idle_times_from(Some("x, 4000"), usual), [5_000, 4_000, 1_000]);
+        assert_eq!(vram_idle_times_from(Some("0,10,20,99999"), usual), [1_000, 1_000, 1_000]);
     }
 
     #[test]
