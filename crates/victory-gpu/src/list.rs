@@ -2286,18 +2286,8 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
             None
         };
         if let Some(groups) = read
-            && let Some(named) = named_targets(groups)
+            && record_named(list, groups)
         {
-            for texture in &named {
-                list.keep(texture);
-            }
-            let barriers: Vec<D3D12_RESOURCE_BARRIER> =
-                named.iter().map(crate::indirect::resource_uav_barrier).collect();
-            if !barriers.is_empty() {
-                // SAFETY: an open list; textures the list keeps.
-                unsafe { list.list.ResourceBarrier(&barriers) };
-            }
-            crate::waitstat::scoped(crate::waitstat::Cause::Groups, barriers.len() as u64);
             return;
         }
         // SAFETY: the same layout; no resource named.
@@ -2344,11 +2334,39 @@ fn barrier_groups_named() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_GROUPS").is_some_and(|v| v == "1"))
 }
 
+/// [`barrier_groups`] with `VICTORY_BARRIER_GROUPS=1`: records the
+/// barriers on the textures `groups` name ([`named_targets`]) into
+/// `list`, and says so; false, with nothing recorded, if a barrier on every
+/// write is due instead (counted as a fall-back with `VICTORY_WAIT_STATS`).
+#[cfg(windows)]
+fn record_named(list: &crate::host::HostList, groups: &[BarrierGroup]) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    let Some(named) = named_targets(groups) else {
+        crate::waitstat::group_fell_back();
+        return false;
+    };
+    for texture in &named {
+        list.keep(texture);
+    }
+    let barriers: Vec<D3D12_RESOURCE_BARRIER> = named.iter().map(crate::indirect::resource_uav_barrier).collect();
+    if !barriers.is_empty() {
+        // SAFETY: an open list; textures the list keeps, each made for
+        // unordered access.
+        unsafe { list.list.ResourceBarrier(&barriers) };
+    }
+    crate::waitstat::scoped(crate::waitstat::Cause::Groups, barriers.len() as u64);
+    true
+}
+
 /// The host textures the barriers of `groups` that order shader writes
 /// name, once each; `None` if one of those is not a texture with a host
-/// copy (then a barrier on every write is due).
+/// copy made for unordered access (then a barrier on every write is due).
+/// A barrier on a resource made without `ALLOW_UNORDERED_ACCESS` (a render
+/// target's or depth texture's host copy) is refused: the list then fails
+/// to close (0x80070057, "Missing resource bind flags").
 #[cfg(windows)]
 fn named_targets(groups: &[BarrierGroup]) -> Option<Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     use windows::core::Interface;
     const TEXTURE: u32 = 1;
     let mut named: Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = Vec::new();
@@ -2359,6 +2377,10 @@ fn named_targets(groups: &[BarrierGroup]) -> Option<Vec<windows::Win32::Graphics
                 return None;
             }
             for texture in crate::resource::uav_targets(resource)? {
+                // SAFETY: a live resource.
+                if !unsafe { texture.GetDesc() }.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+                    return None;
+                }
                 if !named.iter().any(|n| n.as_raw() == texture.as_raw()) {
                     named.push(texture);
                 }
@@ -2789,6 +2811,102 @@ mod tests {
         assert!(unsafe { read_groups(1, odd.as_ptr().cast()) }.is_none());
         // SAFETY: a null pointer is refused before it is read.
         assert!(unsafe { read_groups(1, std::ptr::null()) }.is_none());
+    }
+
+    /// `VICTORY_BARRIER_GROUPS=1` on the host: a group naming a texture whose
+    /// host copy was not made for unordered access (a render target's) falls
+    /// back to the full wait and records no barrier on it (the runtime
+    /// refused such a barrier at Close, 0x80070057, "Missing resource bind
+    /// flags"); one naming only a texture made for it gets its barrier; the
+    /// list closes and runs either way.
+    #[test]
+    fn named_group_barriers_only_on_textures_made_for_unordered_access() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAGS,
+            D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let resource_iid =
+            crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let make_tex = |flags: D3D12_RESOURCE_FLAGS| -> This {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 16,
+                Height: 16,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: flags,
+            };
+            let mut out = null;
+            let hr = crate::resource::create_committed(
+                null,
+                (&raw const props).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut out,
+            );
+            assert_eq!(hr, S_OK);
+            out
+        };
+        let unordered = make_tex(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        let target = make_tex(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        let host_unordered = crate::resource::host_copy(unordered).expect("host copy");
+        let host_target = crate::resource::host_copy(target).expect("host copy");
+        // SAFETY: live resources.
+        let flags = |t: &crate::resource::HostTexture| unsafe { t.texture.GetDesc() }.Flags;
+        assert!(flags(&host_unordered).contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+        assert!(!flags(&host_target).contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let hlist = host_list(list).expect("host list");
+
+        let sync = BarrierSync { sync_before: 0x1, sync_after: 0x1, access_before: 0x10, access_after: 0x80 };
+        let on = |resource: This| TextureBarrier {
+            sync,
+            layout_before: 3,
+            layout_after: 6,
+            resource,
+            subresources: [0; 6],
+            flags: 0,
+        };
+        let both = [on(unordered), on(target)];
+        let one = [on(unordered)];
+        let groups_both = [BarrierGroup { kind: 1, count: 2, barriers: both.as_ptr().cast() }];
+        let groups_one = [BarrierGroup { kind: 1, count: 1, barriers: one.as_ptr().cast() }];
+        assert!(named_targets(&groups_both).is_none(), "the render target's copy takes no such barrier");
+        assert!(!record_named(hlist, &groups_both));
+        // What the call then records: the full wait.
+        barrier_groups(list, 1, groups_both.as_ptr().cast());
+        let named = named_targets(&groups_one).expect("a texture made for unordered access");
+        assert_eq!(named.len(), 1);
+        assert!(record_named(hlist, &groups_one));
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        drop((host_unordered, host_target, named));
+        assert_eq!(release(unordered), 0);
+        assert_eq!(release(target), 0);
+        assert_eq!(close(list), S_OK, "the list closes: no barrier its resources refuse");
+        host.execute(&[hlist]);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 
     /// Upstream #2604: memory that cannot be read meets a wait only by
