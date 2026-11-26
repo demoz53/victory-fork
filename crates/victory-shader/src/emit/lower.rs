@@ -385,6 +385,17 @@ struct Lower<'a> {
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     limit: LimitExits,
+    /// The paired form ([`paired::with_paired_lanes`]): what the lowering keeps per lane for
+    /// the other console lane of this thread, and whether the lane being lowered is the upper
+    /// one (its console lane the host lane plus 32).
+    twin: Option<Box<paired::LaneState>>,
+    upper: bool,
+    /// The paired form: whether the last LDS access of the IR block being lowered wrote (none
+    /// at its start), for the fences between accesses ([`Self::paired_inst`]).
+    lds_last: Option<bool>,
+    /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
+    /// and what is computed from them), on which no branch takes both lanes of a thread.
+    lane_scalars: HashSet<Value>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1866,7 +1877,15 @@ impl<'a> Lower<'a> {
         // host groups per console group, and the console's group ([`with_group_split`])
         let mut split = 1u32;
         let mut console_threads = [1u32; 3];
-        if let StageIo::Cs(cs) = x.native.io {
+        // the paired form ([`paired::with_paired_lanes`]): one host wave per console wave.
+        // (Ahead of the split: a program in the paired form keeps the console's group
+        // and is never split, `VICTORY_GROUP_SPLIT` or not.)
+        let pairs = paired::wanted(x.native);
+        if pairs && let StageIo::Cs(cs) = x.native.io {
+            (halves, halves_borrowed) = paired::group(&mut s, cs.threads, cs.lds_bytes() / 4);
+            console_lanes = true;
+            console_threads = cs.threads;
+        } else if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             console_threads = cs.threads;
@@ -2244,6 +2263,10 @@ impl<'a> Lower<'a> {
             limit,
             counters: HashMap::new(),
             abort: None,
+            twin: pairs.then(Box::default),
+            upper: false,
+            lds_last: None,
+            lane_scalars: if pairs { paired::lane_scalars(p, x.res) } else { HashSet::new() },
         }
     }
 
@@ -2888,6 +2911,9 @@ impl<'a> Lower<'a> {
         }
         self.find_sections();
         self.inputs()?;
+        if self.twin.is_some() {
+            self.paired_inputs()?;
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -2921,15 +2947,27 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            if self.twin.is_some() {
+                self.paired_block_phis(b);
+                self.lds_last = None;
+            }
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
-                self.inst(b, i)?;
+                if self.twin.is_some() {
+                    self.paired_inst(b, i)?;
+                } else {
+                    self.inst(b, i)?;
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                        if self.twin.is_some() {
+                            self.paired_section_inst(b, j, i);
+                        } else {
+                            self.section_inst(b, j, i);
+                        }
                     }
                     i = end;
                     continue;
@@ -2944,6 +2982,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.twin.is_some() {
+            self.paired_fill_phis()?;
+        }
         self.finish_isolated_p10_rows()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -3633,7 +3674,8 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        let whole = self.twin.is_some()
+            || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
@@ -3649,6 +3691,12 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
+                if self.twin.is_some() {
+                    // (the paired form: the lower lanes' ballot, then the upper lanes')
+                    let xy = self.paired_ballot(lo, m, at)?;
+                    self.ballots.insert(lo, xy);
+                    return Ok(if high { xy.1 } else { xy.0 });
+                }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
@@ -4301,7 +4349,8 @@ impl<'a> Lower<'a> {
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        let k32 = self.s.m.i32(32);
+        // (the paired form: a host wave takes a whole console wave, 64 threads)
+        let k32 = self.s.m.i32(if self.twin.is_some() { 64 } else { 32 });
         let add = self.s.m.select(e, first, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
@@ -4320,6 +4369,9 @@ impl<'a> Lower<'a> {
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        if self.twin.is_some() {
+            return self.paired_thread(lane);
+        }
         if let Some(base) = self.wave_base() {
             return self.s.m.bin(e, Bin::Add, base, lane);
         }
@@ -4334,7 +4386,7 @@ impl<'a> Lower<'a> {
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
     /// wave holds a 32-aligned run of console lanes. Without `exchange`: the host lane.
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() {
+        if self.exchange.is_none() && self.twin.is_none() {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -4429,6 +4481,9 @@ impl<'a> Lower<'a> {
     /// exchange theirs, which needs every lane there.
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
+        if self.twin.is_some() {
+            return self.paired_scc_some(scc, m);
+        }
         // (not for a console wave cut into host waves that do not exchange)
         if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
             return Err(LANE_MASK);
@@ -4463,6 +4518,9 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
+        if self.twin.is_some() {
+            return self.paired_wave_wide(when, any);
+        }
         if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
@@ -4565,7 +4623,7 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() {
+        let lane = if self.exchange.is_some() || self.twin.is_some() {
             self.console_lane()
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
@@ -4910,8 +4968,17 @@ impl<'a> Lower<'a> {
         if !self.console_lanes && self.split <= 1 {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        // (split: the id in the console's group, which the host's group is one wave of)
-        let [x, y, _] = if self.split > 1 { self.console_threads } else { self.s.threads.expect("compute") };
+        // (split: the id in the console's group, which the host's group is one wave of;
+        // the paired form: of the console lane being lowered, in the console's group; the
+        // host's is a row of half as many threads)
+        let [x, y, _] = if self.split > 1 {
+            self.console_threads
+        } else {
+            match self.x.native.io {
+                StageIo::Cs(cs) if self.twin.is_some() => cs.threads,
+                _ => self.s.threads.expect("compute"),
+            }
+        };
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         if !self.console_lanes {
@@ -4929,7 +4996,7 @@ impl<'a> Lower<'a> {
                 _ => self.s.m.bin(e, Bin::UDiv, f, xy),
             });
         }
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.twin.is_some() {
             let f = self.console_thread();
             let f = self.split_thread(f);
             self.s.flags |= flags::WAVE_OPS;
@@ -6937,6 +7004,11 @@ impl<'a> Lower<'a> {
                 self.x.p.blocks[b].insts.iter().any(writes)
             });
             if per_lane {
+                // (the paired form: the wave's first lane is a lower one, whichever lane of
+                // the thread is being lowered)
+                if self.twin.is_some() {
+                    d = self.both(|l| l.i32_of(value))?[0];
+                }
                 self.s.flags |= flags::WAVE_OPS;
                 let i32t = self.s.t.i32;
                 d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
@@ -7843,6 +7915,10 @@ impl<'a> Lower<'a> {
                 let clear = self.lane_heap_index(b, sampler)?;
                 Ok(self.s.m.select(self.cur, cond, set, clear))
             }
+            // (in the paired form a thread comes the wave's way, not each lane its own)
+            Source::LanePhi { .. } if self.twin.is_some() => {
+                Err("a per-lane descriptor chosen by the lanes' ways, in paired lanes")
+            }
             Source::LanePhi { block, args } => {
                 // Each predecessor computes its heap index at its end (what
                 // it reads is there: the dwords are, on that edge); the join
@@ -8200,7 +8276,9 @@ impl<'a> Lower<'a> {
         if let Some((rows, banks)) = masks {
             // Row (16 lanes) and bank (4 lanes of a row) write masks.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            // (in the paired form rows 2 and 3 are the upper lanes')
+            let row_lane = if self.twin.is_some() { self.console_lane() } else { lane };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
@@ -11619,6 +11697,11 @@ impl<'a> Lower<'a> {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
+                    // (the paired form: a branch the wave does not take together must be one
+                    // that both lanes of every thread take the same way)
+                    _ if self.twin.is_some() && self.lanes_apart(when) => {
+                        return Err(unsupported(offset, paired::APART));
+                    }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
@@ -11955,6 +12038,10 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 /// Lowering of the memory instructions: image, buffer, scalar and flat loads and stores
 mod memory;
+
+/// The paired form of console wave64 compute programs on hosts of 32-lane waves.
+mod paired;
+pub(super) use paired::with_paired_lanes;
 
 #[cfg(test)]
 mod tests;

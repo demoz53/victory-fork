@@ -376,13 +376,35 @@ pub(crate) fn host_shader_from_group(container: &[u8], base: u32) -> Result<Host
             // any, gets there)
             let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
             let wide_first = emit::wave_wide_first(Some(&hash)) && emit::wave64_retried(container);
-            let key = group_key(&wide_first_key(&program_key(&build().0, off), wide_first), base);
+            // (`VICTORY_WAVE_PAIRS` and its lists: the answer for this program, when it is
+            // one the paired form can matter for)
+            let pairs = match emit::wave_pairs_for(Some(&hash)) {
+                emit::WavePairs::Off => emit::WavePairs::Off,
+                mode if emit::wave64_retried(container) => mode,
+                _ => emit::WavePairs::Off,
+            };
+            let key = pairs_key(&group_key(&wide_first_key(&program_key(&build().0, off), wide_first), base), pairs);
             // (inside `with_shader_opt`, when `pipeline.rs` gives this program its own passes)
             let key = opt_key(&key, emit::shader_opt(), emit::run_shader_opt());
             cached(cache, &key, emit::host_uses_wave32(), container, translate)
         }
         None => translate(container),
     }
+}
+
+/// `key` mixed with the program's answer to `VICTORY_WAVE_PAIRS`
+/// (`victory_shader::emit::wave_pairs_for`) when the paired form is tried for
+/// it; as it is otherwise, so the switch and its lists are in no key.
+fn pairs_key(key: &[u8; 32], pairs: victory_shader::emit::WavePairs) -> [u8; 32] {
+    let how: &[u8] = match pairs {
+        victory_shader::emit::WavePairs::Off => return *key,
+        victory_shader::emit::WavePairs::BeforeWide => b"VICTORY_WAVE_PAIRS=1 for this program",
+        victory_shader::emit::WavePairs::First => b"VICTORY_WAVE_PAIRS=first for this program",
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(key);
+    h.update(how);
+    *h.finalize().as_bytes()
 }
 
 /// `key` mixed with the per-program decision of `VICTORY_WAVE_WIDE_FIRST`
@@ -1009,10 +1031,15 @@ mod tests {
         ];
         // In each program's key by what they decide for it (`program_key`,
         // `wide_first_key`).
-        const PER_PROGRAM: [&str; 3] = [
+        const PER_PROGRAM: [&str; 6] = [
             "VICTORY_WAVE_DEEP_SKIPS_NOT",
             "VICTORY_WAVE_DEEP_SKIPS_ONLY",
             "VICTORY_WAVE_WIDE_FIRST",
+            // (test/pairs: the paired form and its lists, by each program's
+            // answer, `pairs_key`)
+            "VICTORY_WAVE_PAIRS",
+            "VICTORY_WAVE_PAIRS_NOT",
+            "VICTORY_WAVE_PAIRS_ONLY",
         ];
         // Not part of a translation: lines printed and files dumped beside
         // it, the validator and the host device of the offline checks, and

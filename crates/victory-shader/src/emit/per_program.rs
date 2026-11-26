@@ -102,7 +102,7 @@ pub fn wave_wide_first(hash: Option<&str>) -> bool {
 /// or white space, each with or without the `#` the offline listing puts
 /// before it, in lower case and cut to the 16 digits a hash has. Pure, for
 /// testing.
-fn parse_hash_list(value: &str) -> Vec<String> {
+pub(super) fn parse_hash_list(value: &str) -> Vec<String> {
     value
         .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .map(|h| h.trim_start_matches('#').to_ascii_lowercase())
@@ -121,7 +121,7 @@ fn listed(list: &[String], hash: Option<&str>) -> bool {
 }
 
 /// [`deep_skips_allowed`] on the switches' values. Pure, for testing.
-fn decide(on: bool, not: Option<&[String]>, only: Option<&[String]>, hash: Option<&str>) -> bool {
+pub(super) fn decide(on: bool, not: Option<&[String]>, only: Option<&[String]>, hash: Option<&str>) -> bool {
     on && !not.is_some_and(|l| listed(l, hash)) && only.is_none_or(|l| listed(l, hash))
 }
 
