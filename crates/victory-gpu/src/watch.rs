@@ -963,7 +963,7 @@ fn writes_as(
     // for it ([`settle`]), the blocks made read-only first (an asking in
     // flight may be waiting for them in the guards).
     let overlapping = j.flying.iter().any(|&(a, b, _)| a < last && first < b);
-    if !overlapping {
+    if !overlapping && arming.0.is_empty() {
         let answer = (
             now,
             j.written
@@ -972,13 +972,41 @@ fn writes_as(
                 .collect(),
         );
         drop(held);
-        // Read-only before the caller reads the blocks.
-        arming.finish(failed && light != 0);
         return Some(answer);
     }
+    // Blocks made read-only outside the locks ([`guard_outside`]): until
+    // they are, a write to them lands with no fault, and an answer from the
+    // standing asking given meanwhile, under a number [`wrote`] raised
+    // above this asking's, may have taken a block before such a write and
+    // be told nothing more. Once they stand, they are noted again under a
+    // number above every one given so far (review finding, test/watch5),
+    // and this asking answers under it (its copy reads them after now).
+    let armed: Vec<usize> =
+        arming.0.iter().flat_map(|&(from, to)| from * BLOCK / PAGE..to * BLOCK / PAGE).collect();
     drop(held);
-    arming.finish(failed && light != 0);
-    let held = settle(journal(), first, last);
+    #[cfg(test)]
+    if !armed.is_empty()
+        && let Some(hook) = BEFORE_FINISH.with(|h| h.take())
+    {
+        hook();
+    }
+    arming.finish(false);
+    let mut held = journal();
+    if overlapping {
+        held = settle(held, first, last);
+    }
+    let mut now = now;
+    if !armed.is_empty() {
+        let j = &mut *held;
+        j.asked += 1;
+        now = j.asked;
+        for &page in &armed {
+            note_written(j, page, now, ALL_PIECES);
+        }
+        if failed && light != 0 {
+            publish(j, &armed);
+        }
+    }
     Some((now, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -2155,6 +2183,13 @@ fn protect_walk(g: &mut Guards, from: usize, to: usize, later: Option<&mut Vec<(
     g.clean.extend(from..to);
     g.arming.extend(from..to);
     later.push((from, to));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: called once by the next locked asking on this thread between
+    /// letting the journal go and making its armed blocks read-only.
+    static BEFORE_FINISH: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
 /// Signalled, under the guards' lock, when an asking's blocks are made
@@ -4351,6 +4386,64 @@ pub(crate) mod tests {
         for p in [one, two, v2, w2] {
             forget_pages(p, p + SIZE);
         }
+    }
+
+    /// `VICTORY_GUARD_OUTSIDE` without `VICTORY_JOURNAL_UNLOCKED`: a block
+    /// the journal heard of before it was read-only again, a standing
+    /// answer under a number raised above that ([`wrote`]) taking it in
+    /// that moment, and a write landing unfaulted: once the block stands it
+    /// is noted above that answer's number, so that copy takes it again.
+    #[test]
+    fn an_armed_block_is_noted_again_once_it_stands() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        static AT: AtomicUsize = AtomicUsize::new(0);
+        static RAISED: AtomicU64 = AtomicU64::new(0);
+        let _turn = light_turn();
+        const SIZE: usize = 2 * BLOCK;
+        // SAFETY: a pagefile section of two blocks, mapped read-write, told
+        // of no other view.
+        let (section, view) = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize)
+        };
+        assert_ne!(view, 0);
+        mapped(view, SIZE);
+        forget_pages(view, view + SIZE);
+        GUARD_OUTSIDE_TEST.store(2, Ordering::Relaxed);
+        assert!(writes_as(view, view + SIZE, true, 0, false, false).is_some());
+        // SAFETY: inside the view; the write faults and opens the block.
+        unsafe { (view as *mut u64).write_volatile(1) };
+        AT.store(view, Ordering::SeqCst);
+        fn meanwhile() {
+            let mut j = journal();
+            j.asked += 1;
+            j.ahead_asked = j.asked;
+            RAISED.store(j.asked, Ordering::SeqCst);
+            drop(j);
+            // The block is not read-only yet: no fault.
+            // SAFETY: inside the test's view.
+            unsafe { (AT.load(Ordering::SeqCst) as *mut u64).write_volatile(2) };
+        }
+        BEFORE_FINISH.with(|h| h.set(Some(meanwhile)));
+        assert!(writes_as(view, view + SIZE, true, 0, false, false).is_some());
+        let hooked = BEFORE_FINISH.with(|h| h.take()).is_none();
+        GUARD_OUTSIDE_TEST.store(0, Ordering::Relaxed);
+        let stamp = journal().written.get(&(view / PAGE)).copied().unwrap_or(0);
+        title_memory_remapped(view, SIZE);
+        // SAFETY: our view and section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        forget_pages(view, view + SIZE);
+        assert!(hooked, "the block was armed outside the locks");
+        let raised = RAISED.load(Ordering::SeqCst);
+        assert!(stamp > raised, "noted at {stamp}, a standing answer took it at {raised}");
     }
 
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
