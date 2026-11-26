@@ -6709,6 +6709,12 @@ impl Host {
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             let textures = ask_textures();
+            // With `VICTORY_ASK_ONCE_VIEWS`: each refreshed range as its
+            // refresh asks (cut to its copy), for the view memory the
+            // spans' asking cannot take in (`crate::watch::views_once`;
+            // fxceless PR #995, tunczzz).
+            let views = crate::watch::views_once();
+            let mut exact: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
@@ -6718,6 +6724,9 @@ impl Host {
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
                             .or_insert((*address, *address + *len));
                         *span = (span.0.min(*address), span.1.max(*address + *len));
+                        if views && let Some(range) = shadow.refreshed(*address, *len) {
+                            exact.push(range);
+                        }
                     }
                     // The textures checked at their steps too, those whose
                     // memory is write-watched (`ask_textures`).
@@ -6731,6 +6740,7 @@ impl Host {
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
+            crate::watch::ask_once_views(&exact);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -6740,6 +6750,7 @@ impl Host {
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
+                crate::watch::ask_once_views(&exact);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
@@ -9894,6 +9905,14 @@ impl Meter {
                     n(0),
                     ms(0),
                 );
+                // `VICTORY_LIGHT_REFRESH`: the askings it answered without
+                // the guards (they are not among those above).
+                if let Some(line) = crate::watch::light_line(frames) {
+                    tracing::info!("{line}");
+                }
+                // `VICTORY_JOURNAL_UNLOCKED`: the journal's lock as the
+                // askings take it, with the switch or without.
+                tracing::info!("{}", crate::watch::journal_line(frames));
             }
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
