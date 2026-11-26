@@ -21,8 +21,10 @@ pub enum Mode {
     /// approximate form. The wave-wide form stays the last resort.
     BeforeWide,
     /// `VICTORY_WAVE_PAIRS=first`: before every other retry form, for every wave64 program
-    /// the host cannot run as it is (those that today take the form of two host waves that
-    /// exchange through LDS too).
+    /// that does not run as it is on 32-lane waves: those an exact form takes today too (the
+    /// forms without early-outs or skips, two host waves that exchange through LDS at group
+    /// barriers). For telling such a program's picture in the paired form from its picture
+    /// in the form it has.
     First,
 }
 
