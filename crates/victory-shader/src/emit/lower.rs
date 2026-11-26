@@ -61,6 +61,10 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// Host thread groups per console thread group: a console group of `n` 64-lane waves
+    /// runs as `n` host groups of one wave each, numbered along z ([`with_group_split`]);
+    /// 1: as the console's.
+    pub group_split: u32,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -334,6 +338,10 @@ struct Lower<'a> {
     /// Whether `halves` is the program's own first LDS dword, borrowed because the group's
     /// LDS had no room past the program's ([`lds_fit`]).
     halves_borrowed: bool,
+    /// [`Lowered::group_split`] (1: not split), and the console's thread-group size it
+    /// splits ([`with_group_split`]).
+    split: u32,
+    console_threads: [u32; 3],
     /// The first dword of the scatter's scratch, a dword per lane of every console wave in the
     /// group (`ds_permute_b32`), allocated past the program's LDS.
     scatter: Option<u32>,
@@ -1256,6 +1264,23 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_lanes_as_they_stand`].
     static LANES_AS_THEY_STAND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_group_split`].
+    static GROUP_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with each console thread group of several 64-lane waves that share nothing (no
+/// LDS, no `s_barrier`) run as that many host thread groups of one console wave each: host
+/// group z = console z * n + wave, the threads renumbered so that each keeps its console
+/// thread id. On the console those waves never meet, so this is the same program; what it
+/// buys is one console wave per host group, which wave-wide branches need
+/// ([`super::widen`]): their group barriers then wait for the two host waves of that one
+/// console wave only. The host multiplies the dispatch's z by [`Lowered::group_split`].
+/// (`VICTORY_GROUP_SPLIT=1`; from Corgansm/victory-corgi.)
+pub(super) fn with_group_split<R>(f: impl FnOnce() -> R) -> R {
+    let was = GROUP_SPLIT.replace(true);
+    let r = f();
+    GROUP_SPLIT.set(was);
+    r
 }
 
 /// Runs `f` with lane writes and reads lowered wherever they stand, among the lanes that are
@@ -1829,15 +1854,33 @@ impl<'a> Lower<'a> {
         let mut scatter: Option<u32> = None;
         // whether `halves` borrows the program's first LDS dword ([`lds_fit`])
         let mut halves_borrowed = false;
+        // host groups per console group, and the console's group ([`with_group_split`])
+        let mut split = 1u32;
+        let mut console_threads = [1u32; 3];
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            console_threads = cs.threads;
+            // One console wave per host group ([`with_group_split`]).
+            let size = cs.threads.iter().product::<u32>();
+            if GROUP_SPLIT.get()
+                && x.native.wave64
+                && size > 64
+                && size.is_multiple_of(64)
+                && s.lds_dwords == 0
+                && !insts().any(|i| i.name() == "s_barrier")
+            {
+                split = size / 64;
+                s.threads = Some([64, 1, 1]);
+            }
+            // (the host's group: the console's unless split)
+            let host_group = if split > 1 { 64 } else { size };
             // The scatter's scratch: a dword per lane of every console wave
             // in the group, past the program's LDS. (The zero-initialized
             // `tmp` of the ISA's ds_permute_b32; see its lowering in `ds`.)
             if insts().any(|i| i.name() == "ds_permute_b32") {
                 scatter = Some(s.lds_dwords);
-                s.lds_dwords += 64 * cs.threads.iter().product::<u32>().div_ceil(64);
+                s.lds_dwords += 64 * host_group.div_ceil(64);
             }
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
@@ -1855,7 +1898,7 @@ impl<'a> Lower<'a> {
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
             let mut wave = if x.native.wave64 { 64 } else { 32 };
-            let group = cs.threads.iter().product::<u32>();
+            let group = host_group;
             // A 1-thread group has no peers sharing LDS without barriers, so it
             // does not need a fixed WaveSize (which 64-only GCN GPUs and WARP refuse).
             let one_wave = group > 1 && group <= wave;
@@ -2156,6 +2199,8 @@ impl<'a> Lower<'a> {
             pair: None,
             halves,
             halves_borrowed,
+            split,
+            console_threads,
             scatter,
             lane_blocks: all_lane_blocks(x.st),
             wave_base: None,
@@ -2901,6 +2946,7 @@ impl<'a> Lower<'a> {
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
+            group_split: self.split,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2995,6 +3041,11 @@ impl<'a> Lower<'a> {
                     Val::I32(g) if c == 0 && base != 0 => {
                         let k = self.s.m.i32(base);
                         Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, k))
+                    }
+                    // host group z = console z * split + wave ([`with_group_split`])
+                    Val::I32(g) if c == 2 && self.split > 1 => {
+                        let k = self.s.m.i32(self.split);
+                        Val::I32(self.s.m.bin(self.s.entry, Bin::UDiv, g, k))
                     }
                     other => other,
                 };
@@ -4596,6 +4647,8 @@ impl<'a> Lower<'a> {
         let Some(threads) = self.s.threads else {
             return;
         };
+        // (split: the console's group and group id, as the title counts its threads)
+        let threads = if self.split > 1 { self.console_threads } else { threads };
         let e = self.s.entry;
         let zero = self.s.m.i32(0);
         let mut active: Option<V> = None;
@@ -4613,6 +4666,12 @@ impl<'a> Lower<'a> {
             };
             let Val::I32(gid) = self.compute_id("groupId.i32", 94, c as u8) else {
                 unreachable!()
+            };
+            let gid = if c == 2 && self.split > 1 {
+                let k = self.s.m.i32(self.split);
+                self.s.m.bin(e, Bin::UDiv, gid, k)
+            } else {
+                gid
             };
             let g = self.s.m.i32(dim);
             let base = self.s.m.bin(e, Bin::Mul, gid, g);
@@ -4814,20 +4873,56 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// With [`Self::split`]: a thread index within the host group (0..63, one console wave)
+    /// as its index in the console's group: plus 64 for each console wave before it, which
+    /// the host group's z counts (`group z mod split`). Only the thread id the program
+    /// reads takes this: the split's own bookkeeping ([`Self::exchange_pair`], the scatter's
+    /// scratch) is the host group's, which holds one console wave.
+    fn split_thread(&mut self, t: V) -> V {
+        if self.split <= 1 {
+            return t;
+        }
+        let e = self.s.entry;
+        let two = self.s.m.i32(2);
+        let gz = self.s.op(e, "groupId.i32", Attr::ReadNone, self.s.t.i32, 94, &[two]);
+        let k = self.s.m.i32(self.split);
+        let wave = self.s.m.bin(e, Bin::URem, gz, k);
+        let k64 = self.s.m.i32(64);
+        let off = self.s.m.bin(e, Bin::Mul, wave, k64);
+        self.s.m.bin(e, Bin::Add, t, off)
+    }
+
     /// Component `c` of the thread id in the group. With console lanes, the
     /// thread is relabelled so that its host lane is its console lane: the
     /// flat id is the wave's first lane's, rounded down to the wave size,
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes && self.split <= 1 {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        // (split: the id in the console's group, which the host's group is one wave of)
+        let [x, y, _] = if self.split > 1 { self.console_threads } else { self.s.threads.expect("compute") };
         let e = self.s.entry;
         let i32t = self.s.t.i32;
+        if !self.console_lanes {
+            // split, host lanes as they come: the host group is one console wave, its
+            // threads in console order
+            let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+            let f = self.split_thread(flat);
+            let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
+            return Val::I32(match c {
+                0 => self.s.m.bin(e, Bin::URem, f, xk),
+                1 => {
+                    let t = self.s.m.bin(e, Bin::UDiv, f, xk);
+                    self.s.m.bin(e, Bin::URem, t, yk)
+                }
+                _ => self.s.m.bin(e, Bin::UDiv, f, xy),
+            });
+        }
         if self.halves.is_some() {
             let f = self.console_thread();
+            let f = self.split_thread(f);
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
             return Val::I32(match c {
@@ -4860,6 +4955,7 @@ impl<'a> Lower<'a> {
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
         let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let f = self.split_thread(f);
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {

@@ -45,9 +45,11 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing. Bits 2 and up: the part of
+    // run is left empty and costs nothing. Bits 2 to 7: the part of
     // dispatch records over 65,535 groups in x this clamp writes (0: the
-    // first; `with_part`).
+    // first; `with_part`). Bits 8 to 15: dispatches, host thread groups per
+    // console thread group along z (a console group of several waves run as
+    // one host group per wave, `with_split`; 0 or 1: as asked).
     uint has_count;
     uint count_offset;
     // The execution (`note_dispatch`), noted with a record it cuts down; bits
@@ -107,9 +109,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 asked = src_args.Load3(src_at);
-        // Bits 2 and up: part `part` of records over 65,535 groups in x (`with_part`):
+        // Bits 2 to 7: part `part` of records over 65,535 groups in x (`with_part`):
         // the groups from 65,535 x part on, run by the program translated with that base.
-        uint part = has_count >> 2;
+        uint part = (has_count >> 2) & 0x3fu;
         bool rest = part != 0;
         if (rest) {
             uint base = 65535u * part;
@@ -137,6 +139,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (huge) {
             g = uint3(0, 0, 0);
         }
+        // One host group per console wave of a group the translation split
+        // (`with_split`): past what a dispatch runs along z, empty. (The
+        // counts and the charge below are of the console's groups, as
+        // without the split; z is multiplied after them.)
+        uint split = (has_count >> 8) & 0xffu;
+        if (split > 1u && g.z * split > 65535u) {
+            g = uint3(0, 0, 0);
+        }
         budget.InterlockedAdd(16, g.x * g.y * g.z, was);
         // word 7: the groups run by the watched pipelines (`VICTORY_INDIRECT_WATCH`,
         // bit 31 of the execution)
@@ -153,6 +163,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
         }
         cost = g.x * g.y * g.z * 64u;
+        // (split: z counts the console waves of each group too)
+        if (split > 1u) {
+            g.z *= split;
+        }
         groups = g;
     } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
@@ -418,6 +432,25 @@ pub(crate) fn with_part<R>(part: u32, f: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 pub(crate) fn with_remainder<R>(f: impl FnOnce() -> R) -> R {
     with_part(1, f)
+}
+
+thread_local! {
+    /// The host thread groups per console thread group of the dispatch whose records
+    /// the clamp on this thread writes ([`with_split`]; 0 or 1: as the console's).
+    static GROUP_SPLIT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` (the clamp of an indirect dispatch's records) for a program the translation
+/// split into `split` host thread groups per console thread group, numbered along z
+/// (`victory_shader::emit::HostShader::group_split`, `VICTORY_GROUP_SPLIT`): the clamp
+/// multiplies each record's z by it (a record that would pass 65,535 runs empty). The
+/// title's arguments stay as it wrote them; only the clamped copy the host executes
+/// changes. (Corgansm/victory-corgi's `with_split`.)
+pub(crate) fn with_split<R>(split: u32, f: impl FnOnce() -> R) -> R {
+    let was = GROUP_SPLIT.replace(split.min(255));
+    let r = f();
+    GROUP_SPLIT.set(was);
+    r
 }
 
 /// `VICTORY_INDIRECT_SPLIT=<hash>,...`: pipelines (`compute 0123456789abcdef`) whose indirect
@@ -753,7 +786,8 @@ fn record_clamp_at(
         None => (src_gpu, 0u32, 0u32),
     };
     let execution = EXECUTION.with(std::cell::Cell::get);
-    let rest = PART.with(std::cell::Cell::get) << 2;
+    let split = GROUP_SPLIT.with(std::cell::Cell::get);
+    let rest = ((PART.with(std::cell::Cell::get) & 0x3f) << 2) | if kind == 2 && split > 1 { split << 8 } else { 0 };
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1) | rest, count_offset, execution];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
@@ -1575,6 +1609,69 @@ void main() {
         assert_eq!(&out[..9], &[65_535, 1, 1, 1_000, 2, 1, 65_535, 1, 1], "the first parts");
         assert_eq!(&out[9..18], &[21_033, 1, 1, 0, 2, 1, 65_535, 1, 1], "the second parts");
         assert_eq!(&out[18..], &[0, 1, 1, 0, 2, 1, 8_930, 1, 1], "the third parts");
+    }
+
+    /// `with_split`: the records of a dispatch whose program runs each console thread
+    /// group as several host groups along z come out with z multiplied; x and y stay as
+    /// asked, a record whose z would pass 65,535 runs empty, and a clamp outside
+    /// `with_split` leaves z alone.
+    #[test]
+    fn warp_a_split_dispatch_has_its_z_multiplied() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DISPATCH: u32 = 2;
+        const STRIDE: u32 = 12;
+        let records: [[u32; 3]; 3] = [[240, 135, 1], [7, 3, 4], [1, 1, 40_000]];
+        let bytes = (STRIDE as usize) * records.len();
+        let (src_buf, src_ptr, _) = warp.shared_buffer(bytes as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(2 * bytes as u64);
+        let dst_buf = warp.default_uav(2 * bytes as u64);
+        let words: Vec<u8> = records.iter().flatten().flat_map(|w| w.to_le_bytes()).collect();
+        // SAFETY: mapped buffers have sufficient capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr(), src_ptr, bytes);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        let spec = (KIND_DISPATCH, STRIDE, records.len() as u32);
+        let plain = record_clamp_at(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, D3D12_RESOURCE_STATE_COMMON, 0),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            spec,
+            false,
+        );
+        let split = with_split(2, || {
+            record_clamp_at(
+                &warp.clamp,
+                &warp.list,
+                (&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, bytes as u64),
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                spec,
+                false,
+            )
+        });
+        assert!(plain && split);
+        // SAFETY: open command list; the clamped records are copied back.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 2 * bytes as u64);
+        }
+        warp.submit_and_wait();
+        // SAFETY: GPU work completed.
+        let out: Vec<u32> = unsafe { std::slice::from_raw_parts(readback_ptr.cast::<u32>(), 2 * bytes / 4).to_vec() };
+        assert_eq!(&out[..9], &[240, 135, 1, 7, 3, 4, 1, 1, 40_000], "as asked without a split");
+        assert_eq!(&out[9..], &[240, 135, 2, 7, 3, 8, 0, 0, 0], "z times the split; past 65,535: empty");
     }
 
     #[test]

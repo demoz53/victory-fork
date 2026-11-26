@@ -125,6 +125,7 @@ fn a_cube_gradient_selects_the_level_of_its_footprint() {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        group_split: 1,
     };
     let path = validator::Validator::default_path();
     if let Ok(mut v) = validator::Validator::load(path.as_deref()) {

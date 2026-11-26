@@ -198,6 +198,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        group_split: 1,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -2146,6 +2147,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
+        group_split: 1,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2297,6 +2299,7 @@ fn lower_heap_cs(root: RootType, heap: (u32, Option<(u32, u32)>), words: &[u32])
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        group_split: 1,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2497,6 +2500,7 @@ fn wave_prefix_f32_uses_signed_flag_and_validates() {
         root_uavs: l.root_uavs,
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
+        group_split: 1,
     };
     #[cfg(windows)]
     {
@@ -2585,6 +2589,7 @@ fn vs_rt_and_viewport_index_exports_validate_and_create_pso() {
             root_uavs: lowered.root_uavs,
             root_indexed_views: res.root_indexed_views,
             half_views: Vec::new(),
+            group_split: 1,
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
@@ -2858,6 +2863,7 @@ fn try_build_image_store_cs(dmask: u8, d16: bool) -> Result<HostShader, crate::S
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        group_split: 1,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -3955,6 +3961,7 @@ fn tbuffer_load_format_d16_packs_float_and_int_channels() {
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            group_split: 1,
         };
         #[cfg(windows)]
         for (backend, warp) in [("hardware", false), ("WARP", true)] {
@@ -4132,6 +4139,7 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            group_split: 1,
         };
         #[cfg(windows)]
         for (backend, warp) in [("hardware", false), ("WARP", true)] {
@@ -4275,6 +4283,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        group_split: 1,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut dxil = shader.dxil.clone();

@@ -85,6 +85,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         half_views: Vec::new(),
+        group_split: 1,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -389,6 +390,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             root_uavs: lowered.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            group_split: 1,
         };
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
