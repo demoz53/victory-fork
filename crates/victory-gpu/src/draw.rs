@@ -378,6 +378,10 @@ pub(crate) struct State {
     /// Raw thread counts `[x, y, z]` for a partial `DispatchX` call with
     /// `USE_THREAD_DIMENSIONS` (`0` along an axis means full groups / no cap).
     dispatch_threads: [u32; 3],
+    /// The tables the last bind made afresh for a program the stand-in for
+    /// the indirect light follows (`crate::ambient`): root parameter, byte
+    /// offset in the view heap (a slot is 32 bytes).
+    ambient_tables: Vec<(u8, u32)>,
 }
 
 impl Drop for State {
@@ -1388,6 +1392,10 @@ impl State {
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
+            }
+            if stage.shader.ambient.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -2833,6 +2841,104 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient_after(list, p);
+    }
+
+    /// After a dispatch of `p`: the stand-in for the indirect light, if `p`
+    /// is one of the programs it follows (`crate::ambient`). It sets its own
+    /// compute root signature and pipeline, so the next bind sets the
+    /// title's again.
+    fn ambient_after(&mut self, list: &HostList, p: &HostPipeline) {
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    /// The stand-in for the indirect light after a dispatch of `p`: finds
+    /// the program's image (and the depth it read) by the tables it was just
+    /// bound with, checks their formats and sizes, and records the passes.
+    /// Whether it recorded anything.
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        let Some(heap) = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten()
+        else {
+            return false;
+        };
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            // Where the bind put the table: a fresh one in dynamic slots,
+            // else the title's own slots, which the host heap holds at their
+            // own index (`tables` makes one that reaches past them afresh).
+            let index = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => (m.1 + offset * 4) / 32,
+                None => {
+                    let index = (self.user_value(true, slot, RootType::Table, 0) + offset * 4) / 32;
+                    if index >= heap.count() {
+                        return None;
+                    }
+                    index
+                }
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu_handle(index)))
+        };
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
+        };
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        };
+        // R32_UINT holding R9G9B9E5 for the resolve; R11G11B10_FLOAT for the
+        // radiance and the air.
+        let format = if role == Role::Resolve {
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT
+        } else {
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT
+        };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format != format
+            || (seen.Width, seen.Height) != (of.Width, of.Height)
+            || volume != (role == Role::Air)
+        {
+            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            return false;
+        }
+        crate::ambient::after(list, role, &Views {
+            image,
+            depth,
+            size: [of.Width as u32, of.Height],
+            slices: u32::from(of.DepthOrArraySize),
+        })
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -4050,6 +4156,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient_after(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
