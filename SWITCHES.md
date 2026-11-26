@@ -88,6 +88,9 @@ Four review fixes, no new switch, each with a test that fails before it: (1) JOU
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
 | `VICTORY_ASK_SKIP_VIEWS` | `1` | off | ranges whose first block the guards hold (view memory, which has no write watch) are left out of the kernel askings: the submission's one asking (ask_ahead runs, which otherwise fail and are asked again by halves down to single ranges; the lone ranges; ASK_ONCE_VIEWS ranges) and every asking (as GUARD_FIRST). Diagnostics builds: a "kernel calls" line after the journal-lock line (GetWriteWatch answered / failed / not made; hole checks made / from the cache; placeholder questions) | ours (test/watch5) | no |
+| `VICTORY_HOLES_KNOWN` | `1` | off | a block the guards find uncommitted inside a placeholder reservation (asked once, `NtQueryVirtualMemory`, after fxceless 94ed363cc) is kept a hole until the runtime tells of a mapping there (`title_memory_remapped`), with no `VirtualQuery` at every asking; holes in ordinary reservations are asked as before. Counted on the "kernel calls" line | ours (test/watch5), placeholder question after fxceless 94ed363cc | no |
+
+On VirtualProtect batching (the leader's item c): the guards already make each run of adjacent written blocks read-only in one call, split only where the run crosses views (`protect_runs`, one call per region with VIEWS_ONLY); about 2,050 calls a frame on all22-s-wft-prof. Left: the `VirtualQuery` that VIEWS_ONLY makes per run (`view_run`, ~2,100 a frame), which a set of blocks known to be views (cleared at remaps) could take away.
 
 ## New in test/watch4 (on top of test/watch3 a2b96a048)
 `VICTORY_JOURNAL_UNLOCKED` fixed (72dc1fb20, review finding): an answer now waits for every asking in flight over its range.

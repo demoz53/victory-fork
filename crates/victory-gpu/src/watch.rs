@@ -365,8 +365,9 @@ pub(crate) fn kernel_line(frames: f64) -> String {
     format!(
         "the write watch's kernel calls per frame: GetWriteWatch {answered:.0} answered, {failed:.0} failed (not \
          write-watched), {skipped:.0} not made (view memory the guards know, VICTORY_ASK_SKIP_VIEWS {}); hole checks \
-         (VirtualQuery) {holes:.0} made, {cached:.0} answered from a cache, {placeholders:.0} placeholder questions",
+         (VirtualQuery) {holes:.0} made, {cached:.0} answered from the cache (VICTORY_HOLES_KNOWN {}), {placeholders:.0}          placeholder questions",
         if skip_views() { "on" } else { "off" },
+        if holes_known() { "on" } else { "off" },
     )
 }
 
@@ -1828,6 +1829,11 @@ struct Guards {
     /// Of those, the ones an opening met meanwhile: made writable again
     /// when the asking is done.
     disturbed: BTreeSet<usize>,
+    /// With [`holes_known`]: blocks of `absent` found uncommitted in a
+    /// placeholder reservation, where pages come only by the runtime's
+    /// mapping, which it tells ([`title_memory_remapped`]): not asked of
+    /// Windows again until then.
+    holes: BTreeSet<usize>,
 }
 
 /// Blocks `[first, end)` a write through the kernel may be writing
@@ -1955,6 +1961,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     faulted: BTreeMap::new(),
     arming: BTreeSet::new(),
     disturbed: BTreeSet::new(),
+    holes: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -2175,11 +2182,12 @@ fn guard_range(g: &mut Guards, first: usize, last: usize, mut later: Option<&mut
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+                uncommitted_until = hole_end(g, block);
             }
             open = block >= uncommitted_until;
             if open {
                 g.absent.remove(&block);
+                g.holes.remove(&block);
             }
         }
         if open {
@@ -2227,7 +2235,7 @@ fn guard_bits_here(
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region.
             if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+                uncommitted_until = hole_end(g, block);
             }
             if block < uncommitted_until {
                 // Still not there: as a clean block.
@@ -2237,6 +2245,7 @@ fn guard_bits_here(
                 continue;
             }
             g.absent.remove(&block);
+            g.holes.remove(&block);
         }
         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
         if g.protected.contains(&block) {
@@ -2378,7 +2387,7 @@ impl Arming {
             // runtime has not committed is noted absent.
             g.protected.remove(&block);
             g.clean.remove(&block);
-            if !g.disturbed.contains(&block) && block < uncommitted_end(block) {
+            if !g.disturbed.contains(&block) && block < hole_end(g, block) {
                 g.absent.insert(block);
             }
         }
@@ -2760,7 +2769,7 @@ fn protect_run(
 /// A block of a range to guard that was not made read-only: noted absent
 /// where nothing is committed (a placeholder the runtime maps later).
 fn not_guarded(g: &mut Guards, block: usize) {
-    if block < uncommitted_end(block) {
+    if block < hole_end(g, block) {
         g.absent.insert(block);
     }
 }
@@ -2776,6 +2785,104 @@ fn views_only() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_VIEWS_ONLY").is_none_or(|v| v != "0"))
 }
 
+/// [`uncommitted_end`] through the guards' cache of holes ([`holes_known`]):
+/// a block noted a hole in a placeholder reservation is still one (at
+/// least itself), with no question to Windows.
+fn hole_end(g: &mut Guards, block: usize) -> usize {
+    if !holes_known() {
+        return uncommitted_end(block);
+    }
+    if g.holes.contains(&block) {
+        kernel_count(4);
+        return block + 1;
+    }
+    let end = uncommitted_end(block);
+    if end > block && placeholder(block) {
+        g.holes.insert(block);
+    }
+    end
+}
+
+/// Whether the guards keep the blocks they found uncommitted inside a
+/// placeholder reservation as holes until the runtime tells of a mapping
+/// there, instead of asking Windows again at every asking
+/// (`VICTORY_HOLES_KNOWN=1`; off by default).
+///
+/// Every asking of a range with unmapped blocks asks `VirtualQuery`
+/// whether they still are: some 7,000 questions a frame on the Series S
+/// house scene (all22-s-wft-prof: `uncommitted_end` 5 % of the submitting
+/// thread's running). In a placeholder reservation pages come to be only
+/// by mapping a view or an allocation in a placeholder's place, which the
+/// runtime does and tells of (`title_memory_remapped`, xmem); an ordinary
+/// reservation can be committed by anybody with no word to us, so its
+/// holes are asked as before. The placeholder question is asked once a
+/// hole (`NtQueryVirtualMemory`, as fxceless 94ed363cc asks it).
+fn holes_known() -> bool {
+    #[cfg(test)]
+    if HOLES_KNOWN_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLES_KNOWN").is_some_and(|v| v == "1"))
+}
+
+/// Tests: [`holes_known`] on, whatever the switch says.
+#[cfg(test)]
+pub(crate) static HOLES_KNOWN_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+unsafe extern "system" {
+    /// The kernel's question about a process's memory, `(process, address,
+    /// class of the answer, answer out, its room, bytes answered out)`: an
+    /// NTSTATUS, negative when it cannot answer. It changes nothing.
+    fn NtQueryVirtualMemory(
+        process: *mut std::ffi::c_void,
+        at: *const std::ffi::c_void,
+        class: u32,
+        out: *mut std::ffi::c_void,
+        len: usize,
+        returned: *mut usize,
+    ) -> i32;
+}
+
+/// Whether `block` lies in a placeholder reservation: memory in which
+/// pages come to be only by mapping a view, or making an allocation, in
+/// its place. `VirtualQuery` does not tell it from an ordinary reservation;
+/// this question does. (After fxceless/victory-fork 94ed363cc.)
+fn placeholder(block: usize) -> bool {
+    /// `MEMORY_REGION_INFORMATION` (ntddk); only the kinds are read.
+    #[repr(C)]
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct Region {
+        allocation_base: usize,
+        allocation_protect: u32,
+        region_type: u32,
+        region_size: usize,
+        commit_size: usize,
+        partition_id: usize,
+        node_preference: usize,
+    }
+    // (`MemoryRegionInformationEx`; class 3 answers with the kind of memory
+    // in that word, not the flags.)
+    const MEMORY_REGION_INFORMATION_EX: u32 = 7;
+    const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+    kernel_count(5);
+    let mut region = Region::default();
+    // SAFETY: the answer's room and its size; the kernel checks the address.
+    let status = unsafe {
+        NtQueryVirtualMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            (block * BLOCK) as *const _,
+            MEMORY_REGION_INFORMATION_EX,
+            (&raw mut region).cast(),
+            size_of::<Region>(),
+            std::ptr::null_mut(),
+        )
+    };
+    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
@@ -2783,6 +2890,7 @@ fn uncommitted_end(block: usize) -> usize {
     };
     #[cfg(feature = "diagnostics")]
     let asking = std::time::Instant::now();
+    kernel_count(3);
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -3373,6 +3481,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         }
     }
     g.absent.remove_range(range.clone());
+    if !g.holes.is_empty() && range.start < range.end {
+        let told: Vec<usize> = g.holes.range(range.clone()).copied().collect();
+        for block in told {
+            g.holes.remove(&block);
+        }
+    }
     if reopen_remapped() {
         // Forgotten and writable again (a block whose memory is gone has
         // no protection to change: the call fails and nothing is lost).
@@ -4569,6 +4683,82 @@ pub(crate) mod tests {
         forget_pages(one, one + PAGES * BLOCK);
         forget_pages(two, two + PAGES * BLOCK);
         assert!(now >= skipped + 2 * PAGES as u64, "every range left out, ahead and alone");
+    }
+
+    /// `VICTORY_HOLES_KNOWN`: a hole in a placeholder reservation is asked
+    /// of Windows once, then known until the runtime tells of a mapping
+    /// there, and then found mapped; a hole in an ordinary reservation is
+    /// asked every time.
+    #[test]
+    fn holes_in_a_placeholder_are_asked_once_until_told() {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+            MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _turn = light_turn();
+        HOLES_KNOWN_TEST.store(true, Ordering::Relaxed);
+        // A placeholder of two blocks, split: a view over the first, the
+        // second a hole.
+        // SAFETY: a fresh placeholder of ours.
+        let (p, section, view) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 0);
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, 2 * BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view =
+                MapViewOfFile3(section, GetCurrentProcess(), p as *const _, 0, BLOCK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value as usize, p);
+            (p, section, view)
+        };
+        title_memory_remapped(p, 2 * BLOCK);
+        forget_pages(p, p + 2 * BLOCK);
+        let hole = p + BLOCK;
+        assert!(placeholder(hole / BLOCK), "a placeholder");
+        assert!(guard(p, p + 2 * BLOCK).is_some());
+        assert!(guards().absent.contains(&(hole / BLOCK)), "noted unmapped");
+        assert!(guards().holes.contains(&(hole / BLOCK)), "known a hole");
+        let cached = KERNEL_CALLS[4].load(Ordering::Relaxed);
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(Vec::new()), "nothing written, the hole still one");
+        assert_eq!(guard(p, p + 2 * BLOCK), Some(Vec::new()));
+        assert!(KERNEL_CALLS[4].load(Ordering::Relaxed) >= cached + 2, "answered from the cache, no question to Windows");
+        // The runtime maps a view there and tells: the block is written.
+        // SAFETY: the hole is our placeholder; a view of the section's second block over it.
+        let second = unsafe {
+            MapViewOfFile3(section, GetCurrentProcess(), hole as *const _, BLOCK as u64, BLOCK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0)
+        };
+        assert_eq!(second.Value as usize, hole);
+        title_memory_remapped(hole, BLOCK);
+        let written = guard(p, p + 2 * BLOCK).expect("a view");
+        assert!(written.contains(&(hole / PAGE)), "mapped since: taken");
+        HOLES_KNOWN_TEST.store(false, Ordering::Relaxed);
+        title_memory_remapped(p, 2 * BLOCK);
+        // SAFETY: our views, placeholder and section.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            UnmapViewOfFile2(GetCurrentProcess(), second, MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            VirtualFree(hole as *mut _, 0, MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        forget_pages(p, p + 2 * BLOCK);
+        // An ordinary reservation is no placeholder.
+        // SAFETY: a reservation of ours, freed at once.
+        let plain = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert!(!placeholder(plain / BLOCK));
+        // SAFETY: ours.
+        unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
     }
 
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
