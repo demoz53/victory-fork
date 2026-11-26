@@ -73,6 +73,12 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/watch2 (on top of all21; not merged into a combined build yet)
+One new default-on change: `VICTORY_GUARD_VIEWS_ONLY` (a clear bug fix with tests; `=0` restores all21).
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_GUARD_VIEWS_ONLY` | `0` restores | ON | the write watch's guards make view memory read-only and nothing else: free memory is no view (not noted absent, so not guarded once something is allocated there) and committed private memory and images inside a range to guard stay writable. Both ways made the process heap read-only, whose own code then faulted holding the heap lock while the guards' lock holder waited for the heap: every thread waits, no frame, the title's 30-s watchdog | fxceless PR #1147 (tippythetaidum, 772da7e19 + e8a93d2bc) | no |
+
 ## New in all21 (merged on top of all20)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
