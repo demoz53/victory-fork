@@ -90,6 +90,9 @@ diagnostics-build switch).
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
 | `VICTORY_LOOKUP_CACHE` | `1` | off | each thread remembers (weakly) what its asks for a buffer's or window's host copy found, until any lookup table changes (a global count bumped where a buffer is registered or released, a copy taken out, a window made or let go): a copy made again at the same address is never found from memory. A window found so is checked and noted under the windows' lock. Memory line: "asks for a buffer's host copy since the last line: N answered from the asking thread's memory, M from the tables". An ask 745 -> 257 ns with 5 threads asking, 56 -> 44 ns alone | test/trim2 (fxceless 32be36d50, fork PR #1237) | no |
+| `VICTORY_TEXTURE_ONCE` | `1` | off | a texture a draw reads (`readable`) and each state move of a title texture's host copy (`list::ensure_state`, `HostList::transition`) look the host copy up once and hand it on (before: three lookups per texture read, two per move) | test/trim2 (Marvisak/VIctory PR #3258, KainanP) | no |
+| `VICTORY_DESC_CACHE` (extended) | `1` | off | now also: a host texture keeps its resource flags from when it is made; its legal states and "title fills it" answer from them (before: `GetDesc` up to three times per texture read and per move) | test/trim2 (#3258) | no |
+| `VICTORY_TARGETS_ONCE` | `1` | off | a draw leaves out moving its render targets to the render-target state while the same targets are bound, the list's states number is unchanged (bumped at any new or changed entry, any settle, any reset; one counter for all lists) and no host copy of a title resource was made since. The depth target's move stays every draw (twin use, state by shaders) | test/trim2 (Marvisak/VIctory PR #3249, borosf) | no |
 
 ## New in all22 (merged on top of all21)
 From test/watch3 (holds test/watch2), test/async2 (holds test/async1), test/trim1, test/waits (CONSTANT_WAITS),

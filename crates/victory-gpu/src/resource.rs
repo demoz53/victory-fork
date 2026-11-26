@@ -1156,6 +1156,12 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// The host texture's resource flags (render target, depth, unordered
+    /// access, denied shader resource), read once when it is made: a
+    /// texture's description never changes ([`HostTexture::legal`],
+    /// [`HostTexture::title_written`] answer from them with
+    /// `VICTORY_DESC_CACHE=1`).
+    pub(crate) flags: u32,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
@@ -2398,13 +2404,69 @@ impl HostTexture {
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        // SAFETY: a plain query on a live resource.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HostTexture {
             texture,
+            flags,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
         }
     }
+
+    /// [`crate::host::legal_state`] of `state` for this texture: from its
+    /// kept flags with `VICTORY_DESC_CACHE=1`, else by asking the driver.
+    pub(crate) fn legal(&self, state: u32) -> u32 {
+        if crate::shadow::desc_cache() {
+            crate::host::legal_for(self.flags, state)
+        } else {
+            crate::host::legal_state(&self.texture, state)
+        }
+    }
+
+    /// [`crate::texture::title_written`] for this texture, likewise.
+    pub(crate) fn title_written(&self) -> bool {
+        if crate::shadow::desc_cache() {
+            self.flags & 0x7 == 0
+        } else {
+            crate::texture::title_written(&self.texture)
+        }
+    }
+}
+
+/// Whether a texture a draw reads, and each state move of a title
+/// texture's host copy, takes the host copy once (`VICTORY_TEXTURE_ONCE=1`;
+/// off by default). A texture read through a table looked the host copy up
+/// three times (the upload check, then twice in `HostList::transition`:
+/// each a lock on the resource, a reference counted and let go, a clock
+/// read), and asked the driver for its description up to three times. With
+/// it, the copy is looked up once and handed on; with `VICTORY_DESC_CACHE=1`
+/// too, its flags come from the copy. After Marvisak/VIctory pull request
+/// #3258 (KainanP; GPL-3.0): an indexed draw reading six textures 2,713 ->
+/// 2,047 ns there.
+#[cfg(windows)]
+pub(crate) fn texture_once() -> bool {
+    #[cfg(test)]
+    if TEST_ONCE.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Tests: [`texture_once`] on for this thread.
+    pub(crate) static TEST_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`HOST_COPY_SERIAL`] now: it changes whenever a host copy of a title
+/// resource is made (`crate::draw::State::bind` notes it with the targets it
+/// moved, `VICTORY_TARGETS_ONCE`).
+#[cfg(windows)]
+pub(crate) fn host_copies_made() -> u64 {
+    HOST_COPY_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(windows)]
@@ -5106,5 +5168,79 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod kept_flags_tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    /// A host texture's flags are read once, when it is made: the legal
+    /// states and whether title memory fills it are what asking the driver
+    /// gives, for five kinds of texture and every state bit (after
+    /// Marvisak/VIctory #3258's test). And a list's states number changes
+    /// when a held copy is first used and when it moves, not when it is
+    /// asked for the state it has.
+    #[test]
+    fn kept_flags_answer_as_the_description_does() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let kinds = [
+            (D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, DXGI_FORMAT_D32_FLOAT),
+            (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, DXGI_FORMAT_D32_FLOAT),
+        ];
+        let states: Vec<u32> = (0..24).map(|b| 1u32 << b).chain([0, 0xc0, 0x10 | 0x40, 0x8 | 0xc0]).collect();
+        let mut copies = Vec::new();
+        for (flags, format) in kinds {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a valid description and output.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
+                    .unwrap();
+            }
+            let texture = texture.unwrap();
+            let copy = super::HostTexture::new(texture.clone(), 0);
+            assert_eq!(copy.flags, flags.0 as u32);
+            assert_eq!(copy.flags & 0x7 == 0, crate::texture::title_written(&texture), "flags {:#x}", flags.0);
+            assert_eq!(copy.title_written(), crate::texture::title_written(&texture));
+            for &state in &states {
+                assert_eq!(
+                    crate::host::legal_for(copy.flags, state),
+                    crate::host::legal_state(&texture, state),
+                    "flags {:#x}, state {state:#x}",
+                    flags.0
+                );
+                assert_eq!(copy.legal(state), crate::host::legal_state(&texture, state));
+            }
+            copies.push(std::sync::Arc::new(copy));
+        }
+        let list = host.new_list().unwrap();
+        let g0 = list.states_generation();
+        assert_eq!(list.transition_held(&copies[0], 0x40), None, "a first use moves nothing");
+        let g1 = list.states_generation();
+        assert_ne!(g0, g1, "a first use changes the number");
+        assert_eq!(list.transition_held(&copies[0], 0x40), None);
+        assert_eq!(list.states_generation(), g1, "the same state again: unchanged");
+        assert_eq!(list.transition_held(&copies[0], 0x800), Some(0x40), "a move from the state it had");
+        assert_ne!(list.states_generation(), g1, "a move changes the number");
+        list.close();
     }
 }
