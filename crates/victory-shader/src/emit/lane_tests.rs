@@ -1297,3 +1297,26 @@ fn a_mask_whose_halves_are_written_apart_tests_its_high_dword() {
         eprintln!("{what}: every lane its bit of the pair, as the model");
     }
 }
+
+/// A wave64 select on a lane mask held as a number, its halves written apart:
+/// `v_cndmask_b32 v12, 0, 1, s[12:13]` gives each lane its bit of the pair, lanes 32-63 the
+/// high dword's. The select alone asks for the console's lanes (avatarmanz/VIctory-7900XTX
+/// PR #308, compaccount1-coder; `VICTORY_SELECT_LANES`): without them the upper host wave's
+/// lanes took the bits of host lanes 0-31 (a debug build stops on `cross_lane`'s assertion).
+#[test]
+fn a_wave64_select_on_a_number_gives_each_lane_its_bit() {
+    const S_MOV_B32: u32 = 0x03;
+    const LO: u32 = 0x0F0F_00FF;
+    const HI: u32 = 0xA5A5_5A5A;
+    let mut w = prologue();
+    w.extend([sop1(S_MOV_B32, 12, LITERAL), LO, sop1(S_MOV_B32, 13, LITERAL), HI]);
+    // v_cndmask_b32 v12, 0, 1, s[12:13] (VOP3)
+    w.extend([0xD400_0000 | 0x101 << 16 | 12, 12 << 18 | int(1) << 9 | int(0)]);
+    epilogue(&mut w);
+    let bits = u64::from(HI) << 32 | u64::from(LO);
+    let want: [u32; 64] = std::array::from_fn(|l| (bits >> l & 1) as u32);
+    let _one = one_at_a_time();
+    let Some(card) = card_emitted("a select on a number", &w, |_| {}) else { return };
+    compare("a wave64 select on a number", &card.run([0; 4]), &some(want));
+    eprintln!("a wave64 select on a number: every lane its bit of the pair, as the model");
+}

@@ -1794,3 +1794,45 @@ fn a_group_of_two_console_waves_is_split_into_a_host_group_per_wave() {
         eprintln!("ran on the hardware device (rows {rows}): split groups gave every thread the console's sum");
     }
 }
+
+/// The wave size `lower` declares for `native` on a host of 32-lane waves.
+fn flag_wave(native: &NativeProgram) -> Option<u32> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    lowered.expect("lower").wave_size
+}
+
+/// A select on a lane mask held as a number takes the lane's own bit of it, so the program
+/// needs the console's lanes, as one reading the mask through a guard or as data does. It
+/// was lowered without them: in a release build each lane took the bit of its host lane
+/// (with no wave size, whatever the host's waves are); a debug build stopped on the
+/// assertion in `cross_lane`. Ported from avatarmanz/VIctory-7900XTX PR #308
+/// (compaccount1-coder, 2031a0785).
+#[test]
+fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
+    let words = [
+        0xBEEA_03FF, // s_mov_b32 vcc_lo, 0x55555555 (every other lane)
+        0x5555_5555,
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x0200_0A80, // v_cndmask_b32 v0, 0, v5, vcc_lo
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    // 64 threads in waves of 32: two console waves, and no LDS
+    assert_eq!(flag_wave(&native_of(&words, false, 64)), Some(32));
+}
