@@ -9338,10 +9338,17 @@ impl Meter {
             tracing::info!("indirect dispatches run in parts (VICTORY_INDIRECT_SPLIT, _AUTO) so far: {}", crate::draw::split_parts());
         }
         let left = crate::pipeline::LEFT_WITHOUT_RAYS.swap(0, Ordering::Relaxed);
-        if left > 0 {
+        let resolve = crate::pipeline::LEFT_RESOLVE.swap(0, Ordering::Relaxed);
+        if left > resolve {
             tracing::info!(
                 "dispatches of the program that activates the screen probes' rays left out per frame (the structure builder does not run; VICTORY_IDLE_WITHOUT_RAYS=1): {:.1}",
-                left as f64 / frames
+                (left - resolve) as f64 / frames
+            );
+        }
+        if resolve > 0 {
+            tracing::info!(
+                "dispatches of the ray-tracing resolve programs (CS_RaytracingResolve) left out per frame (the structure builder does not run; VICTORY_RT_SKIP_RESOLVE=1): {:.1}",
+                resolve as f64 / frames
             );
         }
         if std::env::var_os("VICTORY_INDIRECT_WATCH").is_some() {

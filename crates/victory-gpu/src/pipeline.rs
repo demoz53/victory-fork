@@ -392,16 +392,96 @@ fn serves_rays(shaders: &[Arc<Shader>]) -> bool {
     shaders.iter().any(|s| s.stage == "compute" && s.container.windows(NAME.len()).any(|w| w == NAME))
 }
 
+/// Whether the title's ray-tracing resolve programs are left out while the
+/// structure builder does not run (`VICTORY_RT_SKIP_RESOLVE=1`; off by
+/// default): see [`resolves_rays`].
+#[cfg(windows)]
+fn rt_skip_resolve() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RT_SKIP_RESOLVE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_RT_SKIP_RESOLVE=1: pipelines whose compute container names CS_RaytracingResolve are not made and their dispatches are left out while the structure builder does not run"
+            );
+        }
+        on
+    })
+}
+
+/// Whether a compute program of `shaders` is one of the title's ray-tracing
+/// resolves, known by the name its container carries
+/// (`CS_RaytracingResolve`; about a thousand variants in this title): it
+/// shades the hits of rays traced through the title's structures, and with
+/// the structure builder off ([`rays_run`]) none is built, so what it
+/// resolves is not the title's light.
+///
+/// The rule (by name, held only while no structure is built, no hash list)
+/// is lordon1a/victory-laptop-8gb c7dc354e3 (`VICTORY_RT_SKIP_RESOLVE`,
+/// `left_out` in its pipeline/make.rs), after carlm125/cool_fox 8cc31ab3
+/// (codec_d's `VICTORY_RT_RESOLVE`); both GPL-3.0. Measured there (RTX 3070
+/// Ti Laptop, Series S, with its BVH_MISS and ActivateRays skips): 184.0 ->
+/// 150.2 ms a frame, the picture the same. Here it rides the same path as
+/// [`serves_rays`] (`VICTORY_IDLE_WITHOUT_RAYS`): its dispatches, direct or
+/// indirect (before our argument clamp), are left out, and its host
+/// pipeline is not made ahead; if the builder runs it runs as before.
+///
+/// Unlike test/speed2's `VICTORY_SKIP_RT` (588ca3b52, a list of 1,034
+/// shader hashes: the resolves and 34 traced-shadow programs, left out
+/// whatever the builder does) it needs no list, leaves the traced shadows
+/// in, and follows the builder.
+#[cfg(windows)]
+fn resolves_rays(shaders: &[Arc<Shader>]) -> bool {
+    const NAME: &[u8] = b"CS_RaytracingResolve";
+    shaders.iter().any(|s| s.stage == "compute" && s.container.windows(NAME.len()).any(|w| w == NAME))
+}
+
+/// Why a pipeline of `shaders` serves only rays ([`Pipeline::no_rays`]):
+/// [`NO_RAYS_ACTIVATE`] with `VICTORY_IDLE_WITHOUT_RAYS=1`,
+/// [`NO_RAYS_RESOLVE`] with `VICTORY_RT_SKIP_RESOLVE=1`, else 0. Looked for
+/// only with a switch on: a walk over the container.
+#[cfg(windows)]
+fn rays_only(shaders: &[Arc<Shader>], activate: bool, resolve: bool) -> u8 {
+    if activate && serves_rays(shaders) {
+        NO_RAYS_ACTIVATE
+    } else if resolve && resolves_rays(shaders) {
+        NO_RAYS_RESOLVE
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+const NO_RAYS_ACTIVATE: u8 = 1;
+#[cfg(windows)]
+const NO_RAYS_RESOLVE: u8 = 2;
+
 /// Whether the dispatches of the title's pipeline `this` are left out
-/// because the rays it serves do not run ([`serves_rays`]).
+/// because the rays it serves do not run ([`serves_rays`],
+/// [`resolves_rays`]). Counts the resolves' in [`LEFT_RESOLVE`].
 #[cfg(windows)]
 pub(crate) fn left_without_rays(this: This) -> bool {
-    !this.is_null() && pipeline(this).no_rays && !rays_run()
+    if this.is_null() {
+        return false;
+    }
+    let kind = pipeline(this).no_rays;
+    if kind == 0 || rays_run() {
+        return false;
+    }
+    if kind == NO_RAYS_RESOLVE {
+        LEFT_RESOLVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
 }
 
 /// Since the last frame line: dispatches left out by [`left_without_rays`].
 #[cfg(windows)]
 pub(crate) static LEFT_WITHOUT_RAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line: of [`LEFT_WITHOUT_RAYS`], the resolves'
+/// (`VICTORY_RT_SKIP_RESOLVE=1`).
+#[cfg(windows)]
+pub(crate) static LEFT_RESOLVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
@@ -489,10 +569,12 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    /// With `VICTORY_IDLE_WITHOUT_RAYS=1`: it only serves the title's rays
-    /// ([`serves_rays`]); its dispatches are left out while they do not run.
+    /// It only serves the title's rays ([`rays_only`]: 0 no; with
+    /// `VICTORY_IDLE_WITHOUT_RAYS=1` [`serves_rays`], with
+    /// `VICTORY_RT_SKIP_RESOLVE=1` [`resolves_rays`]); its dispatches are
+    /// left out while they do not run.
     #[cfg(windows)]
-    no_rays: bool,
+    no_rays: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -658,15 +740,19 @@ fn hand_out(
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    // Looked for only with a switch: a walk over the container.
     #[cfg(windows)]
-    make::early(&host);
+    let no_rays = rays_only(&shaders, idle_without_rays(), rt_skip_resolve());
+    // A resolve whose dispatches are left out is not made ahead either
+    // (made at its first dispatch if the builder runs after all).
+    #[cfg(windows)]
+    if no_rays != NO_RAYS_RESOLVE || rays_run() {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
-    // Looked for only with the switch: a walk over the container.
     #[cfg(windows)]
-    let no_rays = idle_without_rays() && serves_rays(&shaders);
-    #[cfg(windows)]
-    if no_rays {
+    if no_rays == NO_RAYS_ACTIVATE {
         let hashes: Vec<&str> = shaders.iter().map(|s| s.hash.as_str()).collect();
         tracing::info!(
             ?hashes,
@@ -907,6 +993,32 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_RT_SKIP_RESOLVE` and `VICTORY_IDLE_WITHOUT_RAYS` find their
+    /// programs by the name in a compute container, each only with its own
+    /// switch; a graphics stage carrying the name is not one.
+    #[cfg(windows)]
+    #[test]
+    fn ray_programs_are_known_by_their_names() {
+        let shader = |stage: &'static str, bytes: &[u8]| {
+            std::sync::Arc::new(super::Shader {
+                stage,
+                hash: "0123456789abcdef".to_owned(),
+                container: bytes.to_vec(),
+                translated: std::sync::OnceLock::new(),
+            })
+        };
+        let resolve = [shader("compute", b"..DXBC..CS_RaytracingResolve_Diffuse..")];
+        let activate = [shader("compute", b"..CS_ScreenProbes_ActivateRays..")];
+        let pixel = [shader("pixel", b"..CS_RaytracingResolve..")];
+        let other = [shader("compute", b"..CS_Raytracing..Resolve..")];
+        assert_eq!(super::rays_only(&resolve, false, true), super::NO_RAYS_RESOLVE);
+        assert_eq!(super::rays_only(&resolve, true, false), 0);
+        assert_eq!(super::rays_only(&activate, true, true), super::NO_RAYS_ACTIVATE);
+        assert_eq!(super::rays_only(&activate, false, true), 0);
+        assert_eq!(super::rays_only(&pixel, true, true), 0);
+        assert_eq!(super::rays_only(&other, true, true), 0);
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
