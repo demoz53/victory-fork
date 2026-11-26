@@ -93,6 +93,11 @@ per pipeline at its creation (a bool per pipeline, now also in release builds; `
 diagnostics-build switch).
 
 ## New in test/shader7 (on top of test/shader6)
+Boat sweep (3604 programs, each switch against its restore value, `VICTORY_HOST_MAX_WAVE=32`): `VICTORY_LEGACY_ZERO_EXP`
+3228 programs; `VICTORY_LDS_BOUNDS=1` 186 (opt-in); `VICTORY_D16_BITS` 44; `VICTORY_SHADER_FIXES_1126` 0 (no VOP3
+fmac/mac with accumulator modifiers in this set); `VICTORY_SECTIONS_PAST_SAVEEXEC` 0; `VICTORY_PERMUTE_HALF_LOCAL` 0
+(the three programs with `ds_bpermute_b32` here, 068c90badc86f1fd, 5cf00dc39042edaf and ffd93c8a029ff016, are wave32,
+whose permute was right already); test/shader5's `VICTORY_COMPARE_REDUCTION` and `VICTORY_BC7_ROTATION` 0.
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
 | `VICTORY_PERMUTE_HALF_LOCAL` | `0` restores | ON | a wave64 `ds_bpermute_b32` permutes lanes 0-31 and 32-63 INDEPENDENTLY (RDNA 2 ISA 10.4.4; confirmed on gfx1036): the source lane is `((address + offset) >> 2) & 31` in the lane's own half. Before, it was taken modulo 64, and on 32-lane hosts every such program went to `permute_across_halves` (64 LDS dwords a console wave, two group barriers a permute), reading ACROSS the halves exactly where the console does not (the checkerboard shadow-mask generators read wrong neighbours). Now a backward permute is no cross-half code: no exchange, no LDS area, no barrier in host waves of 32; the paired form reads each half within itself too. The lane-test model follows the rule (and the old one with `=0`); GPU lane test `a_backward_permute_stays_in_its_half` (both forms, each against its model) | Marvisak/VIctory 0665a0e85 (QB, #573), as ported in TaynanGT/Vice-Tay 9bb7dbff7; the same rule in fxceless PR #1166 (Lkxex) and JMAN730/project-flamingo bc06faf56 | YES |
