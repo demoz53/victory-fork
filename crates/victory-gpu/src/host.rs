@@ -3908,9 +3908,12 @@ pub(crate) mod declared {
     pub(crate) const VIEW: usize = 1;
     pub(crate) const NUMBERED: usize = 2;
     pub(crate) const HEAP: usize = 3;
+    /// Not declared: a view the bound program only loads from
+    /// (`VICTORY_UAV_WRITTEN`).
+    pub(crate) const LEFT_OUT: usize = 4;
 
     /// Since the last frame line, per origin: declarations, bytes.
-    static COUNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    static COUNT: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
     /// Diagnostics: root unordered views' declarations seen lately (host
     /// copy, from, to), for [`meets_root`].
@@ -3963,7 +3966,8 @@ pub(crate) mod declared {
         let mb = |b: f64| b / (1 << 20) as f64;
         tracing::info!(
             "shader writes declared per frame, by origin: root unordered views {:.0} ({:.0} MB, each to its buffer's end), \
-             views in tables {:.0} ({:.0} MB), numbered copies {:.0} ({:.0} MB), the heap's unordered views {:.0} ({:.0} MB)",
+             views in tables {:.0} ({:.0} MB), numbered copies {:.0} ({:.0} MB), the heap's unordered views {:.0} ({:.0} MB); \
+             left out as only loaded from (VICTORY_UAV_WRITTEN) {:.0} ({:.0} MB)",
             c[0],
             mb(c[1]),
             c[2],
@@ -3972,6 +3976,8 @@ pub(crate) mod declared {
             mb(c[5]),
             c[6],
             mb(c[7]),
+            c[8],
+            mb(c[9]),
         );
     }
 }

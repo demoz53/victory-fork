@@ -66,6 +66,13 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked, with `VICTORY_UAV_WRITTEN=1`: which of
+    /// its UAVs its code stores to (`Translated::uav_writes`; `None`: not
+    /// told apart, every one).
+    static STAGE_WRITES: std::cell::RefCell<Option<std::sync::Arc<crate::pipeline::UavWrites>>> = const { std::cell::RefCell::new(None) };
+    /// While a table entry the stage names is made readable: whether its
+    /// code can store to that UAV ([`uav_written`]).
+    static SLOT_WRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1845,8 +1852,12 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if uav_written_on() {
+                STAGE_WRITES.set(t.uav_writes.clone());
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            STAGE_WRITES.set(None);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1996,6 +2007,10 @@ impl State {
                         None
                     }
                 };
+                // `VICTORY_UAV_WRITTEN`: a root view the program only loads from
+                // is not declared written.
+                let writes = writes
+                    && (!uav_written_on() || t.uav_writes.as_ref().is_none_or(|w| w.roots.contains(&slot)));
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
                 }
@@ -4136,7 +4151,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable_for(list, u.kind, &view, Some(u));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -4309,7 +4324,7 @@ impl State {
                 for u in entries.iter().filter(|u| in_place || u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable_for(list, u.kind, &view, Some(u));
                     }
                 }
                 for k in selected {
@@ -4423,7 +4438,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable_for(list, kind, &view, used.copied());
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -5409,6 +5424,41 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+/// Whether unordered-access views a program only loads from are left out of
+/// the shader writes a flight declares (`VICTORY_UAV_WRITTEN=1`; off by
+/// default). Which of its UAVs a program can store to is found from its
+/// console code at load (`crate::pipeline::uav_writes`: every buffer store
+/// traced to the table entry or root view its descriptor comes from; a
+/// program where one store cannot be is left as before, every view
+/// written). A view declared written costs a snapshot or a compare on the
+/// card, a copy-back at its landing and, while its flight is in the air,
+/// the settles of every refresh or fill over its bytes; a root view's
+/// declaration runs to the end of its title buffer.
+fn uav_written_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_UAV_WRITTEN").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("unordered-access views a program only loads from are not declared written (VICTORY_UAV_WRITTEN=1)");
+        }
+        on
+    })
+}
+
+/// With [`uav_written_on`], while a stage's tables are walked: whether the
+/// stage's code can store to the table UAV `u` (true for anything else).
+fn uav_written(u: &UsedResource) -> bool {
+    u.kind != ResourceType::Uav
+        || STAGE_WRITES.with_borrow(|w| w.as_ref().is_none_or(|w| w.table.contains(&(u.user_data, u.table_offset_dwords))))
+}
+
+/// [`readable`] for a table entry the stage names (`used`), if it does.
+fn readable_for(list: &HostList, kind: ResourceType, view: &View, used: Option<&UsedResource>) {
+    SLOT_WRITTEN.set(used.is_none_or(uav_written));
+    readable(list, kind, view);
+    SLOT_WRITTEN.set(true);
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -5420,7 +5470,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
+            if !SLOT_WRITTEN.get() {
+                // `VICTORY_UAV_WRITTEN`: a view the bound program only loads from.
+                crate::host::declared::note(crate::host::declared::LEFT_OUT, &shadow, address, len);
+            } else if STORES.get() || !write_skip() {
                 crate::host::declared::note(crate::host::declared::VIEW, &shadow, address, len);
                 shadow.gpu_writes(list, address, len);
             } else {

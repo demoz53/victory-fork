@@ -177,6 +177,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Which of its UAVs its code can store to ([`uav_writes`]); `None`: not
+    /// told apart (each written).
+    pub(crate) uav_writes: Option<std::sync::Arc<UavWrites>>,
     /// Compute thread-group dimensions `[x, y, z]` (`[0; 3]` for non-compute).
     pub(crate) threads: [u32; 3],
 }
@@ -257,6 +260,14 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let is_main = |p: &victory_shader::NativeProgram| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs);
+    // Which UAVs it stores to (`VICTORY_UAV_WRITTEN`): the main program's,
+    // when no other program of the shader stores at all.
+    let uav_writes = if programs.iter().filter(|p| !is_main(p)).any(self::stores) {
+        None
+    } else {
+        programs.iter().find(|p| is_main(p)).and_then(uav_writes).map(std::sync::Arc::new)
+    };
     let main = programs.into_iter().find(|p| {
         matches!(
             p.stage,
@@ -272,6 +283,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         host,
         used,
         stores,
+        uav_writes,
         threads,
     })
 }
@@ -531,6 +543,310 @@ pub(crate) fn builder_runs() -> bool {
     );
     b.whole = true;
     true
+}
+
+/// Which of a program's unordered-access views its code can store to
+/// (`VICTORY_UAV_WRITTEN`): the table entries by (first user-data dword of
+/// the table, dword offset in it), and the root views by root slot. Found
+/// from the console code at load (nothing of the translation, nor the
+/// shader cache's key, depends on it).
+#[cfg(windows)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UavWrites {
+    pub(crate) table: std::collections::HashSet<(u8, u32)>,
+    pub(crate) roots: std::collections::HashSet<u8>,
+}
+
+/// [`UavWrites`] of `program`, or `None` where its stores cannot all be
+/// told apart (each view then counts as written, as before): every buffer
+/// store or atomic (MUBUF, MTBUF) must take its descriptor from a load of
+/// a table entry at a fixed offset of a table whose pointer is a user-data
+/// dword, or build it from a root view's address in user data. A flat or
+/// global store, an indirect jump, a descriptor from anything else, code
+/// that does not decode, or user data spilled to memory: `None`. Every
+/// store is looked at whatever branch it sits behind (the code is walked
+/// whole, not along paths), and every definition of a descriptor's first
+/// register must say the same.
+#[cfg(windows)]
+pub(crate) fn uav_writes(program: &victory_shader::NativeProgram) -> Option<UavWrites> {
+    use victory_shader::gfx10::{Encoding, Fields, NULL, Operand, decode};
+    use victory_shader::{ResourceType, RootType};
+    if victory_shader::spill::is_spilled(program) {
+        return None;
+    }
+    let code = decode(&program.code).ok()?;
+    let fields: Vec<Fields> = code.iter().map(|i| i.fields(program.wave64)).collect();
+    // The scalar registers each instruction writes: (first, past the last).
+    let scalar = |o: &Operand| match *o {
+        Operand::Scalar { code, dwords } => Some((code, code.saturating_add(dwords))),
+        _ => None,
+    };
+    let defs: Vec<Vec<(u8, u8)>> = fields
+        .iter()
+        .map(|f| match f {
+            Fields::Sop { dst, .. } => dst.iter().filter_map(scalar).collect(),
+            Fields::Smem { data, .. } => data.iter().filter_map(scalar).collect(),
+            Fields::Valu(v) => v.dst.iter().chain(v.carry.iter()).filter_map(scalar).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    // Where branches land: a definition is followed back only within
+    // straight-line code (no landing between it and its use), where it is
+    // the one definition that reaches.
+    let targets: std::collections::HashSet<usize> = code
+        .iter()
+        .zip(&fields)
+        .filter(|(i, _)| i.name().is_some_and(|n| n.starts_with("s_cbranch") || n == "s_branch"))
+        .filter_map(|(i, f)| match f {
+            Fields::Sopp { imm, .. } => {
+                usize::try_from(i.offset as i64 + 4 + i64::from(*imm as i16) * 4).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    // The instruction whose write of `reg` reaches instruction `at`: `Ok(None)`
+    // if none does (the value is the program's input); `Err` if that cannot
+    // be told (a branch lands between).
+    let reaching = |at: usize, reg: u8| -> Result<Option<usize>, ()> {
+        let mut j = at;
+        loop {
+            if targets.contains(&code[j].offset) {
+                return Err(());
+            }
+            if j == 0 {
+                return Ok(None);
+            }
+            j -= 1;
+            if defs[j].iter().any(|&(a, b)| a <= reg && reg < b) {
+                return Ok(Some(j));
+            }
+        }
+    };
+    // The user SGPR a register's value at instruction `at` comes from,
+    // through plain copies.
+    let user_origin = |mut at: usize, mut reg: u8| -> Option<u8> {
+        for _ in 0..4 {
+            let Some(i) = reaching(at, reg).ok()? else {
+                return Some(reg);
+            };
+            if !matches!(code[i].name(), Some("s_mov_b32" | "s_mov_b64")) {
+                return None;
+            }
+            let Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src, .. } = &fields[i] else {
+                return None;
+            };
+            let Some(Operand::Scalar { code: c, .. }) = src.first() else {
+                return None;
+            };
+            reg = c.checked_add(reg.checked_sub(*d)?)?;
+            at = i;
+        }
+        None
+    };
+    let user_sgpr = |ud: u8| program.stage.user_sgpr(ud);
+    let stores = |n: Option<&str>| n.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"));
+    let mut out = UavWrites::default();
+    for (i, inst) in code.iter().enumerate() {
+        let name = inst.name();
+        match inst.encoding {
+            Encoding::Flat | Encoding::Global if stores(name) => return None,
+            Encoding::Sop1 if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) => return None,
+            Encoding::Mubuf | Encoding::Mtbuf if stores(name) => {}
+            _ => continue,
+        }
+        let Fields::Buffer { rsrc: Operand::Scalar { code: r, .. }, .. } = &fields[i] else {
+            return None;
+        };
+        // The descriptor's first dword, as it reaches the store (its other
+        // dwords come with it from the same load, or are the view's size
+        // and format).
+        let d = reaching(i, *r).ok()??;
+        match &fields[d] {
+            Fields::Smem {
+                data: Some(Operand::Scalar { code: dst, dwords }),
+                base: Operand::Scalar { code: b, .. },
+                offset,
+                soffset,
+                ..
+            } if *dst == *r
+                && *dwords >= 4
+                && code[d].name().is_some_and(|n| n.starts_with("s_load_dword"))
+                && matches!(soffset, Operand::Scalar { code: NULL, .. })
+                && *offset >= 0
+                && offset % 4 == 0 =>
+            {
+                // Its other dwords are not written between the load and the
+                // store either.
+                for k in 1..4 {
+                    if reaching(i, r.checked_add(k)?).ok()? != Some(d) {
+                        return None;
+                    }
+                }
+                let base = user_origin(d, *b)?;
+                let entry = program.used.iter().find(|u| {
+                    u.kind == ResourceType::Uav
+                        && u.root == RootType::Table
+                        && user_sgpr(u.user_data) == base
+                        && u.table_offset_dwords == *offset as u32 / 4
+                })?;
+                out.table.insert((entry.user_data, entry.table_offset_dwords));
+            }
+            Fields::Sop { dst: Some(Operand::Scalar { code: dst, .. }), src, .. } if *dst == *r => {
+                let Some(Operand::Scalar { code: c, .. }) = src.first() else {
+                    return None;
+                };
+                let from = user_origin(d, *c)?;
+                let root = program
+                    .layout
+                    .iter()
+                    .find(|p| p.root == RootType::Descriptor && user_sgpr(p.user_data) == from)?;
+                out.roots.insert(root.slot);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+#[cfg(all(test, windows))]
+mod uav_writes_tests {
+    use super::uav_writes;
+    use victory_shader::{HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], offset` (soffset null).
+    fn s_load_dwordx4(dst: u8, base: u8, offset: u32) -> [u32; 2] {
+        [0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25 | offset]
+    }
+
+    /// MUBUF `op vdata, vaddr, s[srsrc:+3], 0 offen`.
+    fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | (op & 0x7F) << 18 | 1 << 12,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+
+    /// SOPP `s_cbranch_scc0` over `dwords`.
+    fn s_cbranch_scc0(dwords: u16) -> u32 {
+        0xBF84_0000 | u32::from(dwords)
+    }
+
+    const LOAD_DWORD: u32 = 0x0c;
+    const STORE_DWORD: u32 = 0x1c;
+
+    fn program(words: &[u32], used: Vec<UsedResource>) -> NativeProgram {
+        let mut code = Vec::new();
+        for w in words {
+            code.extend_from_slice(&w.to_le_bytes());
+        }
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used,
+            io: victory_shader::native::StageIo::None,
+            code,
+        }
+    }
+
+    fn uav(at: u32) -> UsedResource {
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }
+    }
+
+    /// Two UAVs of the table at s[0:1]: the program loads from the first
+    /// (dword 0) and stores to the second (dword 8), the store behind a
+    /// branch: only the second is written.
+    #[test]
+    fn only_the_view_a_program_stores_to_is_written() {
+        let a = s_load_dwordx4(4, 0, 0);
+        let b = s_load_dwordx4(8, 0, 32);
+        let load = mubuf(LOAD_DWORD, 1, 0, 4);
+        let store = mubuf(STORE_DWORD, 1, 0, 8);
+        let words = [a[0], a[1], b[0], b[1], load[0], load[1], s_cbranch_scc0(2), store[0], store[1], S_ENDPGM];
+        let w = uav_writes(&program(&words, vec![uav(0), uav(8)])).expect("every store told apart");
+        assert!(w.table.contains(&(0, 8)), "the view stored to (behind a branch) is written");
+        assert!(!w.table.contains(&(0, 0)), "the view only loaded from is not");
+    }
+
+    /// A program that only loads from its UAV declares nothing.
+    #[test]
+    fn a_program_that_only_loads_writes_nothing() {
+        let a = s_load_dwordx4(4, 0, 0);
+        let load = mubuf(LOAD_DWORD, 1, 0, 4);
+        let words = [a[0], a[1], load[0], load[1], S_ENDPGM];
+        let w = uav_writes(&program(&words, vec![uav(0)])).expect("nothing unknown");
+        assert!(w.table.is_empty() && w.roots.is_empty());
+    }
+
+    /// Over saved console shaders (`VICTORY_UAV_SURVEY=<dir>` of `.cdxil`
+    /// files, e.g. a `VICTORY_SHADER_SAVE` folder): how many programs that
+    /// store have every store told apart, and how many of their UAVs are
+    /// only loaded from. Prints; asserts nothing.
+    #[test]
+    #[ignore = "reads a folder of saved shaders named by VICTORY_UAV_SURVEY"]
+    fn survey_of_saved_shaders() {
+        use victory_shader::{Container, FourCC};
+        let Some(dir) = std::env::var_os("VICTORY_UAV_SURVEY") else {
+            return;
+        };
+        let (mut storing, mut known, mut uavs, mut loaded_only, mut roots, mut roots_written) = (0, 0, 0, 0, 0, 0);
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if entry.path().extension().is_none_or(|e| e != "cdxil") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else { continue };
+            let Ok(c) = Container::parse(&bytes) else { continue };
+            let Some(part) = c.part(FourCC::DXIL) else { continue };
+            let Ok(programs) = victory_shader::native_programs(part.data) else { continue };
+            for p in &programs {
+                if !super::stores(p) {
+                    continue;
+                }
+                storing += 1;
+                let Some(w) = uav_writes(p) else { continue };
+                known += 1;
+                let table: Vec<_> = p.used.iter().filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table).collect();
+                uavs += table.len();
+                loaded_only += table.iter().filter(|u| !w.table.contains(&(u.user_data, u.table_offset_dwords))).count();
+                let r: Vec<_> = p.layout.iter().filter(|r| r.root == RootType::Descriptor).collect();
+                roots += r.len();
+                roots_written += r.iter().filter(|r| w.roots.contains(&r.slot)).count();
+            }
+        }
+        eprintln!(
+            "programs that store: {storing}, every store told apart: {known}; their table UAVs {uavs}, only loaded from {loaded_only}; \
+             their root descriptors {roots}, stored through {roots_written}"
+        );
+    }
+
+    /// A store whose descriptor is not a known table entry (an offset no
+    /// UAV of the program has): not told apart, every view written.
+    #[test]
+    fn a_store_through_an_unknown_descriptor_counts_as_every_view() {
+        let a = s_load_dwordx4(4, 0, 64);
+        let store = mubuf(STORE_DWORD, 1, 0, 4);
+        let words = [a[0], a[1], store[0], store[1], S_ENDPGM];
+        assert_eq!(uav_writes(&program(&words, vec![uav(0)])), None);
+    }
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
