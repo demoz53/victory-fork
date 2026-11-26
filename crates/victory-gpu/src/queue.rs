@@ -512,6 +512,36 @@ pub(crate) fn behind_line(frames: f64) {
     );
 }
 
+/// The part at the head of `0` is being sent with the line open
+/// ([`Held::Running`]): dropped, the marker comes off the head. Dropped by a
+/// panic (in the preparing, on our thread or a title thread running the
+/// lines): the marker would have stood at the head for good, every later
+/// submission, signal and present (even the present's forced pass) behind
+/// it, a silent freeze until the title's watchdog; the process is ended
+/// with the panic's message instead.
+#[cfg(windows)]
+struct Marked<'a>(&'a std::sync::Mutex<Vec<Held>>);
+
+#[cfg(windows)]
+impl Drop for Marked<'_> {
+    fn drop(&mut self) {
+        {
+            let mut held = lock(self.0);
+            if matches!(held.first(), Some(Held::Running)) {
+                held.remove(0);
+            }
+        }
+        if std::thread::panicking() {
+            tracing::error!(
+                "preparing a submission from a queue's line panicked (VICTORY_ASYNC_SUBMIT; the panic's message is above): \
+                 the process ends rather than stand still"
+            );
+            #[cfg(not(test))]
+            std::process::abort();
+        }
+    }
+}
+
 /// [`release_held`] on this thread, now (one thread at a time runs the
 /// lines: one that finds another doing it waits until it is done).
 #[cfg(windows)]
@@ -598,13 +628,16 @@ fn release_held_now(all: bool) {
                                 held.insert(0, Held::Running);
                                 drop(held);
                                 let sending = std::time::Instant::now();
-                                host.execute_late(lists, order);
+                                {
+                                    // Takes the marker off however this
+                                    // ends: a panic in the preparing would
+                                    // else leave it at the head for good.
+                                    let _marked = Marked(line);
+                                    host.execute_late(lists, order);
+                                }
                                 BEHIND_STATS[SENT_PARTS].fetch_add(1, Ordering::Relaxed);
                                 BEHIND_STATS[SENT_US].fetch_add(sending.elapsed().as_micros() as u64, Ordering::Relaxed);
                                 held = lock(line);
-                                if matches!(held.first(), Some(Held::Running)) {
-                                    held.remove(0);
-                                }
                             } else {
                                 host.execute_late(lists, order);
                             }
@@ -1237,7 +1270,9 @@ extern "system" fn present(
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
-        // will write runs behind that flight, and nothing is settled here.
+        // will write runs behind that flight, and nothing is settled here
+        // (but flights older than `VICTORY_LATE_FRAMES` frames).
+        crate::host::late_frames_bound();
         release_held_now(false);
     }
     // shortcut: what a queue still holds at a present runs now, whatever
@@ -1739,6 +1774,31 @@ mod tests {
         release_held_now(false);
         assert_eq!(crate::fence::completed(f1), 3);
         assert!(!lock(&WAITING).contains(&(q as usize)));
+        release_all(&[q, f1, f2]);
+    }
+
+    /// `VICTORY_ASYNC_SUBMIT`: a panic while a part is sent with the line
+    /// open does not leave the marker at the line's head (everything behind
+    /// it would stand for good); what follows runs again.
+    #[cfg(windows)]
+    #[test]
+    fn a_panic_while_sending_takes_the_marker_off() {
+        let (q, f1, f2) = queue_and_fences();
+        {
+            let mut held = lock(&queue(q).held);
+            held.push(Held::Running);
+            held.push(Held::Signal(crate::fence::FenceRef::new(f1), 5));
+        }
+        lock(&WAITING).push(q as usize);
+        let line = &queue(q).held;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _marked = Marked(line);
+            panic!("preparing failed");
+        }));
+        assert!(caught.is_err());
+        assert!(!matches!(lock(line).first(), Some(Held::Running)), "the marker stayed at the head");
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(f1), 5);
         release_all(&[q, f1, f2]);
     }
 
