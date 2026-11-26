@@ -836,6 +836,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        if crate::waitstat::on() {
+            let uav = host.iter().filter(|b| b.kind == 2);
+            let every = uav.clone().filter(|b| b.first.is_null()).count() as u64;
+            crate::waitstat::global(crate::waitstat::Cause::Barriers, every);
+            crate::waitstat::scoped(crate::waitstat::Cause::Barriers, uav.count() as u64 - every);
+        }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1665,6 +1671,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         SYNCS[1].fetch_add(1, Relaxed);
+        crate::waitstat::global(crate::waitstat::Cause::Sync, 1);
     }
     #[cfg(not(windows))]
     let _ = this;
@@ -2234,11 +2241,29 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // (`VICTORY_INDIRECT_BATCH=2`: the title waits for its dispatches.)
     #[cfg(windows)]
     if count > 0 && crate::draw::batches() == 2 {
         with_state(this, |_, state| state.synced());
+    }
+    // VICTORY_WAIT_STATS=1: what the groups hold.
+    if count > 0 && crate::waitstat::on() {
+        // SAFETY: the title passes `count` groups at `groups`.
+        match unsafe { read_groups(count, groups) } {
+            Some(groups) => {
+                let mut kinds = [0u64; 4];
+                let (mut barriers, mut ordering) = (0u64, 0u64);
+                for g in groups {
+                    kinds[(g.kind as usize).min(3)] += 1;
+                    barriers += u64::from(g.count);
+                    // SAFETY: as `read_groups` checked.
+                    ordering += unsafe { g.ordering() }.count() as u64;
+                }
+                crate::waitstat::groups(kinds, barriers, ordering);
+            }
+            None => crate::waitstat::groups([0, 0, 0, u64::from(count)], 0, 1),
+        }
     }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -2257,9 +2282,156 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        crate::waitstat::global(crate::waitstat::Cause::Groups, 1);
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// An enhanced barrier group as the title passes it
+/// (`D3D12_BARRIER_GROUP`): its kind (0 global, 1 texture, 2 buffer), how
+/// many barriers, and where they are.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BarrierGroup {
+    kind: u32,
+    count: u32,
+    barriers: *const u8,
+}
+
+/// The four words every enhanced barrier begins with (`D3D12_GLOBAL_BARRIER`
+/// is only these; `D3D12_TEXTURE_BARRIER` and `D3D12_BUFFER_BARRIER` go on
+/// with layouts and a resource).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BarrierSync {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+}
+
+/// `D3D12_TEXTURE_BARRIER`: the four words, two layouts, the resource,
+/// the subresource range and flags.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TextureBarrier {
+    sync: BarrierSync,
+    layout_before: u32,
+    layout_after: u32,
+    resource: This,
+    subresources: [u32; 6],
+    flags: u32,
+}
+
+/// `D3D12_BUFFER_BARRIER`: the four words, the resource, offset and size.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BufferBarrier {
+    sync: BarrierSync,
+    resource: This,
+    offset: u64,
+    size: u64,
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BARRIER_GROUP, D3D12_BUFFER_BARRIER, D3D12_GLOBAL_BARRIER, D3D12_TEXTURE_BARRIER,
+    };
+    assert!(size_of::<BarrierGroup>() == size_of::<D3D12_BARRIER_GROUP>());
+    assert!(size_of::<BarrierSync>() == size_of::<D3D12_GLOBAL_BARRIER>());
+    assert!(size_of::<TextureBarrier>() == size_of::<D3D12_TEXTURE_BARRIER>());
+    assert!(offset_of!(TextureBarrier, resource) == offset_of!(D3D12_TEXTURE_BARRIER, pResource));
+    assert!(offset_of!(TextureBarrier, flags) == offset_of!(D3D12_TEXTURE_BARRIER, Flags));
+    assert!(size_of::<BufferBarrier>() == size_of::<D3D12_BUFFER_BARRIER>());
+    assert!(offset_of!(BufferBarrier, resource) == offset_of!(D3D12_BUFFER_BARRIER, pResource));
+    assert!(offset_of!(BufferBarrier, size) == offset_of!(D3D12_BUFFER_BARRIER, Size));
+};
+
+/// `D3D12_BARRIER_ACCESS_*`: a side of a barrier with none of these, and
+/// not `COMMON` (0, any access its layout allows), writes nothing whose
+/// order a barrier on shader writes keeps: unordered access, stream
+/// output, copy and resolve destinations, acceleration structure writes,
+/// the video writes. Render target and depth writes are ordered by the
+/// host's own state changes before a texture is read (every host use of a
+/// title texture moves its host copy to the state it needs first).
+const ACCESS_ORDERED: u32 = 0x10 | 0x100 | 0x400 | 0x1000 | 0x8000 | 0x40000 | 0x100000 | 0x400000;
+/// `D3D12_BARRIER_ACCESS_NO_ACCESS`.
+const ACCESS_NONE: u32 = 0x8000_0000;
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::*;
+    assert!(
+        ACCESS_ORDERED
+            == (D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0
+                | D3D12_BARRIER_ACCESS_STREAM_OUTPUT.0
+                | D3D12_BARRIER_ACCESS_COPY_DEST.0
+                | D3D12_BARRIER_ACCESS_RESOLVE_DEST.0
+                | D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE.0
+                | D3D12_BARRIER_ACCESS_VIDEO_DECODE_WRITE.0
+                | D3D12_BARRIER_ACCESS_VIDEO_PROCESS_WRITE.0
+                | D3D12_BARRIER_ACCESS_VIDEO_ENCODE_WRITE.0) as u32
+    );
+    assert!(ACCESS_NONE == D3D12_BARRIER_ACCESS_NO_ACCESS.0 as u32);
+    assert!(D3D12_BARRIER_SYNC_NONE.0 == 0);
+};
+
+impl BarrierSync {
+    /// Whether the barrier asks that shader writes before it be done
+    /// before what follows: something ran before it (`SyncBefore` not
+    /// `NONE`) and a side may write in a way only such a barrier orders.
+    fn orders_writes(&self) -> bool {
+        let side = |access: u32| access != ACCESS_NONE && (access == 0 || access & ACCESS_ORDERED != 0);
+        self.sync_before != 0 && (side(self.access_before) || side(self.access_after))
+    }
+}
+
+/// The barriers of one group whose order of shader writes is asked for
+/// ([`BarrierSync::orders_writes`]): (kind, the resource named or null).
+impl BarrierGroup {
+    /// # Safety
+    /// The group as [`read_groups`] passed it.
+    unsafe fn ordering(&self) -> impl Iterator<Item = (u32, This)> + '_ {
+        let n = self.count as usize;
+        let (step, at): (usize, usize) = match self.kind {
+            0 => (size_of::<BarrierSync>(), usize::MAX),
+            1 => (size_of::<TextureBarrier>(), offset_of!(TextureBarrier, resource)),
+            _ => (size_of::<BufferBarrier>(), offset_of!(BufferBarrier, resource)),
+        };
+        (0..n).filter_map(move |i| {
+            // SAFETY: `count` barriers of the group's kind at `barriers`.
+            let b = unsafe { self.barriers.add(i * step) };
+            // SAFETY: each begins with the four words.
+            let sync = unsafe { b.cast::<BarrierSync>().read_unaligned() };
+            let resource = if at == usize::MAX {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: the resource pointer at its place in the barrier.
+                unsafe { b.add(at).cast::<This>().read_unaligned() }
+            };
+            sync.orders_writes().then_some((self.kind, resource))
+        })
+    }
+}
+
+/// The title's `count` groups at `groups`, if they look like barrier
+/// groups: of the three kinds, each with its barriers where it says (a
+/// call that does not is met as before, with a barrier on every write).
+///
+/// # Safety
+/// `groups` is the title's argument: `count` groups.
+unsafe fn read_groups<'a>(count: u32, groups: *const u8) -> Option<&'a [BarrierGroup]> {
+    if groups.is_null() || count > 4096 || !(groups as usize).is_multiple_of(align_of::<BarrierGroup>()) {
+        return None;
+    }
+    // SAFETY: as the caller says.
+    let groups = unsafe { std::slice::from_raw_parts(groups.cast::<BarrierGroup>(), count as usize) };
+    groups
+        .iter()
+        .all(|g| g.kind <= 2 && g.count <= 4096 && (g.count == 0 || !g.barriers.is_null()))
+        .then_some(groups)
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

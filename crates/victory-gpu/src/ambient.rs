@@ -584,6 +584,7 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };
+    crate::waitstat::global(crate::waitstat::Cause::Ours, 1);
 }
 
 /// Whether the light of a frame has been kept: the estimate has something

@@ -4932,6 +4932,7 @@ impl State {
             if crate::launch::waits() && (list.first_use(LAUNCH_USE) || self.launch_wait) {
                 // SAFETY: an open list.
                 unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+                crate::waitstat::global(crate::waitstat::Cause::Ours, 1);
                 self.launch_wait = false;
                 crate::launch::count(crate::launch::L_WAIT);
             }

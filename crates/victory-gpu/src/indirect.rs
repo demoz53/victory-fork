@@ -837,6 +837,7 @@ fn record_clamp_at(
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
+        crate::waitstat::global(crate::waitstat::Cause::ClampBefore, u64::from(waits));
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -848,6 +849,7 @@ fn record_clamp_at(
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
+        crate::waitstat::global(crate::waitstat::Cause::ClampAfter, u64::from(waits));
     }
     true
 }

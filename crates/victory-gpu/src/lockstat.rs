@@ -70,8 +70,23 @@ fn waited(which: Lock, since: std::time::Instant) {
 /// `mutex`, locked (a poisoned lock is taken all the same, as everywhere in
 /// the crate), its wait counted as `which`'s with the switch.
 pub(crate) fn lock<T>(mutex: &Mutex<T>, which: Lock) -> MutexGuard<'_, T> {
-    if !on() {
+    // VICTORY_WAIT_STATS=1: the submission lock's waits are the
+    // submitting thread's (`crate::waitstat`).
+    let submit = which == Lock::Submit && crate::waitstat::on();
+    if !on() && !submit {
         return mutex.lock().unwrap_or_else(|e| e.into_inner());
+    }
+    if !on() {
+        return match mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                let since = std::time::Instant::now();
+                let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+                crate::waitstat::stood(crate::waitstat::Stood::SubmitLock, since.elapsed().as_micros() as u64);
+                guard
+            }
+        };
     }
     TAKEN[which as usize].fetch_add(1, Relaxed);
     match mutex.try_lock() {
@@ -80,6 +95,9 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>, which: Lock) -> MutexGuard<'_, T> {
         Err(TryLockError::WouldBlock) => {
             let since = std::time::Instant::now();
             let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+            if submit {
+                crate::waitstat::stood(crate::waitstat::Stood::SubmitLock, since.elapsed().as_micros() as u64);
+            }
             waited(which, since);
             guard
         }
