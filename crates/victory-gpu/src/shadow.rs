@@ -1200,6 +1200,99 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 
 mod relay_merge_simd;
 
+/// `VICTORY_BACK_BLOCKS=1` (off by default): bytes shaders wrote go back
+/// into title memory by 1 KiB block, only the blocks the merge changed
+/// ([`put_back`]), not the whole span from the first changed byte to the
+/// last. After upstream PRs #2242/#2280 (wbkepler, 09595753, 7ef96fa9),
+/// without their shader marks. Fewer bytes written means fewer pages the
+/// write watch reports at the next refresh (the echo).
+fn back_blocks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_BLOCKS").is_some_and(|v| v == "1"))
+}
+
+std::thread_local! {
+    /// Title memory as [`read_title`] read it last on this thread, for
+    /// [`put_back`] to tell what the merge changed.
+    static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Reads title memory at `src` into `dst` (`crate::host::read_into`); with
+/// [`back_blocks`], also keeps what was read for [`put_back`].
+fn read_title(src: *const u8, dst: &mut [u8]) -> bool {
+    let ok = crate::host::read_into(src, dst);
+    if ok && back_blocks() {
+        READ.with_borrow_mut(|r| {
+            r.clear();
+            r.extend_from_slice(dst);
+        });
+    }
+    ok
+}
+
+/// Puts `merged` back into title memory at `at` (read just before by
+/// [`read_title`] on this thread, then merged with what shaders wrote):
+/// the whole span, or with [`back_blocks`] only the 1 KiB blocks that
+/// differ from what was read, joined into runs. Returns the bytes written.
+fn put_back(at: usize, merged: &[u8]) -> usize {
+    let n = merged.len();
+    let whole = || {
+        let _writing = crate::watch::writing(at, n);
+        crate::host::write_mapped(at as *mut u8, merged.as_ptr(), n);
+        n
+    };
+    if !back_blocks() {
+        return whole();
+    }
+    READ.with_borrow(|was| {
+        if was.len() != n {
+            return whole();
+        }
+        let mut written = 0;
+        changed_blocks(merged, was, |a, b| {
+            let _writing = crate::watch::writing(at + a, b - a);
+            crate::host::write_mapped((at + a) as *mut u8, merged[a..].as_ptr(), b - a);
+            written += b - a;
+        });
+        written
+    })
+}
+
+/// Visit contiguous runs of changed 1 KiB blocks, including a partial last block.
+fn changed_blocks(merged: &[u8], before: &[u8], mut visit: impl FnMut(usize, usize)) {
+    const BLOCK: usize = 1024;
+    debug_assert_eq!(merged.len(), before.len());
+    let mut start = None;
+    for (index, (new, old)) in merged.chunks(BLOCK).zip(before.chunks(BLOCK)).enumerate() {
+        let at = index * BLOCK;
+        if new != old {
+            start.get_or_insert(at);
+        } else if let Some(first) = start.take() {
+            visit(first, at);
+        }
+    }
+    if let Some(first) = start {
+        visit(first, merged.len());
+    }
+}
+
+#[cfg(test)]
+mod back_block_tests {
+    #[test]
+    fn adjacent_changes_join_and_a_partial_tail_stays_in_bounds() {
+        let before = vec![0; 4099];
+        let mut after = before.clone();
+        let mut runs = Vec::new();
+        super::changed_blocks(&after, &before, |a, b| runs.push((a, b)));
+        assert!(runs.is_empty());
+        for i in [1024, 3071, 4098] {
+            after[i] = 1;
+        }
+        super::changed_blocks(&after, &before, |a, b| runs.push((a, b)));
+        assert_eq!(runs, [(1024, 3072), (4096, 4099)]);
+    }
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -2906,14 +2999,12 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
+                let read = |first: usize, title: &mut [u8]| read_title((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, read) else {
                     continue;
                 };
                 let at = at + first;
-                let _writing = crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written += n;
+                written += put_back(start + at, &title[..n]);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -2993,15 +3084,13 @@ impl Shadow {
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !read_title((start + at) as *const u8, title) {
             return 0;
         }
         if !merge_piece(now, held, title) {
             return 0;
         }
-        let _writing = crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        put_back(start + at, &title[..n])
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3774,7 +3863,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if read_title((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
@@ -3786,9 +3875,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                let _writing = crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
+                written = put_back(start + at, &title[..n]);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -3850,7 +3937,7 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
+        let mapped = read_title((start + at) as *const u8, title);
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -3861,9 +3948,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        let _writing = crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        put_back(start + at, &title[..n])
     }
 }
 
