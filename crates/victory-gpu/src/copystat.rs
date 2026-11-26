@@ -1118,6 +1118,8 @@ fn log_memory() {
         mb(own[3]),
         own[7],
     );
+    // The placed views' shapes, and the ownerless entries past them.
+    tracing::info!("memory, {}", crate::descriptor::shape_line());
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.
