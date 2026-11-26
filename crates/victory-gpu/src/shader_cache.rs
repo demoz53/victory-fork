@@ -131,7 +131,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// The order, and `VICTORY_WAVE_LOCAL` being here twice, are kept as they
 /// were: with `VICTORY_SHADER_CACHE_KEY=exe` the key is, byte for byte,
 /// what it was while the executable was the identity.
-const SWITCHES: [&str; 50] = [
+const SWITCHES: [&str; 51] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LDS_REGIONS",
@@ -193,6 +193,7 @@ const SWITCHES: [&str; 50] = [
     "VICTORY_SHADER_FIXES_1126",
     "VICTORY_SECTIONS_PAST_SAVEEXEC",
     "VICTORY_LDS_BOUNDS",
+    "VICTORY_LEGACY_ZERO_EXP",
     // (test/shader7: wave64 backward permutes within each half, d16 image loads' integer
     // bits; each on unless "0")
     "VICTORY_PERMUTE_HALF_LOCAL",
