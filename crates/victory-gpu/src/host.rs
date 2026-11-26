@@ -8663,12 +8663,24 @@ impl Meter {
                     .each_ref()
                     .map(|row| row.each_ref().map(|a| a.swap(0, Ordering::Relaxed)));
                 if crate::descriptor::host::queue_age_line() && ages.iter().flatten().any(|&n| n != 0) {
+                    // Since the start, for one number a run: the uploads of
+                    // each row, and those within one frame of the write.
+                    static SO_FAR: [[std::sync::atomic::AtomicU64; 2]; 2] =
+                        [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 2];
                     let [ours, theirs] = ages;
-                    let late = |row: &[u64; 7]| row[2..].iter().sum::<u64>();
+                    let so_far = |i: usize, row: &[u64; 7]| {
+                        let (all, soon) = crate::descriptor::host::age_shares(row);
+                        let all = SO_FAR[i][0].fetch_add(all, Ordering::Relaxed) + all;
+                        let soon = SO_FAR[i][1].fetch_add(soon, Ordering::Relaxed) + soon;
+                        (all, if all == 0 { 100.0 } else { soon as f64 * 100.0 / all as f64 })
+                    };
+                    let ((all_ours, soon_ours), (all_theirs, soon_theirs)) = (so_far(0, &ours), so_far(1, &theirs));
                     tracing::info!(
-                        "textures picked by index, first uploads since the last line, by the frames after their slot was                          written (same frame, 1, 2, 3-5, 6-15, 16-63, more): {ours:?} with their memory there at every look                          ({} two frames or more late), {theirs:?} after a look that found it unmapped ({} two or more late)                          (VICTORY_QUEUE_AGE=0: no line)",
-                        late(&ours),
-                        late(&theirs)
+                        "textures picked by index, first uploads since the last line, by the frames after their slot was \
+                         written (same frame, 1, 2, 3-5, 6-15, 16-63, more): {ours:?} with their memory there at every look, \
+                         {theirs:?} after a look that found it unmapped; since the start {all_ours} and {all_theirs} uploads, \
+                         {soon_ours:.1} % and {soon_theirs:.1} % of them within one frame of the write (VICTORY_QUEUE_AGE=0: no \
+                         line)"
                     );
                 }
             }

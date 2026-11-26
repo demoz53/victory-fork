@@ -684,6 +684,12 @@ pub(crate) fn age_bucket(age: u64) -> usize {
     }
 }
 
+/// Of a row of [`QUEUE_AGE`]: all its uploads, and those in the same frame
+/// as the write or the one after it.
+pub(crate) fn age_shares(row: &[u64; 7]) -> (u64, u64) {
+    (row.iter().sum(), row[0] + row[1])
+}
+
 /// Whether the frame line tells of [`QUEUE_AGE`] (on unless
 /// `VICTORY_QUEUE_AGE=0`; the counting is two atomics an upload).
 pub(crate) fn queue_age_line() -> bool {
@@ -3530,6 +3536,9 @@ mod tests {
         assert_eq!(buckets, [0, 1, 2, 3, 3, 4, 4, 5, 5, 6, 6]);
         assert_eq!(QUEUE_AGE.len(), 2);
         assert!(QUEUE_AGE.iter().all(|row| row.len() == 7));
+        // All of a row, and the part within one frame of the write.
+        assert_eq!(age_shares(&[5, 3, 2, 1, 0, 0, 9]), (20, 8));
+        assert_eq!(age_shares(&[0; 7]), (0, 0));
     }
 
     /// Only the first upload since a slot's write is counted, with the
