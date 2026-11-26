@@ -249,15 +249,25 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
 /// The title also renders to R9G9B9E5 (67), which no PC GPU does: 16-bit
-/// float RGBA stands in, with at least R9G9B9E5's precision and range.
+/// float RGBA stands in, with at least R9G9B9E5's precision; its range ends
+/// at 65,504 (infinity past it, where R9G9B9E5 saturates at 65,408), so
+/// `VICTORY_E5_STAND_IN=32` offers 32-bit float RGBA.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
-    let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
+    // R9G9B9E5 saturates at 65,408 on the console; 16-bit float turns
+    // anything past 65,504 into infinity (the sun's disc, a lamp's core), and
+    // the passes after it (bloom, exposure, tone mapping) make NaN of it,
+    // drawn black or purple. `VICTORY_E5_STAND_IN=32`: 32-bit float RGBA
+    // (2) stands in instead, which holds such values (twice the memory).
+    // Ported from Ranxanat0r/cool_fox-dlss-ranxanat0r 3eb180e12 (Humb8l).
+    static E5: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let e5 = *E5.get_or_init(|| e5_stand_in(std::env::var_os("VICTORY_E5_STAND_IN").as_deref()));
+    let stand_ins: [(u32, u32); 3] = [(86, 28), (115, 28), (67, e5)];
+    let Some(i) = stand_ins.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
@@ -265,7 +275,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
         use windows::Win32::Graphics::Direct3D12::*;
         static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, to)| {
+            stand_ins.map(|(f, to)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -295,7 +305,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
             })
         });
         if refused[i] {
-            return STAND_INS[i].1;
+            return stand_ins[i].1;
         }
     }
     format
@@ -323,6 +333,13 @@ pub(crate) fn stands_in(this: This) -> bool {
 /// to be colour textures altogether).
 pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The host format standing in for R9G9B9E5 render targets:
+/// R16G16B16A16_FLOAT (10), or R32G32B32A32_FLOAT (2) with
+/// `VICTORY_E5_STAND_IN=32`.
+fn e5_stand_in(set: Option<&std::ffi::OsStr>) -> u32 {
+    if set.is_some_and(|v| v == "32") { 2 } else { 10 }
+}
 
 /// Whether the title asked for both depth and unordered access for `this`.
 #[cfg(windows)]
@@ -382,10 +399,11 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 /// frame-rate line; and since the start, how often a depth plane's twin
 /// lacked what was written to the plane (not given to it), and how often a
 /// depth plane was used in the list that had written its twin, before the
-/// pass (which runs when the list closes).
+/// pass (which runs when the list closes); and how often the pass was
+/// drawn at such a use instead (`VICTORY_PLANE_NOW`).
 #[cfg(windows)]
-pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
@@ -3361,6 +3379,33 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    /// R9G9B9E5's stand-in: 16-bit float RGBA unless 32-bit is asked for,
+    /// and the host renders to and stores into 32-bit float RGBA (else the
+    /// switch could not take effect).
+    #[test]
+    fn the_e5_stand_in() {
+        use std::ffi::OsStr;
+        assert_eq!(super::e5_stand_in(None), 10);
+        assert_eq!(super::e5_stand_in(Some(OsStr::new("16"))), 10);
+        assert_eq!(super::e5_stand_in(Some(OsStr::new("32"))), 2);
+        #[cfg(windows)]
+        if let Some(host) = crate::host::host() {
+            use windows::Win32::Graphics::Direct3D12::*;
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT,
+                ..Default::default()
+            };
+            // SAFETY: a plain query into our own structure.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32)
+                    .expect("asked");
+            }
+            let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+            assert_eq!(support.Support1.0 & both, both, "the host renders to and stores into 32-bit float RGBA");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn texture_keep_is_opt_in_and_its_time_is_bounded() {
@@ -4726,6 +4771,39 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
+        depth_plane_classes(Order::AtClose);
+    }
+
+    /// With `VICTORY_PLANE_NOW` the plane's pass is recorded at the use in
+    /// the list that wrote the twin, so the title's "equal" draws later in
+    /// the same list see this list's classes; without it they see the plane
+    /// as it was (here: nothing drawn), and the count of uses before the
+    /// pass goes up.
+    #[cfg(windows)]
+    #[test]
+    fn a_depth_plane_used_in_the_list_that_wrote_its_twin() {
+        crate::host::TEST_PLANE_NOW.set(Some(true));
+        depth_plane_classes(Order::SameList);
+        crate::host::TEST_PLANE_NOW.set(Some(false));
+        depth_plane_classes(Order::SameListLate);
+        crate::host::TEST_PLANE_NOW.set(None);
+    }
+
+    /// Where the title's draws that test the plane are recorded.
+    #[cfg(windows)]
+    #[derive(Clone, Copy, PartialEq)]
+    enum Order {
+        /// In a list after the one that wrote the twin (which closed).
+        AtClose,
+        /// In the list that wrote the twin, after a use of the plane, with
+        /// `VICTORY_PLANE_NOW`.
+        SameList,
+        /// The same, without it.
+        SameListLate,
+    }
+
+    #[cfg(windows)]
+    fn depth_plane_classes(order: Order) {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -4757,6 +4835,7 @@ mod tests {
         );
         let host_depth = host_resource(depth).unwrap();
         let Some(plane) = twin_plane_resource(depth) else {
+            assert!(order == Order::AtClose, "no depth plane twin to test the order with");
             return; // these twins are turned off
         };
         // SAFETY: live resources.
@@ -4905,8 +4984,20 @@ mod tests {
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
-        list.close();
-        host.execute(&[&list]);
+        let same = order != Order::AtClose;
+        if same {
+            // The title's draw that tests the plane, in the same list.
+            let late = PLANES[2].load(Relaxed);
+            assert!(list.twin_use(depth, false, false));
+            crate::list::ensure_state(&list, depth, DEPTH_WRITE);
+            assert_eq!(list.take_plane_reset(), order == Order::SameList, "the title's state is owed again");
+            if order == Order::SameListLate {
+                assert!(PLANES[2].load(Relaxed) > late, "counted as used before the pass");
+            }
+        } else {
+            list.close();
+            host.execute(&[&list]);
+        }
 
         // The draws: a triangle over the target at the depth of a class,
         // as the title's lighting places its rectangles.
@@ -4967,8 +5058,11 @@ float4 lit() : SV_Target { return 1.0; }
                 host.device.CreateGraphicsPipelineState(&desc).unwrap();
             (signature, pipeline)
         };
-        let state = host_copy(depth).unwrap().state.load(Relaxed);
-        let state = D3D12_RESOURCE_STATES(state as i32);
+        let state = if same {
+            tested
+        } else {
+            D3D12_RESOURCE_STATES(host_copy(depth).unwrap().state.load(Relaxed) as i32)
+        };
         let colour = host.rtv(Some(&target), None);
         let depth_view = host.dsv(
             host_depth,
@@ -4978,7 +5072,8 @@ float4 lit() : SV_Target { return 1.0; }
                 ..Default::default()
             }),
         );
-        let back = host.new_list().unwrap();
+        let fresh = (!same).then(|| host.new_list().unwrap());
+        let back = fresh.as_ref().unwrap_or(&list);
         // SAFETY: an open list and live resources and views.
         unsafe {
             let l = &back.list;
@@ -5014,7 +5109,7 @@ float4 lit() : SV_Target { return 1.0; }
             l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
         }
         back.close();
-        host.execute(&[&back]);
+        host.execute(&[back]);
         let mut mapped = std::ptr::null_mut();
         // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
         let read = unsafe {
@@ -5032,7 +5127,9 @@ float4 lit() : SV_Target { return 1.0; }
         };
         for (i, class) in CLASSES.into_iter().enumerate() {
             let covered = read[i / 4 * 256 + i % 4] != 0;
-            let drawn = matches!(class, 65 | 129);
+            // Without the pass first, the plane holds what it held: none of
+            // these classes.
+            let drawn = matches!(class, 65 | 129) && order != Order::SameListLate;
             assert_eq!(covered, drawn, "texel {i}, class {class}");
         }
     }
