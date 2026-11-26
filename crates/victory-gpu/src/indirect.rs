@@ -718,6 +718,15 @@ fn clamp_into(
     let recorded = record_clamp_scoped(c, &list.list, (dst, before, at), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
+        // The clamp waited for every earlier shader write, and wrote only
+        // its scratch and budget (`VICTORY_CONSTANT_WAITS=lazy`).
+        #[cfg(feature = "diagnostics")]
+        let waited = crate::copystat::barrier_test() & 2 == 0;
+        #[cfg(not(feature = "diagnostics"))]
+        let waited = true;
+        if waited {
+            list.waited_all();
+        }
     }
     recorded
 }
@@ -981,6 +990,9 @@ pub(crate) fn open_batch(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    // The pass waited for every earlier shader write, and writes only its
+    // records and the budget (`VICTORY_CONSTANT_WAITS=lazy`).
+    list.waited_all();
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))

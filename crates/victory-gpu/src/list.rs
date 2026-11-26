@@ -842,6 +842,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             crate::waitstat::global(crate::waitstat::Cause::Barriers, every);
             crate::waitstat::scoped(crate::waitstat::Cause::Barriers, uav.count() as u64 - every);
         }
+        if host.iter().any(|b| b.kind == 2 && b.first.is_null()) {
+            list.waited_all();
+        }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1672,6 +1675,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         SYNCS[1].fetch_add(1, Relaxed);
         crate::waitstat::global(crate::waitstat::Cause::Sync, 1);
+        list.waited_all();
     }
     #[cfg(not(windows))]
     let _ = this;
@@ -2295,6 +2299,7 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         crate::waitstat::global(crate::waitstat::Cause::Groups, 1);
+        list.waited_all();
     }
     #[cfg(not(windows))]
     let _ = (this, count, groups);

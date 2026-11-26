@@ -1287,7 +1287,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     }
     if (flights || written) && crate::host::fill_on_card() {
         shadow.refresh(list, address, len);
-        if let Some(gpu) = list.card_constants(&shadow, address, len) {
+        if let Some(gpu) = list.card_constants(&shadow, address, len, crate::waitstat::Cause::ConstantsRoot) {
             FILL_FLIGHTS[1].fetch_add(1, Ordering::Relaxed);
             return Some(gpu);
         }
@@ -3636,6 +3636,7 @@ impl State {
         };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
+        self.may_store(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -4026,6 +4027,7 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
+                    self.may_store(list);
                     match launch {
                         Some(launch) => {
                             crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
@@ -4382,7 +4384,7 @@ impl State {
                             })
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));
-                                list.card_constants(&shadow, address, u64::from(size))
+                                list.card_constants(&shadow, address, u64::from(size), crate::waitstat::Cause::ConstantsTable)
                             } =>
                     {
                         FILL_FLIGHTS[3].fetch_add(1, Ordering::Relaxed);
@@ -4542,6 +4544,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            self.may_store(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4642,6 +4645,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            self.may_store(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4687,6 +4691,18 @@ impl State {
             return;
         }
         self.dispatched_as(pipeline_stores(self.pipeline));
+    }
+
+    /// `VICTORY_CONSTANT_WAITS=lazy`: the draw or dispatch about to be
+    /// recorded into `list` may store to buffer memory (its shaders can, or
+    /// their code is not known: `crate::host::HostList::may_store`).
+    fn may_store(&self, list: &HostList) {
+        if crate::host::lazy_constant_waits() {
+            list.may_store(
+                crate::pipeline::host_pipeline(self.pipeline as This)
+                    .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)),
+            );
+        }
     }
 
     /// [`State::buffers_written`] for a dispatch whose shaders are known to
@@ -4933,6 +4949,7 @@ impl State {
                 // SAFETY: an open list.
                 unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
                 crate::waitstat::global(crate::waitstat::Cause::Ours, 1);
+                list.waited_all();
                 self.launch_wait = false;
                 crate::launch::count(crate::launch::L_WAIT);
             }
@@ -4940,6 +4957,7 @@ impl State {
             let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
             list.keep(&args.buffer);
             self.mesh_scissor(list, true);
+            self.may_store(list);
             let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
             self.mesh_scissor(list, false);
             if !launched {
@@ -5218,6 +5236,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        self.may_store(list);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -5257,6 +5276,7 @@ impl State {
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
                 if self.bind(list, p, true) {
+                    self.may_store(list);
                     // SAFETY: an open list with `p`'s root signature and
                     // arguments set; the part's pipeline shares that root
                     // signature, and it and the scratch buffer are kept alive.
