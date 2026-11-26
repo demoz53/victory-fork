@@ -1010,3 +1010,25 @@ fn single_thread_lds_omits_wave_size() {
     assert_eq!(lower_lds(1).wave_size, None);
     assert_eq!(lower_lds(2).wave_size, Some(32));
 }
+
+#[test]
+fn only_latches_reached_through_a_loop_exit_lose_their_abort() {
+    use crate::structure::{Bool, LaneExit::*};
+
+    // Header 1 sends some lanes straight through latch 4. Only paths to
+    // latch 3 must pass the natural exit in block 2.
+    let branch = |taken, not_taken| Branch { when: Bool::TRUE, taken, not_taken };
+    let exits = [Jump(1), branch(2, 4), branch(5, 3), Jump(1), Jump(1), End];
+    let limit = super::limit_exits(&[0, 1, 4, 2, 3, 5], &exits);
+    assert_eq!(limit.plain, std::collections::HashSet::from([3]));
+    assert_eq!(limit.tests[&2], [1]);
+    assert!(!limit.bodies[&1].contains(&5));
+}
+
+#[test]
+fn an_endless_loop_keeps_its_iteration_limit_in_the_latch() {
+    use crate::structure::LaneExit::Jump;
+    let limit = super::limit_exits(&[0, 1], &[Jump(1), Jump(1)]);
+    assert!(limit.plain.is_empty());
+    assert!(limit.tests.is_empty());
+}

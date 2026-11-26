@@ -370,6 +370,7 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    limit: LimitExits,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -413,9 +414,108 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// that is not there ([`Lower::lane_there`]).
 pub(super) const LANE_ELSEWHERE: Why = "a lane written or read where not every lane runs";
 
+/// The loops closed by a plain jump (a lane's view of a loop entered past its first
+/// instruction, say) whose own exits test the iteration limit.
+///
+/// Testing it in the latch gives the loop a second way out, to the end of the program
+/// (`abort_block`), so no block after the loop is one every lane of it passes. With that, a
+/// wave operation after the loop (a ballot, a first lane, the mask two host waves exchange)
+/// did not cover the wave's lanes on NVIDIA. Measured on a GeForce card
+/// with a title's program that appends each thread's tile to one of two lists after
+/// such a loop, numbered per wave: of 14,260 threads 442 took a slot another had and 53 took
+/// none; with the limit tested at the loop's exits every one has its own.
+///
+/// A lane taken out at the limit this way goes on with the code after the loop, as one in a
+/// loop closed by a branch does.
+///
+/// Only programs whose code asks the wave (`console_lanes`) are shaped this way; in the others
+/// lanes do not see each other, and one stopped at the limit leaves the program as before.
+#[derive(Default)]
+struct LimitExits {
+    /// By block ending in a branch out of such a loop: the loops' headers.
+    tests: HashMap<usize, Vec<usize>>,
+    /// By header: the loop's blocks.
+    bodies: HashMap<usize, HashSet<usize>>,
+    /// The latches whose jump stays a plain one: a lane passes a testing branch on every way
+    /// from the header to them.
+    plain: HashSet<usize>,
+}
+
+fn limit_exits(order: &[usize], exits: &[LaneExit]) -> LimitExits {
+    let mut place = vec![usize::MAX; exits.len()];
+    for (n, &b) in order.iter().enumerate() {
+        place[b] = n;
+    }
+    let mut preds = vec![Vec::new(); exits.len()];
+    for &b in order {
+        let to = match exits[b] {
+            LaneExit::Jump(t) => [Some(t), None],
+            LaneExit::Branch { taken, not_taken, .. } => [Some(taken), Some(not_taken)],
+            LaneExit::End | LaneExit::Indirect => [None, None],
+        };
+        for t in to.into_iter().flatten().filter(|&t| place[t] != usize::MAX) {
+            preds[t].push(b);
+        }
+    }
+    let jumps = |b: usize| matches!(exits[b], LaneExit::Jump(_));
+    let mut found = LimitExits::default();
+    for &h in order {
+        let latches: Vec<usize> = preds[h].iter().copied().filter(|&q| place[h] <= place[q]).collect();
+        if !latches.iter().any(|&q| jumps(q)) {
+            continue;
+        }
+        // the loop: its header and what reaches a latch without passing the header
+        let mut body = HashSet::from([h]);
+        let mut stack = latches.clone();
+        while let Some(b) = stack.pop() {
+            if body.insert(b) {
+                stack.extend(preds[b].iter().copied());
+            }
+        }
+        // (entered at a second place: the header's count is not known in all of it)
+        if h != order[0] && body.contains(&order[0]) {
+            continue;
+        }
+        let exiting: HashSet<usize> = body
+            .iter()
+            .copied()
+            .filter(|&b| {
+                matches!(exits[b], LaneExit::Branch { taken, not_taken, .. }
+                    if body.contains(&taken) != body.contains(&not_taken))
+            })
+            .collect();
+        let mut any = false;
+        for &latch in latches.iter().filter(|&&q| jumps(q)) {
+            // back from the latch to the header through no exiting block?
+            let (mut seen, mut stack, mut free) = (HashSet::new(), vec![latch], false);
+            while let Some(b) = stack.pop() {
+                if exiting.contains(&b) || !seen.insert(b) {
+                    continue;
+                }
+                if b == h {
+                    free = true;
+                    break;
+                }
+                stack.extend(preds[b].iter().copied().filter(|q| body.contains(q)));
+            }
+            if !free {
+                found.plain.insert(latch);
+                any = true;
+            }
+        }
+        if any {
+            for &b in &exiting {
+                found.tests.entry(b).or_default().push(h);
+            }
+            found.bodies.insert(h, body);
+        }
+    }
+    found
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
+/// Per IR block: every lane of the wave that started the program runs it â€“ no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
@@ -1117,7 +1217,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
-/// The widest wave the host GPU runs (0: not known – no host-specific forms); see
+/// The widest wave the host GPU runs (0: not known â€“ no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1740,8 +1840,8 @@ impl<'a> Lower<'a> {
             // does not need a fixed WaveSize (which 64-only GCN GPUs and WARP refuse).
             let one_wave = group > 1 && group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
-            // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
+            // wave64 program whose cross-lane code stays inside 32-lane halves â€“ DPP rows,
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there â€“ runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
@@ -1764,7 +1864,7 @@ impl<'a> Lower<'a> {
                     // waves, which exchange through their own pair of dwords.)
                     // LDS the console shares within its one wave without barriers: split into
                     // two waves of 32, a group barrier before every LDS access keeps their order
-                    // – where every thread of the group gets there (no lane branch around it,
+                    // â€“ where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
@@ -1865,6 +1965,13 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
+        let limit = if p.wave64 && console_lanes && x.native.stage == HwStage::Cs
+            && std::env::var_os("VICTORY_LOOP_EXITS").is_some_and(|v| v == "1")
+        {
+            limit_exits(&crate::ir::reverse_postorder(&p.blocks), &x.st.exits)
+        } else {
+            LimitExits::default()
+        };
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
         // do not run, and all of them in a program with a loop closed by a
@@ -1885,7 +1992,7 @@ impl<'a> Lower<'a> {
                 .exits
                 .iter()
                 .enumerate()
-                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)));
+                .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)) && !limit.plain.contains(&b));
             let all = all_lane_blocks(x.st);
             (0..p.blocks.len())
                 .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
@@ -2060,6 +2167,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            limit,
             counters: HashMap::new(),
             abort: None,
         }
@@ -3920,7 +4028,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2Ï€ (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -3938,7 +4046,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 Ã— 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -5214,7 +5322,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (Ã—64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -5413,7 +5521,7 @@ impl<'a> Lower<'a> {
     /// otherwise a NaN loses to a number (two quiet NaNs give the data);
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as ±0 first (MODE is not modelled).
+    // flushing them they would order as Â±0 first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
@@ -8227,7 +8335,7 @@ impl<'a> Lower<'a> {
                 // Follows the default f32 flush-to-zero (FTZ) denormal mode
                 // used by the console and D3D12/DXIL: subnormal inputs
                 // (`exp == 0`) and underflowing results (`exp + delta <= 0`)
-                // flush to signed zero, while `±inf` and NaNs pass through
+                // flush to signed zero, while `Â±inf` and NaNs pass through
                 // (with sNaNs quieted).
                 let (x_f, delta) = (f(self, 0)?, s(self, 1)?);
                 let x = self.as_int(x_f);
@@ -9255,7 +9363,7 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, at, odd);
         let up = self.s.m.bin(c, Bin::Or, above, tie);
         let up = self.s.m.select(c, up, one, zero);
-        // Rebias the exponent (1023 → 127); a carry out of the mantissa
+        // Rebias the exponent (1023 â†’ 127); a carry out of the mantissa
         // steps the exponent, up to infinity.
         let bias = k(self, 1023 - 127);
         let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
@@ -10887,7 +10995,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 Ã— the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
@@ -11362,9 +11470,14 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                if self.limit.plain.contains(&b) {
+                    self.next_iteration(t);
+                    Term::Br(self.block[t].expect("reachable"))
+                } else {
+                    let ok = self.count_iteration(t, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -11400,7 +11513,7 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
-                let cond = if back(self, taken) {
+                let mut cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
@@ -11409,6 +11522,21 @@ impl<'a> Lower<'a> {
                 } else {
                     cond
                 };
+                // The way out of a loop closed by a plain jump is taken at the limit too
+                // (`LimitExits`).
+                for h in self.limit.tests.get(&b).into_iter().flatten() {
+                    let Some(&(count, _)) = self.counters.get(h) else { continue };
+                    let last = self.s.m.i32(self.iteration_limit() - 1);
+                    cond = if self.limit.bodies[h].contains(&taken) {
+                        let under = self.s.m.cmp(self.cur, pred::IULT, count, last);
+                        self.s.m.tag(under, Tag::Counter);
+                        self.s.m.bin(self.cur, Bin::And, cond, under)
+                    } else {
+                        let over = self.s.m.cmp(self.cur, pred::IUGE, count, last);
+                        self.s.m.tag(over, Tag::Counter);
+                        self.s.m.bin(self.cur, Bin::Or, cond, over)
+                    };
+                }
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -11454,12 +11582,31 @@ impl<'a> Lower<'a> {
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
+        let next = self.next_iteration(to);
+        let limit = self.s.m.i32(self.iteration_limit());
+        let over = self.s.m.cmp(self.cur, p, next, limit);
+        self.s.m.tag(over, Tag::Counter);
+        over
+    }
+
+    /// A back edge to header `to`: the count goes up. Returns the new count.
+    fn next_iteration(&mut self, to: usize) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         self.s.m.tag(phi, Tag::Counter);
         self.s.m.tag(next, Tag::Counter);
+        self.counters
+            .get_mut(&to)
+            .expect("header")
+            .1
+            .push((next, c));
+        next
+    }
+
+    /// The iterations a lane makes of a loop it entered before it is taken out of it.
+    fn iteration_limit(&self) -> u32 {
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -11471,21 +11618,12 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
+        match super::loop_limit() {
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,
             named => named,
-        };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
+        }
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
