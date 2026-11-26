@@ -159,6 +159,10 @@ set of shader switches translates once more.
 |---|---|---|---|---|---|
 | `VICTORY_LOOP_EXITS` | `0` off; unset or anything else on | ON (all15b: on only with `=1`) | wave64 compute programs test the loop iteration limit at the loop's own exits, not in the latch (removes the dark tiles on water) | test/lx (rule from all15b ec51e9045, darkworldhm 08fdf0b47) | YES |
 | `VICTORY_REFRESH_RANGES` | `1` | off | a submission's refresh ranges of a host copy are joined when within 64 KiB of each other (coarser than our default exact union; reviewer: unlikely to gain) | test/cxall | no |
+| `VICTORY_STREAM_COPY` | `1` | off | refreshes into host copies and snapshots of shader-written ranges (4 KiB and more) written with AVX2 streaming stores, fault-safe (avatarmanz #98, Joly0) | test/copies | no |
+| `VICTORY_COPY_THREADS` | `2`-`8` | off | a refresh copy of 2 MiB or more cut into n pieces on a pool of its own (fast cores with FAST_CORES>=2); the caller waits for all | test/copies | no |
+| `VICTORY_GUARD_FIRST` | `1` | off | view memory the guards already hold goes to the guards without a failing write-watch call first (under the journal lock) | test/copies | no |
+| `VICTORY_TITLE_COPY_PLAIN` | `1` | off | the title's buffer copies done at submission (and copy-backs into title memory) are made in place, the kernel's copy only when a page stops it | test/copies | no |
 | `VICTORY_BACK_BLOCKS` | `1` | off | copy-back writes only the 1 KiB blocks the merge changed, not the whole span (fewer write-watch echoes) | test/cxall | no |
 | `VICTORY_DECLARE_ONCE` | `1` | off | a list records the GPU-write declaration of one host copy and range once between refreshes, not at every dispatch | test/cxall | no |
 | `VICTORY_NAMED_WRITES` | `1` | off | raw-address stores copy back only the buffers the dispatch names; RISK: a store through a pointer loaded from memory into an unnamed copy is not copied back (test alone first) | test/cxall | no |

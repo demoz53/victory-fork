@@ -1895,7 +1895,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
     let threads = (len / PER_THREAD).clamp(1, max_jobs);
     if threads == 1 {
         // SAFETY: the caller's.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        unsafe { crate::guarded::copy_host(src, dst, len) };
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
@@ -1905,7 +1905,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
             let n = each.min(len - at);
             s.spawn(move || {
                 // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                unsafe { crate::guarded::copy_host((src + at) as *const u8, (dst + at) as *mut u8, n) };
             });
         }
     });
@@ -2060,7 +2060,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe { crate::guarded::copy_host(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
@@ -3009,7 +3009,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        crate::guarded::copy_host(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
@@ -3767,7 +3767,7 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        crate::host::copy_streamed(at, from as *const u8, to - from);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
