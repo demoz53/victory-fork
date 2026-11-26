@@ -1252,9 +1252,36 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A title texture held alive ([`hold`]).
+/// A title texture held alive ([`hold`], [`alias_of`]).
 #[cfg(windows)]
 pub(crate) struct Held(This);
+
+/// The title texture a placed view aliases ([`alias_of`]), held alive
+/// while the caller copies from it (with [`alias_hold`]).
+#[cfg(windows)]
+pub(crate) struct AliasSource(This, #[allow(dead_code)] Option<Held>);
+
+#[cfg(windows)]
+impl AliasSource {
+    /// The texture.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+/// Whether [`alias_of`] pins the texture it finds until the caller's copy
+/// is recorded (`VICTORY_ALIAS_HOLD`, on; `0`: a bare pointer, as before).
+/// It looked the texture up under `TARGETS_AT`'s lock and returned the
+/// pointer; once the lock was let go, the title could drop its last
+/// reference (its recording threads release textures once their last use
+/// is recorded) and `texture::alias` read a freed `Resource`, or the next
+/// texture made at that address. fxceless/victory-fork pull request #1336
+/// (cwWwWwW).
+#[cfg(windows)]
+fn alias_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_HOLD").is_none_or(|v| v != "0"))
+}
 
 #[cfg(windows)]
 impl Drop for Held {
@@ -1399,7 +1426,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<AliasSource> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1436,7 +1463,16 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    same.then_some(other)
+    if !same {
+        return None;
+    }
+    if !alias_hold() {
+        return Some(AliasSource(other, None));
+    }
+    // Pinned under the lock (a texture leaves the table before it is
+    // freed): one whose last reference is already going is not returned,
+    // and the draw uploads from title memory instead.
+    object::try_add_ref(other).then(|| AliasSource(other, Some(Held(other))))
 }
 
 /// How many threads make host copies of textures ahead of their first use
@@ -4320,6 +4356,48 @@ mod tests {
         }
     }
 
+    /// The source a placed view aliases is held while the caller copies it:
+    /// the title may let go of its own reference between the lookup and the
+    /// copy, and the copy still needs it (fxceless PR #1336's test).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc { flags: 4, ..texture(4, 4, 42, 1) };
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null,
+                resource(source).data() as u64,
+                &texture(4, 4, 67, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        // The title lets go: the pin keeps the source alive.
+        resource_release(source);
+        assert!(host_resource(held.get()).is_some(), "a held source is still copyable");
+        assert!(textures().contains(&(source as usize)), "the held source is not freed");
+        drop(held);
+        assert!(!textures().contains(&(source as usize)), "the last reference frees it");
+        resource_release(view);
+    }
+
     /// An upload of a view from title memory earlier in a list must not
     /// keep the list from copying the card-written texture the view is
     /// placed over into it (`VICTORY_ALIAS_ALWAYS`; fxceless/victory-fork
@@ -4367,7 +4445,7 @@ mod tests {
             S_OK
         );
         resource(view).host.placed.store(true, Relaxed);
-        assert_eq!(alias_of(view), Some(source));
+        assert_eq!(alias_of(view).map(|s| s.get()), Some(source));
         let written = host_resource(source).unwrap();
         let sampled = host_resource(view).unwrap();
         let (upload, data) = host.upload_buffer(1024).unwrap();

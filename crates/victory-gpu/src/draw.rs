@@ -5700,7 +5700,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // texture view bound.)
             let aliasing = crate::timing::Timer::stats();
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             crate::texture::UPLOAD_PARTS[4].fetch_add(aliasing.us(), Ordering::Relaxed);
             // With `VICTORY_TEXTURE_ONCE=1` one host copy for the upload and
             // the state move.
