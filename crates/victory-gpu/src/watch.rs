@@ -41,8 +41,10 @@ struct Journal {
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
-    /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    /// from the journal, without another kernel call. The flag: asked of
+    /// the guards (view memory, with [`views_once`]), not of the kernel;
+    /// such a range answers only an asker that would ask the guards.
+    ahead: Vec<(usize, usize, bool)>,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -359,8 +361,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
+        if !ahead_covers(j, first, last, true) && ask_kernel(j, first, last) {
+            j.ahead.push((first, last, false));
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -373,6 +375,167 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+    }
+}
+
+/// Whether pages `[first, last)` lie inside one range of the standing
+/// ahead asking (with `views` false, one asked of the kernel).
+fn ahead_covers(j: &Journal, first: usize, last: usize, views: bool) -> bool {
+    j.ahead.iter().any(|&(a, b, view)| a <= first && last <= b && (views || !view))
+}
+
+/// Whether the submission's one asking ([`once`]) takes in the view memory
+/// its lists refresh as well (`VICTORY_ASK_ONCE_VIEWS=1`; off by default).
+///
+/// View memory (xmem's physical-page views) has no write watch: each of
+/// its refreshes failed to ask the kernel and asked the guards, once per
+/// flush, some 70 flushes a submission (here some 17,000-20,000 askings a
+/// frame by one copy's refresh, 70-100 ms of threads' time under the
+/// journal's lock; making each cheaper, VICTORY_GUARD_FIRST, did not move
+/// the frame). With the switch each such range is guarded once when the
+/// submission starts ([`ask_once_views`]) and the journal answers its
+/// refreshes, as it does for write-watched memory: what the title's other
+/// threads write while the submission is prepared is seen by the next
+/// submission's asking (the write faults and opens the block, as it sets
+/// the kernel's bit in watched memory); our own writes are told to the
+/// journal or end the asking, as for watched memory ([`once`]); a remap
+/// of view memory takes its ranges out of the asking ([`views_remapped`]).
+///
+/// From fxceless/victory-fork PR #995 (tunczzz), `ask_once_views`.
+pub(crate) fn views_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// With [`views_once`], right after [`ask_once`]: the ranges the
+/// submission refreshes (each as one refresh asks, cut to its copy) that
+/// the asking did not take in are asked now as [`writes`] would ask them:
+/// the kernel, else the guards of view memory; what either says goes into
+/// the journal under the standing asking, and the refreshes inside them
+/// answer from it. What neither takes is left to `writes`.
+pub(crate) fn ask_once_views(ranges: &[(usize, usize)]) {
+    if once() && views_once() && !ranges.is_empty() {
+        ask_views(ranges);
+    }
+}
+
+/// [`ask_once_views`], whatever the switches say.
+fn ask_views(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    // In order of start, the longest first: a range inside one asked
+    // before it is not asked again.
+    pieces.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    pieces.dedup();
+    #[cfg(feature = "diagnostics")]
+    let _who = asking_for(1);
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    // `ask_once` let its asking go if it held nothing: this one stands
+    // under a number of its own.
+    if !j.kept {
+        j.asked += 1;
+        j.ahead_asked = j.asked;
+        j.ahead.clear();
+    }
+    let mut reach = 0;
+    // Ranges the guards know to be views (their first block is guarded or
+    // absent): asked below, joined where they overlap or touch.
+    let mut known = Vec::new();
+    for (first, last) in pieces {
+        if last <= reach {
+            continue;
+        }
+        if ahead_covers(j, first, last, true) {
+            continue;
+        }
+        // With `VICTORY_GUARD_FIRST=1`, as in [`writes`]: a range whose
+        // first block the guards hold cannot be write-watched, no kernel
+        // asking first.
+        let held = guard_first() && guards_know(first);
+        if !held && ask_kernel(j, first, last) {
+            j.ahead.push((first, last, false));
+            reach = reach.max(last);
+            continue;
+        }
+        if held || guards_know(first) {
+            known.push((first, last));
+            continue;
+        }
+        // The guards decide whether it is a view, as for `writes`.
+        if guard_ahead(j, first, last) {
+            reach = reach.max(last);
+        }
+    }
+    // A submission refreshes many overlapping ranges of the same views:
+    // their union is walked once, each block once. The guards say of the
+    // union what they would say of its ranges one after another, all of
+    // whose first blocks they know.
+    let mut i = 0;
+    while i < known.len() {
+        let (first, mut last) = known[i];
+        let mut k = i + 1;
+        while k < known.len() && known[k].0 <= last {
+            last = last.max(known[k].1);
+            k += 1;
+        }
+        if !ahead_covers(j, first, last, true) {
+            guard_ahead(j, first, last);
+        }
+        i = k;
+    }
+    j.kept = !j.ahead.is_empty();
+}
+
+/// [`ask_views`]: the guards asked about blocks `[first, last)`, what they
+/// report noted under the standing asking; whether the range is a view
+/// (and now asked ahead).
+fn guard_ahead(j: &mut Journal, first: usize, last: usize) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let guarding = std::time::Instant::now();
+    let written = guard(first * PAGE, last * PAGE);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let us = guarding.elapsed().as_micros() as u64;
+        add(C::GuardUs, us);
+        add(C::Watches, 1);
+        add(C::WatchUs, us);
+        slow(us);
+    }
+    let Some(written) = written else {
+        return false;
+    };
+    let now = j.ahead_asked;
+    // A guard's block is a page: all of it.
+    for page in written {
+        note_written(j, page, now, ALL_PIECES);
+    }
+    j.ahead.push((first, last, true));
+    true
+}
+
+/// With [`views_once`]: view memory `[at, at + len)` is mapped anew while a
+/// submission's asking stands. The ranges of view memory the asking holds
+/// over it are taken out of it, and the refreshes there ask the guards
+/// themselves (which know of the remap), as without the switch.
+fn views_remapped(at: usize, len: usize) {
+    if !views_once() || len == 0 {
+        return;
+    }
+    forget_views_ahead(at, len);
+}
+
+/// [`views_remapped`], whatever the switch says.
+fn forget_views_ahead(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.kept {
+        j.ahead.retain(|&(a, b, view)| !(view && a < last && first < b));
+        j.kept = !j.ahead.is_empty();
     }
 }
 
@@ -413,7 +576,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
     if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
+        j.ahead.push((first, last, false));
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
@@ -468,9 +631,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    ahead_covers(&j, first, last, true)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -486,7 +647,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    // View memory asked ahead ([`views_once`]) answers only an asker that
+    // would ask the guards.
+    if ahead_covers(j, first, last, guarded) {
         return Some((
             j.ahead_asked,
             j.written
@@ -1945,6 +2108,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // Host copies of placed textures there have nothing left to come from:
     // let go of those nothing else holds now, rather than seconds later.
     crate::resource::evict_placed_in(at as u64, len as u64);
+    // Before the guards' lock: the journal's is taken first.
+    views_remapped(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     if !g.faulted.is_empty() {
@@ -2230,6 +2395,78 @@ mod tests {
             VirtualFree((p + BLOCK) as *mut _, 0, MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+
+    /// `VICTORY_ASK_ONCE_VIEWS`: one asking of a submission's view ranges
+    /// guards their union once; every range inside answers from the journal
+    /// under that asking with what the guards found written, and only an
+    /// asker that would ask the guards; a remap there takes the ranges out
+    /// of the asking. After fxceless PR #995 (tunczzz).
+    #[test]
+    fn view_ranges_asked_once_answer_from_the_journal() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        const SIZE: usize = 8 * BLOCK;
+        // SAFETY: a pagefile section of eight blocks, mapped read-write.
+        let (section, view) = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize)
+        };
+        assert_ne!(view, 0);
+        mapped(view, SIZE);
+        forget_pages(view, view + SIZE);
+        let page = view / PAGE;
+        let b = |k: usize| view + k * BLOCK;
+        let ranges = [(b(0), b(4)), (b(1), b(2)), (b(2), b(3) + 100), (b(3), b(8)), (b(4), b(5)), (b(6), b(7))];
+        // The journal's standing asking is one for the process: a test
+        // beside this one may end it. Such a round is made again.
+        let mut rounds = 0;
+        let undisturbed = loop {
+            rounds += 1;
+            if rounds > 1000 {
+                break false;
+            }
+            // Guarded once, so the guards know it.
+            ask_once_end();
+            ask_views(&[(view, view + SIZE)]);
+            ask_once_end();
+            // SAFETY: inside the view; the writes fault and open the blocks.
+            unsafe {
+                (b(1) as *mut u8).write_volatile(1);
+                ((b(5) + 9) as *mut u8).write_volatile(1);
+            }
+            ask_views(&ranges);
+            let (now, written) = writes(view, view + SIZE, true).expect("the union was asked");
+            let fresh: Vec<usize> = written.iter().filter(|&&(_, w)| w == now).map(|&(p, _)| p).collect();
+            let journal = ranges.iter().all(|&(a, e)| writes(a, e, true).map(|w| w.0) == Some(now))
+                && asked(b(2), b(3)).map(|w| w.0) == Some(now);
+            // Not write-watched: an asker that would not ask the guards
+            // hears so, asking ahead or not.
+            let unwatched = writes(b(2), b(3), false).is_none();
+            // A remap there: the refreshes ask the guards again.
+            forget_views_ahead(b(4), BLOCK);
+            let after = asked(b(0), b(1));
+            let again = writes(b(0), b(1), true).map(|w| w.0);
+            ask_once_end();
+            if !journal || after.is_some() || again.is_none_or(|w| w <= now) {
+                std::thread::yield_now();
+                continue;
+            }
+            assert_eq!(fresh, [page + 1, page + 5], "what the guards found written since");
+            assert!(unwatched, "view memory answers only an asker that would ask the guards");
+            break true;
+        };
+        // SAFETY: our view and section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(view, SIZE);
+        forget_pages(view, view + SIZE);
+        assert!(undisturbed, "the ranges asked once answer from the journal");
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

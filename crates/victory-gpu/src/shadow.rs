@@ -2773,6 +2773,16 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// What a refresh of `[address, address + len)` asks about at most
+    /// (`crate::watch::writes`): the range cut to the buffer; `None` if
+    /// nothing (outside it, or the copy is title memory in place). For
+    /// `crate::watch::ask_once_views` (fxceless PR #995, tunczzz).
+    pub(crate) fn refreshed(&self, address: usize, len: usize) -> Option<(usize, usize)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        (self.place.is_none() && from < to).then_some((from, to))
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
