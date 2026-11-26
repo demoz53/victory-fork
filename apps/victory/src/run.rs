@@ -390,6 +390,14 @@ fn hex_str(bytes: &[u8]) -> String {
 ///   ZigZagBoi1/ScarlettPort). Off unless set.
 /// - `VICTORY_RESOLUTION=<w>x<h>`: its table of output sizes capped there
 ///   (soldsawn/victory-nvidia-8gb). Off unless set.
+/// - `VICTORY_TIME_STEP=0.25|0.5|1`: its game clocks advance by up to that
+///   many seconds a frame instead of 1/15 s (SonicRaT/XNW `timestep*`).
+/// - `VICTORY_PLACE_BUDGET=<us>`: its per-frame time slice for placing
+///   streamed resources may reach that instead of 1250 us (XNW
+///   `place_budget`).
+/// - `VICTORY_TEX_UPGRADES=<n>|unlimited`: at most n texture upgrades a
+///   frame instead of 5, or no cap (XNW `tex_upgrades`).
+///   All three off unless set.
 ///
 /// `VICTORY_TITLE_PATCHES=0`: none. If a group's bytes are not there
 /// (another build), nothing of it is written and that is said once; each
@@ -401,10 +409,19 @@ fn apply_title_patches(
     console: Console,
 ) {
     let var = |name: &str| std::env::var(name).ok();
-    let Some(groups) = title_patch_groups(build, console, var) else {
+    let size = image.info().size_of_image as usize;
+    // The image's read-only constants as mapped (relocated), for the time
+    // step's cap: only asked with its switch.
+    let constants = build.and_then(|b| b.time_step).filter(|_| var("VICTORY_TIME_STEP").is_some()).and_then(|t| {
+        let (start, len) = (t.rdata.0 as usize, t.rdata.1 as usize);
+        // SAFETY: inside the mapped image (checked), its .rdata: readable,
+        // and nothing writes it while we read.
+        (start.checked_add(len).is_some_and(|end| end <= size))
+            .then(|| unsafe { std::slice::from_raw_parts((image.base() + start) as *const u8, len) })
+    });
+    let Some(groups) = title_patch_groups(build, console, var, constants) else {
         return;
     };
-    let size = image.info().size_of_image as usize;
     // SAFETY: the title's image, mapped and not yet run.
     let made = unsafe { apply_patch_groups(image.base(), size, &groups) };
     if made.contains(&RT_FALLBACK) {
@@ -423,6 +440,7 @@ fn title_patch_groups(
     build: Option<&victory_game::KnownBuild>,
     console: Console,
     var: impl Fn(&str) -> Option<String>,
+    constants: Option<&[u8]>,
 ) -> Option<Vec<(&'static str, Vec<victory_game::OwnedPatch>)>> {
     let switch = var("VICTORY_TITLE_PATCHES");
     if switch.as_deref() == Some("0") {
@@ -433,7 +451,11 @@ fn title_patch_groups(
     let fallback = var("VICTORY_RT_FALLBACK").filter(|v| !matches!(v.trim(), "" | "0"));
     let no_watchdog = var("VICTORY_NO_WATCHDOG").is_some_and(|v| v.trim() == "1");
     let resolution = var("VICTORY_RESOLUTION").filter(|v| !v.trim().is_empty());
-    if !upscaler && scale.is_none() && fallback.is_none() && !no_watchdog && resolution.is_none() {
+    let step = var("VICTORY_TIME_STEP").filter(|v| !matches!(v.trim(), "" | "0"));
+    let place = var("VICTORY_PLACE_BUDGET").filter(|v| !matches!(v.trim(), "" | "0"));
+    let upgrades = var("VICTORY_TEX_UPGRADES").filter(|v| !v.trim().is_empty());
+    let asked = [scale.is_some(), fallback.is_some(), no_watchdog, resolution.is_some(), step.is_some(), place.is_some(), upgrades.is_some()];
+    if !upscaler && !asked.contains(&true) {
         return None;
     }
     let Some(build) = build else {
@@ -472,6 +494,27 @@ fn title_patch_groups(
             None => println!(
                 "title patch    none for VICTORY_RESOLUTION={text}: it wants <w>x<h> from 1280x720 to 3840x2160"
             ),
+        }
+    }
+    if let Some(text) = step {
+        match victory_game::parse_time_step(&text) {
+            Some(ms) => match victory_game::time_step_patches(build, ms, constants.unwrap_or_default()) {
+                Ok(patches) => groups.push(("time step", patches)),
+                Err(why) => println!("title patch    none for VICTORY_TIME_STEP={text}: {why}"),
+            },
+            None => println!("title patch    none for VICTORY_TIME_STEP={text}: it wants 0.25, 0.5 or 1"),
+        }
+    }
+    if let Some(text) = place {
+        match victory_game::parse_place_budget(&text) {
+            Some(us) => groups.push(("place budget", victory_game::place_budget_patches(build, us))),
+            None => println!("title patch    none for VICTORY_PLACE_BUDGET={text}: it wants microseconds from 1250 to 100000, or 1"),
+        }
+    }
+    if let Some(text) = upgrades {
+        match victory_game::parse_tex_upgrades(&text) {
+            Some(cap) => groups.push(("tex upgrades", victory_game::tex_upgrade_patches(build, cap))),
+            None => println!("title patch    none for VICTORY_TEX_UPGRADES={text}: it wants a number from 1 to 100000, or unlimited"),
         }
     }
     Some(groups)
@@ -541,8 +584,8 @@ mod patch_tests {
     #[test]
     fn only_asked_groups_are_built() {
         let build = &victory_game::KNOWN_BUILDS[0];
-        assert!(title_patch_groups(Some(build), Console::SeriesX, vars(&[])).is_none());
-        assert!(title_patch_groups(None, Console::SeriesX, vars(&[("VICTORY_NO_WATCHDOG", "1")])).is_none());
+        assert!(title_patch_groups(Some(build), Console::SeriesX, vars(&[]), None).is_none());
+        assert!(title_patch_groups(None, Console::SeriesX, vars(&[("VICTORY_NO_WATCHDOG", "1")]), None).is_none());
         let all = &[
             ("VICTORY_RT_FALLBACK", "2"),
             ("VICTORY_NO_WATCHDOG", "1"),
@@ -552,23 +595,77 @@ mod patch_tests {
             g.unwrap().iter().map(|(n, p)| (*n, p.len())).collect::<Vec<_>>()
         };
         assert_eq!(
-            names(title_patch_groups(Some(build), Console::SeriesX, vars(all))),
+            names(title_patch_groups(Some(build), Console::SeriesX, vars(all), None)),
             [(RT_FALLBACK, 2), ("watchdog", 2), ("resolution", 3)]
         );
         // The one switch that turns them all off.
         let off = &[("VICTORY_TITLE_PATCHES", "0"), ("VICTORY_RT_FALLBACK", "1"), ("VICTORY_NO_WATCHDOG", "1")];
-        assert!(title_patch_groups(Some(build), Console::SeriesS, vars(off)).is_none());
+        assert!(title_patch_groups(Some(build), Console::SeriesS, vars(off), None).is_none());
         // Values they do not take: nothing.
         let bad = &[("VICTORY_RT_FALLBACK", "3"), ("VICTORY_NO_WATCHDOG", "yes"), ("VICTORY_RESOLUTION", "640x360")];
-        assert_eq!(names(title_patch_groups(Some(build), Console::SeriesX, vars(bad))), []);
-        assert_eq!(names(title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_RT_FALLBACK", "1")]))), [(RT_FALLBACK, 1)]);
+        assert_eq!(names(title_patch_groups(Some(build), Console::SeriesX, vars(bad), None)), []);
+        assert_eq!(names(title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_RT_FALLBACK", "1")]), None)), [(RT_FALLBACK, 1)]);
+    }
+
+    #[test]
+    fn the_time_step_cap_is_checked_and_made() {
+        let build = &victory_game::KNOWN_BUILDS[0];
+        let cap = build.time_step.unwrap();
+        let sites: Vec<(u32, &[u8])> = cap.loads.iter().map(|(rva, b)| (*rva, &b[..])).collect();
+        let mut image = image_with(&sites);
+        // The fake image's .rdata holds the three constants where ours does.
+        for &(ms, rva) in cap.values {
+            image[rva as usize..][..4].copy_from_slice(&(ms as f32 / 1000.0).to_le_bytes());
+        }
+        let rdata = image[cap.rdata.0 as usize..].to_vec(); // the fake image ends before .rdata does
+        let groups =
+            title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_TIME_STEP", "0.25")]), Some(&rdata)).unwrap();
+        assert_eq!(groups.iter().map(|(n, p)| (*n, p.len())).collect::<Vec<_>>(), [("time step", 2)]);
+        // SAFETY: our own buffer, nothing runs it.
+        assert_eq!(unsafe { apply_patch_groups(image.as_mut_ptr() as usize, image.len(), &groups) }, ["time step"]);
+        for &(rva, _) in cap.loads {
+            let disp = i32::from_le_bytes(image[rva as usize + 4..][..4].try_into().unwrap());
+            let to = (i64::from(rva) + 8 + i64::from(disp)) as usize;
+            assert_eq!(f32::from_le_bytes(image[to..to + 4].try_into().unwrap()), 0.25, "the load reads the new cap");
+        }
+        // Made twice (or another build): the loads' bytes differ, left out.
+        // SAFETY: as above.
+        assert!(unsafe { apply_patch_groups(image.as_mut_ptr() as usize, image.len(), &groups) }.is_empty());
+        // The constant is not there, or a value it does not take: no group.
+        let none = title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_TIME_STEP", "0.5")]), Some(&[]));
+        assert!(none.unwrap().is_empty());
+        let bad = title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_TIME_STEP", "0.1")]), Some(&rdata));
+        assert!(bad.unwrap().is_empty());
+        let off = &[("VICTORY_TITLE_PATCHES", "0"), ("VICTORY_TIME_STEP", "1"), ("VICTORY_PLACE_BUDGET", "1")];
+        assert!(title_patch_groups(Some(build), Console::SeriesX, vars(off), Some(&rdata)).is_none());
+    }
+
+    #[test]
+    fn placement_and_upgrades_are_made_with_their_bytes() {
+        let build = &victory_game::KNOWN_BUILDS[0];
+        let set = &[("VICTORY_PLACE_BUDGET", "1"), ("VICTORY_TEX_UPGRADES", "unlimited")];
+        let groups = title_patch_groups(Some(build), Console::SeriesX, vars(set), None).unwrap();
+        assert_eq!(groups.iter().map(|(n, p)| (*n, p.len())).collect::<Vec<_>>(), [("place budget", 2), ("tex upgrades", 2)]);
+        let every: Vec<&victory_game::OwnedPatch> = groups.iter().flat_map(|(_, p)| p).collect();
+        let sites: Vec<(u32, &[u8])> = every.iter().map(|p| (p.rva, &p.expect[..])).collect();
+        let mut image = image_with(&sites);
+        // One jge is not there: the upgrade group is left out whole.
+        image[0x220_398c] = 0x0e;
+        // SAFETY: our own buffer, nothing runs it.
+        let made = unsafe { apply_patch_groups(image.as_mut_ptr() as usize, image.len(), &groups) };
+        assert_eq!(made, ["place budget"]);
+        assert_eq!(&image[0x220_3930..][..6], [0x0f, 0x8d, 0x7a, 0xff, 0xff, 0xff], "left as it was");
+        assert_eq!(&image[0x229_4814..][..5], [0xb9, 0x30, 0x75, 0, 0]);
+        // A number instead: the settings' load is the one place.
+        let n = title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_TEX_UPGRADES", "40")]), None).unwrap();
+        assert_eq!(n[0].1.iter().map(|p| p.rva).collect::<Vec<_>>(), [0x224_3645]);
     }
 
     #[test]
     fn groups_with_their_bytes_are_made_and_the_others_left_out() {
         let build = &victory_game::KNOWN_BUILDS[0];
         let set = &[("VICTORY_RT_FALLBACK", "2"), ("VICTORY_NO_WATCHDOG", "1"), ("VICTORY_RESOLUTION", "1920x1080")];
-        let groups = title_patch_groups(Some(build), Console::SeriesX, vars(set)).unwrap();
+        let groups = title_patch_groups(Some(build), Console::SeriesX, vars(set), None).unwrap();
         let every: Vec<&victory_game::OwnedPatch> = groups.iter().flat_map(|(_, p)| p).collect();
 
         // The right bytes everywhere: every group made, each site ours now.
