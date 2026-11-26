@@ -305,14 +305,20 @@ fn windows() -> bool {
 }
 
 /// Whether indirect executions of one record are clamped in batches
-/// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=1` or `2`; off by
-/// default: each on its own, or in windows ([`windows`])). Ported from
+/// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=1`, `2` or `3`; off
+/// by default: each on its own, or in windows ([`windows`])). Ported from
 /// avatarmanz/VIctory-7900XTX 037596241 (GPL-3.0-or-later), where it is on.
 ///
 /// A frame of the boat scene has some 2,400 clamps even with the windows
 /// (run speed1: 2,441 against 151 in that fork's build with `=2`): each a
 /// dispatch of ours between two full waits, with the scratch buffer moved
-/// twice, in the middle of the title's drawing.
+/// twice, in the middle of the title's drawing. Of a frame's indirect
+/// executions 480-660 are by shaders that store to buffers (dispatches, by
+/// where they stand: they hardly ever end a window) and 260-360 are
+/// dispatches that store to none (the frame lines of runs all15-base2,
+/// cs-base1, sx-base1); the rest are draws. So `1` should leave about a
+/// pass for each dispatch (740-1,020), `3` one for each execution that
+/// stores, and `2` about 150 as in that fork: none of it measured here.
 ///
 /// `1`: a batch is opened by the first execution after a point where
 /// arguments may have changed, and all executions up to the next such point
@@ -340,6 +346,17 @@ fn windows() -> bool {
 /// barrier of the title's, may run beside it. Whether the title has ways to
 /// wait that do not pass through its lists' methods is not known.
 ///
+/// `3`: as `1`, but a dispatch whose shaders store to no buffer does not
+/// end the batch: it cannot change arguments (it writes textures only; the
+/// same word of its shaders, `stores`, already decides what is copied back
+/// from the card, `VICTORY_WRITE_SKIP`). Every record is still clamped
+/// after all that could have written it. What it gives up is only the
+/// second half of `2`'s: around such a dispatch there is no wait of ours
+/// any more, so it is ordered against its neighbours by the title's
+/// barriers and the texture state changes alone. (The rule of
+/// fxceless/victory-fork #995, tunczzz: "a run ends only at work that can
+/// store to a buffer"; written here from that sentence, not from its code.)
+///
 /// Not batched, and clamped as before: executions with a count buffer or of
 /// more than one record, and the dispatches of pipelines that run in parts
 /// (`VICTORY_INDIRECT_SPLIT`, `_AUTO`).
@@ -348,32 +365,35 @@ pub(crate) fn batches() -> u8 {
     *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ => 0,
     })
 }
 
 /// What a batch meets after it was opened ([`batch_after`]): a dispatch
-/// (direct or indirect), a draw (whose shaders store to buffers or not), a
-/// wait of the title's for earlier work (a barrier, a pipeline sync).
+/// or a draw (direct or indirect, whose shaders store to buffers or not),
+/// a wait of the title's for earlier work (a barrier, a pipeline sync).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Met {
-    Dispatch,
+    Dispatch { stores: bool },
     Draw { stores: bool },
     Wait,
 }
 
 /// Whether a batch lives on after `met`, in `mode` (`VICTORY_INDIRECT_BATCH`:
-/// 1 or 2): `None` if it ends there, so that the next execution's record is
-/// clamped anew, after everything recorded up to it; else whether dispatches
-/// have run since it was opened (`wrote`: only ever with 2).
+/// 1, 2 or 3): `None` if it ends there, so that the next execution's record
+/// is clamped anew, after everything recorded up to it; else whether
+/// dispatches have run since it was opened (`wrote`: only ever with 2).
 ///
-/// 1: what may write buffers ends it (a dispatch, a draw whose shaders
-/// store). 2: a dispatch only marks it, and it ends when the title waits or
-/// draws after one (a draw waits for the dispatches before it: here also a
-/// direct one, which the source of the port lets by).
+/// 1: a dispatch ends it, and a draw whose shaders store. 2: a dispatch
+/// only marks it, and it ends when the title waits or draws after one (a
+/// draw waits for the dispatches before it: here also a direct one, which
+/// the source of the port lets by). 3: as 1, but a dispatch whose shaders
+/// store to no buffer leaves it as it is.
 fn batch_after(mode: u8, wrote: bool, met: Met) -> Option<bool> {
     match met {
-        Met::Dispatch => (mode == 2).then_some(true),
+        Met::Dispatch { stores: false } if mode == 3 => Some(wrote),
+        Met::Dispatch { .. } => (mode == 2).then_some(true),
         Met::Wait => (!wrote).then_some(false),
         Met::Draw { stores } => (!wrote && !stores).then_some(false),
     }
@@ -432,8 +452,8 @@ pub(crate) fn batch_line(frames: f64) {
     tracing::info!(
         "indirect batches per frame (VICTORY_INDIRECT_BATCH={}): {:.0} passes clamped the records of {:.0} executions; \
          clamped on their own: {:.0} with a count buffer or of more than one record, {:.0} dispatches that run in \
-         parts, {:.0} a batch could not take; batches ended by {:.0} dispatches, {:.0} draws whose shaders store, \
-         {:.0} waits of the title's or draws after dispatches (=2)",
+         parts, {:.0} a batch could not take; batches ended by {:.0} dispatches (=3: those whose shaders store), {:.0} \
+         draws whose shaders store, {:.0} waits of the title's or draws after dispatches (=2)",
         batches(),
         b[B_OPENED],
         b[B_READ],
@@ -3836,7 +3856,7 @@ impl State {
             Some(wrote) => batch.wrote = wrote,
             None => {
                 batch_count(match met {
-                    Met::Dispatch => B_END_WRITE,
+                    Met::Dispatch { .. } => B_END_WRITE,
                     Met::Draw { stores: true } if !batch.wrote => B_END_STORE,
                     _ => B_END_SYNC,
                 });
@@ -3845,10 +3865,20 @@ impl State {
         }
     }
 
-    /// Shaders that can write buffers are recorded (a dispatch): arguments
-    /// may be others from here on ([`batches`]).
+    /// A direct dispatch with the pipeline set is recorded: shaders that
+    /// can write buffers, so arguments may be others from here on
+    /// ([`batches`]; no host pipeline: nothing runs, nothing is stored).
     fn buffers_written(&mut self) {
-        self.batch_meets(Met::Dispatch);
+        if self.batch.is_none() {
+            return;
+        }
+        self.dispatched_as(pipeline_stores(self.pipeline));
+    }
+
+    /// [`State::buffers_written`] for a dispatch whose shaders are known to
+    /// store to buffers or not.
+    fn dispatched_as(&mut self, stores: bool) {
+        self.batch_meets(Met::Dispatch { stores });
     }
 
     /// A direct draw with the pipeline set is recorded: as
@@ -3898,6 +3928,11 @@ impl State {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
+        // A record no job can name (past 32 bits of its copy, off 4 bytes):
+        // clamped on its own, and the batch stays for the others.
+        if !crate::indirect::batch::fits(offset, kind) {
+            return None;
+        }
         // A dispatch's record is noted with its execution, as its own clamp
         // notes it (`crate::indirect::with_dispatch`): a job for each
         // pipeline that reads it.
@@ -4330,7 +4365,7 @@ impl State {
         // What a batch holds clamped (`batches`) may be other from here on:
         // as after a direct dispatch or draw. Nothing without a batch.
         if kind == DISPATCH {
-            self.buffers_written();
+            self.dispatched_as(stores);
         } else {
             self.drew_as(stores);
         }
@@ -5033,11 +5068,12 @@ mod early_textures_tests {
 mod batch_tests {
     use super::{Met, batch_after};
 
-    /// `VICTORY_INDIRECT_BATCH=1`: a batch ends at whatever may write
-    /// buffers (a dispatch, a draw whose shaders store), and at nothing else.
+    /// `VICTORY_INDIRECT_BATCH=1`: a batch ends at a dispatch and at a draw
+    /// whose shaders store, and at nothing else.
     #[test]
     fn an_exact_batch_ends_where_arguments_may_change() {
-        assert_eq!(batch_after(1, false, Met::Dispatch), None);
+        assert_eq!(batch_after(1, false, Met::Dispatch { stores: true }), None);
+        assert_eq!(batch_after(1, false, Met::Dispatch { stores: false }), None);
         assert_eq!(batch_after(1, false, Met::Draw { stores: true }), None);
         assert_eq!(batch_after(1, false, Met::Draw { stores: false }), Some(false));
         assert_eq!(batch_after(1, false, Met::Wait), Some(false));
@@ -5048,8 +5084,10 @@ mod batch_tests {
     /// it as before.
     #[test]
     fn a_batch_of_dispatches_ends_when_the_title_waits_or_draws() {
-        assert_eq!(batch_after(2, false, Met::Dispatch), Some(true));
-        assert_eq!(batch_after(2, true, Met::Dispatch), Some(true));
+        for stores in [false, true] {
+            assert_eq!(batch_after(2, false, Met::Dispatch { stores }), Some(true));
+            assert_eq!(batch_after(2, true, Met::Dispatch { stores }), Some(true));
+        }
         assert_eq!(batch_after(2, true, Met::Wait), None);
         assert_eq!(batch_after(2, true, Met::Draw { stores: false }), None);
         assert_eq!(batch_after(2, true, Met::Draw { stores: true }), None);
@@ -5058,12 +5096,23 @@ mod batch_tests {
         assert_eq!(batch_after(2, false, Met::Draw { stores: true }), None);
     }
 
+    /// `VICTORY_INDIRECT_BATCH=3`: as 1, but a dispatch whose shaders store
+    /// to no buffer leaves the batch as it is; the title's waits end nothing.
+    #[test]
+    fn a_batch_outlives_dispatches_that_store_to_no_buffer() {
+        assert_eq!(batch_after(3, false, Met::Dispatch { stores: false }), Some(false));
+        assert_eq!(batch_after(3, false, Met::Dispatch { stores: true }), None);
+        assert_eq!(batch_after(3, false, Met::Draw { stores: true }), None);
+        assert_eq!(batch_after(3, false, Met::Draw { stores: false }), Some(false));
+        assert_eq!(batch_after(3, false, Met::Wait), Some(false));
+    }
+
     /// What the list records, as `State` meets it.
     #[derive(Clone, Copy)]
     enum Op {
-        /// An indirect execution of one record: a dispatch, or a draw whose
+        /// An indirect execution of one record: a dispatch or a draw, whose
         /// shaders store or not.
-        IndirectDispatch,
+        IndirectDispatch { stores: bool },
         IndirectDraw { stores: bool },
         /// A direct dispatch or draw, a barrier of the title's.
         Direct(Met),
@@ -5084,7 +5133,7 @@ mod batch_tests {
         for op in ops {
             let met = match *op {
                 Op::Direct(met) => met,
-                Op::IndirectDispatch => Met::Dispatch,
+                Op::IndirectDispatch { stores } => Met::Dispatch { stores },
                 Op::IndirectDraw { stores } => Met::Draw { stores },
             };
             if !matches!(op, Op::Direct(_)) {
@@ -5102,19 +5151,21 @@ mod batch_tests {
     }
 
     /// A stretch of a frame as the title records it: mesh draws one record
-    /// a call, the tile classes side by side, a barrier, more dispatches, a
-    /// draw whose shaders store among plain ones. One clamp each without
-    /// batches (22); in batches: 10 exact, 4 with dispatches side by side.
+    /// a call, the tile classes side by side (the third and fourth store to
+    /// buffers), a barrier, more dispatches that store, a draw whose shaders
+    /// store among plain ones. One clamp each without batches (22); in
+    /// batches: 10 exact, 4 with dispatches side by side, 7 ending at stores.
     #[test]
     fn executions_between_two_points_where_arguments_change_share_a_pass() {
         let draw = Op::IndirectDraw { stores: false };
+        let (plain, storing) = (Op::IndirectDispatch { stores: false }, Op::IndirectDispatch { stores: true });
         let mut ops = vec![draw; 6];
         ops.push(Op::Direct(Met::Draw { stores: false }));
         ops.extend([draw; 3]);
-        ops.extend([Op::IndirectDispatch; 5]);
+        ops.extend([plain, plain, storing, storing, plain]);
         ops.push(Op::Direct(Met::Wait));
-        ops.extend([Op::IndirectDispatch; 3]);
-        ops.push(Op::Direct(Met::Dispatch));
+        ops.extend([storing; 3]);
+        ops.push(Op::Direct(Met::Dispatch { stores: true }));
         ops.extend([draw, draw, Op::IndirectDraw { stores: true }, draw, draw]);
         let executions = ops.iter().filter(|op| !matches!(op, Op::Direct(_))).count();
         assert_eq!(executions, 22);
@@ -5126,5 +5177,10 @@ mod batch_tests {
         // Side by side: the draws and the five dispatches; the three after
         // the barrier; the draws up to the one that stores; the two after.
         assert_eq!(passes(2, &ops), 1 + 1 + 2);
+        // Ending at stores: the draws and the dispatches up to and with the
+        // first that stores; the second that stores; the plain one after it
+        // and the first after the barrier; the two after that; then the
+        // draws as before.
+        assert_eq!(passes(3, &ops), 1 + 1 + 1 + 2 + 2);
     }
 }

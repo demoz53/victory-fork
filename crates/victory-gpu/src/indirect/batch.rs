@@ -198,6 +198,15 @@ pub(crate) fn words(kind: u32) -> Option<u32> {
     super::min_stride(kind).map(|bytes| bytes / 4)
 }
 
+/// Whether a job can name the record of `kind` at `offset` of its copy: a
+/// kind of ours, on 4 bytes, inside 32 bits.
+pub(crate) fn fits(offset: u64, kind: u32) -> bool {
+    let Some(words) = words(kind) else {
+        return false;
+    };
+    u32::try_from(offset).is_ok_and(|o| o.is_multiple_of(4) && o.checked_add(words * 4).is_some())
+}
+
 /// A job's first word.
 pub(crate) fn job(source: u32, kind: u32, times: u32) -> u32 {
     source | (kind << 4) | (words(kind).unwrap_or(0) << 8) | (times << 16)
@@ -262,8 +271,7 @@ impl Table {
         execution: impl FnOnce() -> u32,
     ) -> Option<u64> {
         let source = self.sources.iter().position(|&s| s == id)? as u32;
-        let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
-        offset.checked_add(words(kind)? * 4)?;
+        let offset = u32::try_from(offset).ok().filter(|_| fits(offset, kind))?;
         let key = (source, offset, kind, who);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
