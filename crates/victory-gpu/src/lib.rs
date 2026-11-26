@@ -61,6 +61,8 @@ mod texture;
 mod watch;
 #[cfg(windows)]
 mod texback;
+#[cfg(windows)]
+mod hostcopy;
 
 #[cfg(windows)]
 pub use queue::world_began;

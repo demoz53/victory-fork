@@ -921,11 +921,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
+            let first = crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            // And into the texture's keeper, if an upload of title memory
+            // may land after this copy (`VICTORY_COPY_KEEP=1`).
+            crate::hostcopy::copied(list, dst, to, first, None, true, |keeper| {
+                // SAFETY: an open list and live textures; the keeper has
+                // the destination's description.
+                unsafe { list.list.CopyResource(keeper, from) };
+            });
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1017,7 +1024,18 @@ extern "system" fn copy_texture_region(
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        // What the copy reads when no box is given: the footprint, or the
+        // source's subresource (`crate::hostcopy::whole`).
+        let keeping = crate::hostcopy::active();
+        let source_extent;
         if src.kind == FOOTPRINT {
+            let (format, [width, height, depth]) = src.footprint.extent();
+            source_extent = crate::resource::element(format).filter(|_| keeping).map(|(_, block)| crate::hostcopy::Extent {
+                width: u64::from(width),
+                height: u64::from(height),
+                depth: u64::from(depth),
+                block,
+            });
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
@@ -1051,12 +1069,13 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            source_extent = keeping.then(|| crate::hostcopy::Extent::of(texture, src.footprint.offset as u32)).flatten();
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        let first = crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1096,6 +1115,27 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        // And into the texture's keeper, if an upload of title memory may
+        // land after this copy (`VICTORY_COPY_KEEP=1`).
+        if keeping && dst.kind != FOOTPRINT {
+            let sub = dst.footprint.offset as u32;
+            let whole = crate::hostcopy::whole(
+                crate::hostcopy::Extent::of(to, sub),
+                source_extent,
+                [x, y, z],
+                host_box.is_some(),
+            );
+            crate::hostcopy::copied(list, dst.resource, to, first, Some(sub), whole, |keeper| {
+                let mut kept = to_location;
+                kept.resource = keeper.as_raw().cast_const().cast();
+                // SAFETY: as the copy above; the keeper has the
+                // destination's description and is in the copy
+                // destination state.
+                unsafe {
+                    list.list.CopyTextureRegion((&raw const kept).cast(), x, y, z, (&raw const from).cast(), host_box)
+                };
+            });
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1211,6 +1251,8 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        // A keeper does not follow a resolve: it goes.
+        crate::hostcopy::forget(dst as usize);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

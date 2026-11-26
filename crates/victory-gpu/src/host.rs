@@ -7505,6 +7505,10 @@ impl HostList {
                 Step::Texture { staging, uploads } => {
                     if *uploads {
                         staging.note_upload();
+                        if crate::hostcopy::trace() > 0 {
+                            let (resource, _) = staging.of();
+                            crate::hostcopy::upload_submitted(std::ptr::from_ref(self) as usize, resource, staging.memory().0, || staging.of().1);
+                        }
                     }
                     if batch.texture_due(staging) {
                         if wide_textures() {
