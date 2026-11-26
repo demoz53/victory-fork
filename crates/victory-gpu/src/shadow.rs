@@ -327,7 +327,7 @@ fn card_limits() -> (u64, u64) {
             reserve = card_reserve_on(),
             "card buffer limits"
         );
-        (min_bytes, max_bytes)
+        (if card_all() { 0 } else { min_bytes }, max_bytes)
     })
 }
 
@@ -655,11 +655,55 @@ fn card_piece_parts_of(
     parts
 }
 
-/// A buffer of `size` bytes in the card's memory for a title buffer's
-/// copy, if the copy is to be there: [`cards`] is on, the size is within
-/// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
-/// host has what it takes (`Host::card_ready`).
+/// A buffer of `size` bytes for a title buffer's copy's card side, if the
+/// copy is to have two sides: in the card's memory ([`card_room_for`]), or
+/// with [`card_all`] in the PC's memory where the card has none for it.
 fn card_for(size: u64) -> Option<ID3D12Resource> {
+    let there = card_room_for(size);
+    if there.is_some() || !card_all() || size >= 1 << 30 {
+        return there;
+    }
+    // Two sides all the same, the card's in the PC's memory.
+    let host = crate::host::host()?;
+    if !cards() || !host.card_ready() {
+        return None;
+    }
+    let (buffer, _) = host.shared_buffer(size)?;
+    CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    Some(buffer)
+}
+
+/// Whether every title buffer's copy has two sides, however small
+/// (`VICTORY_CARD_ALL=1`; off by default): the smallest copy goes to the
+/// card's memory too, and one the card has no room for gets its card side
+/// in the PC's memory instead of having one side only.
+///
+/// A copy with one side, in the PC's memory, is what the card reads while
+/// our refreshes write it: a submission that is prepared changes it under
+/// the ones in the air ahead of it. With two sides what changed goes up to
+/// the card side in queue order (`Host::card_before`), behind them.
+///
+/// From avatarmanz/VIctory-7900XTX 5b422ba02 (GPL-3.0; there via
+/// cobrez/Victory-Nvidia-4090-laptop, and in Corgansm/victory-corgi
+/// 8b6671cc2's NVIDIA set, "card wait 58 -> 0 ms of a 104 ms frame").
+/// Here it does not remove the settles for refreshes over another copy's
+/// shader writes (they wait for the title's memory, whatever the sides),
+/// and a copy with two sides is never carried by `VICTORY_ALIAS_COPY`.
+fn card_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("every title buffer's copy has two sides, the card's in the PC's memory where the card has no room (VICTORY_CARD_ALL=1)");
+        }
+        on
+    })
+}
+
+/// [`card_for`] in the card's own memory: [`cards`] is on, the size is
+/// within [`card_limits`] and below 1 GiB (the compare counts in 32 bits),
+/// and the host has what it takes (`Host::card_ready`).
+fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
@@ -2350,6 +2394,14 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Since the last frame-rate line: the times [`Shadow::merge_under_writes`]
+/// gave up and the flights were settled ("title memory changed under shader
+/// writes"), by why: the memory is not write-watched; neither the journal
+/// nor the kernel nor the guards answered; a copy in the card's memory had
+/// more changed runs than the submission's budget left (512 a submission);
+/// a copy in the PC's memory had no snapshot.
+pub(crate) static MERGE_GAVE_UP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -3401,6 +3453,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGE_GAVE_UP[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -3415,6 +3468,7 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             let _who = crate::watch::asking_for(3);
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3445,22 +3499,13 @@ impl Shadow {
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
                 if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
+                    if !self.card_put_title(at, title, runs_left) {
+                        MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
                         return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGE_GAVE_UP[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -3490,6 +3535,69 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// [`Shadow::merge_under_writes`] for a copy in the card's memory: the
+    /// title's bytes `title`, read at offset `at` of the copy, go into its
+    /// CPU side where they differ from it, and those runs are noted for the
+    /// card side. False, with nothing done, if they cost more than
+    /// `runs_left` (a run each, or one for a page that goes up with a mask,
+    /// [`crate::card_mask`]); else they are taken from it. The caller holds
+    /// the lock of the copy's reference. From fxceless PR #1295 (KainanP).
+    pub(crate) fn card_put_title(&self, at: usize, title: &[u8], runs_left: &mut usize) -> bool {
+        let n = title.len();
+        // SAFETY: inside the mapping of the copy's CPU side, which only
+        // the submitting thread writes.
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        let runs = changed_runs(title, held);
+        let size = self.card.as_ref().map_or(0, |c| c.size);
+        let cost = crate::card_mask::cost(runs.len(), self.start as usize, size);
+        if cost > *runs_left {
+            return false;
+        }
+        *runs_left -= cost;
+        if cost < runs.len() {
+            // A page that goes up with a mask: outside its runs the CPU
+            // side holds the title's bytes already, so the page is copied
+            // whole, and its runs are noted under one lock.
+            held.copy_from_slice(title);
+            self.card_changed_runs(at, &runs);
+            MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+            MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum::<u64>(), Ordering::Relaxed);
+            return true;
+        }
+        for (r, m) in runs {
+            held[r..r + m].copy_from_slice(&title[r..r + m]);
+            self.card_changed(at + r, at + r + m);
+            MERGED[1].fetch_add(1, Ordering::Relaxed);
+            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// [`Shadow::card_changed`] for runs (offset, bytes) from `at`, in
+    /// order and apart, under one lock.
+    fn card_changed_runs(&self, at: usize, runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.reserve(runs.len());
+        for &(r, m) in runs {
+            let (from, to) = (at + r, at + r + m);
+            if from >= to {
+                continue;
+            }
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
+        }
+    }
+
+    /// The title buffer's first address.
+    pub(crate) fn title_start(&self) -> usize {
+        self.start as usize
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -4210,7 +4318,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
