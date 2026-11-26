@@ -197,7 +197,8 @@ pub(crate) fn mailbox() -> std::sync::MutexGuard<'static, Wanted> {
 }
 
 /// Since the start: records read, records that named a due slot, slots that
-/// went ahead in a pass, and passes in which one did.
+/// went ahead in a pass, and passes in which one did (a line every five
+/// seconds says them, `host.rs`).
 pub(crate) static SEEN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Puts the `wanted` slots (each with its write, as the queue hands them
@@ -226,17 +227,7 @@ pub(crate) fn promote(due: &mut Vec<(u32, u64)>, wanted: &[(u32, u64)], frame: u
     }
     if moved > 0 {
         SEEN[2].fetch_add(moved as u64, Ordering::Relaxed);
-        let n = SEEN[3].fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            tracing::info!(
-                frame,
-                passes = n,
-                slots_ahead_so_far = SEEN[2].load(Ordering::Relaxed),
-                records_read_so_far = SEEN[0].load(Ordering::Relaxed),
-                records_that_named_a_due_slot_so_far = SEEN[1].load(Ordering::Relaxed),
-                "material records read: the due textures they name went ahead in the texture pass"
-            );
-        }
+        SEEN[3].fetch_add(1, Ordering::Relaxed);
     }
     moved
 }

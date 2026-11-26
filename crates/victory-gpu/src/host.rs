@@ -8638,6 +8638,15 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                if crate::material_demand::enabled() {
+                    let [read, named, ahead, passes] =
+                        crate::material_demand::SEEN.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    tracing::info!(
+                        "material records, since the start: {read} read when their draw was bound, {named} of them named \
+                         textures that were due, {ahead} slots went ahead in {passes} texture passes \
+                         (VICTORY_MATERIAL_TEXTURE_DEMAND=1)"
+                    );
+                }
                 let [kept, nulled, again] =
                     crate::descriptor::host::STALE_KEPT.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 if kept + nulled + again != 0 {
