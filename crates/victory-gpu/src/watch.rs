@@ -99,9 +99,10 @@ static LANDED_ASKING: std::sync::Condvar = std::sync::Condvar::new();
 /// keeps the answers right: a kernel asking resets the pages it reports,
 /// so another asking of the same pages made meanwhile does not see them;
 /// every answer of a range (by an asking, from the standing asking ahead,
-/// [`asked`]) therefore waits until the askings in flight that overlap it
-/// and are numbered below it have noted theirs ([`settle`]); later ones
-/// note stamps above its number, which its copy takes at its next refresh.
+/// [`asked`]) therefore waits until every asking in flight over it when
+/// it reads the journal has noted what it found ([`settle`]); askings that
+/// start later reset after it and note stamps above its number, which its
+/// copy takes at its next refresh.
 /// The journal never takes a page's stamp back to a lower number.
 pub(crate) fn unlocked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -151,15 +152,22 @@ pub(crate) fn journal_line(frames: f64) -> String {
     )
 }
 
-/// The journal, once no asking in flight that overlaps pages `[first,
-/// last)` and is numbered below `before` is left ([`unlocked`]).
+/// The journal, once no asking that was in flight over pages `[first,
+/// last)` when this was called is left ([`unlocked`]).
+///
+/// Every one of them, whatever its number: an asking numbered above the
+/// answer that reached the kernel first has reset pages whose writes the
+/// answer's own asking then did not see (found by a review of a2b96a048,
+/// which waited only for those numbered below). Askings that start after
+/// this call reset after the answer's own asking, and are not waited for
+/// (no answer waits for ever behind new askings).
 fn settle(
     mut j: std::sync::MutexGuard<'static, Journal>,
     first: usize,
     last: usize,
-    before: u64,
 ) -> std::sync::MutexGuard<'static, Journal> {
-    let overlapping = |j: &Journal| j.flying.iter().any(|&(a, b, n)| n < before && a < last && first < b);
+    let before = j.asked;
+    let overlapping = |j: &Journal| j.flying.iter().any(|&(a, b, n)| n <= before && a < last && first < b);
     if j.flying.is_empty() || !overlapping(&j) {
         return j;
     }
@@ -757,7 +765,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         return None;
     }
     let now = j.ahead_asked;
-    let j = settle(j, first, last, now);
+    let j = settle(j, first, last);
     Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -804,7 +812,7 @@ fn writes_as(
     // would ask the guards.
     if ahead_covers(&held, first, last, guarded) {
         let now = held.ahead_asked;
-        let held = settle(held, first, last, now);
+        let held = settle(held, first, last);
         return Some((
             now,
             held.written
@@ -1003,7 +1011,7 @@ fn writes_unlocked(
         light_count(1);
         publish(j, viewed);
     }
-    let held = settle(held, first, last, now);
+    let held = settle(held, first, last);
     Some((now, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -1400,7 +1408,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     }
     if !by_bits {
         let now = j.ahead_asked;
-        j = settle(j, first, last, now);
+        j = settle(j, first, last);
     }
     let same = j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]);
     if same && by_bits {
@@ -3773,6 +3781,84 @@ mod tests {
             forget_pages(one, one + PAGES * BLOCK);
             forget_pages(two, two + PAGES * BLOCK);
         }
+    }
+
+    /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
+    /// askings of one range, the lower-numbered one (`low`) started first,
+    /// the higher (`high`) reaching the kernel first. `high` resets the
+    /// page the title wrote, so `low`'s kernel call does not see the write;
+    /// `low`, done and out of flight, must not answer before `high` notes
+    /// it, or its copy misses the write until its next refresh. a2b96a048
+    /// waited only for askings numbered below the answer (it answered at
+    /// once here); every asking in flight over the range is waited for now.
+    #[test]
+    fn an_answer_waits_for_a_later_asking_that_reset_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const PAGES: usize = 4;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        forget_pages(p, p + PAGES * PAGE);
+        let (first, last) = (p / PAGE, p / PAGE + PAGES);
+        assert!(writes_as(p, p + PAGES * PAGE, false, 0, false, true).is_some());
+        // The title writes page 1.
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(1) };
+        // Both in flight, numbered as `writes_unlocked` numbers them.
+        let (low, high) = {
+            let mut j = journal();
+            j.asked += 1;
+            let low = j.asked;
+            j.flying.push((first, last, low));
+            j.asked += 1;
+            let high = j.asked;
+            j.flying.push((first, last, high));
+            (low, high)
+        };
+        // `high`'s kernel call first: it takes the write.
+        let mut found = vec![0usize; PAGES * PAGE / KERNEL_PAGE];
+        let (mut count, mut granularity) = (found.len(), 0);
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(1, p as *const _, PAGES * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        } != 0;
+        assert!(!failed && count > 0, "the write was there to reset");
+        // `low`'s: nothing there now. It notes nothing, is out of flight,
+        // and answers as `writes_unlocked` does.
+        count = found.len();
+        // SAFETY: as above.
+        unsafe {
+            GetWriteWatch(1, p as *const _, PAGES * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        };
+        assert_eq!(count, 0);
+        journal().flying.retain(|&(_, _, n)| n != low);
+        let answered = AtomicBool::new(false);
+        let written = std::thread::scope(|scope| {
+            let answer = scope.spawn(|| {
+                let held = settle(journal(), first, last);
+                let written: Vec<(usize, u64)> = held.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+                answered.store(true, Ordering::SeqCst);
+                written
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let early = answered.load(Ordering::SeqCst);
+            {
+                let mut j = journal();
+                note_written(&mut j, first + 1, high, ALL_PIECES);
+                j.flying.retain(|&(_, _, n)| n != high);
+                LANDED_ASKING.notify_all();
+            }
+            let written = answer.join().expect("the answer");
+            assert!(!early, "answered before the asking that reset the page noted it");
+            written
+        });
+        assert_eq!(written, [(first + 1, high)], "the write the other asking found");
+        forget_pages(p, p + PAGES * PAGE);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// `VICTORY_JOURNAL_UNLOCKED`: an answer waits for an asking in flight
