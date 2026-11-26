@@ -309,9 +309,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired)
         .push((started, Retired(Box::new(object))));
 }
 
@@ -326,7 +324,7 @@ pub(crate) fn submissions() -> (u64, u64) {
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
     let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retired = crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired);
         if retired.is_empty() {
             return;
         }
@@ -3971,7 +3969,7 @@ pub(crate) fn settle_now(why: usize) {
     let Some(host) = host() else {
         return;
     };
-    let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let mut submitted = crate::lockstat::lock(&host.submitted, crate::lockstat::Lock::Submit);
     host.settle(&mut submitted, why);
 }
 
@@ -4036,7 +4034,7 @@ fn late_helper() {
             }
         }
         {
-            let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let mut submitted = crate::lockstat::lock(&host.submitted, crate::lockstat::Lock::Submit);
             // Something newer went up meanwhile: the card is waited for
             // again, the submitting thread is not held up for it.
             if line().target != target {
@@ -6534,7 +6532,7 @@ impl Host {
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = crate::lockstat::lock(&self.submitted, crate::lockstat::Lock::Submit);
         let was_working = working(true);
         submitting(1, runs.len());
         // Display planes these lists write ([`crate::shown`]), in submission
@@ -9758,6 +9756,11 @@ impl Meter {
                     syncs[1],
                     crate::descriptor::host::NOT_RAW.load(Ordering::Relaxed)
                 );
+                // VICTORY_LOCK_STATS=1: waits on the recording path's shared
+                // locks since the last line.
+                if let Some(line) = crate::lockstat::line((self.presented - presented_then).max(1) as f64) {
+                    tracing::info!("{line}");
+                }
             }
             #[cfg(feature = "diagnostics")]
             {

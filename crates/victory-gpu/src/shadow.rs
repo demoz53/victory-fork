@@ -4078,7 +4078,7 @@ struct Entry {
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lockstat::lock(&BUFFERS, crate::lockstat::Lock::Buffers)
 }
 
 /// A title buffer exists at `start` (`len` bytes).
