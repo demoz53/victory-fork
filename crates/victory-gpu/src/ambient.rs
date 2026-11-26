@@ -70,12 +70,23 @@ pub(crate) enum Role {
     /// Writes the title's reflections for the last time in a frame
     /// (`CS_UpdateHistory_*`; `VICTORY_AMBIENT_REFLECT`).
     Reflect,
+    /// Resolves the traced reflections (`CS_TemporalResolve2_Opaque_*`, the
+    /// opaque surfaces'; `CS_TemporalResolve1_Alpha_*`, the transparent
+    /// ones', window panes and glasses): `VICTORY_AMBIENT_REFLECT_RESOLVES`.
+    ReflectResolve,
+    /// Traces the sun's distant shadows (`CS_RTDistantShadowTrace*`):
+    /// `VICTORY_AMBIENT_SHADOW_MASKS`.
+    ShadowTrace,
 }
 
 /// The program's part in this, by its name in the container.
 pub(crate) fn role(container: &[u8]) -> Option<Role> {
     let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
-    if has(b"CS_ScreenProbes_TemporalResolve") {
+    if has(b"CS_TemporalResolve2_Opaque") || has(b"CS_TemporalResolve1_Alpha") {
+        Some(Role::ReflectResolve)
+    } else if has(b"CS_RTDistantShadowTrace") {
+        Some(Role::ShadowTrace)
+    } else if has(b"CS_ScreenProbes_TemporalResolve") {
         Some(Role::Resolve)
     } else if has(b"CS_CacheScreenSpaceRadiance") {
         Some(Role::Radiance)
@@ -107,6 +118,47 @@ pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 /// otherwise it stores the colour unpacked at dword 40 (u31). Which branch
 /// the title takes is not known offline.
 pub(crate) const REFLECTIONS_PACKED: (u8, u32) = (1, 48);
+/// Where the reflections' resolves ([`Role::ReflectResolve`]) write them:
+/// the first of these places that holds a 2D R32_UINT image (the opaque
+/// surfaces' resolve at the first, the transparent ones' at the second).
+/// From avatarmanz/VIctory-7900XTX PR #314.
+pub(crate) const REFLECTIONS_RESOLVED: [(u8, u32); 2] = [(1, 128), (1, 136)];
+
+/// `VICTORY_AMBIENT_REFLECT_RESOLVES=1` (off by default; acts only with
+/// `VICTORY_AMBIENT_REFLECT`): the reflections are also held right after the
+/// two programs that resolve them (`CS_TemporalResolve2_Opaque_*`,
+/// `CS_TemporalResolve1_Alpha_*`), each texel to `VICTORY_AMBIENT_REFLECT`
+/// times the light around it (the estimate at the four points about it,
+/// with a fifth of the room's slow mean), hue kept. The hold after
+/// `CS_UpdateHistory` misses the transparent surfaces' resolve: window
+/// panes and glasses kept the open sky. Ported from avatarmanz/VIctory-7900XTX
+/// PR #314 (Serph91P, 6c7e3a87c, GPL-3.0), which builds on beloooo's hold.
+fn reflect_resolves() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_AMBIENT_REFLECT_RESOLVES").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `VICTORY_AMBIENT_SHADOW_MASKS=1` (off by default): after each program that
+/// traces the sun's distant shadows (`CS_RTDistantShadowTrace*`: the trace,
+/// its leak plug and their temporal upsamples), the 2D float or unorm images
+/// it writes are filled with 1 (lit): without the structure builder its rays
+/// walk structures nothing built, and what it leaves is not a shadow.
+/// Integer images are left alone (their encoding is not known). The idea and
+/// the programs are from ScarlettPort's stand-in (ZigZagBoi1/ScarlettPort,
+/// as copied into JMAN730/project-flamingo 83af519c8 `emit/stand_in.rs`,
+/// GPL-3.0-or-later), which translates those programs with every image
+/// store writing 1; here a pass of ours writes it after them, and the
+/// title's shaders are untouched.
+pub(crate) fn shadow_masks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_AMBIENT_SHADOW_MASKS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Float and normalized formats a pass of ours can fill with 1 through a
+/// typed unordered access view (DXGI numbers).
+pub(crate) fn fillable(format: u32) -> bool {
+    matches!(format, 2 | 10 | 11 | 16 | 24 | 26 | 28 | 34 | 35 | 41 | 49 | 54 | 56 | 61)
+}
 
 /// `VICTORY_AMBIENT_REFLECT_AT=48`: [`reflect`] holds the image at table
 /// dword 48 ([`REFLECTIONS_PACKED`]), the one `CS_UpdateHistory_*` writes
@@ -553,12 +605,27 @@ uint pack(float3 c) {
 #endif
 
 #ifdef HOLD
-// Reflections: no brighter than a part of the light around.
+// Reflections: no brighter than a part of the light around (with flag 4:
+// around the texel, the estimate at the four points about it with a fifth
+// of the room's slow mean, as avatarmanz PR #314 has it).
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void hold(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     float3 around = constant > 0.0 ? float3(1.0, 0.98, 0.94) * constant : cells[CELLS].rgb * level;
+    if (constant <= 0.0 && (flags & 4) != 0) {
+        float2 g = (float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY) - 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        float3 near = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            uint at0 = (q.y * PX + q.x) * 3;
+            near += b.x * b.y * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        }
+        around = lerp(near, cells[CELLS].rgb, 0.2) * level;
+    }
     float top = max(dot(around, LUMA) * held, 1e-6);
     float3 c = unpack(light[at.xy]);
     // (`VICTORY_AMBIENT_MAGENTA`: what the memory held is the light around.)
@@ -568,6 +635,17 @@ void hold(uint3 at : SV_DispatchThreadID) {
     }
     float has = dot(c, LUMA);
     if (has > top) light[at.xy] = pack(c * (top / has));
+}
+#endif
+
+#ifdef FILL
+// Lit: what a traced shadow pass that cannot trace leaves.
+RWTexture2D<float4> target : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void fill(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    target[at.xy] = 1.0;
 }
 #endif
 
@@ -662,6 +740,7 @@ struct Pass {
     raise: ID3D12PipelineState,
     hold: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    fill: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -694,6 +773,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let hold = pipeline("HOLD", s!("hold"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let fill = pipeline("FILL", s!("fill"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -704,6 +784,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         hold,
         air,
+        fill,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -761,6 +842,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    if role == Role::ReflectResolve && (!reflect_resolves() || reflect() == 0.0) {
+        return false;
+    }
+    if role == Role::ShadowTrace && !shadow_masks() {
+        return false;
+    }
     if role == Role::Reflect {
         if reflect() == 0.0 {
             return false;
@@ -795,7 +882,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (dt / 1000.0).to_bits();
     words[15] = skip_dark().to_bits();
-    words[16] = flags(air_finite(), magenta_filter());
+    words[16] = flags(air_finite(), magenta_filter()) | if role == Role::ReflectResolve { 4 } else { 0 };
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -819,7 +906,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Reflect => run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::Reflect | Role::ReflectResolve => {
+                run(&pass.hold, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1)
+            }
+            Role::ShadowTrace => run(&pass.fill, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
@@ -1017,6 +1107,22 @@ mod tests {
         out.chunks_exact(16)
             .map(|c| std::array::from_fn(|i| f32::from_le_bytes(c[i * 4..i * 4 + 4].try_into().unwrap())))
             .collect()
+    }
+
+    #[test]
+    fn roles_by_name() {
+        assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
+        assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
+        assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_UpdateHistory_e877ef6e_Wrapped.."), Some(Role::Reflect));
+        assert_eq!(role(b"CS_TemporalResolve"), None);
+        // The name the resolve has in the containers this title gives us.
+        assert_eq!(role(b"CS_ScreenProbes_TemporalResolve_ReflectiveCaustics_a911b49c_Wrapped"), Some(Role::Resolve));
+        assert_eq!(role(b"CS_TemporalResolve2_Opaque_FrameStatistics_357e0818"), Some(Role::ReflectResolve));
+        assert_eq!(role(b"CS_TemporalResolve1_Alpha_68979fba"), Some(Role::ReflectResolve));
+        assert_eq!(role(b"CS_RTDistantShadowTraceLeakPlug32_Tiled_d6296256_Wrapped"), Some(Role::ShadowTrace));
+        assert_eq!(role(b"CS_RTDistantShadowFinalUpsample_588514d8"), None);
+        assert!(fillable(10) && fillable(61) && !fillable(42) && !fillable(57));
     }
 
     /// The passes compile with the system's compiler and the host takes them.
