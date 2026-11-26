@@ -2694,6 +2694,95 @@ void main() {
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
         assert_eq!(hits, 3 + (5 + 6) + 10 + 3);
     }
+
+    /// What the clamps of a frame cost on this card, each on its own and in
+    /// batches (a measurement, ignored: run it by name with `--ignored
+    /// --nocapture`): 2,400 indirect dispatches of one group that does next
+    /// to nothing, through a host list, as many as a frame of the boat
+    /// scene clamps. A batch every 1 is what `VICTORY_INDIRECT_BATCH=1`
+    /// leaves of a run of dispatches; every 16 or 256, what runs of draws
+    /// (or of dispatches with `=2`) come to. (After the measurement of
+    /// avatarmanz/VIctory-7900XTX 037596241, `batch_costs`.)
+    ///
+    /// On the RTX 4060 Ti (a release build, the best of 8 submissions, twice,
+    /// with the test queue's game running beside it): each on its own 8.2
+    /// to 10.5 ms (3.4 to 4.4 microseconds a clamp); a batch every 1: 11.0
+    /// to 11.6 ms (a pass of a batch costs more than a clamp of one, so
+    /// runs of dispatches gain nothing with `=1`); every 3: 5.3; every 16:
+    /// 2.2; every 256: 1.6 ms. A table of 64 jobs (one group of threads)
+    /// instead of 256 changed nothing (11.0 ms every 1). The dispatches
+    /// here do nothing: in a frame each pass also waits for real work.
+    #[test]
+    #[ignore = "a measurement on the card: run it by name with --ignored --nocapture"]
+    fn batch_costs_on_this_card() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        const EXECUTIONS: u32 = 2400;
+        const RECORDS: u32 = 2048;
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let Some((source, ptr)) = host.shared_buffer(u64::from(RECORDS) * 32) else {
+            return;
+        };
+        for i in 0..RECORDS as usize {
+            for w in 0..3 {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i * 8 + w).write_volatile(1) };
+            }
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live buffer.
+        let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
+        let bind = || {
+            // SAFETY: an open list; the worker's root signature and pipeline;
+            // buffers the test holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            }
+        };
+        for run in [0u32, 1, 3, 16, 256, 0, 1, 16] {
+            let mut best = f64::MAX;
+            for _ in 0..8 {
+                // SAFETY: the mapping holds 256 bytes; nothing runs.
+                unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+                let mut batch = None;
+                for i in 0..EXECUTIONS {
+                    let offset = u64::from(i % RECORDS) * 32;
+                    let (scratch, at) = if run == 0 {
+                        let scratch = bound(&list, (&source, offset), None, (2, 12, 1)).unwrap();
+                        bind();
+                        (scratch, 0)
+                    } else {
+                        if i % run == 0 {
+                            batch = Some(open_batch(&list, (1, &source), &[]).unwrap());
+                            bind();
+                        }
+                        let (table, scratch) = batch.as_mut().unwrap();
+                        (scratch.clone(), table.place(1, offset, 2).unwrap())
+                    };
+                    // SAFETY: as in `bind`.
+                    unsafe { list.list.ExecuteIndirect(&signature, 1, &scratch, at, None, 0) };
+                }
+                list.close();
+                let started = std::time::Instant::now();
+                host.execute(&[&list]);
+                best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                list.reset();
+                // SAFETY: the list has run; a mapped buffer.
+                assert_eq!(unsafe { (hits_ptr as *const u32).read_volatile() }, EXECUTIONS);
+            }
+            let what = if run == 0 { "each clamped on its own".to_owned() } else { format!("a batch every {run}") };
+            println!("{EXECUTIONS} indirect dispatches, {what}: {best:.2} ms (the best of 8 submissions)");
+        }
+    }
 }
 
 /// The benchmark of the clamp and its barriers (ignored by default).
