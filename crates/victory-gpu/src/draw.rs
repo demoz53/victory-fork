@@ -1002,6 +1002,7 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            list.plane_written(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
@@ -4233,6 +4234,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // Read by the title's CPU code: copied back into title memory
             // ([`crate::texback`]).
             list.texture_written(*resource as This, desc.as_ref());
+            list.plane_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

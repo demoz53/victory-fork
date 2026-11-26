@@ -925,6 +925,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.twin_use(src, false, false);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            list.plane_written(dst);
             let first = crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -1079,6 +1080,7 @@ extern "system" fn copy_texture_region(
         // source above too).
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
+        list.plane_written(dst.resource);
         let first = crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();

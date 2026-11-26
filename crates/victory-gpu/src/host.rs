@@ -913,6 +913,9 @@ pub(crate) struct HostList {
     /// the buffer, the bytes used, and whether it is in the constant buffer
     /// state (it decays to the common state when a submission has run).
     card_constants: Mutex<Option<(ID3D12Resource, u64, bool)>>,
+    /// The title's display planes the list writes ([`crate::shown`]): told
+    /// when it is submitted. Empty unless planes are followed.
+    planes: Mutex<Vec<usize>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4429,6 +4432,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 card_constants: Mutex::default(),
+                planes: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5790,6 +5794,12 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // Display planes these lists write ([`crate::shown`]), in submission
+        // order: what a present after this submission shows holds them.
+        for run in runs {
+            let planes = run.planes.lock().unwrap_or_else(|e| e.into_inner());
+            crate::shown::written(&planes);
+        }
         // Ranges the card carries over between copies ([`alias_copy`]).
         let mut alias: Vec<AliasCopy> = Vec::new();
         // Flights in the air ([`late`]): a submission that is waited for
@@ -6504,6 +6514,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.planes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         if let Some(c) = self.card_constants.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             // Every submission of the list has run: the buffer is free, and
             // in the common state again.
@@ -6738,6 +6749,20 @@ impl HostList {
             // leave its own pipeline and target set.
             self.pass_plane(depth, twin);
             self.settle(depth, SHADER_RESOURCE);
+        }
+    }
+
+    /// The list draws, copies or stores into title texture `resource`: if
+    /// it is a display plane the title has shown ([`crate::shown`]), the
+    /// write is told when the list is submitted. Nothing with
+    /// `VICTORY_PRESENT_TRACE` and `VICTORY_PRESENT_NEWEST` off.
+    pub(crate) fn plane_written(&self, resource: crate::object::This) {
+        if !crate::shown::is_plane(resource as usize) {
+            return;
+        }
+        let mut planes = self.planes.lock().unwrap_or_else(|e| e.into_inner());
+        if !planes.contains(&(resource as usize)) {
+            planes.push(resource as usize);
         }
     }
 
