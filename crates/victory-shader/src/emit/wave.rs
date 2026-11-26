@@ -177,7 +177,14 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             insts[j].write(Reg::S(EXEC)).is_some()
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
+        // A saveexec whose restore is not in the block is no section; the scan goes on past
+        // it (Vice-Tay 17e3e2c8d, shh; `VICTORY_SECTIONS_PAST_SAVEEXEC=0`: it stopped there,
+        // and the block's later sections took the fallback forms).
         let Some(end) = end else {
+            if super::sections_past_saveexec() {
+                i += 1;
+                continue;
+            }
             break;
         };
         let shapes = simulate(&insts[i + 1..end], wave, saved);
@@ -342,6 +349,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
             continue;
         };
+        let f16_inline = name == "v_add_f16" && super::shader_fixes_1126();
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -359,6 +367,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
+                // `v_add_f16`'s inline floats are halves (upstream #2493, shh, 6cd2489d5;
+                // `VICTORY_SHADER_FIXES_1126`): the f32 pattern's low half of 1.0 is +0.0
+                Operand::Const(c @ 240..=248) if f16_inline => {
+                    let h = [0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118][usize::from(c - 240)];
+                    one(Sym::K(h))
+                }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
@@ -1279,4 +1293,83 @@ mod tests {
             assert_eq!(sec.shapes.get(&v6), None);
         }
     }
+
+    /// A saveexec of every lane whose restore is not in the block is no section, and the
+    /// sections after it in the block are still found. Ported from TaynanGT/Vice-Tay 17e3e2c8d
+    /// (shh); with `VICTORY_SECTIONS_PAST_SAVEEXEC=0` the scan stopped there (checked).
+    #[test]
+    fn an_unmatched_saveexec_leaves_the_later_sections_of_its_block() {
+        let total = |w: &[u32], start: usize| {
+            let p = build(w, true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[start].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
+            let s7 = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            let secs = sections(&p, 0);
+            assert!(start == 0 || !secs.contains_key(&0), "the unmatched saveexec is no section");
+            let shape = secs.get(&start).and_then(|sec| sec.shapes.get(&s7).copied());
+            (shape, Shape::Active(Op::Or, v7, saved, 0))
+        };
+        let (got, want) = total(&WAVE_OR_V7_TO_S7, 0);
+        assert_eq!(got, Some(want));
+        // s_or_saveexec_b64 s[2:3], -1, restored nowhere in the block
+        let mut w = vec![sop1(2, 0x25, 193)];
+        w.extend(WAVE_OR_V7_TO_S7);
+        let (got, want) = total(&w, 1);
+        assert_eq!(got, Some(want), "the section after an unmatched saveexec");
+        let was = super::super::TEST_FIXES_1126.replace(Some(false));
+        let (old, _) = total(&w, 1);
+        super::super::TEST_FIXES_1126.set(was);
+        assert_eq!(old, None, "the scan stopped at the unmatched saveexec (the fault)");
+    }
+
+    /// The whole-wave simulation of `v_add_f16`: 0 (code 128) is an additive identity, the
+    /// inline floats (240-248: 0.5, -0.5, 1.0, ... 1/(2 pi)) are non-zero halves, read as their
+    /// half patterns (0x3800 ... 0x3118). After Marvisak/VIctory #2493 (shh, 6cd2489d5),
+    /// on this tree's sum of halves (`a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree`).
+    #[test]
+    fn v_add_f16_inline_float_constants_are_not_zero_identity() {
+        let shape = |k: u32| {
+            let w = [
+                0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+                0xD501_0001,
+                0x0012_0E80,      // v_cndmask_b32 v1, 0, v7, s[4:5]
+                0x6402_0200 | k,  // v_add_f16 v1, <k>, v1
+                0x6402_02E9,
+                0xDE54_C101, // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+                0x6402_02E9,
+                0x9360_1201, // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+                0x6402_02E9,
+                0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+                0x6402_02FA,
+                0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+                0xD778_0002,
+                0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+                0x6402_0302, // v_add_f16 v1, v2, v1
+                0xD760_0007,
+                0x0001_4101, // v_readlane_b32 s7, v1, 32
+                0x6402_0207, // v_add_f16 v1, s7, v1
+                0xD760_0007,
+                0x0001_0101, // v_readlane_b32 s7, v1, 0
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            ];
+            let p = build(&w, true);
+            let insts = &p.blocks[0].insts;
+            let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            sections(&p, 0).get(&0).and_then(|sec| sec.shapes.get(&total).copied())
+        };
+        assert!(matches!(shape(128), Some(Shape::Active(Op::AddH, ..))), "adding 0 keeps the sum");
+        for k in 240..=248 {
+            assert_eq!(shape(k), None, "inline float {k} taken for an identity");
+        }
+        // (Unlike upstream's, this tree's identity test compares all 32 bits of a constant, so
+        // 1.0's f32 pattern was not taken for +0.0 here even with `VICTORY_SHADER_FIXES_1126=0`:
+        // the fix only makes the constants the halves they are.)
+        let was = super::super::TEST_FIXES_1126.replace(Some(false));
+        let old = shape(242);
+        super::super::TEST_FIXES_1126.set(was);
+        assert_eq!(old, None);
+    }
 }
+

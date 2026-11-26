@@ -1027,6 +1027,43 @@ fn widen_loop(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`shader_fixes_1126`] and [`sections_past_saveexec`], for its thread.
+    pub(crate) static TEST_FIXES_1126: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Three small arithmetic fixes of 2026-11-26, each a plain bug fix with a test, on unless
+/// `VICTORY_SHADER_FIXES_1126=0`:
+/// - the VOP3 form of `v_fmac_f32` / `v_mac_f32` / `v_mac_legacy_f32` applies abs and neg bit 2
+///   to its accumulator (TaynanGT/Vice-Tay 8fe3ccddc, Bartosz; also Kamiloj9/victory-dlss
+///   2b0646d5e): `a*b - d` was translated as `a*b + d`;
+/// - the legacy multiplies take a denormal operand as zero, by its exponent bits
+///   (Marvisak/VIctory #682, Senchsus, 704d25edd);
+/// - the whole-wave simulation reads `v_add_f16`'s inline float constants as halves
+///   (Marvisak/VIctory #2493, shh, 6cd2489d5).
+pub fn shader_fixes_1126() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FIXES_1126.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_FIXES_1126").is_none_or(|v| v != "0"))
+}
+
+/// Whether the whole-wave section scan of a block goes on past a saveexec whose restore is not
+/// in the block (TaynanGT/Vice-Tay 17e3e2c8d, shh; also Kamiloj9/victory-dlss 2b0646d5e). On;
+/// `VICTORY_SECTIONS_PAST_SAVEEXEC=0`: it stopped there, so the block's later wave reductions
+/// and ballots were never recognised and took the fallback forms.
+pub fn sections_past_saveexec() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FIXES_1126.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SECTIONS_PAST_SAVEEXEC").is_none_or(|v| v != "0"))
+}
+
 /// Whether the wave-wide form is tried for every console wave64 compute program on a host of
 /// 32-lane waves as [`per_program::wave_wide_first`] tries it for the programs it lists: after
 /// the exact forms without barriers and the deep-skips form, on the program as it is first,

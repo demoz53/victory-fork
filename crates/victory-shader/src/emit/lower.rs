@@ -1268,6 +1268,24 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     Some(meet)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lds_bounds`], for its thread only.
+    pub(super) static TEST_LDS_BOUNDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether each LDS access is checked against the program's own LDS (reads past it give 0,
+/// writes and atomics past it do nothing), as on the console. Opt-in (`VICTORY_LDS_BOUNDS=1`):
+/// it costs a compare and a select per dword in every program with LDS.
+fn lds_bounds() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_BOUNDS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_BOUNDS").is_some_and(|v| v == "1"))
+}
+
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
 fn lane_constant_masks(st: &Structured) -> bool {
@@ -1999,6 +2017,7 @@ impl<'a> Lower<'a> {
         } else if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            s.lds_title_dwords = s.lds_dwords;
             console_threads = cs.threads;
             // One console wave per host group ([`with_group_split`]).
             let size = cs.threads.iter().product::<u32>();
@@ -2218,6 +2237,7 @@ impl<'a> Lower<'a> {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            s.lds_title_dwords = s.lds_dwords;
             s.mesh = Some(super::shader::Mesh {
                 max_vertices: ms.max_vertices,
                 max_primitives: ms.max_primitives,
@@ -4369,12 +4389,26 @@ impl<'a> Lower<'a> {
     }
 
     /// `0 × anything = 0`, as in D3D9.
+    ///
+    /// As on RDNA2 a denormal operand counts as zero too: the test is on the exponent bits,
+    /// not a float compare whose answer depends on the host's denormal mode (upstream #682,
+    /// Senchsus, 704d25edd; `VICTORY_SHADER_FIXES_1126`).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
-        let az = self.s.m.cmp(c, pred::OEQ, a, zero);
-        let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
+        let (az, bz) = if super::shader_fixes_1126() {
+            let exp = self.s.m.i32(0x7F80_0000);
+            let izero = self.s.m.i32(0);
+            let is_zero = |l: &mut Self, v: V| {
+                let bits = l.as_int(v);
+                let e = l.s.m.bin(c, Bin::And, bits, exp);
+                l.s.m.cmp(c, pred::EQ, e, izero)
+            };
+            (is_zero(self, a), is_zero(self, b))
+        } else {
+            (self.s.m.cmp(c, pred::OEQ, a, zero), self.s.m.cmp(c, pred::OEQ, b, zero))
+        };
         let z = self.s.m.bin(c, Bin::Or, az, bz);
         self.s.m.select(c, z, zero, m)
     }
@@ -5646,16 +5680,54 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // Past the program's LDS the console reads 0 and drops writes. On the host such an
+        // index is undefined, and the dwords right after the program's are ours (the lane
+        // exchange, the wave order): with `VICTORY_LDS_BOUNDS=1` each access gets its dword's
+        // pointer with the index clamped into the program's part, and whether it was in it
+        // (`inb`): reads past it give 0, writes and atomics past it do nothing (avatarmanz
+        // PR #336, DiosET3RN0, af63c911f). Without it (the default) every index is taken as in
+        // bounds and `inb` is true.
+        // shortcut: LDS addresses are taken as dword-aligned.
+        let bounds = lds_bounds().then_some(self.s.lds_title_dwords);
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let (index, inb) = match bounds {
+                Some(limit) => {
+                    let n = l.s.m.i32(limit);
+                    let inb = l.s.m.cmp(c, pred::IULT, index, n);
+                    let zero = l.s.m.i32(0);
+                    (l.s.m.select(c, inb, index, zero), inb)
+                }
+                None => (index, l.s.m.bool(true)),
+            };
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inb)
+        };
+        // A read's dword, 0 past the program's LDS.
+        let read_in = |l: &mut Self, x: V, inb: V| -> V {
+            if bounds.is_none() {
+                return x;
+            }
+            let c = l.cur;
+            let zero = l.s.m.i32(0);
+            l.s.m.select(c, inb, x, zero)
+        };
+        // The lanes that access memory: the lane guard's, and in bounds.
+        let within = |l: &mut Self, g: Option<V>, inb: V| -> Option<V> {
+            if bounds.is_none() {
+                return g;
+            }
+            match g {
+                Some(g) => {
+                    let c = l.cur;
+                    Some(l.s.m.bin(c, Bin::And, g, inb))
+                }
+                None => Some(inb),
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -5689,7 +5761,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inb) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -5699,6 +5771,7 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
+                let w = read_in(self, w, inb);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -5741,7 +5814,8 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let g = within(self, guard, inb);
+                let at = self.begin_guarded(g);
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -5760,8 +5834,9 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inb) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let x = read_in(self, x, inb);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -5785,8 +5860,14 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
+                let (p, inb) = dword(self, off);
+                if bounds.is_some() {
+                    let here = self.begin_guarded(Some(inb));
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(here, &[]);
+                } else {
+                    self.s.m.store(self.cur, p, x);
+                }
             }
             self.end_guarded(at, &[]);
             return Ok(());
@@ -5821,7 +5902,20 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, inb) = dword(self, offset);
+        // A lane the guard lets through but whose dword is past the program's LDS gets 0 back;
+        // a lane the guard stops keeps its value.
+        let outside = if bounds.is_some() {
+            let c = self.cur;
+            let t = self.s.m.bool(true);
+            let oob = self.s.m.bin(c, Bin::Xor, inb, t);
+            let lost = within(self, guard, oob).expect("bounds give a mask");
+            let zero = self.s.m.i32(0);
+            self.s.m.select(c, lost, zero, outside)
+        } else {
+            outside
+        };
+        let guard = within(self, guard, inb);
         if matches!(op.as_str(), "max_f32" | "min_f32" | "add_f32" | "cmpst_f32") {
             let at = self.begin_guarded(guard);
             let r = match op.as_str() {
@@ -8916,13 +9010,25 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
+                let mut acc = match self.floats.get(&acc) {
                     Some(&x) => x,
                     None => {
                         let x = self.i32_of(acc)?;
                         self.as_float(x)
                     }
                 };
+                // In VOP3, bit 2 of abs and neg names the accumulator (the destination): RDNA2
+                // computes fma(a, b, |d|) and fma(a, b, -d) (Vice-Tay 8fe3ccddc, Bartosz;
+                // `VICTORY_SHADER_FIXES_1126`).
+                if super::shader_fixes_1126() {
+                    if v.abs >> 2 & 1 != 0 {
+                        acc = self.unary(6, acc);
+                    }
+                    if v.neg >> 2 & 1 != 0 {
+                        let z = self.s.m.f32(0x8000_0000);
+                        acc = self.s.m.bin(c, Bin::Sub, z, acc);
+                    }
+                }
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {

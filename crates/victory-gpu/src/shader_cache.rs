@@ -131,7 +131,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// The order, and `VICTORY_WAVE_LOCAL` being here twice, are kept as they
 /// were: with `VICTORY_SHADER_CACHE_KEY=exe` the key is, byte for byte,
 /// what it was while the executable was the identity.
-const SWITCHES: [&str; 45] = [
+const SWITCHES: [&str; 48] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LDS_REGIONS",
@@ -188,6 +188,11 @@ const SWITCHES: [&str; 45] = [
     // (test/shader5: a comparison sampler's reduction replaced, not ORed into;
     // on unless "0": the static samplers an entry holds)
     "VICTORY_COMPARE_REDUCTION",
+    // (test/shader6: three small arithmetic fixes and the section scan, on unless "0"; LDS
+    // bounds, off unless "1")
+    "VICTORY_SHADER_FIXES_1126",
+    "VICTORY_SECTIONS_PAST_SAVEEXEC",
+    "VICTORY_LDS_BOUNDS",
 ];
 
 /// The translation settings of this process that are in the run's key by

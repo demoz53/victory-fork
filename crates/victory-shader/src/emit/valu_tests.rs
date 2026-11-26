@@ -5058,3 +5058,123 @@ fn sdwa_16bit_dst_unused_sext_sign_extends_word0() {
         });
     }
 }
+
+/// `v_fmac_f32` in the VOP3 encoding takes `neg[2]` (`-acc`) and `abs[2]` (`|acc|`) on its
+/// accumulator, the destination register. Ported from TaynanGT/Vice-Tay 8fe3ccddc (Bartosz),
+/// whose 16 rows were measured on RDNA2 (gfx1031, IEEE mode off, f32 denormals flushed) and
+/// published by the AnyPS5 project (no code taken from it); a NaN is compared as any NaN.
+/// With `VICTORY_SHADER_FIXES_1126=0` the modifiers are dropped (the fault): checked too.
+#[test]
+fn v_fmac_f32_takes_the_accumulator_modifiers() {
+    // ([a, b, acc], with neg[2], with abs[2])
+    const ROWS: [([u32; 3], u32, u32); 16] = [
+        ([0x3F80_0000, 0x4000_0000, 0x3F80_0000], 0x3F80_0000, 0x4040_0000),
+        ([0x3F80_0000, 0x4000_0000, 0xBF80_0000], 0x4040_0000, 0x4040_0000),
+        ([0x4000_0000, 0x4040_0000, 0xC0C0_0000], 0x4140_0000, 0x4140_0000),
+        ([0x4000_0000, 0xC040_0000, 0xC0C0_0000], 0x0000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x0000_0000], 0x8000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x8000_0000], 0x0000_0000, 0x0000_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7F80_0000], 0xFF80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x7F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7FC0_0001], 0xFFC0_0001, 0x7FC0_0001),
+        ([0x3F80_0000, 0x3F80_0000, 0xFFA0_0000], 0x7FA0_0000, 0x7FA0_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x0000_0001], 0x3F80_0000, 0x3F80_0000),
+        ([0x0080_0000, 0x3F80_0000, 0x8080_0001], 0x0100_0000, 0x0100_0000),
+        ([0x4040_0000, 0x3EAA_AAAB, 0xBF80_0000], 0x4000_0000, 0x4000_0000),
+        ([0x7F7F_FFFF, 0x4000_0000, 0xFF7F_FFFF], 0x7F80_0000, 0x7F80_0000),
+        ([0xBF80_0000, 0x4000_0000, 0x4000_0000], 0xC080_0000, 0x0000_0000),
+    ];
+    let nan = |x: u32| x & 0x7FFF_FFFF > 0x7F80_0000;
+    let cases: Vec<[u32; 4]> = ROWS.iter().map(|&([a, b, acc], _, _)| [a, b, acc, 0]).collect();
+    for (label, abs, neg) in [("neg[2]", 0, 4), ("abs[2]", 4, 0)] {
+        // v_mov_b32 v5, v3; v_fmac_f32 v5, v1, v2 (VOP3, the modifier on src2); v_mov_b32 v0, v5
+        let mut body = vec![vop1(0x001, 5, vgpr(3))];
+        body.extend(vop3_mod(0x12B, 5, vgpr(1), vgpr(2), 0, abs, neg, 0, false));
+        body.push(vop1(0x001, 0, vgpr(5)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let want = if neg != 0 { ROWS[i].1 } else { ROWS[i].2 };
+            assert!(
+                got == want || nan(got) && nan(want),
+                "{backend}: {label} row {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+        // the fault: row 1 (1 * 2 + -(-1)) came out as 1 * 2 + (-1) = 1 with neg[2]
+        let was = super::TEST_FIXES_1126.replace(Some(false));
+        let old = build_valu_cs(&body);
+        super::TEST_FIXES_1126.set(was);
+        assert_ne!(old.dxil, shader.dxil, "{label}: the modifier changes the translation");
+    }
+}
+
+/// `v_mul_legacy_f32` takes a denormal operand as zero, as RDNA2 does: 0 x anything = +0 for
+/// it too, whatever the host's denormal mode. Ported from Marvisak/VIctory #682 (Senchsus,
+/// 704d25edd).
+#[test]
+fn v_mul_legacy_f32_treats_denormals_as_zero() {
+    // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
+    let shader = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), vgpr(0)));
+    let f = f32::to_bits;
+    let (denorm, neg_denorm, min_normal) = (0x0000_0001u32, 0x8040_0000u32, 0x0080_0000u32);
+    let cases: &[(u32, u32, u32)] = &[
+        // Zero or denormal times anything, non-finite included, is +0.
+        (f(0.0), f(f32::INFINITY), f(0.0)),
+        (f(-0.0), f(f32::NAN), f(0.0)),
+        (f(f32::NAN), f(0.0), f(0.0)),
+        (denorm, f(f32::INFINITY), f(0.0)),
+        (f(f32::NAN), neg_denorm, f(0.0)),
+        (denorm, f(2.0f32.powi(100)), f(0.0)),
+        // The smallest normal is not zero.
+        (min_normal, f(2.0), f(f32::MIN_POSITIVE * 2.0)),
+        // Ordinary products.
+        (f(1.5), f(-4.0), f(-6.0)),
+        (f(3.0), f(0.5), f(1.5)),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+
+/// With `VICTORY_LDS_BOUNDS=1` an LDS access past the program's LDS reads 0 and drops the write
+/// and the atomic (which returns 0), as on the console. 512 bytes of LDS (128 dwords): LDS[0] =
+/// v1; at the byte address v2 write v3, read it back into v6, add v3 with the old value into v7;
+/// v0 = LDS[0] + v6 + v7: in bounds v1 + 2 * v3, past the end v1 with LDS[0] untouched. Ported
+/// from avatarmanz/VIctory-7900XTX PR #336 (DiosET3RN0, af63c911f).
+#[test]
+fn ds_past_the_program_lds_reads_zero_and_drops_writes() {
+    const ADD_RTN_U32: u8 = 0x20;
+    let mut body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0
+    body.extend(ds(DS_WRITE_B32, 0, 5, 1));
+    body.extend(ds(DS_WRITE_B32, 0, 2, 3));
+    body.extend(ds(DS_READ_B32, 6, 2, 0));
+    body.extend(ds(ADD_RTN_U32, 7, 2, 3));
+    body.extend(ds(DS_READ_B32, 0, 5, 0));
+    body.push(vop2(0x25, 0, vgpr(6), 0)); // v_add_nc_u32 v0, v6, v0
+    body.push(vop2(0x25, 0, vgpr(7), 0)); // v_add_nc_u32 v0, v7, v0
+    let was = lower::TEST_LDS_BOUNDS.replace(Some(true));
+    let shader = build_cs(&body, 1, 512);
+    lower::TEST_LDS_BOUNDS.set(was);
+    let plain = build_cs(&body, 1, 512);
+    assert_ne!(shader.dxil, plain.dxil, "the bounds are in the translation");
+    let cases = [[100, 4, 7, 0], [100, 508, 7, 0], [100, 512, 7, 0], [100, 0x1_0000, 7, 0], [100, 0xFFFF_FFFC, 7, 0]];
+    // One thread with LDS declares WaveSize(32), which WARP refuses.
+    run_cases_on(&shader, &cases, &[("hardware", false)], |backend, _, inp, got| {
+        let inside = inp[1] < 512;
+        let want = if inside { inp[0] + 2 * inp[2] } else { inp[0] };
+        assert_eq!(
+            got,
+            want,
+            "{backend}: LDS access at byte {:#x} ({})",
+            inp[1],
+            if inside { "in bounds" } else { "past the program's LDS" },
+        );
+    });
+}

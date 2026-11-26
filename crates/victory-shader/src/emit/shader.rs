@@ -254,6 +254,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// The part of [`Self::lds_dwords`] the program itself declares (the rest is ours: lane
+    /// exchange, wave order): LDS accesses past it are bounded with `VICTORY_LDS_BOUNDS=1`.
+    pub lds_title_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -308,6 +311,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            lds_title_dwords: 0,
             lds: None,
             main,
             entry,
