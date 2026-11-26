@@ -482,6 +482,8 @@ fn emit_once(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    // (`VICTORY_AFTER_LOOP=1`: this program's lane regions with the loops their branches leave)
+    let _after_loop = lower::after_loop_scope(native);
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every

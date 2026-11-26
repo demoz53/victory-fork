@@ -12,6 +12,11 @@ use crate::native::{
 };
 use crate::{ShaderError, io, ir, resource, structure};
 
+/// The loops a per-lane branch leaves (`VICTORY_AFTER_LOOP=1`), and a console wave's
+/// operations after a loop its lanes leave apart, against the console's results.
+#[path = "wave64_after_loop.rs"]
+mod after_loop;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
