@@ -1630,9 +1630,34 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
     Some(Reading(Held::Bytes(s.read(at, end))))
 }
 
+/// Whether [`title_memory_remapped`] gives write access back to the blocks
+/// of its range that a guard made read-only, not only forgets them
+/// (`VICTORY_REMAP_REOPEN=0`: forgets them, as before). On by default.
+///
+/// The runtime tells of a new mapping after it has made it (`xmem`'s `map`:
+/// the view is mapped and committed, then told), and a guard check runs on
+/// another thread under no lock the runtime holds (`writes` for a host copy
+/// over the range). A check that fell between the two made the new view
+/// read-only and noted it guarded; the notice then only forgot the blocks.
+/// They stayed read-only with no guard that knew them: the title's next
+/// write there was an access violation our handler passed on (`open` found
+/// no guarded block, `writable` said no), and a kernel read into them
+/// failed, until some later check guarded them again. The same for a view
+/// told before it is unmapped and written in between.
+///
+/// What it costs: one protection call for each run of blocks the range
+/// still holds guarded (none for a range no check has guarded since its
+/// last notice).
+fn reopen_remapped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_REOPEN").is_none_or(|v| v != "0"))
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
-/// unmapped).
+/// unmapped). Blocks of it that a guard made read-only are made writable
+/// again ([`reopen_remapped`]): the check that guarded them may have come
+/// after the mapping this tells of.
 pub fn title_memory_remapped(at: usize, len: usize) {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -1660,6 +1685,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         }
     }
     g.absent.remove_range(range.clone());
+    if reopen_remapped() {
+        // Forgotten and writable again (a block whose memory is gone has
+        // no protection to change: the call fails and nothing is lost).
+        open_here(&mut g, at, at.saturating_add(len));
+    }
     g.protected.remove_range(range.clone());
     g.clean.remove_range(range.clone());
     // A write through the kernel announced there wrote what the memory
@@ -1787,6 +1817,9 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        // The journal is one for the process, and this address may have been
+        // another test's until it freed it.
+        forget_pages(start, end);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
@@ -1806,8 +1839,18 @@ mod tests {
             )
             .is_none()
         );
+        forget_pages(start, end);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Tests: the runtime's notice of a new mapping at `[at, at + len)`
+    /// (`title_memory_remapped`), which every test gives for the memory it
+    /// maps, as `xmem` does: the guards are one set for the process, and
+    /// the address may have been another test's view, whose blocks would
+    /// still count as guarded and clean here.
+    fn mapped(at: usize, len: usize) {
+        title_memory_remapped(at, len);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
@@ -1832,6 +1875,7 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
+        mapped(view, 2 * BLOCK);
         assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
@@ -1856,6 +1900,10 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        // Told before the view goes: once it is unmapped the address is
+        // anyone's (another test's view, guarded at once), and a notice
+        // given after that would take the other's guard away under it.
+        title_memory_remapped(view, 2 * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
@@ -1864,7 +1912,6 @@ mod tests {
                 },
             )
         };
-        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -1902,6 +1949,7 @@ mod tests {
             View(view)
         };
         let start = view.0.Value as usize;
+        mapped(start, SIZE);
         let commit = |at: usize, len| {
             // SAFETY: these pages belong to our reserved view.
             let committed = unsafe { VirtualAlloc(at as _, len, MEM_COMMIT, PAGE_READWRITE) };
@@ -1986,6 +2034,7 @@ mod tests {
         };
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
+        mapped(p, 3 * BLOCK);
         // Nothing mapped at all: a view with every block absent.
         assert!(is_view(p, p + 3 * BLOCK));
         let middle = map(1);
@@ -2005,6 +2054,8 @@ mod tests {
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
         assert!(!is_view(at, at + local.len()));
+        // Told before the memory goes (the address is anyone's after).
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -2014,7 +2065,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// Blocks of a placeholder between views are reported once, then not
@@ -2077,6 +2127,7 @@ mod tests {
             view
         };
         let first = map(0);
+        mapped(p, 3 * BLOCK);
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
         assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
@@ -2089,6 +2140,8 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        // Told before the memory goes (the address is anyone's after).
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -2098,7 +2151,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// A pagefile section mapped twice: two views of the same physical
@@ -2125,6 +2177,8 @@ mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
+            mapped(one, bytes);
+            mapped(two, bytes);
             crate::inplace::title_memory_view(one, bytes, section as usize, 0);
             crate::inplace::title_memory_view(two, bytes, section as usize, 0);
             (section as usize, one, two)
@@ -2435,6 +2489,7 @@ mod tests {
                 .map(|_| {
                     let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
                     assert_ne!(at, 0);
+                    mapped(at, SIZE);
                     crate::inplace::title_memory_view(at, SIZE, section as usize, 0);
                     at
                 })
@@ -2470,6 +2525,36 @@ mod tests {
         title_memory_written(section, (BLOCK / 2) as u64, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         drop_views(section, &[guarded, _unused], SIZE);
+    }
+
+    /// The runtime's notice of a new mapping comes after the mapping itself
+    /// (`xmem`'s `map`), and a guard check of another thread can fall
+    /// between the two: it makes the new view read-only and notes it
+    /// guarded. The notice gives the write access back. Before, it only
+    /// forgot the blocks: they stayed read-only with no guard to open them,
+    /// and the title's next write there was an access violation nothing
+    /// took.
+    #[test]
+    fn a_notice_after_a_guard_check_leaves_the_view_writable() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        let pages = |block: usize| (view + block * BLOCK) / PAGE;
+        // The check that fell between the mapping and its notice.
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1)]));
+        assert!(!writable(view) && !writable(view + BLOCK), "guarded: read-only");
+        // The notice, and what `xmem` tells after it.
+        title_memory_remapped(view, SIZE);
+        if reopen_remapped() {
+            assert!(writable(view) && writable(view + BLOCK), "left read-only with no guard to open it");
+            // SAFETY: the view, read-write again; no fault to take.
+            unsafe { ((view + BLOCK + 8) as *mut u8).write_volatile(1) };
+        }
+        assert!(!guards().protected.contains(&(view / BLOCK)), "forgotten");
+        crate::inplace::title_memory_view(view, SIZE, section, 0);
+        // Not guarded any more: the next check takes all of it again.
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1)]));
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        drop_views(section, &[view, other], SIZE);
     }
 
     /// A write or mapping that runs past the end of the address space (a
@@ -2603,18 +2688,36 @@ mod wrote_tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        // The journal is one for the process, and this address may have been
+        // another test's until it freed it.
+        super::forget_pages(p, p + PAGE);
 
-        ask_once(&[(p, p + PAGE)]);
-        wrote(p, PAGE);
+        // So is the journal's standing asking: a submission of a test
+        // running beside this one ends it (`ask_once_end`) or notes writes
+        // of its own under it, and the answers below are then not this
+        // test's alone. Such a round is made again.
+        let mut undisturbed = None;
+        for _ in 0..1000 {
+            ask_once(&[(p, p + PAGE)]);
+            wrote(p, PAGE);
+            let (now, written) = writes(p, p + PAGE, false).expect("write-watched page");
+            let from_journal = asked(p, p + PAGE);
+            ask_once_end();
+            if let Some((asked_now, asked_written)) = from_journal
+                && asked_now == now
+            {
+                undisturbed = Some((now, written, asked_written));
+                break;
+            }
+            std::thread::yield_now();
+        }
 
-        let (now, written) = writes(p, p + PAGE, false).expect("write-watched page");
-        let (asked_now, asked_written) = asked(p, p + PAGE).expect("in ask_once range");
-        ask_once_end();
-
+        super::forget_pages(p, p + PAGE);
         // SAFETY: freeing our private reservation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
 
-        assert_eq!(now, asked_now);
+        let (now, written, asked_written) =
+            undisturbed.expect("writes() and asked() agree on the asking that stands after wrote()");
         let page = p / PAGE;
         let &(_, w) = written
             .iter()

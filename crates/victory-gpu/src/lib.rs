@@ -77,6 +77,26 @@ pub use watch::{
     title_writing as kernel_will_write,
 };
 
+/// Tests: held by a test from before it asks for a device on the software
+/// adapter (WARP) until everything it made there is released, so that one
+/// test at a time has work on that adapter.
+///
+/// Tests run side by side, and each test of the indirect clamp asked for a
+/// WARP device, made a queue of its own on it, compiled the same two
+/// shaders and ran them. With several of them at work at once, one of
+/// WARP's own pool threads read a table at index 0xFFFFFFFF and the test
+/// process died of an access violation (`d3d10warp!Ordinal199+0x7cca9` and
+/// `+0x7dd03`, both under `+0x7bc55`: 2 of 30 runs of the whole suite on an
+/// idle PC; with the seven clamp tests alone 2 of 160 side by side, 0 of 60
+/// one after another, and 0 of 100 for one of them by itself). Whether WARP
+/// or our use of it is at fault there is not settled; the product runs on
+/// the card's driver, not on WARP (but for diagnostics' software mode).
+#[cfg(all(test, windows))]
+pub(crate) fn warp_alone() -> std::sync::MutexGuard<'static, ()> {
+    static ALONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ALONE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Total installed physical RAM in bytes, queried once from the OS.
 pub(crate) fn total_system_ram_bytes() -> Option<u64> {
     static TOTAL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
