@@ -149,6 +149,38 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     }
 }
 
+/// How long host copies of textures the title fills must have been idle to
+/// be let go, in milliseconds, and how many bytes of them go at most (the
+/// longest idle first), with `VICTORY_TEXTURE_KEEP=1`: none but those idle
+/// for `kept_ms` while what is in use of the card is under `room_percent -
+/// 2` percent of its budget (88 at the default 90, the share up to which
+/// `resource::room` makes host copies), else enough to come down to
+/// `room_percent - 5` percent, idle for 5 s; from `room_percent + 5` percent
+/// on, idle for 1.5 s.
+///
+/// With room on the card nothing has to go. By [`vram_idle_ms`]' rule every
+/// host copy no slot showed for 5 s went, with half the card free: 79,163 of
+/// them (29.8 GB) in a session of seven minutes, of which 13,105 (6.6 GB)
+/// were made and uploaded again when the title showed them again, each
+/// through the texture queue, frames after its slot was written.
+/// From avatarmanz/VIctory-7900XTX 1f1a43367 and 8d79927a8 (`vram_keep`).
+pub(crate) fn vram_keep(budget: u64, used: u64, room_percent: u64, kept_ms: u64) -> (u64, u64) {
+    const IDLE_MS: u64 = 5_000;
+    const SHORT_MS: u64 = 1_500;
+    if budget == 0 {
+        return (IDLE_MS, u64::MAX);
+    }
+    let share = |percent: u64| budget / 100 * percent;
+    let down_to = share(room_percent.saturating_sub(5));
+    if used < share(room_percent.saturating_sub(2)) {
+        (kept_ms, u64::MAX)
+    } else if used < share(room_percent + 5) {
+        (IDLE_MS.min(kept_ms), used.saturating_sub(down_to))
+    } else {
+        (SHORT_MS.min(kept_ms), used.saturating_sub(down_to))
+    }
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
@@ -9727,6 +9759,28 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn vram_keep_lets_go_only_what_the_card_needs_back() {
+        use super::vram_keep;
+        let gib = 1024 * 1024 * 1024;
+        // Room on the card: only what was idle for the kept time, no limit.
+        assert_eq!(vram_keep(100 * gib, 0, 90, 600_000), (600_000, u64::MAX));
+        assert_eq!(vram_keep(100 * gib, 87 * gib, 90, 600_000), (600_000, u64::MAX));
+        // From two percent under the share textures fill: down to five under.
+        assert_eq!(vram_keep(100 * gib, 88 * gib, 90, 600_000), (5_000, 3 * gib));
+        assert_eq!(vram_keep(100 * gib, 94 * gib, 90, 600_000), (5_000, 9 * gib));
+        // Nearly full: what was idle for a moment too.
+        assert_eq!(vram_keep(100 * gib, 95 * gib, 90, 600_000), (1_500, 10 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib, 90, 600_000), (1_500, 35 * gib));
+        // Another share for the textures moves the lines with it.
+        assert_eq!(vram_keep(100 * gib, 88 * gib, 94, 600_000), (600_000, u64::MAX));
+        assert_eq!(vram_keep(100 * gib, 92 * gib, 94, 600_000), (5_000, 3 * gib));
+        // A kept time under the idle times is the idle time everywhere.
+        assert_eq!(vram_keep(100 * gib, 90 * gib, 90, 1_000), (1_000, 5 * gib));
+        // No budget known: the old five seconds.
+        assert_eq!(vram_keep(0, 5 * gib, 90, 600_000), (5_000, u64::MAX));
     }
 
     #[test]
