@@ -798,6 +798,14 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Then, of the buffer views: the slots looked at and the refreshes of the
 /// host copies their views read, microseconds, and the copies refreshed.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+/// Where the pass over textures picked by index records its uploads: into
+/// a list of the title's, or into lists of the thread that runs it ahead
+/// (`crate::heap_worker`, `VICTORY_HEAP_WORKER=1`).
+pub(crate) enum PassInto<'a> {
+    List(&'a HostList),
+    Ahead(&'a mut crate::heap_worker::Batch),
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -2251,7 +2259,10 @@ impl State {
         HEAP_PASS_PARTS[11].fetch_add(spans.len() as u64, Ordering::Relaxed);
         HEAP_PASS_PARTS[0].fetch_add((textures - started).as_micros() as u64, Ordering::Relaxed);
         HEAP_PASS_PARTS[4].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        self.heap_textures(list, heap, host);
+        // With `VICTORY_HEAP_WORKER=1` the worker's turn.
+        if !crate::heap_worker::kick(heap) {
+            Self::heap_textures(PassInto::List(list), heap, host);
+        }
         HEAP_PASS_PARTS[1].fetch_add(textures.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2563,10 +2574,14 @@ impl State {
                 }
             }
             let _turn = Turn;
+            // With `VICTORY_HEAP_WORKER=1` the worker catches up.
+            if crate::heap_worker::kick(heap) {
+                return true;
+            }
             let began = std::time::Instant::now();
             PASS_BUDGET.set(Some(budget));
             PASS_LIGHT.set(true);
-            self.heap_textures(list, heap, host);
+            Self::heap_textures(PassInto::List(list), heap, host);
             let took = began.elapsed().as_micros() as u64;
             CATCH_UP_SPENT.fetch_add(took, Ordering::Relaxed);
             CATCH_UPS[0].fetch_add(1, Ordering::Relaxed);
@@ -2594,8 +2609,15 @@ impl State {
         // Textures the host copied into while an upload of title memory was
         // on its way: from their keepers again (`VICTORY_COPY_KEEP=1`).
         crate::hostcopy::restore_due(list);
+        // With `VICTORY_HEAP_WORKER=1`, what can wait for a later list is the
+        // worker's; a bake's uploads must be in its own list, and the worker
+        // makes way for them.
+        if !bake && crate::heap_worker::kick(heap) {
+            return true;
+        }
+        let _pass = if bake { crate::heap_worker::urgent() } else { None };
         PASS_BUDGET.set(Some(budget));
-        self.heap_textures(list, heap, host);
+        Self::heap_textures(PassInto::List(list), heap, host);
         PASS_BUDGET.set(None);
         if bake {
             baked_ms.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -2689,9 +2711,11 @@ impl State {
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
-    fn heap_textures(
-        &self,
-        list: &HostList,
+    /// On a thread of its own (`into` is [`PassInto::Ahead`]) the pass
+    /// records into lists of its own, and a slot is made when its list is
+    /// handed to a submission (`crate::heap_worker`).
+    pub(crate) fn heap_textures(
+        mut into: PassInto<'_>,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
     ) {
@@ -2699,6 +2723,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        let ahead = matches!(into, PassInto::Ahead(_));
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` sets it (fxceless main): a backlog of tens
         // of thousands of textures (a scene's first minutes) then drains in
@@ -2806,7 +2831,23 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         static MOST: AtomicU64 = AtomicU64::new(16);
         let now = crate::host::now_ms();
-        let took = if light { 1 } else { now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1) };
+        // The worker may run several passes in a frame: there the time is
+        // a frame's, worked out at its first pass in a frame and kept for
+        // the others.
+        static AHEAD_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        let (light_most, took) = if ahead {
+            let last = AHEAD_FRAME.swap(frame, Ordering::Relaxed);
+            if last == frame {
+                (true, 1)
+            } else {
+                let frames = frame.saturating_sub(last).max(1);
+                (false, (now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)) / frames).max(1))
+            }
+        } else if light {
+            (true, 1)
+        } else {
+            (false, now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1))
+        };
         // `VICTORY_RELOOK_MS` (20,000 unless said; 4,000 before), the
         // longest wait in ms, clamped to 16-1,024 frames. Ported from
         // fxceless/victory-fork PR #1246 (Exopus-0x65f7ad0).
@@ -2814,7 +2855,7 @@ impl State {
         let relook = *RELOOK_MS.get_or_init(|| {
             std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20_000)
         });
-        let most = if light {
+        let most = if light_most {
             MOST.load(Ordering::Relaxed)
         } else {
             let most = (relook / took).clamp(16, if relook == 4000 { 256 } else { 1024 });
@@ -2861,7 +2902,33 @@ impl State {
                 break;
             }
             let bake_source = at < firsts;
+            // A bake draw waits for the pass ([`crate::heap_worker::urgent`]).
+            if ahead && crate::heap_worker::make_way() {
+                break;
+            }
             HEAP_PASS_PARTS[5].fetch_add(1, Ordering::Relaxed);
+            // On the worker: the record the slot has now, taken once (what is
+            // uploaded is what is made, `HostHeap::publish_ahead`), and the
+            // texture object it names held while a thread the title knows
+            // nothing of works on it. (Released meanwhile: nothing to upload.)
+            let record = if ahead { heap.handle(index).and_then(crate::descriptor::view_and_key) } else { None };
+            let mut held = None;
+            if let Some((View::Shader(object, _), _)) = &record {
+                match crate::resource::hold(*object as This) {
+                    Some(h) => held = Some(h),
+                    None => {
+                        host.texture_slot_done(index, write, None);
+                        continue;
+                    }
+                }
+            }
+            let current = || {
+                if ahead {
+                    record.as_ref().map(|(view, _)| view.clone())
+                } else {
+                    heap.handle(index).and_then(crate::descriptor::view)
+                }
+            };
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2906,7 +2973,7 @@ impl State {
                 }
             }
             let mut partly = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            if let Some(View::Placed(false, resource, desc)) = current() {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 let asking = std::time::Instant::now();
@@ -2945,7 +3012,7 @@ impl State {
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
             // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
+            if let Some(View::Shader(object, _)) = current()
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
@@ -2991,7 +3058,7 @@ impl State {
             // A texture placed in title memory whose host copy is not made
             // yet: the makers make it (`resource::texture_makers`), and the
             // slot is looked at again next frame.
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view)
+            if let Some(View::Placed(false, resource, desc)) = current()
                 && resource[0] != 1
                 && let Some(texture) = crate::resource::texture_at(u64::from(desc[10]) | u64::from(desc[11]) << 32, &resource)
                 && !crate::resource::has_host_copy(texture)
@@ -3002,7 +3069,21 @@ impl State {
                 continue;
             }
             let making = std::time::Instant::now();
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = match &mut into {
+                PassInto::List(_) => heap.handle(index).and_then(|handle| host.mirror(index, handle, true)),
+                // On the worker the slot is made when this pass's list is
+                // handed to a submission, whatever becomes of it below (as
+                // `mirror` makes it here without the worker).
+                PassInto::Ahead(batch) => match (&record, heap.handle(index)) {
+                    (Some((view, key)), Some(handle)) => {
+                        if !batch.publish(index, handle, *key) {
+                            return; // no list
+                        }
+                        Some(view.clone())
+                    }
+                    _ => None,
+                },
+            };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -3011,6 +3092,16 @@ impl State {
                     continue;
                 }
             };
+            // The texture made for a placed view, held as a view's object is.
+            if ahead && held.is_none() {
+                match crate::resource::hold(resource) {
+                    Some(h) => held = Some(h),
+                    None => {
+                        host.texture_slot_done(index, write, None);
+                        continue;
+                    }
+                }
+            }
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
@@ -3068,7 +3159,19 @@ impl State {
             let uploading = std::time::Instant::now();
             HEAP_PASS_PARTS[6].fetch_add((uploading - making).as_micros() as u64, Ordering::Relaxed);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                match &mut into {
+                    PassInto::List(list) => readable(list, sampled.kind, view),
+                    PassInto::Ahead(batch) => {
+                        let Some(list) = batch.list() else {
+                            return;
+                        };
+                        readable(list, sampled.kind, view);
+                        // Alive until the list is in the queue.
+                        if let Some(held) = held.take() {
+                            batch.hold(held);
+                        }
+                    }
+                }
             }
             HEAP_PASS_PARTS[7].fetch_add(uploading.elapsed().as_micros() as u64, Ordering::Relaxed);
             HEAP_PASS_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -3123,6 +3226,9 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            if let PassInto::Ahead(batch) = &mut into {
+                batch.uploaded(bytes);
+            }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             if bake_source {

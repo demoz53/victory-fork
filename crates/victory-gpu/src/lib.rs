@@ -67,6 +67,8 @@ mod watch;
 mod texback;
 #[cfg(windows)]
 mod hostcopy;
+#[cfg(windows)]
+mod heap_worker;
 
 #[cfg(windows)]
 pub use queue::world_began;

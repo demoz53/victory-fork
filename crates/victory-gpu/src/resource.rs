@@ -1203,6 +1203,27 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`hold`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of (`crate::heap_worker`). `None` if it is no texture, or is
+/// being released. (fxceless/victory-fork d4a528ba0.)
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    // A texture leaves the table before it is freed, under this lock.
+    let all = textures();
+    (all.contains(&(this as usize)) && object::try_add_ref(this)).then_some(Held(this))
+}
+
 /// The title textures the title fills, by the memory they take ([`Resource::data`]
 /// and their bytes), for [`evict_placed_in`]: kept with [`TEXTURES`] and
 /// under its lock (taken first), so a texture leaves both before it is freed.
