@@ -1588,15 +1588,53 @@ pub fn local_any_masks() -> bool {
 }
 
 /// `VICTORY_NAN_GUARD` ([`Lower::nan_guard`]): unset or `0`, off (as before); `1`, pixel
-/// programs' float colour exports; `stores`, typed stores as well. Opt-in. Part of the
+/// programs' float colour exports; `stores`, typed stores as well (both: NaN 0, an infinity
+/// ±65504); `scrub`, colour exports and image stores of every stage, NaN and both
+/// infinities 0; `scrub-exports`, the same for colour exports alone. Opt-in. Part of the
 /// translation: the shader cache keys on it (`victory-gpu`'s does).
 pub fn nan_guard_mode() -> u8 {
+    if let Some(mode) = NAN_GUARD_HERE.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_NAN_GUARD").as_deref() {
-        Ok("1") => 1,
-        Ok("stores") => 2,
+    *MODE.get_or_init(|| nan_guard_mode_of(std::env::var("VICTORY_NAN_GUARD").ok().as_deref()))
+}
+
+/// [`nan_guard_mode`] of the switch's value: 0 off, 1 `1`, 2 `stores`, 3 `scrub`, 4
+/// `scrub-exports`.
+pub(crate) fn nan_guard_mode_of(value: Option<&str>) -> u8 {
+    match value {
+        Some("1") => 1,
+        Some("stores") => 2,
+        Some("scrub") => 3,
+        Some("scrub-exports") => 4,
         _ => 0,
-    })
+    }
+}
+
+thread_local! {
+    /// [`with_nan_guard`]'s setting for translations on this thread.
+    static NAN_GUARD_HERE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`nan_guard_mode`] giving the mode of `value` on this thread (tests).
+#[cfg(test)]
+pub fn with_nan_guard<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+    let was = NAN_GUARD_HERE.replace(Some(nan_guard_mode_of(value)));
+    let r = f();
+    NAN_GUARD_HERE.set(was);
+    r
+}
+
+/// Where [`Lower::nan_guard`] is asked about a value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NanSite {
+    /// A float a pixel program exports to a colour target.
+    Export,
+    /// A float an image store writes (any stage).
+    Image,
+    /// A float a typed buffer store writes.
+    Buffer,
 }
 
 /// Whether pixel shaders read their quads' other lanes with quad reads, helper
@@ -4067,12 +4105,21 @@ impl<'a> Lower<'a> {
     /// infinities, since typed stores go out as `.f32` whatever the view's format (integer
     /// words 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000 change too). From
     /// fxceless/victory-fork PR #837 (PastiiJay).
+    ///
+    /// `scrub` and `scrub-exports` ([`Self::nan_scrub`]) make every NaN and both infinities
+    /// 0 instead, after trustno1-coder/VIctory-NVIDIA 77e13a974 (`VICTORY_NAN_SCRUB`).
     // shortcut: raw buffer stores are left as they are (no type to go by).
-    pub(super) fn nan_guard(&mut self, f: V, strict: bool) -> V {
+    pub(super) fn nan_guard(&mut self, f: V, at: NanSite) -> V {
         let mode = nan_guard_mode();
-        if mode == 0 || (!strict && mode < 2) {
-            return f;
+        let scrub = match (mode, at) {
+            (3, NanSite::Export | NanSite::Image) | (4, NanSite::Export) => true,
+            (1, NanSite::Export) | (2, _) => false,
+            _ => return f,
+        };
+        if scrub {
+            return self.nan_scrub(f);
         }
+        let strict = at == NanSite::Export;
         let c = self.cur;
         let bits = self.as_int(f);
         let mag = self.s.m.i32(0x7FFF_FFFF);
@@ -4092,6 +4139,24 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let r = self.s.m.select(c, inf, big, bits);
         let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
+    }
+
+    /// `f`, or 0 where it is NaN (any payload, either sign) or an infinity: `|bits| >=
+    /// 0x7F800000`. A clamp to ±65504 still feeds a huge value into the title's bloom and
+    /// exposure ("the whole picture went white at one angle with only NaN scrubbed",
+    /// trustno1-coder/VIctory-NVIDIA 77e13a974). NVIDIA's own NaN is 0x7FFFFFFF, which the
+    /// clamp's store form does not see. Through an image view of an integer format the
+    /// words 0x7F800000..=0x7FFFFFFF and 0xFF800000..=0xFFFFFFFF (-1 among them) become 0 too.
+    fn nan_scrub(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let bad = self.s.m.cmp(c, pred::IUGE, abs, inf_bits);
+        let zero = self.s.m.i32(0);
+        let r = self.s.m.select(c, bad, zero, bits);
         self.as_float(r)
     }
 
@@ -11279,7 +11344,7 @@ impl<'a> Lower<'a> {
             };
             // A pixel program's float colour target ([`nan_guard_mode`]).
             let x = if !mesh && self.s.pixel && kind == 16 && comp == 9 {
-                self.nan_guard(x, true)
+                self.nan_guard(x, NanSite::Export)
             } else {
                 x
             };

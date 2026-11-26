@@ -2978,6 +2978,100 @@ fn image_store_partial_dmask_writes_expected_channels() {
     assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
 }
 
+/// `VICTORY_NAN_GUARD`'s values ([`lower::nan_guard_mode`]): the old ones keep their modes.
+#[test]
+fn nan_guard_values_name_their_modes() {
+    for (value, mode) in [
+        (None, 0),
+        (Some("0"), 0),
+        (Some("1"), 1),
+        (Some("stores"), 2),
+        (Some("scrub"), 3),
+        (Some("scrub-exports"), 4),
+        (Some("Scrub"), 0),
+    ] {
+        assert_eq!(lower::nan_guard_mode_of(value), mode, "{value:?}");
+        assert_eq!(lower::with_nan_guard(value, lower::nan_guard_mode), mode, "{value:?}");
+    }
+}
+
+/// An image store of NVIDIA's NaN (0x7FFFFFFF), both infinities and a negative quiet NaN under
+/// each `VICTORY_NAN_GUARD` value: `scrub` makes all four 0 (trustno1-coder/VIctory-NVIDIA
+/// 77e13a974), `stores` clamps the infinities to ±65504 and zeroes only the quiet NaN, and
+/// the values that guard colour exports alone leave the store as it is. Finite values,
+/// -0.0 and the largest float pass every form unchanged.
+#[test]
+fn nan_guard_scrub_zeroes_nan_and_infinities_in_image_stores() {
+    const NV_NAN: u32 = 0x7FFF_FFFF;
+    const INF: u32 = 0x7F80_0000;
+    const NEG_INF: u32 = 0xFF80_0000;
+    const NEG_QNAN: u32 = 0xFFC0_0000;
+    let bad = [NV_NAN, INF, NEG_INF, NEG_QNAN];
+    let finite = [1.5f32.to_bits(), (-0.0f32).to_bits(), f32::MAX.to_bits(), (-2.25f32).to_bits()];
+    let kept = |x: [u32; 4]| x.map(Some);
+    let big = 65504f32.to_bits();
+    // (value, store data, wanted words: None = some NaN)
+    let cases: Vec<(Option<&str>, [u32; 4], [Option<u32>; 4])> = vec![
+        (None, bad, [None, Some(INF), Some(NEG_INF), None]),
+        (Some("1"), bad, [None, Some(INF), Some(NEG_INF), None]),
+        (Some("scrub-exports"), bad, [None, Some(INF), Some(NEG_INF), None]),
+        (Some("stores"), bad, [None, Some(big), Some(big | 0x8000_0000), Some(0)]),
+        (Some("scrub"), bad, [Some(0); 4]),
+        (Some("scrub"), finite, kept(finite)),
+        (Some("stores"), finite, kept(finite)),
+    ];
+    let shaders: Vec<HostShader> = cases
+        .iter()
+        .map(|&(value, ..)| {
+            lower::with_nan_guard(value, || try_build_image_store_cs(0xF, false))
+                .unwrap_or_else(|e| panic!("{value:?}: {e}"))
+        })
+        .collect();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (&(value, inputs, want), shader) in cases.iter().zip(&shaders) {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: {value:?}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::TextureUav(1, 1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let got = &out[0][..4];
+            for (k, (&g, w)) in got.iter().zip(want).enumerate() {
+                let ok = match w {
+                    Some(w) => g == w,
+                    None => f32::from_bits(g).is_nan(),
+                };
+                assert!(ok, "{label}: {value:?} channel {k}: wrote {g:#010x}, want {w:#x?} (all {got:#x?})");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP supports SM 6.6");
+}
+
 #[test]
 fn float_compares_that_are_always_false_or_true_cmpx_and_f16() {
     let cmp_shader = |op: u16| {

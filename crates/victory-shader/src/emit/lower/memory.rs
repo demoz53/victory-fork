@@ -601,7 +601,7 @@ impl<'a> Lower<'a> {
                 };
                 packed += 1;
             }
-            let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, false)).collect();
+            let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, super::NanSite::Image)).collect();
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -1664,7 +1664,7 @@ impl<'a> Lower<'a> {
                         x
                     } else {
                         let f = self.as_float(x);
-                        self.nan_guard(f, false)
+                        self.nan_guard(f, super::NanSite::Buffer)
                     });
                 }
                 (69, if halves { "bufferStore.i32" } else { "bufferStore.f32" })
