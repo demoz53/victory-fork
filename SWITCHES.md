@@ -188,3 +188,8 @@ switch.
   pass the validator and make pipelines on this card. Nothing else changes, nothing is lost.
 - Tests on the software adapter take turns through ONE lock, `crate::warp_alone` (test/avfix); test/clamps' own
   `warp_turn` was not taken over.
+
+## New in test/small3 (on top of all17)
+| Switch | Default | What | Shader |
+|---|---|---|---|
+| `VICTORY_CARD_FETCH_INFLIGHT=1` (+ `VICTORY_CARD_FETCH_INFLIGHT_MB`, 64) | off | with the relay, the pieces a flight's compare flags are copied to PC memory inside the flight's own compare list (no fetch on the copy queue beside later flights: no torn fetches); a landing that cannot use them fetches the old way on the main queue. fxceless 9376fd60c / PR #648 (Jonirulah). Works with `VICTORY_INDIRECT_WINDOW=1` (see the commit) | no |
