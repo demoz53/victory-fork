@@ -134,6 +134,28 @@ fn air() -> f32 {
 }
 
 /// Strength and radius of the creases' shade.
+/// `VICTORY_AMBIENT_MOST=<multiple>`: how much of what the title's resolve
+/// left is kept, at most, as a multiple of the estimate (4 by default, as
+/// avatarmanz has it). Without rays that output is the sky's light where
+/// rays escape and, in blocks of tiles, whatever the probes' memory held
+/// (in the house: a picture of foliage on a bedroom wall, flat dark blocks).
+/// `0`: the estimate replaces it everywhere (darkworldhm's "replace, do not
+/// raise"). Unset, unparsable or negative: 4.
+fn parse_most(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(4.0)
+}
+
+fn most() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let most = parse_most(&std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default());
+        if most != 4.0 {
+            tracing::info!(most, "the title's own indirect light is kept up to this multiple of the stand-in's");
+        }
+        most
+    })
+}
+
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -480,7 +502,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -530,6 +552,11 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert_eq!(parse_most(""), 4.0);
+        assert_eq!(parse_most("0"), 0.0);
+        assert_eq!(parse_most("1.5"), 1.5);
+        assert_eq!(parse_most("-1"), 4.0);
+        assert_eq!(parse_most("inf"), 4.0);
     }
 
     #[test]
