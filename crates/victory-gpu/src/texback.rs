@@ -335,6 +335,9 @@ pub(crate) fn record(
     // shortcut: a buffer for every subresource also when some are copied
     // (a megabyte at most for the kinds copied back).
     let buffer = host.read_back_buffer(total)?;
+    // With device-removed data on: a page fault in it, alive or freed, is
+    // reported under this name (it was "unnamed"). (fxceless 4cc775f57.)
+    crate::host::name_frame(&buffer, || format!("texback read-back buffer of {total} bytes"));
     let subresources: Vec<_> = indices
         .into_iter()
         .filter_map(|i| Some((i, *footprints.get(i as usize)?, *rows.get(i as usize)?)))

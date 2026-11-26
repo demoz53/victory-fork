@@ -304,18 +304,60 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// Drops `object` once every submission running now has finished, and
+/// [`retire_ahead`] submissions more (`VICTORY_RETIRE_AHEAD`, 64 by
+/// default): lists recorded but not yet submitted (the submission being
+/// prepared, those the relay sends ahead, the title's lists recorded early)
+/// can name a host copy without holding it (`resource::host_resource` hands
+/// textures out unheld), and the sweeps that let copies go run right before
+/// a submission starts. Dropped at once, such a list reads freed memory on
+/// the card: a page fault, the device removed (0x887A0005). With
+/// `VICTORY_RETIRE_AHEAD=0`, as before: at once if no submission is running.
+/// (AntoninMichelq/VIctory-forkAMD e90063015: three device removals with a
+/// page fault in the range of the host copies, none with the sweeps off.)
 pub(crate) fn retire<T: 'static>(object: T) {
+    retire_with(object, retire_ahead());
+}
+
+/// [`retire`] with `ahead` submissions more to wait for; the submission
+/// count the object waits for, `None` if it was dropped at once.
+fn retire_with<T: 'static>(object: T, ahead: u64) -> Option<u64> {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    let Some(at) = retire_at(started, FINISHED.load(Ordering::Acquire), ahead) else {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
-        return;
-    }
+        return None;
+    };
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired)
-        .push((started, Retired(Box::new(object))));
+    crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired).push((at, Retired(Box::new(object))));
+    Some(at)
+}
+
+/// The submission count something retired with `started` and `finished`
+/// submissions waits for: `None` (dropped at once) only without `ahead`
+/// and with no submission running.
+fn retire_at(started: u64, finished: u64, ahead: u64) -> Option<u64> {
+    (ahead > 0 || started > finished).then_some(started + ahead)
+}
+
+/// Submissions [`retire`] waits for beyond those running:
+/// `VICTORY_RETIRE_AHEAD` (64; `0`: none, as before). Antonin's fork
+/// waits for 16, about four of its frames; with the relay this build sends
+/// about 43 submissions a frame (vf-bis logs of 26 Nov), so 16 would be
+/// under half a frame, while a list the title recorded early may wait a
+/// frame for its submission: 64 is about a frame and a half.
+pub(crate) fn retire_ahead() -> u64 {
+    static AHEAD: OnceLock<u64> = OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        let ahead = std::env::var("VICTORY_RETIRE_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64);
+        tracing::info!(
+            "objects let go wait for the running submissions and {ahead} more (VICTORY_RETIRE_AHEAD; 0: as before)"
+        );
+        ahead
+    })
 }
 
 /// Submissions started and finished so far ([`STARTED`], [`FINISHED`]): a
@@ -380,6 +422,48 @@ pub(crate) static REAPED_LATER: [std::sync::atomic::AtomicU64; 2] = [const { std
 pub(crate) fn reap_later<T: Send + 'static>(object: T) {
     REAPED_LATER[0].fetch_add(1, Ordering::Relaxed);
     send_to_reaper(Reaping::Any(Box::new(object)));
+}
+
+#[cfg(test)]
+mod retire_tests {
+    /// Without `ahead`, as before: at once with nothing running, else once
+    /// the running submissions have finished; with it, that many more.
+    #[test]
+    fn what_is_retired_waits_for_the_submissions_ahead() {
+        assert_eq!(super::retire_at(5, 5, 0), None);
+        assert_eq!(super::retire_at(7, 5, 0), Some(7));
+        assert_eq!(super::retire_at(5, 5, 16), Some(21));
+        assert_eq!(super::retire_at(7, 5, 16), Some(23));
+    }
+
+    /// An object retired with nothing running is kept until the
+    /// submissions ahead have finished (lists recorded, not yet submitted,
+    /// may name it), and dropped then.
+    #[test]
+    fn a_retired_object_lives_until_its_submission_is_through() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let gone = Arc::new(AtomicBool::new(false));
+        let at = super::retire_with(Flag(gone.clone()), 16).expect("kept, not dropped at once");
+        assert!(!gone.load(Ordering::SeqCst));
+        super::bury(at.saturating_sub(16));
+        assert!(!gone.load(Ordering::SeqCst), "dropped before the submissions ahead finished");
+        super::bury(at);
+        assert!(gone.load(Ordering::SeqCst));
+        // As before: nothing running and nothing ahead is dropped at once.
+        let now = Arc::new(AtomicBool::new(false));
+        let (started, finished) = super::submissions();
+        if started <= finished {
+            assert_eq!(super::retire_with(Flag(now.clone()), 0), None);
+            assert!(now.load(Ordering::SeqCst));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -497,11 +581,29 @@ pub(crate) fn removal_context() -> String {
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !trail_on() || SAID.swap(true, Ordering::Relaxed) {
+    if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
-    tracing::error!("when the host device went: {}", removal_context());
+    if trail_on() {
+        tracing::error!("when the host device went: {}", removal_context());
+    }
+    // With device-removed data on (any form of `VICTORY_D3D12_DRED`): the
+    // runtime's data too, unless a submission's own report has asked for
+    // it. Such a report comes only from the places that wait for a
+    // submission; a removal found anywhere else (a view being made, a tile
+    // mapped) printed none of it. Without the lookups in our own tables:
+    // whoever calls may hold their locks. (fxceless 4cc775f57.)
+    if dred_any()
+        && !DATA_SAID.load(Ordering::Relaxed)
+        && let Some(host) = host()
+    {
+        tracing::error!("device-removed data, asked where the removal was found{}", host.removal_data_of(&[], false));
+    }
 }
+
+/// Whether [`Host::removal_data`] was asked for (once is enough for
+/// [`log_removal_context`]).
+static DATA_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
@@ -774,13 +876,24 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        if dred_any() {
+            let mode = dred_mode();
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                // `faults`: no breadcrumbs (the runtime then adds nothing
+                // to the commands), only the faulting address.
+                if mode != Dred::Faults {
+                    dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                tracing::info!("device-removed data on: {}", mode.text());
+            } else {
+                tracing::warn!(
+                    "device-removed data was asked for ({}) and the runtime gave no settings for it: none will be kept",
+                    mode.text()
+                );
             }
         }
         let mut device: Option<ID3D12Device> = None;
@@ -1563,12 +1676,88 @@ pub(crate) fn env_flag(name: &str) -> bool {
     parse_env_flag(std::env::var_os(name).as_deref())
 }
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// The forms of device-removed data (`VICTORY_D3D12_DRED`, diagnostics
+/// builds; the two cheaper forms after fxceless/victory-fork 4cc775f57).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Dred {
+    /// Not set (or a false value: `0`, `off`, ...).
+    Off,
+    /// Any other value (`1`): breadcrumbs, the faulting address, and a
+    /// marker with its text before every noted command.
+    Full,
+    /// `light`: breadcrumbs and the faulting address, no marker and no
+    /// text: which list a removed device stopped in, at which of its
+    /// commands (the operation's kind), and the pipelines the list binds.
+    /// (fxceless: the full form made a frame's recording 2.4 times slower.)
+    Light,
+    /// `faults`: the faulting address and the allocations around it only
+    /// (no breadcrumbs, no marker, no text), to stay on while the title
+    /// is played.
+    Faults,
+}
+
+impl Dred {
+    /// For the log.
+    fn text(self) -> &'static str {
+        match self {
+            Dred::Off => "off",
+            Dred::Full => "full: breadcrumbs, page faults, a marker text per command",
+            Dred::Light => "light: breadcrumbs and page faults, no marker texts",
+            Dred::Faults => "faults: page faults only, no breadcrumbs",
+        }
+    }
+
+    /// The form a value of `VICTORY_D3D12_DRED` asks for.
+    fn of(value: Option<&std::ffi::OsStr>) -> Dred {
+        match value.and_then(std::ffi::OsStr::to_str).map(str::trim) {
+            Some("light") => Dred::Light,
+            Some("faults") => Dred::Faults,
+            // Any other value, as before the two above were known.
+            _ if parse_env_flag(value) => Dred::Full,
+            _ => Dred::Off,
+        }
+    }
+}
+
+/// The form of device-removed data asked for (always off outside
+/// diagnostics builds).
+pub(crate) fn dred_mode() -> Dred {
+    static MODE: OnceLock<Dred> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !cfg!(feature = "diagnostics") {
+            return Dred::Off;
+        }
+        Dred::of(std::env::var_os("VICTORY_D3D12_DRED").as_deref())
+    })
+}
+
+/// Whether device-removed data is on in its full form (`VICTORY_D3D12_DRED`
+/// set to anything but `light` or `faults`): the one in which every noted
+/// command gets a marker and a text (`HostList::note`).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| cfg!(feature = "diagnostics") && env_flag("VICTORY_D3D12_DRED"))
+    *ON.get_or_init(|| dred_mode() == Dred::Full)
 }
+
+/// Whether device-removed data is on in any form ([`Dred`]).
+pub(crate) fn dred_any() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| dred_mode() != Dred::Off)
+}
+
+/// Whether objects made while frames are drawn are named too
+/// ([`name_frame`]): always in the full form (as before); in `light` and
+/// `faults` unless `VICTORY_D3D12_DRED_FRAME_NAMES=0`.
+fn frame_names() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        dred_on() || (dred_any() && std::env::var_os("VICTORY_D3D12_DRED_FRAME_NAMES").is_none_or(|v| v != "0"))
+    })
+}
+
+/// Host objects named since the start ([`name`]), and those of them made
+/// while frames are drawn ([`name_frame`]): each is one `SetName` call.
+static NAMED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
@@ -1614,13 +1803,36 @@ fn timing() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on, in any
+/// of its forms: the names are what a faulting address is read by).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
-    if dred_on()
+    if dred_any()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
+        // Counted, so that a log says what naming costs: one text and one
+        // call each. Said at 4,096 and at every doubling after it.
+        let named = NAMED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if named >= 4096 && named.is_power_of_two() {
+            tracing::info!(
+                "device-removed data: {named} host objects named so far, {} of them made while frames are drawn",
+                NAMED[1].load(Ordering::Relaxed)
+            );
+        }
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
+    }
+}
+
+/// As [`name`], for an object made while frames are drawn (a list's upload
+/// buffer, a texture upload's staging buffer, a read-back buffer: hundreds
+/// a second): those are the freed allocations a faulting address is most
+/// likely to be found in, so they are named in every form, and
+/// `VICTORY_D3D12_DRED_FRAME_NAMES=0` leaves them unnamed in `light` and
+/// `faults` ([`frame_names`]).
+pub(crate) fn name_frame(object: &impl Interface, text: impl FnOnce() -> String) {
+    if frame_names() {
+        NAMED[1].fetch_add(1, Ordering::Relaxed);
+        name(object, text);
     }
 }
 
@@ -8496,20 +8708,60 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        self.removal_data_of(runs, true)
+    }
+
+    /// [`Host::removal_data`]; `tables`: whether a faulting address is also
+    /// looked up in our own tables (title memory copies, view heaps), which
+    /// takes their locks.
+    ///
+    /// With the data on in any form ([`Dred`]) the report says each of its
+    /// parts whatever the runtime answered: why the device went, the page
+    /// fault (an address, none reported, or the call failed) and the
+    /// breadcrumbs (how many lists the runtime returned, none, or the call
+    /// failed). (fxceless 4cc775f57.)
+    fn removal_data_of(&self, runs: &[&HostList], tables: bool) -> String {
+        DATA_SAID.store(true, Ordering::Relaxed);
+        let said = dred_any();
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return if said {
+                "; device-removed data: this device has no interface for it".to_owned()
+            } else {
+                String::new()
+            };
         };
         let mut text = String::new();
         let mut fault_va = None;
+        if said {
+            // SAFETY: a plain query.
+            let reason = match unsafe { self.device.GetDeviceRemovedReason() } {
+                Ok(()) => "none, the device is not removed".to_owned(),
+                Err(e) => format!("{:#010X}", e.code().0),
+            };
+            text.push_str(&format!(
+                "; device-removed data ({}): removal reason {reason}; {} host objects named, {} of them made while frames are drawn",
+                dred_mode().text(),
+                NAMED[0].load(Ordering::Relaxed),
+                NAMED[1].load(Ordering::Relaxed)
+            ));
+        }
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
         unsafe {
-            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+            let fault = dred.GetPageFaultAllocationOutput1();
+            // Said either way: no address, or no answer at all.
+            match &fault {
+                Ok(f) if said && f.PageFaultVA == 0 => text.push_str("; page fault: no fault address reported"),
+                Err(e) if said => text.push_str(&format!("; page fault: the call failed ({e})")),
+                _ => {}
+            }
+            if let Ok(fault) = fault
                 && fault.PageFaultVA != 0
             {
                 let va = fault.PageFaultVA;
                 fault_va = Some(va);
                 text.push_str(&format!("; page fault at {va:#x}"));
+                let mut found = 0;
                 for (what, head) in [
                     ("inside", fault.pHeadExistingAllocationNode),
                     ("inside freed", fault.pHeadRecentFreedAllocationNode),
@@ -8528,21 +8780,46 @@ impl Host {
                         node = n.pNext;
                     }
                     if !names.is_empty() {
+                        found += names.len();
                         text.push_str(&format!("; {what} {names:?}"));
                     }
                 }
-                text.push_str(&crate::shadow::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
+                if found == 0 {
+                    text.push_str("; inside no allocation the runtime lists, alive or freed lately");
+                }
+                if tables {
+                    text.push_str(&crate::shadow::near(va));
+                    text.push_str(&crate::descriptor::host::near_heaps(va));
+                }
+            }
+            // `faults` keeps no breadcrumbs: none are asked for.
+            if dred_mode() == Dred::Faults {
+                text.push_str("; breadcrumbs: not kept in this form (VICTORY_D3D12_DRED=light keeps them)");
+                return text;
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
-            let crumbs = match dred.GetAutoBreadcrumbsOutput() {
+            let mut crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
-                    text.push_str(&format!("; no breadcrumbs ({e})"));
+                    if said {
+                        text.push_str(&format!("; breadcrumbs: the call failed ({e})"));
+                    } else {
+                        text.push_str(&format!("; no breadcrumbs ({e})"));
+                    }
                     return text;
                 }
             };
+            // An empty list within a millisecond of the removal (fxceless
+            // run 277): asked again for half a second before it is believed.
+            let mut asked = 0u32;
+            while said && crumbs.pHeadAutoBreadcrumbNode.is_null() && asked < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                asked += 1;
+                if let Ok(again) = dred.GetAutoBreadcrumbsOutput() {
+                    crumbs = again;
+                }
+            }
             // Every list's progress (done/count), in the runtime's order.
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
@@ -8552,6 +8829,14 @@ impl Host {
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
+            }
+            if said {
+                let again = if asked > 0 { format!(", asked {asked} more times over {} ms", asked * 50) } else { String::new() };
+                if progress.is_empty() {
+                    text.push_str(&format!("; breadcrumbs: the runtime returned none (nodes 0{again})"));
+                } else {
+                    text.push_str(&format!("; breadcrumbs: data returned (nodes {}{again})", progress.len()));
+                }
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
@@ -8587,7 +8872,12 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
+                    }
+                    // A list that never started; and in `light`, where no
+                    // marker says what a command runs, every stopped list.
+                    if (done == 0 || dred_mode() == Dred::Light)
+                        && let Some(r) = run
+                    {
                         let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
@@ -9499,7 +9789,7 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
+        name_frame(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
     }
@@ -9523,7 +9813,7 @@ impl HostList {
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            name_frame(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             let shown = view.then(|| buffer.clone());
@@ -12917,6 +13207,22 @@ mod fill_on_card_tests {
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn device_removed_data_forms_follow_the_value() {
+        use super::Dred;
+        use std::ffi::OsStr;
+        assert_eq!(Dred::of(None), Dred::Off);
+        for off in ["", "0", "off", "false"] {
+            assert_eq!(Dred::of(Some(OsStr::new(off))), Dred::Off, "{off:?}");
+        }
+        assert_eq!(Dred::of(Some(OsStr::new("faults"))), Dred::Faults);
+        assert_eq!(Dred::of(Some(OsStr::new(" faults "))), Dred::Faults);
+        assert_eq!(Dred::of(Some(OsStr::new("light"))), Dred::Light);
+        for full in ["1", "on", "full", "yes"] {
+            assert_eq!(Dred::of(Some(OsStr::new(full))), Dred::Full, "{full:?}");
+        }
     }
 
     #[test]
