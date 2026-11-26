@@ -1261,6 +1261,16 @@ impl Flights {
         }
     }
 
+    /// The newest submission that declared a range overlapping `[from,
+    /// to)`; `None` if none did (`VICTORY_SETTLE_PARTIAL`).
+    fn newest_over(&self, from: usize, to: usize) -> Option<u64> {
+        self.0
+            .range(..(to, 0))
+            .filter(|(r, _)| r.0 < to && r.1 > from)
+            .map(|(_, &(_, last))| last)
+            .max()
+    }
+
     /// One submission that declared `ranges` (each once) is copied back:
     /// the ranges no other submission still holds, in input order.
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
@@ -1494,6 +1504,28 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
 #[cfg(test)]
 mod relay_tests {
     use super::{Flights, PAGE, changed_runs, merge_piece, outside, stale_pages_in};
+
+    /// `VICTORY_SETTLE_PARTIAL`: a stale refresh waits for the NEWEST flight
+    /// that declared a range overlapping it, the one whose landing frees
+    /// the last of them; flights over other bytes, newer or not, do not
+    /// count, and the bytes are free once that one is done.
+    #[test]
+    fn a_partial_settle_waits_for_the_newest_flight_over_the_bytes() {
+        let mut flights = Flights::default();
+        flights.declare((0x1000, 0x2000), 3);
+        flights.declare((0x1800, 0x2800), 5);
+        flights.declare((0x1000, 0x2000), 4);
+        flights.declare((0x8000, 0x9000), 9);
+        assert_eq!(flights.newest_over(0x1900, 0x1a00), Some(5));
+        assert_eq!(flights.newest_over(0x1000, 0x1100), Some(4));
+        assert_eq!(flights.newest_over(0x3000, 0x4000), None);
+        assert_eq!(flights.newest_over(0x0, 0x10000), Some(9));
+        // The flights land in order; after 5, nothing over 0x1900 is left.
+        flights.done(&[(0x1000, 0x2000)]);
+        flights.done(&[(0x1000, 0x2000)]);
+        assert_eq!(flights.done(&[(0x1800, 0x2800)]), vec![(0x1800, 0x2800)]);
+        assert_eq!(flights.newest_over(0x1900, 0x1a00), None);
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -3299,6 +3331,30 @@ impl Shadow {
                 })
                 .collect()
         })
+    }
+
+    /// With [`relay`] (`VICTORY_SETTLE_PARTIAL`): the submission after whose
+    /// landing no flight's shaders write `[address, address + len)` of the
+    /// copy any more (the newest that declared an overlapping range);
+    /// `u64::MAX` if a range shaders write there is not one the flights
+    /// count (all flights must land); 0 if none writes there. From
+    /// AntoninMichelq/VIctory-forkAMD 74768592a.
+    pub(crate) fn landed_free_after(&self, address: usize, len: usize) -> u64 {
+        let (from, to) = (address, address + len);
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let over: Vec<(usize, usize)> = pending.iter().copied().filter(|&(a, e)| a < to && e > from).collect();
+        drop(pending);
+        if over.is_empty() {
+            return 0;
+        }
+        if !relay() {
+            return u64::MAX;
+        }
+        let flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        if !over.iter().all(|r| flights.0.contains_key(r)) {
+            return u64::MAX;
+        }
+        flights.newest_over(from, to).unwrap_or(u64::MAX)
     }
 
     /// After [`Shadow::copy_back`] of a submission's ranges: every submitted
