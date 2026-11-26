@@ -91,6 +91,14 @@ diagnostics-build switch).
 test/shader4b (on test/shader4, after review): `VICTORY_LDS_ATOMICS_READ` and `VICTORY_SELECT_LANES` are OPT-IN (`=1`),
 each narrowed (constant addresses only for the two-kind exemption; all-or-none selectors skipped); OWN_BITS_SCALAR,
 OWN_BITS_LATCH and MASK_PAIR stay on. The five are in the shader cache's key (5065cfe7e).
+Boat sweep (3604 programs, all five off vs all five on): 4 compute programs change, all validate and make pipelines:
+`CS_TransmissionVolumetricsSubmerged` 926c46bab3b86bd6 and `CS_TransmissionVolumetrics_VolumePortalsOnly`
+a10179ab7eda0dc3 (MASK_PAIR, so also in a default run), `CS_SortRayTiles` a1bf269d5b19f025 and
+`CS_CollisionRaytraced` caf96a3229145fa6 (LDS_ATOMICS_READ=1 only). SELECT_LANES changes none. With
+LDS_ATOMICS_READ=1, `CS_SortRayTiles` leaves the "without skips" form for the LAST-RESORT "LDS regions APPROXIMATE"
+form (no exact form takes it: wave-wide branches are refused in a group of several console waves), which leaves
+the order inside its region to the card again; `CS_CollisionRaytraced` is in the wave-wide form
+(`VICTORY_WAVE_EXACT`, as it is) with the switch on or off.
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
 | `VICTORY_OWN_BITS_SCALAR` | `0` restores | ON | `own_bits` (the light loops' wave OR taken as each host wave's own where not every lane runs) also checks the joins of the bits still to visit when they are kept in an SGPR itself (before: only for the VGPR copy). That loop is left with one bit to go, so the SGPR holds the wave OR's highest bit; read after the loop, the lower host wave got its own half's highest bit. Now refused there, and the program takes a form where the halves exchange. GPU lane test `a_scalar_loops_last_bit_after_it_is_the_whole_waves` (all 32 lower lanes wrong with `=0`, every lane right with it on) | avatarmanz/VIctory-7900XTX PR #286 (sharan104, 82a3a8e32) | YES |
