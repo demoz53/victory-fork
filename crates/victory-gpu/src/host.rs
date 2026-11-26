@@ -4732,6 +4732,19 @@ fn partial_landed(finished: u64, until: u64) -> bool {
 /// the card's memory and is write-watched (a copy that is not is taken
 /// whole again after the wait). Stricter than [`refresh_blocked`], which
 /// lets a copy refresh over its own shaders' ranges.
+/// Whether [`prewarm`] leaves alone a copy the card reads itself (one side)
+/// that a flight still in the air read (`VICTORY_PREWARM_READERS=0`: it
+/// does not, as before). On by default: the fault of Belobug #139 (its
+/// PR #203's test, by Lux-Designs), reproduced here by
+/// `prewarm_readers_tests`: a prewarm made before a settle's wait wrote the
+/// title's newer bytes into a copy that an earlier flight, still queued,
+/// then read. Left out of the prewarm, the copy is refreshed after the wait
+/// as without prewarms.
+fn prewarm_readers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREWARM_READERS").is_none_or(|v| v != "0"))
+}
+
 fn prewarm_safe(written: &[(usize, usize)], immed: &[(usize, usize)], from: usize, to: usize, held: bool) -> bool {
     !held && from < to && !touches(written, from, to) && !touches(immed, from, to)
 }
@@ -4758,6 +4771,9 @@ fn prewarm(runs: &[&HostList]) {
                 Step::Copy(..) | Step::Run(_) => break 'lists,
                 Step::Refresh(shadow, address, len) => {
                     let held = shadow.writes_pending() || shadow.carded() || shadow.unwatched();
+                    // A copy the card reads itself, read by a flight still in the
+                    // air: a refresh now would write under that read.
+                    let held = held || (prewarm_readers() && shadow.read_in_flight(FINISHED.load(Ordering::Acquire)));
                     if prewarm_safe(&written, &immed, *address, address.saturating_add(*len), held) {
                         batch.add(shadow, *address, *len);
                         made += 1;
@@ -9680,6 +9696,7 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
+                    shadow.note_read();
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -12798,5 +12815,100 @@ mod copy_bench {
             UnmapViewOfFile(view);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+}
+
+/// Belobug #139 / PR #203 (Lux-Designs, 70697c1f2: its WARP test fails 20 of
+/// 20 there) brought to our tree: a submission sent ahead reads a host copy
+/// whose card side is the copy itself (one side, in the PC's memory); the
+/// title then writes the bytes, and before the first has run a refresh for
+/// the next one, by a settle's prewarm ([`prewarm`]) or by its preparing,
+/// writes them. Ignored: each needs the relay on in a process of its own
+/// (`VICTORY_RELAY=2 cargo test -p victory-gpu --lib prewarm_readers --
+/// --ignored --test-threads=1`; the second also `VICTORY_CARD_ALL=1`).
+#[cfg(test)]
+mod prewarm_readers_tests {
+    use super::*;
+
+    const OLD: u32 = 0x1122_3344;
+    const NEW: u32 = 0xaabb_ccdd;
+
+    /// The two submissions' reads of the word. `warm`: the second is
+    /// warmed by a prewarm and refreshes nothing itself; else it refreshes.
+    fn run(warm: bool) -> [u32; 2] {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let host = host().expect("a D3D12 device");
+        assert!(relay(), "run with VICTORY_RELAY=2");
+        const LEN: usize = 1 << 16;
+        // SAFETY: a private allocation, kept until the process ends.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: the allocation's first dword.
+        unsafe { (base as *mut u32).write_volatile(OLD) };
+        crate::shadow::register(base, base as u64, LEN as u64);
+        let copy = crate::shadow::find(base as u64, LEN as u64).expect("the copy");
+        let back = host.read_back_buffer(256).expect("a read-back buffer");
+        let record = |at: u64, refresh: bool| {
+            let list = host.new_list().unwrap();
+            if refresh {
+                copy.refresh(&list, base as u64, 8);
+            }
+            // SAFETY: live buffers; the ranges lie in them.
+            unsafe { list.list.CopyBufferRegion(&back, at, &copy.buffer, copy.offset(base as u64), 4) };
+            list.close();
+            list
+        };
+        // The first flight stands on the queue until the second is prepared.
+        // SAFETY: plain creation; the queue waits for a fence this thread signals.
+        let gate: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        // SAFETY: as above.
+        unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+        host.execute_late(vec![crate::list::Detached::ours(record(0, true))], vec![0]);
+        // SAFETY: the allocation's first dword; the title writes after its submit.
+        unsafe { (base as *mut u32).write_volatile(NEW) };
+        if warm {
+            // As a settle's prewarm makes it, ahead of its wait.
+            let warmed = host.new_list().unwrap();
+            copy.refresh(&warmed, base as u64, 8);
+            warmed.close();
+            prewarm(&[&warmed]);
+        }
+        host.execute_late(vec![crate::list::Detached::ours(record(4, !warm))], vec![0]);
+        // SAFETY: our fence.
+        unsafe { gate.Signal(1) }.unwrap();
+        settle_now(WHY_SYNC);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: both copies ran (the settle waited for them).
+        unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            let words = mapped.cast::<[u32; 2]>().read_unaligned();
+            back.Unmap(0, None);
+            words
+        }
+    }
+
+    /// A settle's prewarm leaves a copy alone that a flight in the air read
+    /// (`VICTORY_PREWARM_READERS`, on by default): the first submission
+    /// reads what it was given. Fails with `VICTORY_PREWARM_READERS=0`.
+    #[test]
+    #[ignore = "needs a D3D12 adapter and VICTORY_RELAY=2; run alone"]
+    fn a_prewarm_does_not_write_under_a_running_read() {
+        let words = run(true);
+        assert_eq!(words[0], OLD, "the prewarm reached the first submission's read: {words:#x?}");
+    }
+
+    /// The same for the next submission's own refresh. KNOWN TO FAIL in our
+    /// tree, with one side and with two (`VICTORY_CARD_ALL=1`: the copy up
+    /// to the card side reads the CPU side when the card runs it, by which
+    /// time the next refresh has written it): a submission sent ahead reads
+    /// what the title wrote after its submit call, `late`'s stated
+    /// assumption (as the console's card reads title memory late), here
+    /// further behind. Fixing it needs each submission's changed bytes kept
+    /// apart until it has run (as lean windows' ring does), not a wait.
+    #[test]
+    #[ignore = "known to fail (late's assumption); needs a D3D12 adapter and VICTORY_RELAY=2"]
+    fn a_refresh_writes_under_a_running_read_known() {
+        assert_eq!(run(false), [OLD, NEW], "the next submission's refresh reached the first one's read");
     }
 }

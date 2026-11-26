@@ -90,6 +90,11 @@ pub(crate) struct Shadow {
     /// Whether shaders were ever given a range of the copy to write
     /// ([`Shadow::gpu_writes`]).
     shaders_wrote: AtomicBool,
+    /// The last submission whose preparing refreshed the copy (its lists
+    /// read it): with one side the card reads the copy itself, and a
+    /// refresh while that submission is in the air writes under its reads
+    /// ([`Shadow::read_in_flight`]).
+    read_by: AtomicU64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -681,7 +686,11 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// A copy with one side, in the PC's memory, is what the card reads while
 /// our refreshes write it: a submission that is prepared changes it under
 /// the ones in the air ahead of it. With two sides what changed goes up to
-/// the card side in queue order (`Host::card_before`), behind them.
+/// the card side in queue order (`Host::card_before`), behind them; but NOT
+/// in our tree: that copy reads the CPU side when the card runs it, and a
+/// later preparing may have written the CPU side by then (test/async5's
+/// `prewarm_readers_tests`; avatarmanz sends each submission's bytes
+/// through memory of its own, which ours does only for lean windows).
 ///
 /// From avatarmanz/VIctory-7900XTX 5b422ba02 (GPL-3.0; there via
 /// cobrez/Victory-Nvidia-4090-laptop, and in Corgansm/victory-corgi
@@ -2923,12 +2932,27 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             declared: Mutex::default(),
             shaders_wrote: AtomicBool::new(false),
+            read_by: AtomicU64::new(0),
         }
     }
 
     /// Whether shaders were ever given a range of the copy to write: a
     /// constant buffer view of it may read what a flight in the air writes
     /// by the time its list is submitted (`crate::host::fill_on_card`).
+    /// The submission being prepared ([`preparing`]) refreshes the copy:
+    /// its lists read it.
+    pub(crate) fn note_read(&self) {
+        self.read_by.fetch_max(PREPARED.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// Whether a submission that read the copy may still be on the card
+    /// (`finished`: the last landed) and the card reads the copy itself (one
+    /// side, not in place: in place the card reads title memory, with two
+    /// sides it reads the card side, updated in queue order).
+    pub(crate) fn read_in_flight(&self, finished: u64) -> bool {
+        self.place.is_none() && self.card.is_none() && self.read_by.load(Ordering::Relaxed) > finished
+    }
+
     pub(crate) fn shaders_wrote(&self) -> bool {
         self.shaders_wrote.load(Ordering::Relaxed)
     }
