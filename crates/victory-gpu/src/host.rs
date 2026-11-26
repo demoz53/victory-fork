@@ -304,18 +304,60 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// Drops `object` once every submission running now has finished, and
+/// [`retire_ahead`] submissions more (`VICTORY_RETIRE_AHEAD`, 64 by
+/// default): lists recorded but not yet submitted (the submission being
+/// prepared, those the relay sends ahead, the title's lists recorded early)
+/// can name a host copy without holding it (`resource::host_resource` hands
+/// textures out unheld), and the sweeps that let copies go run right before
+/// a submission starts. Dropped at once, such a list reads freed memory on
+/// the card: a page fault, the device removed (0x887A0005). With
+/// `VICTORY_RETIRE_AHEAD=0`, as before: at once if no submission is running.
+/// (AntoninMichelq/VIctory-forkAMD e90063015: three device removals with a
+/// page fault in the range of the host copies, none with the sweeps off.)
 pub(crate) fn retire<T: 'static>(object: T) {
+    retire_with(object, retire_ahead());
+}
+
+/// [`retire`] with `ahead` submissions more to wait for; the submission
+/// count the object waits for, `None` if it was dropped at once.
+fn retire_with<T: 'static>(object: T, ahead: u64) -> Option<u64> {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    let Some(at) = retire_at(started, FINISHED.load(Ordering::Acquire), ahead) else {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
-        return;
-    }
+        return None;
+    };
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired)
-        .push((started, Retired(Box::new(object))));
+    crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired).push((at, Retired(Box::new(object))));
+    Some(at)
+}
+
+/// The submission count something retired with `started` and `finished`
+/// submissions waits for: `None` (dropped at once) only without `ahead`
+/// and with no submission running.
+fn retire_at(started: u64, finished: u64, ahead: u64) -> Option<u64> {
+    (ahead > 0 || started > finished).then_some(started + ahead)
+}
+
+/// Submissions [`retire`] waits for beyond those running:
+/// `VICTORY_RETIRE_AHEAD` (64; `0`: none, as before). Antonin's fork
+/// waits for 16, about four of its frames; with the relay this build sends
+/// about 43 submissions a frame (vf-bis logs of 26 Nov), so 16 would be
+/// under half a frame, while a list the title recorded early may wait a
+/// frame for its submission: 64 is about a frame and a half.
+pub(crate) fn retire_ahead() -> u64 {
+    static AHEAD: OnceLock<u64> = OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        let ahead = std::env::var("VICTORY_RETIRE_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64);
+        tracing::info!(
+            "objects let go wait for the running submissions and {ahead} more (VICTORY_RETIRE_AHEAD; 0: as before)"
+        );
+        ahead
+    })
 }
 
 /// Submissions started and finished so far ([`STARTED`], [`FINISHED`]): a
@@ -380,6 +422,48 @@ pub(crate) static REAPED_LATER: [std::sync::atomic::AtomicU64; 2] = [const { std
 pub(crate) fn reap_later<T: Send + 'static>(object: T) {
     REAPED_LATER[0].fetch_add(1, Ordering::Relaxed);
     send_to_reaper(Reaping::Any(Box::new(object)));
+}
+
+#[cfg(test)]
+mod retire_tests {
+    /// Without `ahead`, as before: at once with nothing running, else once
+    /// the running submissions have finished; with it, that many more.
+    #[test]
+    fn what_is_retired_waits_for_the_submissions_ahead() {
+        assert_eq!(super::retire_at(5, 5, 0), None);
+        assert_eq!(super::retire_at(7, 5, 0), Some(7));
+        assert_eq!(super::retire_at(5, 5, 16), Some(21));
+        assert_eq!(super::retire_at(7, 5, 16), Some(23));
+    }
+
+    /// An object retired with nothing running is kept until the
+    /// submissions ahead have finished (lists recorded, not yet submitted,
+    /// may name it), and dropped then.
+    #[test]
+    fn a_retired_object_lives_until_its_submission_is_through() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let gone = Arc::new(AtomicBool::new(false));
+        let at = super::retire_with(Flag(gone.clone()), 16).expect("kept, not dropped at once");
+        assert!(!gone.load(Ordering::SeqCst));
+        super::bury(at.saturating_sub(16));
+        assert!(!gone.load(Ordering::SeqCst), "dropped before the submissions ahead finished");
+        super::bury(at);
+        assert!(gone.load(Ordering::SeqCst));
+        // As before: nothing running and nothing ahead is dropped at once.
+        let now = Arc::new(AtomicBool::new(false));
+        let (started, finished) = super::submissions();
+        if started <= finished {
+            assert_eq!(super::retire_with(Flag(now.clone()), 0), None);
+            assert!(now.load(Ordering::SeqCst));
+        }
+    }
 }
 
 #[cfg(test)]
