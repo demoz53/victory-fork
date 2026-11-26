@@ -83,3 +83,8 @@ switch.
   PARTIAL_PROMPT (run cs-all1: one of them took the boat to 2,474 ms a frame; separate them one per run first).
 - Shader-changing switches (LOOP_EXITS, NORM_EXACT, HEAP_BELOW_ZERO, LOCAL_LDS_SYNC, NAN_GUARD): give each value
   its own warm; do not mix a first use of one of them into a speed comparison.
+- Checked offline (2026-11-25, unit tests of victory-gpu and victory-hle run with the switches in the environment):
+  every new switch on at once passes, except that with `VICTORY_GUARD_REST` set two tests that assert the default
+  (`watch::tests::a_range_that_begins_in_an_unmapped_block_is_guarded`,
+  `watch::tests::a_write_through_another_view_is_reported_at_the_guarded_one`) fail by design: a resting block is
+  told as written at every asking. Run `cargo test` with no `VICTORY_*` switch exported.
