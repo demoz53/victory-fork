@@ -27,6 +27,49 @@ pub struct KnownBuild {
     pub watchdog: &'static [CodePatch],
     /// Its table of output sizes (`VICTORY_RESOLUTION`).
     pub resolution: Option<ResolutionLadder>,
+    /// Where its game clocks' largest step is loaded (`VICTORY_TIME_STEP`).
+    pub time_step: Option<TimeStepCap>,
+    /// The ceiling of its per-frame placement budget for streamed resources
+    /// (`VICTORY_PLACE_BUDGET`).
+    pub place_budget: Option<PlaceBudget>,
+    /// Its per-frame cap of texture upgrades (`VICTORY_TEX_UPGRADES`).
+    pub tex_upgrades: Option<TexUpgrades>,
+}
+
+/// The largest step the title's game clocks take in a frame: each clock
+/// advances by `min(frame time, cap)` (times its time scale; the frame time
+/// is a real `QueryPerformanceCounter` difference), and the cap is a float
+/// constant shared with dozens of other uses, loaded by `loads` (`vmovss
+/// xmm, [rip + disp32]`, 8 bytes each). Raising the cap points those loads
+/// at another read-only constant of the image: `values` pairs a cap in
+/// milliseconds with the RVA of a constant holding it, in `rdata` (the
+/// image's .rdata: RVA and length), checked as mapped before use.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeStepCap {
+    pub loads: &'static [(u32, [u8; 8])],
+    pub values: &'static [(u32, u32)],
+    pub rdata: (u32, u32),
+}
+
+/// The ceiling of the title's per-frame time slice for placing streamed
+/// resources: the clamp `min(budget, 1250)` then `max(it, 250)` in
+/// microseconds, whose 1250 is two immediates (`mov ecx, 1250` at `mov_ecx`,
+/// `cmp eax, 1250` at `cmp_eax`, 5 bytes each).
+#[derive(Debug, Clone, Copy)]
+pub struct PlaceBudget {
+    pub mov_ecx: u32,
+    pub cmp_eax: u32,
+    pub ceiling: u32,
+}
+
+/// The title's cap of texture upgrades a frame (maxTexUpgradesPerFrame, 5):
+/// a data word its settings code stores from a settings field (`mov eax,
+/// [rsi+0x110]` at `load`, then the store), compared by two `jge` (`jges`,
+/// 6 bytes each) that end the frame's upgrades.
+#[derive(Debug, Clone, Copy)]
+pub struct TexUpgrades {
+    pub load: (u32, [u8; 6]),
+    pub jges: &'static [(u32, [u8; 6])],
 }
 
 /// The title's table of output sizes (the resolution "ladder"): five entries
@@ -135,6 +178,105 @@ pub fn resolution_patches(build: &KnownBuild, w: u32, h: u32) -> Vec<OwnedPatch>
         patches.extend(owned(&[r.budget_check]));
     }
     patches
+}
+
+/// The cap `VICTORY_TIME_STEP` asks for, in milliseconds: `0.25`, `0.5` or
+/// `1` (`1.0`) seconds (the title's own is 1/15 s).
+pub fn parse_time_step(text: &str) -> Option<u32> {
+    match text.trim() {
+        "0.25" => Some(250),
+        "0.5" | "0.50" => Some(500),
+        "1" | "1.0" => Some(1000),
+        _ => None,
+    }
+}
+
+/// The patches that make `build`'s game clocks take at most `ms` a frame:
+/// both loads of the cap (or neither) pointed at the build's constant of
+/// that value, after checking that `rdata` (the image's .rdata as mapped,
+/// from [`TimeStepCap::rdata`]'s RVA) holds it there. An error says why none
+/// can be made. SonicRaT/XNW 2fa40fef6 (`apps/xnw/src/patches.rs`,
+/// `timestep4`, `timestep2`, `timestep1`; GPL-3.0): the same places,
+/// constants and bytes.
+pub fn time_step_patches(build: &KnownBuild, ms: u32, rdata: &[u8]) -> Result<Vec<OwnedPatch>, String> {
+    let Some(cap) = build.time_step else {
+        return Err("this build has no places for it".to_owned());
+    };
+    let &(_, constant) = cap.values.iter().find(|(v, _)| *v == ms).ok_or("this build has no constant of that value")?;
+    let want = (ms as f32 / 1000.0).to_le_bytes();
+    let held = (constant.checked_sub(cap.rdata.0).map(|at| at as usize))
+        .and_then(|at| rdata.get(at..at + 4));
+    if held != Some(&want[..]) {
+        return Err(format!("the constant at +{constant:#x} is not {} s (another build?)", ms as f32 / 1000.0));
+    }
+    cap.loads
+        .iter()
+        .map(|&(rva, expect)| {
+            let disp = i32::try_from(i64::from(constant) - (i64::from(rva) + 8)).map_err(|_| "the constant is out of reach".to_owned())?;
+            let mut write = expect;
+            write[4..].copy_from_slice(&disp.to_le_bytes());
+            Ok(OwnedPatch { name: "time step: the cap's load", rva, expect: expect.to_vec(), write: write.to_vec() })
+        })
+        .collect()
+}
+
+/// The ceiling `VICTORY_PLACE_BUDGET` asks for, in microseconds: a number
+/// from 1250 (the title's own) to 100000, or `1`/`on` for XNW's 30000.
+pub fn parse_place_budget(text: &str) -> Option<u32> {
+    match text.trim() {
+        "1" | "on" => Some(30_000),
+        t => t.parse().ok().filter(|us| (1250..=100_000).contains(us)),
+    }
+}
+
+/// The patches that raise `build`'s placement ceiling to `us`: both
+/// immediates of the clamp. SonicRaT/XNW 2fa40fef6 `place_budget`.
+pub fn place_budget_patches(build: &KnownBuild, us: u32) -> Vec<OwnedPatch> {
+    let Some(b) = build.place_budget else {
+        return Vec::new();
+    };
+    let imm = |op: u8, v: u32| [&[op][..], &v.to_le_bytes()].concat();
+    vec![
+        OwnedPatch { name: "place budget: the ceiling (mov ecx)", rva: b.mov_ecx, expect: imm(0xb9, b.ceiling), write: imm(0xb9, us) },
+        OwnedPatch { name: "place budget: the ceiling (cmp eax)", rva: b.cmp_eax, expect: imm(0x3d, b.ceiling), write: imm(0x3d, us) },
+    ]
+}
+
+/// What `VICTORY_TEX_UPGRADES` asks for: a cap from 1 to 100000 a frame, or
+/// `unlimited`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TexUpgradeCap {
+    Most(u32),
+    Unlimited,
+}
+
+pub fn parse_tex_upgrades(text: &str) -> Option<TexUpgradeCap> {
+    match text.trim() {
+        "unlimited" => Some(TexUpgradeCap::Unlimited),
+        t => t.parse().ok().filter(|n| (1..=100_000).contains(n)).map(TexUpgradeCap::Most),
+    }
+}
+
+/// The patches for `VICTORY_TEX_UPGRADES`: a number becomes the value the
+/// title's settings code stores as its cap (`mov eax, <n>; nop` in place of
+/// the load of the settings field, so every later store of the settings
+/// keeps it); `unlimited` makes both `jge` of the cap 6-byte `nop`s
+/// (SonicRaT/XNW 2fa40fef6 `tex_upgrades`).
+pub fn tex_upgrade_patches(build: &KnownBuild, cap: TexUpgradeCap) -> Vec<OwnedPatch> {
+    let Some(t) = build.tex_upgrades else {
+        return Vec::new();
+    };
+    match cap {
+        TexUpgradeCap::Most(n) => {
+            let write = [&[0xb8][..], &n.to_le_bytes(), &[0x90]].concat();
+            vec![OwnedPatch { name: "tex upgrades: the cap the settings store", rva: t.load.0, expect: t.load.1.to_vec(), write }]
+        }
+        TexUpgradeCap::Unlimited => t
+            .jges
+            .iter()
+            .map(|&(rva, expect)| OwnedPatch { name: "tex upgrades: no cap (jge -> nop)", rva, expect: expect.to_vec(), write: vec![0x90; 6] })
+            .collect(),
+    }
 }
 
 /// What `VICTORY_RT_FALLBACK` asks for: `1` the set test alone, `2` it and
@@ -254,7 +396,8 @@ pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
     }],
     // The title's hang watchdog (thread function +0x2215a60): every second
     // it compares each registered thread's last beat with a limit (`>=
-    // 300.0` scaled ticks, about 30 s) and, past it, calls a handler kept
+    // 300.0` QueryPerformanceCounter ticks times 1/frequency: 300 s by this
+    // reading; the sources say about 30 s) and, past it, calls a handler kept
     // in a data word, which writes to address 0 on purpose (`mov dword
     // [0], 0x4d8bd421` at +0x23cf683), and after it does the same itself
     // (`mov dword [0], 0; int3` at +0x2215c35): a deliberate crash for the
@@ -293,6 +436,45 @@ pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
             expect: &[0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0x76, 0x01, 0xcc],
             write: &[0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0x76, 0x01, 0x90],
         },
+    }),
+    // The game clocks' step (+0x22264d0, once a frame): the frame time is
+    // the difference of two QueryPerformanceCounter reads times 1/frequency,
+    // and every clock (nine calls of the helper +0x2226040, and one inline
+    // step at +0x2226833) advances by min(it, 1/15 s) times its time scale
+    // (and at least 1/30 s). Both loads read the constant 1/15 at
+    // +0x6159ec0, which 63 other places read too, so the loads move, not the
+    // constant. SonicRaT/XNW 2fa40fef6 `timestep4/2/1`: the same places and
+    // constants (0.25 at +0x6159ca4, 0.5 at +0x6159b10, 1 at +0x6159bc4),
+    // read again from our executable.
+    time_step: Some(TimeStepCap {
+        loads: &[
+            // vmovss xmm3, [rip + 0x3f33e73] (= +0x6159ec0)
+            (0x222_6045, [0xc5, 0xfa, 0x10, 0x1d, 0x73, 0x3e, 0xf3, 0x03]),
+            // vmovss xmm0, [rip + 0x3f33685] (= +0x6159ec0)
+            (0x222_6833, [0xc5, 0xfa, 0x10, 0x05, 0x85, 0x36, 0xf3, 0x03]),
+        ],
+        values: &[(250, 0x615_9ca4), (500, 0x615_9b10), (1000, 0x615_9bc4)],
+        // .rdata
+        rdata: (0x5f4_1000, 0x8a_0c0c),
+    }),
+    // The main thread places streamed resources (+0x9d94a0) until a
+    // deadline of a per-frame budget (+0x2576d40); +0x2294750 works the
+    // budget out from two counts and the frame rate and clamps it to
+    // 250-1250 us. SonicRaT/XNW 2fa40fef6 `place_budget` (30000 there).
+    place_budget: Some(PlaceBudget { mov_ecx: 0x229_4814, cmp_eax: 0x229_4819, ceiling: 1250 }),
+    // maxTexUpgradesPerFrame: dword +0x6849848 (5 in the file), stored by
+    // the settings code at +0x224364b from its settings field +0x110, so a
+    // value written in the data word would not last; compared at
+    // +0x220392a and +0x2203986 against the frame's count (+0x71290ec).
+    // XNW `tex_upgrades` NOPs both jge.
+    tex_upgrades: Some(TexUpgrades {
+        // mov eax, [rsi+0x110]
+        load: (0x224_3645, [0x8b, 0x86, 0x10, 0x01, 0x00, 0x00]),
+        jges: &[
+            // jge +0x22038b0
+            (0x220_3930, [0x0f, 0x8d, 0x7a, 0xff, 0xff, 0xff]),
+            (0x220_398c, [0x0f, 0x8d, 0x1e, 0xff, 0xff, 0xff]),
+        ],
     }),
 }];
 
@@ -342,6 +524,73 @@ mod tests {
         assert!(p.iter().all(|p| p.write.len() == p.expect.len() && p.write != p.expect));
         let none = KnownBuild { render_scale: None, ..*build };
         assert!(render_scale_patches(&none, 0.5).is_empty());
+    }
+
+    #[test]
+    fn the_time_step_cap_moves_its_loads() {
+        assert_eq!(parse_time_step("0.25"), Some(250));
+        assert_eq!(parse_time_step(" 0.5 "), Some(500));
+        assert_eq!(parse_time_step("1.0"), Some(1000));
+        assert_eq!(parse_time_step("0.1"), None);
+        let build = &KNOWN_BUILDS[0];
+        let cap = build.time_step.unwrap();
+        // Both loads read the title's own cap, 1/15 s, at +0x6159ec0.
+        for &(rva, bytes) in cap.loads {
+            let disp = i32::from_le_bytes(bytes[4..].try_into().unwrap());
+            assert_eq!(i64::from(rva) + 8 + i64::from(disp), 0x615_9ec0);
+        }
+        // A fake .rdata holding the three constants where the build has them.
+        let mut rdata = vec![0u8; cap.rdata.1 as usize];
+        for &(ms, rva) in cap.values {
+            let at = (rva - cap.rdata.0) as usize;
+            rdata[at..at + 4].copy_from_slice(&(ms as f32 / 1000.0).to_le_bytes());
+        }
+        // XNW's bytes, both places.
+        let quarter = time_step_patches(build, 250, &rdata).unwrap();
+        assert_eq!(quarter[0].write, [0xc5, 0xfa, 0x10, 0x1d, 0x57, 0x3c, 0xf3, 0x03]);
+        assert_eq!(quarter[1].write, [0xc5, 0xfa, 0x10, 0x05, 0x69, 0x34, 0xf3, 0x03]);
+        let half = time_step_patches(build, 500, &rdata).unwrap();
+        assert_eq!((&half[0].write[4..6], &half[1].write[4..6]), (&[0xc3, 0x3a][..], &[0xd5, 0x32][..]));
+        let one = time_step_patches(build, 1000, &rdata).unwrap();
+        assert_eq!((&one[0].write[4..6], &one[1].write[4..6]), (&[0x77, 0x3b][..], &[0x89, 0x33][..]));
+        // The constant not there (another build), or no such value: nothing.
+        let at = (0x615_9ca4 - cap.rdata.0) as usize;
+        rdata[at] ^= 1;
+        assert!(time_step_patches(build, 250, &rdata).is_err());
+        assert!(time_step_patches(build, 100, &rdata).is_err());
+        assert!(time_step_patches(build, 500, &[]).is_err());
+        let none = KnownBuild { time_step: None, ..*build };
+        assert!(time_step_patches(&none, 500, &rdata).is_err());
+    }
+
+    #[test]
+    fn place_budget_and_tex_upgrades() {
+        assert_eq!(parse_place_budget("1"), Some(30_000));
+        assert_eq!(parse_place_budget("30000"), Some(30_000));
+        assert_eq!(parse_place_budget("100"), None);
+        let build = &KNOWN_BUILDS[0];
+        let p = place_budget_patches(build, 30_000);
+        assert_eq!(p.iter().map(|p| p.rva).collect::<Vec<_>>(), [0x229_4814, 0x229_4819]);
+        assert_eq!((p[0].expect.as_slice(), p[0].write.as_slice()), (&[0xb9, 0xe2, 0x04, 0, 0][..], &[0xb9, 0x30, 0x75, 0, 0][..]));
+        assert_eq!((p[1].expect.as_slice(), p[1].write.as_slice()), (&[0x3d, 0xe2, 0x04, 0, 0][..], &[0x3d, 0x30, 0x75, 0, 0][..]));
+
+        assert_eq!(parse_tex_upgrades("unlimited"), Some(TexUpgradeCap::Unlimited));
+        assert_eq!(parse_tex_upgrades("50"), Some(TexUpgradeCap::Most(50)));
+        assert_eq!(parse_tex_upgrades("0"), None);
+        let most = tex_upgrade_patches(build, TexUpgradeCap::Most(50));
+        assert_eq!(most.len(), 1);
+        assert_eq!(most[0].write, [0xb8, 50, 0, 0, 0, 0x90]);
+        let all = tex_upgrade_patches(build, TexUpgradeCap::Unlimited);
+        assert_eq!(all.iter().map(|p| p.rva).collect::<Vec<_>>(), [0x220_3930, 0x220_398c]);
+        assert!(all.iter().all(|p| p.write == [0x90; 6]));
+        // Both jge go to the same place: the end of the frame's upgrades.
+        for p in &all {
+            let rel = i32::from_le_bytes(p.expect[2..6].try_into().unwrap());
+            assert_eq!(i64::from(p.rva) + 6 + i64::from(rel), 0x220_38b0);
+        }
+        let none = KnownBuild { place_budget: None, tex_upgrades: None, ..*build };
+        assert!(place_budget_patches(&none, 30_000).is_empty());
+        assert!(tex_upgrade_patches(&none, TexUpgradeCap::Unlimited).is_empty());
     }
 
     #[test]
