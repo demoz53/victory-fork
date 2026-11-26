@@ -4028,7 +4028,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2Ï€ (a last-place difference).
+    /// different constant than 2π (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -5521,7 +5521,7 @@ impl<'a> Lower<'a> {
     /// otherwise a NaN loses to a number (two quiet NaNs give the data);
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as Â±0 first (MODE is not modelled).
+    // flushing them they would order as ±0 first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
@@ -8335,7 +8335,7 @@ impl<'a> Lower<'a> {
                 // Follows the default f32 flush-to-zero (FTZ) denormal mode
                 // used by the console and D3D12/DXIL: subnormal inputs
                 // (`exp == 0`) and underflowing results (`exp + delta <= 0`)
-                // flush to signed zero, while `Â±inf` and NaNs pass through
+                // flush to signed zero, while `±inf` and NaNs pass through
                 // (with sNaNs quieted).
                 let (x_f, delta) = (f(self, 0)?, s(self, 1)?);
                 let x = self.as_int(x_f);
@@ -9363,7 +9363,7 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, at, odd);
         let up = self.s.m.bin(c, Bin::Or, above, tie);
         let up = self.s.m.select(c, up, one, zero);
-        // Rebias the exponent (1023 â†’ 127); a carry out of the mantissa
+        // Rebias the exponent (1023 → 127); a carry out of the mantissa
         // steps the exponent, up to infinity.
         let bias = k(self, 1023 - 127);
         let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
