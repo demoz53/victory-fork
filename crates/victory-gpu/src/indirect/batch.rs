@@ -319,6 +319,8 @@ pub(super) fn record(
     sources: [u64; SOURCES],
     jobs: u64,
 ) {
+    // Bindings outside the draw state's memory of them (`VICTORY_SET_CACHE`).
+    let _binds = crate::draw::sets::Announce;
     let after = transition(
         dst,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

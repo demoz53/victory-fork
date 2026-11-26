@@ -4395,20 +4395,27 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    tables_changed();
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    let mut map = buffers();
+    let end = start + len;
+    // A replaced entry changed the memory its old end covered too.
+    let old_end = map.get(&(start, resource)).map_or(start, |e| e.end);
+    map.insert((start, resource), Entry { end, shadow: None });
+    // Counted after the change and under the table's lock: an ask reads the
+    // count before it takes the lock, so an answer is never kept under a
+    // count newer than the table it read. (Counted before the lock was
+    // taken, an ask in between kept the table without this buffer under
+    // the new count, for good.)
+    buffers_changed(start, end.max(old_end));
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
-    tables_changed();
+    let mut map = buffers();
+    if let Some(entry) = map.remove(&(start, resource)) {
+        buffers_changed(start, entry.end);
+    } else {
+        tables_changed();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4442,9 +4449,10 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        for (key, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
+                buffers_changed(key.0, entry.end);
             }
         }
     }
@@ -4508,6 +4516,88 @@ static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
 
 fn tables_changed() {
     TABLES_CHANGED.fetch_add(1, Ordering::Release);
+}
+
+/// [`TABLES_CHANGED`] now (`VICTORY_TABLE_MEMO`: a root view found earlier
+/// in a list stands while the tables are as they were).
+pub(crate) fn table_changes() -> u64 {
+    TABLES_CHANGED.load(Ordering::Acquire)
+}
+
+/// Title memory in grains of 64 KiB for [`find_buckets`].
+const GRAIN_SHIFT: u32 = 16;
+/// The longest span (grains, from an answer's buffer's first grain to the
+/// ask's) an answer is checked by grain; longer ones stand only while
+/// nothing at all changed.
+const SPAN_MOST: u64 = 256;
+/// Grain slots: a grain's last change is kept in slot grain % this (grains
+/// 1 GiB apart share one, which only makes a change count for more).
+const GRAIN_SLOTS: usize = 1 << 14;
+/// Changes of the buffer table ([`buffers_changed`]), and per grain slot
+/// the number of the last that touched it.
+static BUFFER_CHANGES: AtomicU64 = AtomicU64::new(0);
+static GRAIN_CHANGED: [AtomicU64; GRAIN_SLOTS] = [const { AtomicU64::new(0) }; GRAIN_SLOTS];
+
+/// The buffer table changed over `[start, end)` (a buffer registered,
+/// released, or its copy taken out): the grains it covers take the change's
+/// number, and the whole-table count moves too. Called under the table's
+/// lock, after the change.
+fn buffers_changed(start: u64, end: u64) {
+    let number = BUFFER_CHANGES.fetch_add(1, Ordering::AcqRel) + 1;
+    let first = start >> GRAIN_SHIFT;
+    let last = end.saturating_sub(1).max(start) >> GRAIN_SHIFT;
+    for grain in first..=last.min(first + GRAIN_SLOTS as u64 - 1) {
+        GRAIN_CHANGED[grain as usize % GRAIN_SLOTS].store(number, Ordering::Release);
+    }
+    tables_changed();
+}
+
+/// Whether a thread's remembered answer from a title buffer stands by the
+/// grains it depends on (`VICTORY_FIND_BUCKETS=1`, with
+/// `VICTORY_LOOKUP_CACHE=1`; off by default: any change of the tables drops
+/// every answer, as before). Buffers come and go all the time while the
+/// world streams, and each one dropped every thread's answers.
+///
+/// Exact: an answer from a buffer depends on the buffers covering the ask
+/// and on the 64 table keys nearest below it. A change moves it only by
+/// covering the ask (it touches the ask's grain), by starting between the
+/// answer's buffer and the ask (inside the span), or by changing the
+/// answer's own entry (it touches its first grain); the span is checked
+/// whole. Answers from windows outside buffers stand only while nothing at
+/// all changed, as before. After zocram4cc/victory-linux-perf 40e3525ed
+/// (zocram4cc; GPL-3.0; in Proudnoob4/VIctory-NVIDIA nvidia-hybrid-v2), whose
+/// bench went from 2% to 84% answered with a change every ten asks.
+fn find_buckets() -> bool {
+    #[cfg(test)]
+    if TEST_BUCKETS.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FIND_BUCKETS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`find_buckets`] on for this thread.
+    static TEST_BUCKETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an answer kept at whole-table count `tables` and buffer change
+/// `number`, from a buffer starting in grain `first` (a window: `None`),
+/// for an ask in grain `last`, still stands ([`find_buckets`]).
+fn still_stands(tables: u64, number: u64, first: Option<u64>, last: u64) -> bool {
+    if TABLES_CHANGED.load(Ordering::Acquire) == tables {
+        return true;
+    }
+    let Some(first) = first else {
+        return false;
+    };
+    if BUFFER_CHANGES.load(Ordering::Acquire) == number {
+        return true;
+    }
+    last >= first
+        && last - first < SPAN_MOST
+        && (first..=last).all(|grain| GRAIN_CHANGED[grain as usize % GRAIN_SLOTS].load(Ordering::Acquire) <= number)
 }
 
 /// Since the start: asks answered from a thread's own memory of them
@@ -4583,7 +4673,9 @@ thread_local! {
 /// The most asks a thread remembers before it starts again.
 const FOUND_MOST: usize = 8192;
 
-type Found = crate::fasthash::Map<(u64, u64, bool), std::sync::Weak<Shadow>>;
+/// An answer: the copy, the whole-table count and buffer change number it
+/// was given at ([`find_buckets`]).
+type Found = crate::fasthash::Map<(u64, u64, bool), (std::sync::Weak<Shadow>, u64, u64)>;
 
 thread_local! {
     /// What this thread's asks found, and the count of table changes they
@@ -4595,16 +4687,24 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if !lookup_cache() {
         return lookup_tables(address, len, any);
     }
+    let buckets = find_buckets();
+    // (Read before the tables are: see `register`.)
     let changes = TABLES_CHANGED.load(Ordering::Acquire);
+    let number = BUFFER_CHANGES.load(Ordering::Acquire);
     let found = FOUND.with(|f| {
         let f = &mut *f.borrow_mut();
-        if f.0 != changes {
-            if let Some(map) = &mut f.1 {
-                map.clear();
-            }
-            f.0 = changes;
+        if f.0 != changes
+            && !buckets
+            && let Some(map) = &mut f.1
+        {
+            map.clear();
         }
-        f.1.as_ref()?.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+        f.0 = changes;
+        let (weak, tables, at) = f.1.as_ref()?.get(&(address, len, any))?;
+        let shadow = weak.upgrade()?;
+        let first = (!shadow.window).then_some(shadow.start >> GRAIN_SHIFT);
+        let stands = if buckets { still_stands(*tables, *at, first, address >> GRAIN_SHIFT) } else { *tables == changes };
+        stands.then_some(shadow)
     });
     if let Some(shadow) = found {
         if !shadow.window {
@@ -4631,12 +4731,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let f = &mut *f.borrow_mut();
         // (From the count read before the tables were: a change since
         // clears it at the next ask.)
-        if f.0 == changes {
+        if f.0 == changes || buckets {
             let map = f.1.get_or_insert_with(Default::default);
             if map.len() >= FOUND_MOST {
                 map.clear();
             }
-            map.insert((address, len, any), Arc::downgrade(&shadow));
+            map.insert((address, len, any), (Arc::downgrade(&shadow), changes, number));
         }
     });
     Some(shadow)
@@ -5029,6 +5129,111 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     map.insert((start, len), shadow.clone());
     tables_changed();
     Some(shadow)
+}
+
+#[cfg(test)]
+mod find_bucket_tests {
+    use std::sync::Arc;
+
+    /// A xorshift generator: the same sequence in every run.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// Random registrations, releases and asks over buffers that overlap,
+    /// nest and share starts: with the thread's memory by grains, every
+    /// answer is the one the tables give (after zocram4cc 40e3525ed's test).
+    /// Addresses of the test's own, never read.
+    #[test]
+    fn answers_by_grain_match_the_tables_through_random_changes() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        super::TEST_LOOKUP_CACHE.set(true);
+        super::TEST_BUCKETS.set(true);
+        const BASE: u64 = 0x6a00_0000_0000;
+        const KIB: u64 = 1 << 10;
+        const LENS: [u64; 5] = [4 * KIB, 16 * KIB, 64 * KIB, 256 * KIB, 1024 * KIB];
+        for seed in [0x2545_F491_4F6C_DD1Du64, 0x9E37_79B9_7F4A_7C15] {
+            let mut rng = Rng(seed);
+            let mut live: Vec<(usize, u64)> = Vec::new();
+            let mut next = 0x7e59_0000usize + (seed as usize & 0xff) * 0x1000;
+            let mut asks: Vec<(u64, u64)> = Vec::new();
+            for step in 0..1500 {
+                match rng.below(10) {
+                    0..=2 => {
+                        let start = BASE + rng.below(64) * 16 * KIB;
+                        let len = LENS[rng.below(LENS.len() as u64) as usize];
+                        super::register(next, start, len);
+                        live.push((next, start));
+                        next += 1;
+                    }
+                    3 if !live.is_empty() => {
+                        let (resource, start) = live.swap_remove(rng.below(live.len() as u64) as usize);
+                        super::unregister(resource, start);
+                    }
+                    _ => {
+                        let ask = if !asks.is_empty() && rng.below(2) == 0 {
+                            asks[rng.below(asks.len() as u64) as usize]
+                        } else {
+                            let a = (BASE + rng.below(1536) * KIB, [1u64, 64, 4096][rng.below(3) as usize]);
+                            asks.push(a);
+                            a
+                        };
+                        let cached = super::lookup(ask.0, ask.1, false);
+                        let tables = super::lookup_tables(ask.0, ask.1, false);
+                        let same = match (&cached, &tables) {
+                            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        assert!(same, "seed {seed:#x} step {step}: ask {:#x}+{} answered from memory with another copy", ask.0, ask.1);
+                    }
+                }
+            }
+            for (resource, start) in live {
+                super::unregister(resource, start);
+            }
+        }
+        super::TEST_BUCKETS.set(false);
+        super::TEST_LOOKUP_CACHE.set(false);
+    }
+
+    /// A far change keeps an answer; a covering one replaces it.
+    #[test]
+    fn a_far_change_keeps_an_answer_a_covering_one_does_not() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        super::TEST_LOOKUP_CACHE.set(true);
+        super::TEST_BUCKETS.set(true);
+        const BASE: u64 = 0x6b00_0000_0000;
+        super::register(0x7e5a_0001, BASE, 1 << 16);
+        let first = super::find(BASE + 64, 64).expect("a copy");
+        // Far away (16 MiB up): the answer stands.
+        super::register(0x7e5a_0002, BASE + (16 << 20), 1 << 16);
+        let hits = super::lookups_seen(0);
+        let again = super::find(BASE + 64, 64).expect("the copy");
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(super::lookups_seen(0) > hits, "answered from memory after a far change");
+        // A buffer at the same start that covers the ask (registered after:
+        // found first): the answer goes.
+        super::register(0x7e5a_0003, BASE, 1 << 17);
+        let now = super::find(BASE + 64, 64).expect("a copy");
+        let want = super::lookup_tables(BASE + 64, 64, false).expect("a copy");
+        assert!(Arc::ptr_eq(&now, &want), "the tables' answer, not the remembered one");
+        for (r, s) in [(0x7e5a_0001, BASE), (0x7e5a_0002, BASE + (16 << 20)), (0x7e5a_0003, BASE)] {
+            super::unregister(r, s);
+        }
+        super::TEST_BUCKETS.set(false);
+        super::TEST_LOOKUP_CACHE.set(false);
+    }
 }
 
 #[cfg(test)]
