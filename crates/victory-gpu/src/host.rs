@@ -504,7 +504,12 @@ mod retire_tests {
             }
         }
         let gone = Arc::new(AtomicBool::new(false));
-        let at = super::retire_with(Flag(gone.clone()), 16).expect("kept, not dropped at once");
+        // Far ahead of anything other tests retire meanwhile (they share the
+        // list): `bury` releases only from the front, so an entry of theirs
+        // with a later count, put in before ours, held ours back at its own
+        // count (seen once in a full run). Nothing anyone retires can be
+        // due later than this one.
+        let at = super::retire_with(Flag(gone.clone()), 1 << 41).expect("kept, not dropped at once");
         assert!(!gone.load(Ordering::SeqCst));
         super::bury(at.saturating_sub(16));
         assert!(!gone.load(Ordering::SeqCst), "dropped before the submissions ahead finished");
