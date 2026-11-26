@@ -1,9 +1,10 @@
 # SWITCHES.md - every switch added since test/all14n, in test/all19
 
 `test/all19` = `test/all18` (ddb959c0e) + merges, in this order, of test/meshclamp (9e5d01b28), test/scrub
-(b9ebab139), test/room1 (f424f55f8) and test/heapw (b3a6e21c2). Left out: test/small3 (its worktree had uncommitted
-changes and no pre-build stamp: its agent was still at work). No new default-on change: every all19 switch is opt-in,
-so the default-on list and the restoring line below are all18's.
+(b9ebab139), test/room1 (f424f55f8, then again to its tip 849247e67) and test/heapw (b3a6e21c2, then again to its tip
+694eb0672). Left out: test/small3 (its worktree had uncommitted changes and no pre-build stamp: its agent was still
+at work). One new default-on change, `VICTORY_AMBIENT_SETTLE` (row 20 below); it acts only with `VICTORY_AMBIENT`
+set, so a run with nothing set behaves as all18.
 
 `test/all18` = `test/all17` (8cc48702e) + merges, in this order, of test/bake2 (53231fab3), test/variants
 (69b26a019), test/ambient (8d5dd30df), test/speed2 (588ca3b52), test/light1 (987d937cb) and test/tables
@@ -44,9 +45,10 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | 17 | `VICTORY_BAKE_WIDE` is full (the bake's care also goes to three more ped-bake pixel shaders, the ped baker's geometry stages and the bake's shape) | test/bake2 087bca876 (all18) | `VICTORY_BAKE_WIDE=0` |
 | 18 | `VICTORY_CLEAR_CHECKED` is on (a slot found unmapped is made null only while the write looked at is still the queued one) | test/bake2 53231fab3 (all18) | `VICTORY_CLEAR_CHECKED=0` |
 | 19 | `VICTORY_TARGET_VARIANTS` is on (a draw into render targets of other formats than its pipeline declares gets a host pipeline made for the bound formats) | test/variants 7c52fed2b (all18) | `VICTORY_TARGET_VARIANTS=0` |
+| 20 | `VICTORY_AMBIENT_SETTLE` is 250,3 (with `VICTORY_AMBIENT` only: the stand-in's mean of the light around follows by the clock, a jump taken at once; before: 0.04 a frame) | test/room1 4ef159e3f (all19) | `VICTORY_AMBIENT_SETTLE=0` |
 
-Everything restored (all15b behaviour, one line; all18 added the last three before the cache key):
-`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_SHADER_CACHE_KEY=exe`
+Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE):
+`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_SHADER_CACHE_KEY=exe`
 (leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
 entries a build finds. Five of these change translated code - LOOP_EXITS and the four lane fixes of test/loops2,
 343 compute programs by its agent's count - so a run with them restored needs a warm of its own.)
@@ -66,6 +68,8 @@ diagnostics-build switch).
 |---|---|---|---|---|---|
 | `VICTORY_MESH_CLAMP_IN_DRAW` | `1`; `2` also one wait for every shader write before a launched record when a dispatch or a storing draw came since the last such wait | off | every mesh pipeline gets an amplification stage of ours (`launch.hlsl`) that reads the title's indirect mesh record where its passes wrote it, bounds it as the clamp does (65,535 groups, the list's budget) and launches the mesh groups: a single indirect mesh record needs no clamp pass and none of its two waits; calls with a count buffer or several records keep the clamp on the same pipeline made without the stage | test/meshclamp 9e5d01b28 (fablinoo/kelvaroq patch 0041) | YES (every mesh shader declares a 4-byte payload; in the cache key) |
 | `VICTORY_NAN_GUARD` (new values) | `scrub`: every NaN and both infinities become 0 in pixel colour exports and image stores of every stage; `scrub-exports`: colour exports alone (`1` and `stores` as before) | off | NaN/infinity scrubbing that also catches NVIDIA's NaN 0x7FFFFFFF and does not leave +-65504 for the bloom; under `scrub` an image store through an integer view also turns words 0x7F800000-0x7FFFFFFF and 0xFF800000-0xFFFFFFFF (-1 among them) into 0 | test/scrub b9ebab139 (trustno1-coder 77e13a974) | YES (the raw value is in the key) |
+| `VICTORY_AMBIENT_SETTLE` | `<ms>[,<jump>[,<fresh s>]]`; `0` as before (0.04 a frame) | ON: `250,3` (read only with `VICTORY_AMBIENT`) | the stand-in's slow mean of the light around follows with a time constant of <ms>; a change by more than <jump> either way (a new room) is taken at once, and for <fresh> seconds after it the title's leftover light is bounded by the estimate itself | test/room1 4ef159e3f (avatarmanz b4ba4bbb3, 9576c45f1) | no (the stand-in's own HLSL: 15 root constants) |
+| `VICTORY_AMBIENT_REFLECT` | a multiple of the light around | off (read only with `VICTORY_AMBIENT`) | after CS_UpdateHistory (found by name), every reflection brighter than that multiple of the light around is scaled down to it (the sky's unoccluded glaze on glossy floors indoors) | test/room1 f87637a03, 849247e67 (Belobug 44dcd4371) | no (a pass of ours) |
 | `VICTORY_AMBIENT_MOST` | a multiple; `0` the estimate replaces the title's output everywhere | unset: 4 (as before) | with `VICTORY_AMBIENT`: how much of what the title left in the resolve's diffuse light image the stand-in keeps, as a multiple of its estimate (the house bedroom's foliage picture and dark blocks are such leftovers) | test/room1 f424f55f8 (darkworldhm 08fdf0b47, idea only) | no |
 | `VICTORY_HEAP_WORKER` | `1` | off | the pass over textures picked by index runs on a worker thread of its own into upload lists that the next submission with flights sent ahead runs before the title's lists (slots made under one lock with that submission; a slot rewritten meanwhile is refused and due again); bake draws still upload on the recording thread. Refused with a warning without `VICTORY_RELAY` or `VICTORY_LATE_WAIT` | test/heapw 6f257f5f7, b3a6e21c2 (fxceless d4a528ba0, PR #1007) | no |
 
