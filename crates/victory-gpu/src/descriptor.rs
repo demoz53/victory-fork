@@ -857,6 +857,87 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Whether a placed view leaves out the words of its two descriptions that
+/// the title does not write (on by default; `VICTORY_PLACED_PADDING=0`:
+/// every word as the title passed it, as before).
+///
+/// The title leaves padding unwritten: words 1 and 13 of the 56-byte
+/// resource description (after `dimension`, and at the end), and of the
+/// view description the word after a shader resource view's component
+/// mapping (its union starts on 8 bytes) and the union's words the view's
+/// dimension does not use. A placed view is named in its record by its
+/// shape, both descriptions without the address ([`shape_of`]), so the same
+/// view of the same texture was a new shape at each write: our play log
+/// vf-play-6 counted 566 shapes at its start and 649,425 after 18 minutes
+/// (some 550 a second, no plateau). Once all [`SHAPES`] are taken every
+/// placed view becomes a table entry kept for the run (TaynanGT/Vice-Tay:
+/// 34.9 million entries, 16.7 GB at 70 minutes, preparation doubled).
+fn placed_padding() -> bool {
+    #[cfg(test)]
+    if TEST_RAW_PADDING.with(std::cell::Cell::get) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_PADDING").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: placed views keep every word on this thread (as
+    /// `VICTORY_PLACED_PADDING=0`).
+    static TEST_RAW_PADDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A placed resource description with its padding words (1 and 13) zero
+/// ([`placed_padding`]). After TaynanGT/Vice-Tay f07e54a2b (from
+/// JMAN730/project-flamingo b1e0cd1d); our texture key already did this
+/// (`crate::resource::placed_desc_key`).
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    let mut d = words(desc)?;
+    if placed_padding() {
+        (d[1], d[13]) = (0, 0);
+    }
+    Some(d)
+}
+
+/// A placed view description with the words its kind does not use zero
+/// ([`placed_padding`]). Words 0-9 are the PC's view description: for a
+/// shader resource view the format, the dimension, the component mapping,
+/// a word of padding and the union's six words; for an unordered access
+/// view the format, the dimension and the union's eight words. Each
+/// dimension uses the head of the union (`D3D12_BUFFER_SRV`,
+/// `D3D12_TEX2D_SRV` and the like say how many words). Words 10 and on
+/// (the address and the console's own fields) are kept; so is every word
+/// of an unknown dimension, and of a texture dimension on a buffer
+/// resource (`resource_dimension` 1), which is no view the PC knows.
+/// After TaynanGT/Vice-Tay ce914907f, whose run counted 131,392 values of
+/// word 3 and 36,413 of word 9 in a million shapes.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool, resource_dimension: u32) -> Option<[u32; 16]> {
+    let mut d = words(desc)?;
+    if !placed_padding() {
+        return Some(d);
+    }
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: unknown, buffer, 1D, 1D array, 2D, 2D array,
+        // 2D MS, 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(d[1] as usize).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: unknown, buffer, 1D, 1D array, 2D, 2D array,
+        // 2D MS, 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(d[1] as usize).copied())
+    };
+    let texture_on_buffer = resource_dimension == 1 && d[1] != 1;
+    if let Some(used) = used.filter(|_| d[1] != 0 && !texture_on_buffer) {
+        if !unordered {
+            d[3] = 0;
+        }
+        d[start + used..10].fill(0);
+    }
+    Some(d)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -866,7 +947,9 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let Some(resource) = placed_resource_words(resource)
+        && let Some(desc) = placed_view_words(desc, false, resource[0])
+    {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -877,7 +960,9 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let Some(resource) = placed_resource_words(resource)
+        && let Some(desc) = placed_view_words(desc, true, resource[0])
+    {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1105,6 +1190,92 @@ mod tests {
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
     }
 
+    /// The same placed view written again and again with other garbage in
+    /// the words the title leaves unwritten (resource words 1 and 13, the
+    /// view's padding word and its union's unused tail) is one shape and
+    /// one record; a used word still tells views apart; with the padding
+    /// kept (`VICTORY_PLACED_PADDING=0`) every write was a new shape.
+    #[test]
+    fn placed_views_ignore_their_padding() {
+        if !inline() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        // SAFETY: a slot of 32 bytes above.
+        let record_words = || unsafe { *(at as *const [u32; 3]) };
+        // A 2D texture (dimension 3) no other test uses.
+        let mut resource: [u32; 14] = [3, 0, 0x1_0000, 0, 0x1234_0400, 0, 0x400, 0x10001, 28, 1, 0, 0, 0, 0];
+        let shapes = |r: &[u32; 14]| {
+            let mut clean = *r;
+            (clean[1], clean[13]) = (0, 0);
+            VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == clean).count()
+        };
+        // A 2D texture SRV: format, dimension 4, mapping, pad, then four
+        // used words (most detailed mip, mip levels, plane, min LOD clamp),
+        // two unused; the address in 10-11.
+        let mut srv: [u32; 16] = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x4940_0000, 0xd, 0, 0, 0, 0];
+        // A 2D texture UAV: format, dimension 4, mip slice, plane, six unused.
+        let mut uav: [u32; 16] = [28, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0x4940_0000, 0xd, 0, 0, 0, 0];
+        let clean_srv = srv;
+        create_placed_srv(null, &resource, &srv, at);
+        let first = record_words();
+        let before = shapes(&resource);
+        for n in 1..5_000u32 {
+            (resource[1], resource[13]) = (n.wrapping_mul(0x9e37_79b9), !n);
+            (srv[3], srv[8], srv[9]) = (n, n << 7, n ^ 0x5555);
+            create_placed_srv(null, &resource, &srv, at);
+            assert_eq!(record_words(), first, "write {n}: the same record");
+            (uav[6], uav[9]) = (n, !n);
+            create_placed_uav(null, &resource, &uav, at);
+        }
+        assert_eq!(shapes(&resource), before + 1, "one more shape: the unordered one");
+        let mut clean = resource;
+        (clean[1], clean[13]) = (0, 0);
+        create_placed_srv(null, &resource, &srv, at);
+        assert_eq!(view(at), Some(View::Placed(false, clean, clean_srv)));
+        // A used word (the mip levels) counts.
+        srv[5] = 2;
+        create_placed_srv(null, &resource, &srv, at);
+        assert_ne!(record_words(), first);
+        // Kept as passed: each garbage is a shape of its own.
+        TEST_RAW_PADDING.set(true);
+        let raw = shapes(&resource);
+        for n in 0..10u32 {
+            srv[9] = 0xabc0_0000 + n;
+            create_placed_srv(null, &resource, &srv, at);
+        }
+        TEST_RAW_PADDING.set(false);
+        assert!(VIEWS.read().unwrap().shapes.len() >= raw + 10);
+    }
+
+    /// The words each dimension uses: a buffer SRV keeps five of its union
+    /// (first element, count, stride, flags), an unknown dimension and a
+    /// texture dimension on a buffer resource keep every word.
+    #[test]
+    fn view_words_by_dimension() {
+        let buffer_srv: [u32; 16] = [0, 1, 0x1688, 7, 16, 0, 64, 16, 1, 9, 10, 11, 12, 13, 14, 15];
+        let d = placed_view_words(&buffer_srv, false, 1).unwrap();
+        assert_eq!(d, [0, 1, 0x1688, 0, 16, 0, 64, 16, 1, 0, 10, 11, 12, 13, 14, 15]);
+        let buffer_uav: [u32; 16] = [0, 1, 16, 0, 64, 16, 0, 0, 1, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(
+            placed_view_words(&buffer_uav, true, 1).unwrap(),
+            [0, 1, 16, 0, 64, 16, 0, 0, 1, 0, 10, 11, 12, 13, 14, 15]
+        );
+        let unknown: [u32; 16] = std::array::from_fn(|k| k as u32 + 1);
+        let mut unknown = unknown;
+        unknown[1] = 40;
+        assert_eq!(placed_view_words(&unknown, false, 3).unwrap(), unknown);
+        let mut on_buffer = buffer_srv;
+        on_buffer[1] = 4;
+        assert_eq!(placed_view_words(&on_buffer, false, 1).unwrap(), on_buffer);
+        let resource: [u32; 14] = std::array::from_fn(|k| k as u32 + 1);
+        let r = placed_resource_words(&resource).unwrap();
+        assert_eq!((r[1], r[13]), (0, 0));
+        assert_eq!(r[2..13], resource[2..13]);
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
@@ -1173,7 +1344,8 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // (Its padding words 1 and 13 zero: the view is recorded as passed.)
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
