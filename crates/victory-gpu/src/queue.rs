@@ -1244,6 +1244,13 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// The title's presents so far (each call of its present counts once,
+/// inside the call, before its picture is shown): the frame count of `VICTORY_KEYS_FILE`'s frame holds and of the
+/// window title.
+pub fn presents() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 /// Shows the planes in our window. One plane (or
 /// `VICTORY_COMPOSE_PLANES=0`): its first resource, copied as it is.
 /// Several (Series S: the game image under the interface): composed, each

@@ -12059,7 +12059,10 @@ impl Meter {
         let run = RUN.get_or_init(|| {
             std::env::var("VICTORY_RUN_NAME").map(|n| format!("[{n}] ")).unwrap_or_default()
         });
-        let text = format!(" | VIctory {run}{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(
+            " | VIctory {run}{fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame frame {}",
+            crate::queue::presents()
+        );
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

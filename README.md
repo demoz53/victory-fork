@@ -225,7 +225,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_KEYS_FILE=<file>` | each line appended to the file while the title runs (`Enter`, `Down`, `X`, ...) is pressed once, focus or not; lines already there are skipped. `<key> <ms>` holds it that long (at most 60000), for stick moves at low frame rates (`L 1500`) |
+| `VICTORY_KEYS_FILE=<file>` | each line appended to the file while the title runs (`Enter`, `Down`, `X`, ...) is pressed once, focus or not; lines already there are skipped. `<key> <ms>` holds it that long (at most 60000), for stick moves at low frame rates (`L 1500`); `<key>+<key> <ms>` holds them together and `wait <ms>` holds none. `<keys> <n>f` and `wait <n>f` (n 1-6000) hold for exactly n of the title's frames (its presents) whatever a frame takes, so a route walks the same distance on a faster build; a frame hold ends with a warning after 30 s without a frame. Timed and frame lines play back to back. Each time the queue runs dry after one, the log says `scripted keys: done (<n> lines, <f> frames held, <ms> ms held)`. The window title ends in `frame <n>`, the presents so far |
 | `VICTORY_RUN_NAME=<text>` | shown in the window title before the frame rate, to tell test runs apart on screen |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |

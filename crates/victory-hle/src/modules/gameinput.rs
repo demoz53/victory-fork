@@ -350,6 +350,10 @@ unsafe impl Sync for Hub {}
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// The title's presents when the last poll began ([`Hub::fresh`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+static POLLED_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Microseconds, the clock of every timestamp we hand out.
 fn now() -> u64 {
     START.elapsed().as_micros() as u64
@@ -401,13 +405,38 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let events = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            self.poll_from(source.as_mut())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
+    }
+
+    /// Reads `source` into the readings, the source's lock held throughout
+    /// (polls come one at a time, so an older look never lands after a
+    /// newer one); the callbacks to run are returned.
+    fn poll_from(&self, source: &mut dyn Source) -> Vec<Event> {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        POLLED_FRAME.store(victory_gpu::queue::presents(), Ordering::Relaxed);
+        let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+        let keys = source.keys();
+        self.state().poll(&self.devices, pads, keys)
+    }
+
+    /// Before a title read while `VICTORY_KEYS_FILE` plays: a poll now when
+    /// the title presented since the last poll began, so the first read of
+    /// a frame sees the scripted keys of that frame (not those of up to one
+    /// poll interval before); `read` then notes the read's frame, under the
+    /// source's lock. Callbacks of such a poll wait for the poll thread.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn fresh(&self, read: impl FnOnce(u64)) {
+        let mut source = lock(&self.source);
+        let frame = victory_gpu::queue::presents();
+        if POLLED_FRAME.load(Ordering::Relaxed) != frame {
+            let events = self.poll_from(source.as_mut());
+            self.state().pending.extend(events);
+        }
+        read(frame);
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -593,6 +622,10 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if host::scripting() {
+        hub.fresh(host::title_read);
+    }
     let state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
@@ -1169,6 +1202,472 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// The lines of `VICTORY_KEYS_FILE` and how they play: by time, or by the
+/// title's frames.
+///
+/// The title advances its world by min(frame time, 1/15 s) a frame, and our
+/// frames take longer than 1/15 s, so what a held key does depends on how
+/// many frames it is held, not on how many milliseconds: `<keys> <n>f` and
+/// `wait <n>f` count frames. A frame is one present of the title
+/// (`victory_gpu::queue::presents`), counted by the caller; the counter
+/// value a title read sees is its frame.
+///
+/// Exactness: a frame line holds its keys exactly while the counter is in
+/// `start..start + n`, so the title sees them in every read whose counter is
+/// in that range, and in no other. With one simulation step per present and
+/// a step's reads between its two presents (the counter is then the same in
+/// all the reads of one step, and one more in the next step's), that is n
+/// consecutive steps. Both edges sit on counter values, never on the time
+/// a line is reached: a line started while the title has already read in
+/// this frame starts at the next frame (it would have lost this one), and
+/// one started before the frame's first read starts in this frame; a line
+/// right after a frame line starts at the counter value where that one
+/// ended, so no step falls between them. `Hub::fresh` makes the first read
+/// after a present see the state of the new counter value.
+#[cfg(any(test, feature = "diagnostics"))]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+mod script {
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    /// How long a bare `<key>` line holds, and the pause after it.
+    pub(super) const HOLD: Duration = Duration::from_millis(200);
+    /// A frame line ends when the counter has not moved for this long in it.
+    pub(super) const STILL: Duration = Duration::from_secs(30);
+    /// The most frames one line may hold.
+    pub(super) const MOST_FRAMES: u32 = 6000;
+    /// The longest millisecond hold of one line.
+    const MOST_MS: u64 = 60_000;
+    /// The most "the title read nothing in a frame" warnings per run.
+    const SKIP_WARNINGS: u32 = 20;
+
+    /// A key name of `VICTORY_KEYS` / `VICTORY_KEYS_FILE` as a virtual key.
+    pub(super) fn key_code(key: &str) -> Option<u8> {
+        Some(match key.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
+    /// How long a line holds.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Hold {
+        /// `<key>`: 0.2 s, then 0.2 s of nothing.
+        Bare,
+        /// `<keys> <ms>`: that long, the next line at once.
+        Ms(Duration),
+        /// `<keys> <n>f`: n frames, the next line at once.
+        Frames(u32),
+    }
+
+    /// One line of the keys file: the keys held together (none for `wait`).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Line {
+        pub(super) keys: Vec<u8>,
+        pub(super) hold: Hold,
+    }
+
+    /// `<key>`, `<key>+<key>... <ms>`, `wait <ms>`, `<key>+... <n>f` or
+    /// `wait <n>f` (ms at most 60000, n from 1 to 6000); `None` for anything
+    /// else.
+    pub(super) fn parse(line: &str) -> Option<Line> {
+        let mut words = line.split_whitespace();
+        let key = words.next()?;
+        let count = words.next();
+        if words.next().is_some() {
+            return None;
+        }
+        let hold = match count {
+            None => Hold::Bare,
+            Some(count) => match count.strip_suffix('f') {
+                Some(n) => Hold::Frames(
+                    n.parse::<u32>().ok().filter(|n| (1..=MOST_FRAMES).contains(n))?,
+                ),
+                None => Hold::Ms(Duration::from_millis(
+                    count.parse::<u64>().ok().filter(|&ms| ms <= MOST_MS)?,
+                )),
+            },
+        };
+        // `wait` holds nothing; otherwise every key of `a+b+...` must be known.
+        let keys = if key == "wait" && hold != Hold::Bare {
+            Vec::new()
+        } else {
+            key.split('+').map(key_code).collect::<Option<Vec<u8>>>()?
+        };
+        Some(Line { keys, hold })
+    }
+
+    /// When the line held now ends.
+    #[derive(Clone, Copy, Debug)]
+    enum End {
+        /// A bare or timed line: at this time; whether 0.2 s of nothing follows.
+        At(Instant, bool),
+        /// A frame line: held while the counter is in `start..end`; `since`
+        /// is when it was taken from the queue.
+        Frames { start: u64, end: u64, since: Instant },
+    }
+
+    /// What the lines played since the queue last ran dry did.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Done {
+        /// Lines played.
+        pub(super) lines: u64,
+        /// Frames held by frame lines (keys or `wait`).
+        pub(super) frames: u64,
+        /// Milliseconds held by bare and timed lines (keys or `wait`).
+        pub(super) ms: u64,
+    }
+
+    /// The scripted lines: queued, the one held, and what was played.
+    pub(super) struct Player {
+        queue: VecDeque<Line>,
+        held: Option<(Vec<u8>, End)>,
+        /// The next line may start then (after a bare line's pause).
+        free_at: Instant,
+        /// The frame line just ended at this counter value, with nothing between.
+        chain: Option<u64>,
+        /// The counter at the title's latest read.
+        read: Option<u64>,
+        /// The counter's value and when it took it.
+        moved: (u64, Instant),
+        /// Since the queue last ran dry, and whether a timed or frame line was among them.
+        played: Done,
+        timed: bool,
+        skip_warnings: u32,
+    }
+
+    impl Player {
+        pub(super) fn new(now: Instant) -> Player {
+            Player {
+                queue: VecDeque::new(),
+                held: None,
+                free_at: now,
+                chain: None,
+                read: None,
+                moved: (0, now),
+                played: Done::default(),
+                timed: false,
+                skip_warnings: 0,
+            }
+        }
+
+        pub(super) fn push(&mut self, line: Line) {
+            self.queue.push_back(line);
+        }
+
+        /// The title read its input while the counter was `frame`.
+        pub(super) fn read(&mut self, frame: u64) {
+            if let Some(last) = self.read
+                && frame > last + 1
+                && let Some((_, End::Frames { start, end, .. })) = &self.held
+                && last + 1 < *end
+                && frame > *start
+                && self.skip_warnings < SKIP_WARNINGS
+            {
+                self.skip_warnings += 1;
+                tracing::warn!(
+                    from = last + 1,
+                    to = frame - 1,
+                    "VICTORY_KEYS_FILE: the title read no input in these frames of a frame hold (it counts them as held)"
+                );
+            }
+            self.read = Some(self.read.map_or(frame, |last| last.max(frame)));
+        }
+
+        /// The keys held at `now` with the counter at `frame`.
+        pub(super) fn tick(&mut self, now: Instant, frame: u64) -> Vec<u8> {
+            self.step(now, frame).0
+        }
+
+        /// As [`Player::tick`], with the counts of the lines played when the
+        /// queue just ran dry after a timed or frame line (logged here too).
+        pub(super) fn step(&mut self, now: Instant, frame: u64) -> (Vec<u8>, Option<Done>) {
+            if frame != self.moved.0 {
+                self.moved = (frame, now);
+            }
+            let mut done = None;
+            // A line that ends at once (`W 0`) lets the next one start in the same look.
+            for _ in 0..=self.queue.len() {
+                if let Some((_, end)) = self.held {
+                    match end {
+                        End::At(until, gap) if now >= until => {
+                            self.held = None;
+                            self.free_at = if gap { until + HOLD } else { until };
+                            self.chain = None;
+                        }
+                        End::Frames { end, .. } if frame >= end => {
+                            self.held = None;
+                            self.free_at = now;
+                            // Back to back only with a line waiting.
+                            self.chain = (!self.queue.is_empty()).then_some(end);
+                        }
+                        End::Frames { start, end, since }
+                            if now.duration_since(self.moved.1.max(since)) >= STILL =>
+                        {
+                            let held = (frame + 1).saturating_sub(start).min(end - start);
+                            tracing::warn!(
+                                held,
+                                frames = end - start,
+                                frame,
+                                "VICTORY_KEYS_FILE: no frame was presented for 30 s in a frame hold; it ends"
+                            );
+                            self.played.frames -= (end - start) - held;
+                            self.held = None;
+                            self.free_at = now;
+                            self.chain = None;
+                        }
+                        _ => break,
+                    }
+                }
+                if self.held.is_none()
+                    && now >= self.free_at
+                    && let Some(line) = self.queue.pop_front()
+                {
+                    self.played.lines += 1;
+                    let end = match line.hold {
+                        Hold::Bare | Hold::Ms(_) => {
+                            let hold = match line.hold {
+                                Hold::Ms(ms) => {
+                                    self.timed = true;
+                                    ms
+                                }
+                                _ => HOLD,
+                            };
+                            self.played.ms += hold.as_millis() as u64;
+                            // Back to back: start where the last one ended when it ended moments ago, so a
+                            // long recording does not drift by a poll each line.
+                            let start = if now.duration_since(self.free_at) < Duration::from_millis(50) {
+                                self.free_at
+                            } else {
+                                now
+                            };
+                            End::At(start + hold, line.hold == Hold::Bare)
+                        }
+                        Hold::Frames(n) => {
+                            self.timed = true;
+                            self.played.frames += u64::from(n);
+                            // Right after a frame line: where it ended. Else this frame, unless the title
+                            // has read in it already: then the next.
+                            let start = self.chain.unwrap_or(if self.read == Some(frame) { frame + 1 } else { frame });
+                            End::Frames { start, end: start + u64::from(n), since: now }
+                        }
+                    };
+                    self.chain = None;
+                    self.held = Some((line.keys, end));
+                    continue;
+                }
+                break;
+            }
+            if self.held.is_none() && self.queue.is_empty() && self.played.lines > 0 {
+                let played = std::mem::take(&mut self.played);
+                if std::mem::take(&mut self.timed) {
+                    tracing::info!(
+                        "scripted keys: done ({} lines, {} frames held, {} ms held)",
+                        played.lines,
+                        played.frames,
+                        played.ms
+                    );
+                    done = Some(played);
+                }
+            }
+            let keys = match &self.held {
+                Some((_, End::Frames { start, .. })) if frame < *start => Vec::new(),
+                Some((keys, _)) => keys.clone(),
+                None => Vec::new(),
+            };
+            (keys, done)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn line(text: &str) -> Line {
+            parse(text).unwrap_or_else(|| panic!("{text} does not parse"))
+        }
+
+        #[test]
+        fn lines_parse_in_every_form() {
+            assert_eq!(line("Enter"), Line { keys: vec![0x0D], hold: Hold::Bare });
+            assert_eq!(
+                line("W+L 1500"),
+                Line { keys: vec![b'W', b'L'], hold: Hold::Ms(Duration::from_millis(1500)) }
+            );
+            assert_eq!(line("wait 300"), Line { keys: vec![], hold: Hold::Ms(Duration::from_millis(300)) });
+            assert_eq!(line("w 20f"), Line { keys: vec![b'W'], hold: Hold::Frames(20) });
+            assert_eq!(line("W+A+Up 1f"), Line { keys: vec![b'W', b'A', 0x26], hold: Hold::Frames(1) });
+            assert_eq!(line("wait 6000f"), Line { keys: vec![], hold: Hold::Frames(6000) });
+            assert_eq!(line("  D   7f  "), Line { keys: vec![b'D'], hold: Hold::Frames(7) });
+            assert_eq!(line("W 60000").hold, Hold::Ms(Duration::from_millis(60_000)));
+        }
+
+        #[test]
+        fn bad_lines_are_refused() {
+            for bad in [
+                "W 0f", "W 6001f", "W f", "W -3f", "W 2.5f", "W 20F", "W 20ff", "W 20 f", "wait 0f",
+                "wait", "W 60001", "W x", "Foo 20f", "W+ 20f", "wait+W 20f", "W 20f extra", "",
+            ] {
+                assert_eq!(parse(bad), None, "{bad:?}");
+            }
+        }
+
+        /// Plays `lines` with the counter going up by one every 113 ms (a
+        /// read 5 ms after each present, polls every 8 ms between), and
+        /// returns what each frame's read saw.
+        fn play(lines: &[&str], frames: u64, frame_ms: u64) -> (Vec<Vec<u8>>, Vec<Done>) {
+            let t0 = Instant::now();
+            let mut p = Player::new(t0);
+            for l in lines {
+                p.push(line(l));
+            }
+            let mut seen = Vec::new();
+            let mut done = Vec::new();
+            for frame in 0..frames {
+                let base = frame * frame_ms;
+                let mut ms = base;
+                // The read: at a fresh look, then noted.
+                ms += 5;
+                let (keys, d) = p.step(t0 + Duration::from_millis(ms), frame);
+                done.extend(d);
+                p.read(frame);
+                seen.push(keys);
+                // The poll thread's looks until the next present.
+                while ms + 8 < base + frame_ms {
+                    ms += 8;
+                    let (_, d) = p.step(t0 + Duration::from_millis(ms), frame);
+                    done.extend(d);
+                }
+            }
+            (seen, done)
+        }
+
+        fn held(seen: &[Vec<u8>], key: u8) -> Vec<usize> {
+            seen.iter().enumerate().filter(|(_, k)| k.contains(&key)).map(|(i, _)| i).collect()
+        }
+
+        #[test]
+        fn a_frame_line_holds_exactly_its_frames_at_any_frame_time() {
+            for frame_ms in [17, 113, 145, 170, 400] {
+                let (seen, _) = play(&["W 20f"], 60, frame_ms);
+                let frames = held(&seen, b'W');
+                assert_eq!(frames.len(), 20, "{frame_ms} ms a frame: {frames:?}");
+                assert_eq!(frames.last().unwrap() - frames[0], 19, "consecutive");
+            }
+        }
+
+        #[test]
+        fn back_to_back_lines_leave_no_frame_between() {
+            let (seen, done) = play(&["W 20f", "D 3f", "wait 2f", "A 1f", "S 300", "L 4f"], 80, 113);
+            let w = held(&seen, b'W');
+            let d = held(&seen, b'D');
+            let a = held(&seen, b'A');
+            let s = held(&seen, b'S');
+            let l = held(&seen, b'L');
+            assert_eq!((w.len(), d.len(), a.len(), l.len()), (20, 3, 1, 4));
+            assert_eq!(d[0], w[19] + 1);
+            // Two frames of nothing, then A.
+            assert!(seen[d[2] + 1].is_empty() && seen[d[2] + 2].is_empty());
+            assert_eq!(a[0], d[2] + 3);
+            // The timed line follows A at once; L starts at the first frame step after it.
+            assert_eq!(s[0], a[0] + 1);
+            assert_eq!(l[0], s.last().unwrap() + 1);
+            assert_eq!(
+                done,
+                vec![Done { lines: 6, frames: 30, ms: 300 }],
+                "one done line when the queue ran dry"
+            );
+        }
+
+        #[test]
+        fn a_line_reached_after_the_frames_read_starts_at_the_next_frame() {
+            let t0 = Instant::now();
+            let ms = |m| t0 + Duration::from_millis(m);
+            let mut p = Player::new(t0);
+            // Frame 10 is read before the line arrives: frames 11 and 12 hold it.
+            p.step(ms(0), 10);
+            p.read(10);
+            p.push(line("W 2f"));
+            assert_eq!(p.tick(ms(50), 10), Vec::<u8>::new());
+            assert_eq!(p.tick(ms(100), 11), vec![b'W']);
+            p.read(11);
+            assert_eq!(p.tick(ms(200), 12), vec![b'W']);
+            p.read(12);
+            assert_eq!(p.step(ms(300), 13), (Vec::new(), Some(Done { lines: 1, frames: 2, ms: 0 })));
+            // Reached before frame 20's read: frame 20 holds it.
+            p.push(line("W 1f"));
+            assert_eq!(p.tick(ms(400), 20), vec![b'W']);
+            p.read(20);
+            assert_eq!(p.tick(ms(450), 20), vec![b'W']);
+            assert_eq!(p.tick(ms(500), 21), Vec::<u8>::new());
+        }
+
+        #[test]
+        fn a_frame_hold_ends_when_no_frame_comes_for_30_s() {
+            let t0 = Instant::now();
+            let mut p = Player::new(t0);
+            p.push(line("W 100f"));
+            p.push(line("D 1f"));
+            assert_eq!(p.tick(t0, 5), vec![b'W']);
+            p.read(5);
+            assert_eq!(p.tick(t0 + Duration::from_secs(1), 6), vec![b'W']);
+            p.read(6);
+            // The counter stays at 6 (a loading screen).
+            assert_eq!(p.tick(t0 + Duration::from_secs(30), 6), vec![b'W']);
+            let (keys, done) = p.step(t0 + Duration::from_secs(31), 6);
+            // W ended; D starts at the next frame (6 was read).
+            assert_eq!(keys, Vec::<u8>::new());
+            assert_eq!(done, None);
+            assert_eq!(p.tick(t0 + Duration::from_secs(32), 7), vec![b'D']);
+            let (_, done) = p.step(t0 + Duration::from_secs(33), 8);
+            assert_eq!(done, Some(Done { lines: 2, frames: 3, ms: 0 }), "W held frames 5 and 6, D frame 7");
+            // A pending line whose frame never comes ends too.
+            p.read(8);
+            p.push(line("W 5f"));
+            assert_eq!(p.tick(t0 + Duration::from_secs(34), 8), Vec::<u8>::new());
+            let (_, done) = p.step(t0 + Duration::from_secs(64), 8);
+            assert_eq!(done, Some(Done { lines: 1, frames: 0, ms: 0 }));
+        }
+
+        #[test]
+        fn bare_keys_alone_log_no_done_line() {
+            let (seen, done) = play(&["Enter", "X"], 10, 113);
+            assert!(!held(&seen, 0x0D).is_empty() && !held(&seen, b'X').is_empty());
+            assert!(done.is_empty());
+            let (_, done) = play(&["Enter", "W 2f"], 20, 113);
+            assert_eq!(done, vec![Done { lines: 2, frames: 2, ms: 200 }]);
+        }
+
+        #[test]
+        fn the_done_line_comes_each_time_the_queue_runs_dry() {
+            let t0 = Instant::now();
+            let mut p = Player::new(t0);
+            let mut dones = Vec::new();
+            for batch in 0..2u64 {
+                p.push(line("W 2f"));
+                p.push(line("wait 50"));
+                for i in 0..10 {
+                    let frame = batch * 100 + i;
+                    let (_, d) = p.step(t0 + Duration::from_millis(frame * 100), frame);
+                    p.read(frame);
+                    dones.extend(d);
+                }
+            }
+            assert_eq!(dones, vec![Done { lines: 2, frames: 2, ms: 50 }; 2]);
+        }
+    }
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1346,24 +1845,8 @@ mod host {
         down
     }
 
-    /// A key name of `VICTORY_KEYS` / `VICTORY_KEYS_FILE` as a virtual key.
     #[cfg(feature = "diagnostics")]
-    fn key_code(key: &str) -> Option<u8> {
-        Some(match key.trim() {
-            "Enter" => 0x0D,
-            "Esc" => 0x1B,
-            "Tab" => 0x09,
-            "Back" => 0x08,
-            "Up" => 0x26,
-            "Down" => 0x28,
-            "Left" => 0x25,
-            "Right" => 0x27,
-            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                k.as_bytes()[0].to_ascii_uppercase()
-            }
-            _ => return None,
-        })
-    }
+    use super::script::key_code;
 
     /// Debugging aid: `VICTORY_KEYS_FILE=<file>`: every line appended to the
     /// file while the title runs is a key (the names of `VICTORY_KEYS`),
@@ -1375,32 +1858,11 @@ mod host {
     /// `<key>+<key>... <ms>` holds the keys together (a walk while the camera
     /// turns), and `wait <ms>` holds none; a line with its time is followed
     /// by the next one at once, with no 0.2 s between, so a recording
-    /// (`VICTORY_INPUT_RECORD`) plays back as it was pressed.
+    /// (`VICTORY_INPUT_RECORD`) plays back as it was pressed. `<keys> <n>f`
+    /// and `wait <n>f` hold for n of the title's frames instead (its
+    /// presents, [`super::script::Player`]), whatever a frame takes.
     #[cfg(feature = "diagnostics")]
     fn filed() -> Vec<u8> {
-        const HOLD: Duration = Duration::from_millis(200);
-        /// Keys held together, for how long, and whether 0.2 s of nothing follows.
-        type Entry = (Vec<u8>, Duration, bool);
-        struct Filed {
-            path: Option<std::path::PathBuf>,
-            read: Option<u64>,
-            partial: String,
-            polled: Option<Instant>,
-            queue: VecDeque<Entry>,
-            held: Option<(Vec<u8>, Instant, bool)>,
-            free_at: Instant,
-        }
-        static FILED: LazyLock<Mutex<Filed>> = LazyLock::new(|| {
-            Mutex::new(Filed {
-                path: std::env::var_os("VICTORY_KEYS_FILE").map(std::path::PathBuf::from),
-                read: None,
-                partial: String::new(),
-                polled: None,
-                queue: VecDeque::new(),
-                held: None,
-                free_at: Instant::now(),
-            })
-        });
         let mut f = FILED.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(path) = f.path.clone() else {
             return Vec::new();
@@ -1430,31 +1892,12 @@ mod host {
                             if line.is_empty() {
                                 continue;
                             }
-                            // `<key>` or `<key> <ms>`: held 200 ms, or as long as the line says (at most a
-                            // minute). A frame can take longer than 200 ms, so a stick turn needs more.
-                            let mut words = line.split_whitespace();
-                            let key = words.next().unwrap_or_default();
-                            let timed = words.clone().next().is_some();
-                            let hold = match words.next() {
-                                None => Some(HOLD),
-                                Some(ms) => ms
-                                    .parse::<u64>()
-                                    .ok()
-                                    .filter(|&ms| ms <= 60_000)
-                                    .map(Duration::from_millis),
-                            };
-                            // `wait` holds nothing; otherwise every key of `a+b+...` must be known.
-                            let keys: Option<Vec<u8>> = if key == "wait" && timed {
-                                Some(Vec::new())
-                            } else {
-                                key.split('+').map(key_code).collect()
-                            };
-                            match (keys, hold) {
-                                (Some(keys), Some(hold)) if words.next().is_none() => {
+                            match super::script::parse(line) {
+                                Some(parsed) => {
                                     tracing::info!(key = line, "scripted key from VICTORY_KEYS_FILE");
-                                    f.queue.push_back((keys, hold, !timed));
+                                    f.player.push(parsed);
                                 }
-                                _ => tracing::warn!(line, "VICTORY_KEYS_FILE: unknown key, skipped"),
+                                None => tracing::warn!(line, "VICTORY_KEYS_FILE: unknown key, skipped"),
                             }
                         }
                     }
@@ -1464,22 +1907,42 @@ mod host {
                 Some(_) => {}
             }
         }
-        if let Some((_, until, gap)) = f.held
-            && now >= until
-        {
-            f.held = None;
-            f.free_at = if gap { until + HOLD } else { until };
-        }
-        if f.held.is_none()
-            && now >= f.free_at
-            && let Some((keys, hold, gap)) = f.queue.pop_front()
-        {
-            // Back to back: start where the last one ended when it ended moments ago, so a long
-            // recording does not drift by a poll each line.
-            let start = if now.duration_since(f.free_at) < Duration::from_millis(50) { f.free_at } else { now };
-            f.held = Some((keys, start + hold, gap));
-        }
-        f.held.as_ref().map(|(keys, _, _)| keys.clone()).unwrap_or_default()
+        f.player.tick(now, victory_gpu::queue::presents())
+    }
+
+    /// The keys file's state: where it is read to and the lines playing.
+    #[cfg(feature = "diagnostics")]
+    struct Filed {
+        path: Option<std::path::PathBuf>,
+        read: Option<u64>,
+        partial: String,
+        polled: Option<Instant>,
+        player: super::script::Player,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    static FILED: LazyLock<Mutex<Filed>> = LazyLock::new(|| {
+        Mutex::new(Filed {
+            path: std::env::var_os("VICTORY_KEYS_FILE").map(std::path::PathBuf::from),
+            read: None,
+            partial: String::new(),
+            polled: None,
+            player: super::script::Player::new(Instant::now()),
+        })
+    });
+
+    /// Whether `VICTORY_KEYS_FILE` is set: the title's reads then fetch a
+    /// fresh poll at each new frame ([`Hub::fresh`]).
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn scripting() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").is_some());
+        *ON
+    }
+
+    /// The title read its input in frame `frame` (presents so far).
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn title_read(frame: u64) {
+        FILED.lock().unwrap_or_else(PoisonError::into_inner).player.read(frame);
     }
 
     /// The name `VICTORY_KEYS_FILE` takes for a virtual key (the inverse of [`key_code`]).
