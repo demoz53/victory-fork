@@ -456,7 +456,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
 /// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: &[u8]) -> Option<usize> {
+pub(crate) fn clwb_len(code: &[u8]) -> Option<usize> {
     let at = if *code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
     if *code.first()? != 0x66 || code.get(at..at + 2)? != [0x0f, 0xae] {
         return None;
@@ -935,6 +935,14 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     let context = &mut aligned.0;
     frames.push(context.Rip);
     while frames.len() < MAX_FRAMES {
+        // Inside a stub of the CPU rewrite the thread is, as the title's
+        // code has it, at the stub's site: go on from there (the stub has
+        // no unwind data and no return address of its own).
+        if let Some((rip, rsp)) = crate::rewrite::step_out(context.Rip, context.Rsp) {
+            (context.Rip, context.Rsp) = (rip, rsp);
+            frames.push(rip);
+            continue;
+        }
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
         if rsp < low || rsp + 8 > high {
@@ -1138,6 +1146,9 @@ pub(crate) unsafe fn step_reads_fit(
 
 /// `module+rva`, or the bare address.
 pub fn locate(address: usize) -> String {
+    if let Some(stub) = crate::rewrite::stub_at(address) {
+        return format!("{address:#x} (the {} stub of title+{:#x})", stub.kind.name(), stub.rva);
+    }
     module_of(address).unwrap_or_else(|| format!("{address:#x}"))
 }
 
@@ -1201,6 +1212,36 @@ fn memory_at(address: usize) -> String {
     match module_of(address) {
         Some(module) if info.Type == MEM_IMAGE => format!("{protect}, in {module}"),
         _ => protect,
+    }
+}
+
+/// Tests (this module's and the rewrite's): gives `code` to the emulation
+/// as if it faulted at `code[at]` with `context` as the saved state, on any
+/// CPU; returns whether it emulated and leaves the state after in
+/// `context`, its `Rip` counted from the start of `code`.
+#[cfg(test)]
+pub(crate) fn emulate_in(code: &[u8], at: usize, context: &mut CONTEXT) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD;
+    // At a fixed place in a page, so the loops' neighbours are always
+    // read (they are not near a page's edges).
+    #[repr(align(4096))]
+    struct Page([u8; 4096]);
+    let mut page = Box::new(Page([0xcc; 4096]));
+    let bytes = &mut page.0[0x800..];
+    bytes[..code.len()].copy_from_slice(code);
+    context.Rip = bytes.as_ptr() as u64 + at as u64;
+    // SAFETY: a zeroed record is valid; the emulation reads only
+    // `bytes` and writes `context` and the lines the caller owns.
+    unsafe {
+        let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+        record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+        let mut pointers = EXCEPTION_POINTERS {
+            ExceptionRecord: &mut record,
+            ContextRecord: context,
+        };
+        let emulated = emulate_amd_only(&mut pointers);
+        context.Rip -= bytes.as_ptr() as u64;
+        emulated
     }
 }
 
@@ -1676,27 +1717,7 @@ mod tests {
     /// `context` as the saved state, on any CPU; returns whether it
     /// emulated and leaves the state after in `context`.
     fn emulate_in(code: &[u8], at: usize, context: &mut CONTEXT) -> bool {
-        // At a fixed place in a page, so the loops' neighbours are always
-        // read (they are not near a page's edges).
-        #[repr(align(4096))]
-        struct Page([u8; 4096]);
-        let mut page = Box::new(Page([0xcc; 4096]));
-        let bytes = &mut page.0[0x800..];
-        bytes[..code.len()].copy_from_slice(code);
-        context.Rip = bytes.as_ptr() as u64 + at as u64;
-        // SAFETY: a zeroed record is valid; the emulation reads only
-        // `bytes` and writes `context` and the lines the caller owns.
-        unsafe {
-            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
-            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
-            let mut pointers = EXCEPTION_POINTERS {
-                ExceptionRecord: &mut record,
-                ContextRecord: context,
-            };
-            let emulated = emulate_amd_only(&mut pointers);
-            context.Rip -= bytes.as_ptr() as u64;
-            emulated
-        }
+        super::emulate_in(code, at, context)
     }
 
     #[test]
