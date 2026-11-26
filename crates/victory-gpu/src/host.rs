@@ -8639,6 +8639,10 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// Frames presented since the start, and the title's pipeline syncs
+    /// and this count at the last log line (`crate::list::SYNCS`).
+    presented: u64,
+    syncs_logged: [u64; 2],
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -8653,6 +8657,8 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            presented: 0,
+            syncs_logged: [0; 2],
             caption: None,
         }
     }
@@ -8664,6 +8670,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.presented += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9045,6 +9052,23 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            {
+                // Since the start: pipelines made again for the formats bound
+                // at their draws (VICTORY_TARGET_VARIANTS), and the title's
+                // pipeline syncs with the barriers given them
+                // (VICTORY_SYNC_BARRIER).
+                let syncs = crate::list::SYNCS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                let [syncs_then, presented_then] = self.syncs_logged;
+                let per_frame = (syncs[0] - syncs_then) as f64 / (self.presented - presented_then).max(1) as f64;
+                self.syncs_logged = [syncs[0], self.presented];
+                tracing::info!(
+                    "pipelines made for the render target formats bound at their draws: {} so far; the title's pipeline syncs: {per_frame:.1} a frame, {} so far, {} of them given a barrier; structured buffer views that could not be made raw (read zeros on NVIDIA): {} so far",
+                    crate::pipeline::target_variants(),
+                    syncs[0],
+                    syncs[1],
+                    crate::descriptor::host::NOT_RAW.load(Ordering::Relaxed)
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

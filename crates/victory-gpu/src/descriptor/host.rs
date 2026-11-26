@@ -2807,6 +2807,34 @@ type Kept = Option<ID3D12Resource>;
 /// the bytes must start on 16 (the host's raw view alignment) and be whole
 /// dwords. A view that cannot stays structured.
 fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
+    let window = raw_window_of(offset, first, count, stride);
+    if window.is_none() && stride > 0 {
+        not_raw(offset, first, stride);
+    }
+    window
+}
+
+/// Structured buffer views made since the start that could not be raw
+/// ([`raw_window`]: their bytes do not start on 16 in their host copy, or
+/// are not whole dwords): translated shaders read them as raw bytes, which
+/// gives zeros on NVIDIA (avatarmanz/VIctory-7900XTX PR #23 by gomeaw). The
+/// frame line; the first 16 are logged with their stride.
+pub(crate) static NOT_RAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn not_raw(offset: u64, first: u64, stride: u32) {
+    if NOT_RAW.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        tracing::warn!(
+            stride,
+            first,
+            offset,
+            start = first * u64::from(stride) + offset,
+            "a structured buffer view whose bytes do not start on 16 in its host copy stays structured: translated shaders read it as raw bytes, which reads zeros on NVIDIA"
+        );
+    }
+}
+
+/// [`raw_window`] without the count.
+fn raw_window_of(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
     if stride == 0 {
         return None;
     }

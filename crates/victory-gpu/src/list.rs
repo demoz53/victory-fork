@@ -1603,16 +1603,61 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
-/// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
+/// The title's pipeline syncs since the start, and the barriers they were
+/// given (`VICTORY_SYNC_BARRIER=1`): the frame line.
+pub(crate) static SYNCS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a pipeline sync is a barrier on every shader write
+/// (`VICTORY_SYNC_BARRIER=1`; off by default: nothing, as before).
+fn sync_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_some_and(|v| v == "1"))
+}
+
+/// Pipeline syncs (console slots 0x408 and 0x410, 0x418/0x420 in newer
+/// lists): waits for earlier work and cache flushes, at the top or bottom
+/// of the pipe `(flags, control, address, size)`. Every submission is
+/// waited for, so by default there is nothing to do. But a host list does
+/// not order its own dispatches: without a barrier a later one may run
+/// alongside an earlier one and read what it has not written yet. With
+/// `VICTORY_SYNC_BARRIER=1` a sync is one barrier on every shader write, as
+/// the title's barriers are ([`barrier_groups`]). (realblastex/flamingo
+/// a1178ce85, its `FLAMINGO_SYNC_BARRIER`, on there.) The first 16 are
+/// logged with their arguments, and the count is in the frame line.
 /// (With `VICTORY_INDIRECT_BATCH=2` arguments may be what earlier dispatches
-/// wrote from here on: `State::synced`.)
-extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+/// wrote from here on: `State::synced`, with or without the barrier.)
+extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
     #[cfg(windows)]
     if crate::draw::batches() == 2 {
         with_state(this, |_, state| state.synced());
+    }
+    if SYNCS[0].fetch_add(1, Relaxed) < 16 {
+        tracing::info!(
+            flags = format_args!("{flags:#x}"),
+            control = format_args!("{control:#x}"),
+            address = format_args!("{address:#x}"),
+            size,
+            barrier = sync_barrier(),
+            "a pipeline sync from the title (VICTORY_SYNC_BARRIER=1: a barrier on every shader write)"
+        );
+    }
+    if !sync_barrier() {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_COMMAND_LIST_TYPE_COPY, D3D12_RESOURCE_BARRIER};
+        // SAFETY: a live list. (A copy list takes no unordered access barrier.)
+        if unsafe { list.list.GetType() } == D3D12_COMMAND_LIST_TYPE_COPY {
+            return;
+        }
+        // SAFETY: the same layout; no resource named.
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        SYNCS[1].fetch_add(1, Relaxed);
     }
     #[cfg(not(windows))]
     let _ = this;
