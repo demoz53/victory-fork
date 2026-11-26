@@ -1033,13 +1033,11 @@ thread_local! {
     pub(crate) static TEST_FIXES_1126: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Three small arithmetic fixes of 2026-11-26, each a plain bug fix with a test, on unless
+/// Two small arithmetic fixes of 2026-11-26, each a plain bug fix with a test, on unless
 /// `VICTORY_SHADER_FIXES_1126=0`:
 /// - the VOP3 form of `v_fmac_f32` / `v_mac_f32` / `v_mac_legacy_f32` applies abs and neg bit 2
 ///   to its accumulator (TaynanGT/Vice-Tay 8fe3ccddc, Bartosz; also Kamiloj9/victory-dlss
 ///   2b0646d5e): `a*b - d` was translated as `a*b + d`;
-/// - the legacy multiplies take a denormal operand as zero, by its exponent bits
-///   (Marvisak/VIctory #682, Senchsus, 704d25edd);
 /// - the whole-wave simulation reads `v_add_f16`'s inline float constants as halves
 ///   (Marvisak/VIctory #2493, shh, 6cd2489d5).
 pub fn shader_fixes_1126() -> bool {
@@ -1049,6 +1047,21 @@ pub fn shader_fixes_1126() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_FIXES_1126").is_none_or(|v| v != "0"))
+}
+
+/// Whether the legacy multiplies (`v_mul_legacy_f32`, `v_mad_legacy_f32`, `v_mac_legacy_f32`)
+/// take a denormal operand as zero by its exponent bits, as RDNA2 does, instead of a float
+/// compare with 0.0 whose answer depends on the host's denormal mode (a denormal times an
+/// infinity gave NaN where the host keeps denormals). Marvisak/VIctory #682 (Senchsus,
+/// 704d25edd). On; `VICTORY_LEGACY_ZERO_EXP=0` as before. Its own switch: it changes the code
+/// of most programs.
+pub fn legacy_zero_exp() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_FIXES_1126.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_ZERO_EXP").is_none_or(|v| v != "0"))
 }
 
 /// Whether the whole-wave section scan of a block goes on past a saveexec whose restore is not

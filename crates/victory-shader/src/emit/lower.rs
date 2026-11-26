@@ -4392,12 +4392,13 @@ impl<'a> Lower<'a> {
     ///
     /// As on RDNA2 a denormal operand counts as zero too: the test is on the exponent bits,
     /// not a float compare whose answer depends on the host's denormal mode (upstream #682,
-    /// Senchsus, 704d25edd; `VICTORY_SHADER_FIXES_1126`).
+    /// Senchsus, 704d25edd; `VICTORY_LEGACY_ZERO_EXP`, on: it changes most programs, the
+    /// legacy multiplies being everywhere in the title's code).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
-        let (az, bz) = if super::shader_fixes_1126() {
+        let (az, bz) = if super::legacy_zero_exp() {
             let exp = self.s.m.i32(0x7F80_0000);
             let izero = self.s.m.i32(0);
             let is_zero = |l: &mut Self, v: V| {
