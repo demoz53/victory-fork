@@ -429,6 +429,22 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// Whether the compare of the copies in the card's memory (`card.check`)
+/// is sent in an `ExecuteCommandLists` call of its own, right after the
+/// title's lists and before the submission's fence (`VICTORY_CHECK_APART`,
+/// on; `0`: in the same call, as before). A title list can leave a buffer
+/// implicitly promoted (to COPY_DEST, say); buffers decay to COMMON only
+/// between calls, so in the same call the compare, which reads them as
+/// shader resources with no barrier, read them in a state they were not in
+/// (D3D12 error 538 under the debug layer), with no guarantee that the
+/// title's writes were visible to it: a copy judged unchanged when it had
+/// changed. trustno1-coder/VIctory-NVIDIA pull request #1 (d1fe0bd01,
+/// Jeremy Goldberg).
+fn check_apart() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CHECK_APART").is_none_or(|v| v != "0"))
+}
+
 /// Whether what the submitting thread lets go of after its submissions ran
 /// goes to the reaper's thread ([`reap_later`]) instead of being dropped
 /// there (`VICTORY_DROP_LATER=1`; off by default): the objects retired
@@ -7940,8 +7956,16 @@ impl Host {
             settled += settling.elapsed();
         }
         let card = self.card_before(runs, flown);
+        // The compare of the copies in the card's memory follows the
+        // title's lists in an ExecuteCommandLists call of its own
+        // ([`check_apart`]); with `VICTORY_CHECK_APART=0` in the same call.
+        let mut check_alone = None;
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
+            if check_apart() {
+                check_alone = Some([Some(check)]);
+            } else {
+                lists.push(Some(check));
+            }
         }
         // The carried ranges ahead of everything else of the submission,
         // behind the flights that wrote them ([`alias_copy`]).
@@ -7973,6 +7997,9 @@ impl Host {
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
+                if let Some(check) = &check_alone {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
@@ -8046,6 +8073,11 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len()
+                    && let Some(check) = &check_alone
+                {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 awake::sent(&self.device);
                 self.card_sent();
                 let waited = self
