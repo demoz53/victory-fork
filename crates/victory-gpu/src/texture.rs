@@ -793,7 +793,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-        list.defer_texture(staging, false);
+        // With `VICTORY_PRELUDE_UPLOADS=1` what the check finds changed is
+        // uploaded on this list's prelude, not by the next list.
+        let host = if prelude_uploads() { crate::resource::host_copy(resource) } else { None };
+        list.defer_texture(staging, false, host);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -856,10 +859,104 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     UPLOAD_PARTS[1].fetch_add(copies_began.elapsed().as_micros() as u64, Relaxed);
-    list.defer_texture(staging, true);
+    list.defer_texture(staging, true, None);
+}
+
+/// Whether a title texture a list samples without having recorded its
+/// copy (the host copy held the staging buffer's contents when the list
+/// was recorded) is uploaded on that list's prelude when the submission's
+/// check finds its memory changed (`VICTORY_PRELUDE_UPLOADS=1`; off by
+/// default). Without it the next list that samples the texture uploads it,
+/// and this list's draws show the texture from before: a frame late where
+/// every list of the frame was recorded before the check, a face black for
+/// a moment after a cut, a video frame shown late. After Belobug's
+/// VIctory-Belobug-AMD 5d6bd8418 (GPL-3.0), which moves every upload of a
+/// title texture to the prelude; here only those no list recorded.
+pub(crate) fn prelude_uploads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_PRELUDE_UPLOADS").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("title textures found changed at submission are uploaded on the prelude of the list that samples them (VICTORY_PRELUDE_UPLOADS=1)");
+        }
+        on
+    })
+}
+
+/// Since the last line: lists that asked for uploads on their prelude
+/// ([`prelude_uploads`]), and textures uploaded there.
+static PRELUDE_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts a list's prelude uploads ([`prelude_uploads`]); an info line
+/// every 5 s while there are any.
+pub(crate) fn prelude_counted(uploads: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PRELUDE_COUNTS[0].fetch_add(1, Relaxed);
+    PRELUDE_COUNTS[1].fetch_add(uploads as u64, Relaxed);
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let said = SAID.load(Relaxed);
+    if now.saturating_sub(said) >= 5000 && SAID.compare_exchange(said, now, Relaxed, Relaxed).is_ok() {
+        let [lists, textures] = PRELUDE_COUNTS.each_ref().map(|c| c.swap(0, Relaxed));
+        if textures > 0 {
+            tracing::info!(
+                lists,
+                textures,
+                "title textures uploaded on a list's prelude in the last 5 s, found changed at submission after the list had recorded no copy (VICTORY_PRELUDE_UPLOADS=1)"
+            );
+        }
+    }
+}
+
+/// Whether a host copy that held a staging buffer's contents now lacks
+/// them (`uploaded`, then `dirty`: the submission's check detiled new
+/// bytes); if so the upload is noted as made, by the caller, now.
+fn claim(uploaded: &std::sync::atomic::AtomicBool, dirty: &std::sync::atomic::AtomicBool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !uploaded.load(Relaxed) || !dirty.load(Relaxed) {
+        return false;
+    }
+    dirty.store(false, Relaxed);
+    true
 }
 
 impl Staging {
+    /// For a list's prelude ([`prelude_uploads`]): whether the host copy,
+    /// which held the staging buffer's contents, lacks what the check just
+    /// detiled; if so the upload counts as made (the prelude records it).
+    pub(crate) fn claim_prelude(&self) -> bool {
+        claim(&self.uploaded, &self.dirty)
+    }
+
+    /// Records the copies of the staging buffer into `texture`, its host
+    /// copy (in the copy destination state), on `list` (a prelude).
+    pub(crate) fn record_copies(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+        use std::sync::atomic::Ordering::Relaxed;
+        UPLOAD_PARTS[2].fetch_add(self.footprints.len() as u64, Relaxed);
+        UPLOAD_PARTS[3].fetch_add(1, Relaxed);
+        for (i, footprint) in self.footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: i as u32,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: *footprint,
+                },
+            };
+            // SAFETY: an open list; both locations name live resources (the
+            // list's steps hold the staging buffer and the host copy).
+            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+    }
+
     /// Note an upload before checking for changed contents. The check sets
     /// dirty again if the next list needs to upload newer contents.
     pub(crate) fn note_upload(&self) {
@@ -2463,6 +2560,43 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+#[cfg(test)]
+mod prelude_upload_tests {
+    use super::claim;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    /// A list that recorded no copy uploads on its prelude only what the
+    /// submission's check detiled after the host copy last got the staging
+    /// buffer's bytes, and once (`VICTORY_PRELUDE_UPLOADS`; after Belobug
+    /// 5d6bd8418's claim test).
+    #[test]
+    fn a_prelude_uploads_only_what_the_check_changed_and_once() {
+        let (uploaded, dirty) = (AtomicBool::new(false), AtomicBool::new(true));
+        // Never uploaded: a list that records the copy does that, not the prelude.
+        assert!(!claim(&uploaded, &dirty));
+        // Uploaded and unchanged: nothing.
+        uploaded.store(true, Relaxed);
+        dirty.store(false, Relaxed);
+        assert!(!claim(&uploaded, &dirty));
+        // The check detiled new bytes: this prelude uploads them...
+        dirty.store(true, Relaxed);
+        assert!(claim(&uploaded, &dirty));
+        // ...and a second list of the same submission does not again.
+        assert!(!claim(&uploaded, &dirty));
+        assert!(!dirty.load(Relaxed) && uploaded.load(Relaxed));
+        // A video's ring of three: every new frame shown in its own submission.
+        let ring: [(AtomicBool, AtomicBool); 3] = std::array::from_fn(|_| (AtomicBool::new(true), AtomicBool::new(false)));
+        let mut shown = [0u32; 3];
+        for (n, slot) in (1..=12).zip((0..3).cycle()) {
+            let (uploaded, dirty) = &ring[slot];
+            dirty.store(true, Relaxed);
+            if claim(uploaded, dirty) {
+                shown[slot] = n;
+            }
+            assert_eq!(shown[slot], n, "slot {slot} showed a frame late");
         }
     }
 }

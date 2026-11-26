@@ -2792,6 +2792,11 @@ enum Step {
     Texture {
         staging: std::sync::Arc<crate::texture::Staging>,
         uploads: bool,
+        /// With `VICTORY_PRELUDE_UPLOADS=1` (`crate::texture::prelude_uploads`),
+        /// for a list that recorded no copy (the host copy held the staging
+        /// buffer's contents then): the host copy, uploaded on the list's
+        /// prelude if the submission's check finds the texture changed.
+        host: Option<std::sync::Arc<crate::resource::HostTexture>>,
     },
 }
 
@@ -6239,7 +6244,7 @@ mod late_tests {
         // list's submission is what a later detile waits for.
         let mut uploading = 0;
         for step in &list.deferred().copies {
-            if let super::Step::Texture { staging, uploads } = step {
+            if let super::Step::Texture { staging, uploads, .. } = step {
                 assert!(*uploads, "the first use of a texture copies from its staging buffer");
                 uploading += 1;
                 staging.mark_in_flight(10);
@@ -8711,13 +8716,18 @@ impl Host {
         // The submit audit: what these steps read of title memory, against
         // what it was at the title's submit call.
         audit::prepared(runs);
+        // Staging buffers uploaded on a list's prelude
+        // (`VICTORY_PRELUDE_UPLOADS=1`): read by this submission, as the
+        // copies lists recorded are.
+        let mut prelude_staged: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
         for list in runs {
-            list.run_deferred(&mut batch);
+            let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&uploads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            prelude_staged.extend(uploads.into_iter().map(|(staging, _)| staging));
         }
         batch.flush();
         for p in &alias {
@@ -8823,10 +8833,13 @@ impl Host {
             }
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Texture { staging, uploads: true } = step {
+                    if let Step::Texture { staging, uploads: true, .. } = step {
                         staging.note_upload_fence(*submitted);
                     }
                 }
+            }
+            for staging in &prelude_staged {
+                staging.note_upload_fence(*submitted);
             }
             let back = declared_writes(runs);
             let backs: Vec<(usize, usize)> = runs
@@ -9848,7 +9861,15 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    ///
+    /// With `VICTORY_PRELUDE_UPLOADS=1` it first uploads `uploads`: title
+    /// textures this list samples without having recorded their copy, whose
+    /// staging buffers the submission's check found changed
+    /// ([`HostList::run_deferred`]).
+    fn prelude(
+        &self,
+        uploads: &[(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)],
+    ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -9903,13 +9924,27 @@ impl HostList {
                 }
             }
         }
+        // Uploads on the prelude: each host copy into the copy destination
+        // state from its real one, and back to it if the list does not use
+        // it (else on to the state the list starts with, below).
+        for (_, copy) in uploads {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(&copy.texture, host_state(real), host_state(COPY_DEST)));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(&copy.texture, host_state(COPY_DEST), host_state(real)));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -9929,6 +9964,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (staging, copy) in uploads {
+                    staging.record_copies(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -10646,17 +10684,36 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, uploads: bool) {
-        self.deferred().copies.push(Step::Texture { staging, uploads });
+    /// submitted, keeping it alive until the list is reset. `host`: see
+    /// [`Step::Texture`].
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        uploads: bool,
+        host: Option<std::sync::Arc<crate::resource::HostTexture>>,
+    ) {
+        self.deferred().copies.push(Step::Texture { staging, uploads, host });
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    ///
+    /// Returns the textures to upload on the list's prelude
+    /// (`VICTORY_PRELUDE_UPLOADS=1`): sampled by this list, which recorded no
+    /// copy of them, and found changed by this submission's check. Without
+    /// that they were uploaded by the next list that samples them, and this
+    /// one showed the texture from before (a frame late where every list of
+    /// the frame was recorded before the check). After Belobug's
+    /// VIctory-Belobug-AMD 5d6bd8418 (GPL-3.0).
+    #[allow(clippy::type_complexity)]
+    fn run_deferred(
+        &self,
+        batch: &mut Batch,
+    ) -> Vec<(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)> {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut late_ones = false;
         for step in &self.deferred().copies {
             // With `VICTORY_TIMING_LEAN=1` one copy in 16 is timed (the
             // "copies" time of the frame line is then an estimate), and
@@ -10736,7 +10793,8 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture { staging, uploads } => {
+                Step::Texture { staging, uploads, host } => {
+                    late_ones |= host.is_some();
                     if *uploads {
                         staging.note_upload();
                         if crate::hostcopy::trace() > 0 {
@@ -10759,6 +10817,23 @@ impl HostList {
             PREPARING[0].fetch_add(started.us(), Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        if !late_ones {
+            return Vec::new();
+        }
+        // The checks of this list's textures are done now, not at the next
+        // flush: the prelude is recorded next (as without
+        // `VICTORY_WIDE_TEXTURES`, where each ran at its step).
+        batch.refresh_textures();
+        let mut uploads = Vec::new();
+        for step in &self.deferred().copies {
+            if let Step::Texture { staging, uploads: false, host: Some(host) } = step
+                && staging.claim_prelude()
+            {
+                uploads.push((staging.clone(), host.clone()));
+            }
+        }
+        crate::texture::prelude_counted(uploads.len());
+        uploads
     }
 }
 
