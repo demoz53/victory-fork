@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 memchr.workspace = true
 zlib-rs.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

@@ -73,6 +73,16 @@ pub unsafe fn patch_mapped(base: usize, size: usize, patches: &[MemoryPatch<'_>]
     Ok(())
 }
 
+/// A line of the title's hooks in the log (`victory_game::hooks` has no
+/// logger of its own): info, or a warning.
+pub fn log_line(warning: bool, text: &str) {
+    if warning {
+        tracing::warn!("{text}");
+    } else {
+        tracing::info!("{text}");
+    }
+}
+
 /// `mov r64, gs:[0x58]` (the title's load of its thread's TLS array), 9
 /// bytes: the loader turns each into `call thunk; nop4` when the image got
 /// a TLS index other than 0 (`crate::tls`).

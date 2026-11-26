@@ -439,6 +439,8 @@ fn apply_title_patches(
         println!("title hook     none: not a known build (it runs without them)");
         return;
     }
+    // Their lines go to the log (stderr), beside the frame lines.
+    victory_game::hooks::set_logger(victory_loader::patch::log_line);
     victory_game::hooks::configure(image.base(), victory_gpu::frame::current);
     victory_game::hooks::set_teleport_source(keys_file_teleport);
     // SAFETY: the title's image, mapped and not yet run.

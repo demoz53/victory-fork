@@ -33,6 +33,25 @@ static BASE: AtomicUsize = AtomicUsize::new(0);
 /// The frame counter of the log lines (the front end's).
 static FRAME: AtomicUsize = AtomicUsize::new(0);
 
+/// Where the hooks' lines go: the front end's `fn(warning, text)` (this
+/// crate has no logger of its own, so that its dependencies, and the shader
+/// cache key built from Cargo.lock, stay as they are). Unset: nowhere.
+static LOGGER: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets where the hooks' lines go ([`LOGGER`]).
+pub fn set_logger(log: fn(bool, &str)) {
+    LOGGER.store(log as usize, Ordering::Relaxed);
+}
+
+fn say(warning: bool, text: &str) {
+    let log = LOGGER.load(Ordering::Relaxed);
+    if log != 0 {
+        // SAFETY: set by `set_logger` from a `fn(bool, &str)`.
+        let log: fn(bool, &str) = unsafe { std::mem::transmute(log) };
+        log(warning, text);
+    }
+}
+
 fn frame() -> u64 {
     match FRAME.load(Ordering::Relaxed) {
         0 => 0,
@@ -139,15 +158,10 @@ extern "system" fn cine_hook(inst: usize, flag: usize) -> usize {
                 let def = ((inst + 8) as *const usize).read();
                 let skippable = def != 0 && ((def + 0x158) as *const u8).read() & 4 != 0;
                 let window = ((inst + 0x496) as *const u8).read() & 0x20 != 0;
-                tracing::info!(
-                    instance = format_args!("{inst:#x}"),
-                    state,
-                    scene_s = time,
-                    window,
-                    skippable,
-                    frame = frame(),
-                    "VICTORY_CINE: a playing cinematic's skip gate is closed (said once per instance)"
-                );
+                say(false, &format!(
+                    "VICTORY_CINE: a playing cinematic's skip gate is closed (said once per instance): instance {inst:#x} state {state} scene {time:.2} s window {window} skippable {skippable} frame {}",
+                    frame()
+                ));
             }
             return result;
         }
@@ -171,14 +185,10 @@ extern "system" fn cine_hook(inst: usize, flag: usize) -> usize {
         unlock(group);
         if asked {
             let n = CINE_SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::info!(
-                skip = n,
-                instance = format_args!("{inst:#x}"),
-                state,
-                scene_s = time,
-                frame = frame(),
-                "VICTORY_CINE: the title's own skip asked for a playing cinematic"
-            );
+            say(false, &format!(
+                "VICTORY_CINE: skip {n}: the title's own skip asked for instance {inst:#x} (state {state}, scene {time:.2} s) at frame {}",
+                frame()
+            ));
         }
     }
     result
@@ -406,16 +416,15 @@ fn frame_work(base: usize) {
     match st.home {
         None => {
             st.home = Some(me);
-            tracing::info!(
-                thread = ?me,
-                os_thread = os_thread_id(),
-                frame = frame(),
-                "title frame hook: first call (the game timer update, +0x22264d0); it acts on this thread only"
-            );
+            say(false, &format!(
+                "title frame hook: first call (the game timer update, +0x22264d0) on thread {} ({me:?}) at frame {}; it acts on this thread only",
+                os_thread_id(),
+                frame()
+            ));
         }
         Some(home) if home != me => {
             if !std::mem::replace(&mut st.other_said, true) {
-                tracing::warn!(thread = ?me, os_thread = os_thread_id(), "title frame hook: called on another thread too; nothing done there");
+                say(true, &format!("title frame hook: called on thread {} ({me:?}) too; nothing is done there", os_thread_id()));
             }
             return;
         }
@@ -435,8 +444,8 @@ fn frame_work(base: usize) {
         if st.last_log.is_none_or(|t| now.duration_since(t).as_secs_f32() >= 1.0) {
             st.last_log = Some(now);
             match here {
-                Some((p, h)) => tracing::info!(frame = frame(), "player at x={:.2} y={:.2} z={:.2} heading={:.3}", p[0], p[1], p[2], h),
-                None => tracing::info!(frame = frame(), "no player"),
+                Some((p, h)) => say(false, &format!("player at x={:.2} y={:.2} z={:.2} heading={:.3} (frame {})", p[0], p[1], p[2], h, frame())),
+                None => say(false, &format!("no player (frame {})", frame())),
             }
         }
     }
@@ -450,7 +459,7 @@ fn frame_work(base: usize) {
     let t = match decide(&mut st.once, &mut st.still, from, take) {
         None => return,
         Some(Err((t, why))) => {
-            tracing::warn!(frame = frame(), from = ?from, to = ?t.to, "teleport refused: {why}");
+            say(true, &format!("teleport refused: {why} (frame {}, from {from:?}, to {:?})", frame(), t.to));
             return;
         }
         Some(Ok(t)) => t,
@@ -460,19 +469,18 @@ fn frame_work(base: usize) {
         Ok(()) => {
             // SAFETY: as above.
             let (now, h) = unsafe { place(ped) };
-            tracing::info!(
-                frame = frame(),
-                from = ?from,
-                to = ?t.to,
-                heading = ?t.heading,
-                "teleport done: the player is at x={:.2} y={:.2} z={:.2} heading={:.3}",
+            say(false, &format!(
+                "teleport done (frame {}, from {from:?}, to {:?}, heading {:?}): the player is at x={:.2} y={:.2} z={:.2} heading={:.3}",
+                frame(),
+                t.to,
+                t.heading,
                 now[0],
                 now[1],
                 now[2],
                 h
-            );
+            ));
         }
-        Err(why) => tracing::warn!(frame = frame(), from = ?from, to = ?t.to, "teleport refused: {why}"),
+        Err(why) => say(true, &format!("teleport refused: {why} (frame {}, from {from:?}, to {:?})", frame(), t.to)),
     }
 }
 
