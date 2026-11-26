@@ -2,8 +2,8 @@
 
 `test/all23` = `test/all22` (7c275212b) + merges, in this order, of test/watch5 (2a61eb7d2, holds test/watch4),
 test/async5 (f4d212aa8, holds test/async4 8798ddb11 and test/async3), test/leak1 (0af946da1), test/pic4 (fcf8630c2, holds test/pic3 6518051e4), test/stream3 (972fbdb77),
-test/stable1 (f830f7c2e), test/lib1 (9c62b2b9d), test/trim2 (46c8acccd; holds test/leak1) and test/stable2 at
-f2229131e (its first two commits; the branch goes on). Left out (not finished when merged):
+test/stable1 (f830f7c2e), test/lib1 (9c62b2b9d), test/trim2 (46c8acccd; holds test/leak1) and test/stable2 (730b48e79;
+first its commit f2229131e, then its tip). Left out (not finished when merged):
 test/shader3, test/shader4.
 
 ALL default-on changes since all21 (a run with nothing set does these; each line's switch restores all21's way):
@@ -23,6 +23,12 @@ ALL default-on changes since all21 (a run with nothing set does these; each line
   with no lock held (the async-worker freeze): `VICTORY_XASYNC_CLEANUP_UNLOCKED=0`.
 - `VICTORY_PIPELINE_COMPUTE_WAIT` 10000 ms (all23, test/stable2 f2229131e): a dispatch whose compute pipeline is
   still being made waits for it, at most 15 s a frame in all, instead of being dropped: `VICTORY_PIPELINE_COMPUTE_WAIT=0`.
+- `VICTORY_OOM_RETRY_MS` 500 (all23, test/stable2 789716061): a host texture refused for want of memory is tried again
+  after that long, not refused for the run: `VICTORY_OOM_RETRY_MS=0`.
+- `VICTORY_CHECK_APART` on (all23, test/stable2 730b48e79): the card-copy compare list goes in its own
+  ExecuteCommandLists call after the title's lists: `VICTORY_CHECK_APART=0`.
+- Always on, no switch (all23, test/stable2 8c73c8804): the release pass takes only the due entries from the front of
+  the retired list instead of sorting the whole list at every finished submission (removes RETIRE_AHEAD's cost).
 - `VICTORY_WRITE_ALIAS_TEXTURES` on (all23, test/pic4): a write of ours into title memory also makes the textures
   placed at other views of those pages upload again: `VICTORY_WRITE_ALIAS_TEXTURES=0`.
 - `VICTORY_VIEW_STATS` on, log only: the "dstorage views" line every 5 s while DirectStorage works (all23,
@@ -109,9 +115,11 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | - | (no switch: a fix) a library save that cannot map its file and cannot get memory for the serialised buffer (3 GB) is a warning and is saved later, not an abort of the process (fxceless PR #1326, cwWwWwW, after upstream #2007) | test/lib1 | - |
 | 31 | `VICTORY_XASYNC_CLEANUP_UNLOCKED` is on (XAsyncComplete runs a failed call's cleanup with no lock held) | test/stable2 (upstream #114 / fxceless #1330) | `VICTORY_XASYNC_CLEANUP_UNLOCKED=0` |
 | 32 | `VICTORY_PIPELINE_COMPUTE_WAIT` is 10000 (a dispatch waits up to 10 s for its compute pipeline, 15 s per frame in all, instead of dropping after the 0.5-s budget) | test/stable2 (fxceless #1312) | `VICTORY_PIPELINE_COMPUTE_WAIT=0` |
+| 33 | `VICTORY_OOM_RETRY_MS` is 500 (a host texture refused for want of memory is tried again, not refused for the run) | test/stable2 (upstream #3276) | `VICTORY_OOM_RETRY_MS=0` |
+| 34 | `VICTORY_CHECK_APART` is on (the card-copy compare list goes in its own ExecuteCommandLists after the title's lists) | test/stable2 (trustno1 #1) | `VICTORY_CHECK_APART=0` |
 
-Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE, all20 HEAP_FORGET and SDWA_SEXT, all22 GUARD_VIEWS_ONLY and AMBIENT_AIR_FINITE, all23 PLACED_PADDING, OWNERLESS_VIEWS, RETIRE_AHEAD, WRITE_ALIAS_TEXTURES, PREWARM_READERS, LIBRARY_SAVE_SECS, XASYNC_CLEANUP_UNLOCKED, PIPELINE_COMPUTE_WAIT):
-`VICTORY_PLACED_PADDING=0 VICTORY_OWNERLESS_VIEWS=0 VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_HEAP_FORGET=0 VICTORY_SDWA_SEXT=0 VICTORY_GUARD_VIEWS_ONLY=0 VICTORY_AMBIENT_AIR_FINITE=0 VICTORY_RETIRE_AHEAD=0 VICTORY_WRITE_ALIAS_TEXTURES=0 VICTORY_PREWARM_READERS=0 VICTORY_LIBRARY_SAVE_SECS=20 VICTORY_XASYNC_CLEANUP_UNLOCKED=0 VICTORY_PIPELINE_COMPUTE_WAIT=0 VICTORY_SHADER_CACHE_KEY=exe`
+Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE, all20 HEAP_FORGET and SDWA_SEXT, all22 GUARD_VIEWS_ONLY and AMBIENT_AIR_FINITE, all23 PLACED_PADDING, OWNERLESS_VIEWS, RETIRE_AHEAD, WRITE_ALIAS_TEXTURES, PREWARM_READERS, LIBRARY_SAVE_SECS, XASYNC_CLEANUP_UNLOCKED, PIPELINE_COMPUTE_WAIT, OOM_RETRY_MS, CHECK_APART):
+`VICTORY_PLACED_PADDING=0 VICTORY_OWNERLESS_VIEWS=0 VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_HEAP_FORGET=0 VICTORY_SDWA_SEXT=0 VICTORY_GUARD_VIEWS_ONLY=0 VICTORY_AMBIENT_AIR_FINITE=0 VICTORY_RETIRE_AHEAD=0 VICTORY_WRITE_ALIAS_TEXTURES=0 VICTORY_PREWARM_READERS=0 VICTORY_LIBRARY_SAVE_SECS=20 VICTORY_XASYNC_CLEANUP_UNLOCKED=0 VICTORY_PIPELINE_COMPUTE_WAIT=0 VICTORY_OOM_RETRY_MS=0 VICTORY_CHECK_APART=0 VICTORY_SHADER_CACHE_KEY=exe`
 (leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
 entries a build finds. Five of these change translated code - LOOP_EXITS and the four lane fixes of test/loops2,
 343 compute programs by its agent's count - so a run with them restored needs a warm of its own.)
@@ -162,6 +170,9 @@ test/stable1, test/trim2; each row's "From" names its source.
 | `VICTORY_XASYNC_CLEANUP_UNLOCKED` | `0` restores | ON | `XAsyncComplete` claims the call with an atomic flag and runs the provider's `OP_CLEANUP` (failed result or no result size) with no lock held; the `done` lock is taken only to publish the status after it. Held through the cleanup, a provider whose cleanup waits for the thread completing the same call (or one in a blocking `XAsyncGetStatus`) deadlocked with it: the title's async worker hung, and the game with it. A second completion or an `XAsyncCancel` after the claim leaves the call alone. | test/stable2 a177e7fe8 (upstream Marvisak/VIctory #114 (Manuel Perez) via fxceless PR #1330) | no |
 | `VICTORY_PIPELINE_COMPUTE_WAIT` | ms; `0` restores | ON (10000) | a dispatch whose compute pipeline is still being made waits for it (until made, its compile found stuck, or the bound) instead of within the frame's 0.5-s budget; a dropped dispatch is not run again, so one-shot compute work (a character's skin set up once) stayed missing for the scene or the run (avatarmanz issue #75; "dropped N/frame without a host pipeline: compute ..." counts such drops). Each wait logged when it was long, dropped all the same, or at powers of two. Draws unchanged. | test/stable2 f2229131e (fxceless PR #1312, Exopus-0x65f7ad0; bounded here) | no |
 | `VICTORY_PIPELINE_COMPUTE_WAIT_FRAME_MS` | ms | 15000 | what all of one title frame's dispatches may wait in all under COMPUTE_WAIT (under the title's 30-s watchdog); past it, the frame's usual budget | test/stable2 f2229131e | no |
+| `VICTORY_REAPER` | `1` | off | the last release of what `host::retire` is given (dropped at once, or by `bury` once its submissions and RETIRE_AHEAD more are through) and of the texture staging the sweep lets go happens on the existing reaper thread ("victory-reaper"), not the submitting/landing thread; nothing is released earlier. Also: `bury` now takes only the due entries from the front of the retired list (in retirement order) instead of sorting the whole list at every finished submission (no switch; with RETIRE_AHEAD the list holds ~1.5 frames of retirements). | fxceless VICTORY_REAPER (idea; our reaper thread) | no |
+| `VICTORY_OOM_RETRY_MS` | ms; `0` restores | ON (500) | a host texture whose CreateCommittedResource failed with E_OUTOFMEMORY is tried again after this long instead of being marked refused for the run; slots made null for it are not noted as made, so their next use makes them again; slots that wait for it are made when it is. Other refusals stay permanent. Warned (first 16, then powers of two) with the count made at a later try. | upstream Marvisak/VIctory PR #3276 (lerapeurdu62280-debug; avatarmanz #293) | no |
+| `VICTORY_CHECK_APART` | `0` restores | ON | the compare of copies in the card's memory is sent in its own ExecuteCommandLists right after the title's lists, before the submission's fence (both the sent-ahead and the waited paths), so implicitly promoted buffers have decayed to COMMON before it reads them (D3D12 error 538 in the same call; the compare had no guarantee of seeing the title's writes). | trustno1-coder/VIctory-NVIDIA PR #1 (d1fe0bd01, Jeremy Goldberg) | no |
 
 From test/watch4 (on top of test/watch3 a2b96a048):
 `VICTORY_JOURNAL_UNLOCKED` fixed (72dc1fb20, review finding): an answer now waits for every asking in flight over its range.
