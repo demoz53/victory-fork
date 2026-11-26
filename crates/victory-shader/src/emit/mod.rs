@@ -516,13 +516,25 @@ fn emit_once(
         // (approximate: a tile-wide result becomes two half-tile ones);
         // `VICTORY_WAVE_LOCAL=idiom` refuses those instead.
         let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
-        let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
-            Ok(()) => true,
-            Err((offset, what)) => {
+        let idiom = |p: &ir::Program, st: &structure::Structured| {
+            if local_lds_sync() && wave_synchronous_lds(p) {
                 if why {
-                    eprintln!("WAVE64-RETRY #{hash} local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!(
+                        "WAVE64-RETRY #{hash} local waves: not exact, LDS between the halves with no barrier"
+                    );
                 }
-                false
+                return false;
+            }
+            match lower::wave_local(p, st) {
+                Ok(()) => true,
+                Err((offset, what)) => {
+                    if why {
+                        eprintln!(
+                            "WAVE64-RETRY #{hash} local waves: not the allocation idiom at {offset:#x}: {what}"
+                        );
+                    }
+                    false
+                }
             }
         };
         // The program in two other forms: without its early-outs, and
@@ -764,6 +776,34 @@ fn emit_once(
 /// transmission volumetrics ran for the first time, and the room came out lit as in the
 /// real game, with no device loss); `VICTORY_WAVE_WIDE=off` (or `0`) turns it off, as
 /// before, and `=1` tries the form before the approximate ones for every program.
+/// Whether a console wave's LDS traffic keeps the two host waves from being waves of their
+/// own: a program that writes and reads LDS with no `s_barrier` relies on its wave running
+/// in lockstep (a lane's write is there for the next instruction's reads, whichever lane);
+/// as two host waves, one half reads before the other half wrote. The tile classifier
+/// `5e7cd6d3557a6c35` (8x8 groups, one console wave) flags the tile in LDS dword 0 from some
+/// lanes and reads it back in every lane: in the per-half-wave idiom form a half that read
+/// before the other wrote left its lanes out of the tile lists, and the water's tile pass
+/// (`cad2edef5ecea3ba`) left those tiles black, the dashes on the water.
+fn wave_synchronous_lds(p: &ir::Program) -> bool {
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let lds = |n: &str| {
+        n.starts_with("ds_")
+            && !n.starts_with("ds_swizzle")
+            && !n.starts_with("ds_permute")
+            && !n.starts_with("ds_bpermute")
+    };
+    insts().any(|i| lds(i.name())) && !insts().any(|i| i.name() == "s_barrier")
+}
+
+/// Whether [`wave_synchronous_lds`] keeps a program from the per-half-wave idiom form
+/// (`VICTORY_LOCAL_LDS_SYNC=0`: not, as before): it then takes the wave-wide form, where the
+/// halves meet around such accesses, or an approximate one. Part of the translation: the
+/// shader cache keys on it (`victory-gpu`'s does).
+pub fn local_lds_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_LDS_SYNC").is_none_or(|v| v != "0"))
+}
+
 fn wide_last() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_WIDE_LAST.get() {
