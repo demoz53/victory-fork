@@ -31,6 +31,11 @@ mod loop_regions;
 pub(super) use loop_regions::TEST_AFTER_LOOP;
 pub(super) use loop_regions::scope as after_loop_scope;
 
+/// Lane fixes of wave64 compute on 32-lane hosts that the lane tests found.
+mod lanes;
+#[cfg(test)]
+pub(super) use lanes::TEST_PERMUTE_HALVES;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -343,6 +348,9 @@ struct Lower<'a> {
     /// The first dword of the scatter's scratch, a dword per lane of every console wave in the
     /// group (`ds_permute_b32`), allocated past the program's LDS.
     scatter: Option<u32>,
+    /// `ds_bpermute_b32` across two host waves: the first LDS dword of the area the lanes
+    /// write their data into ([`lanes::permute_area`]).
+    permute_area: Option<u32>,
     /// Per IR block, whether every lane runs it ([`all_lane_blocks`]); none without a computable
     /// flow (an indirect exit). A scatter's barriers need it.
     lane_blocks: Option<Vec<bool>>,
@@ -1836,6 +1844,8 @@ impl<'a> Lower<'a> {
         let mut halves: Option<u32> = None;
         // the scatter's scratch base (`ds_permute_b32`)
         let mut scatter: Option<u32> = None;
+        // the area of `ds_bpermute_b32` across two host waves ([`lanes::permute_area`])
+        let mut permute_area: Option<u32> = None;
         // whether `halves` borrows the program's first LDS dword ([`lds_fit`])
         let mut halves_borrowed = false;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1934,6 +1944,8 @@ impl<'a> Lower<'a> {
                                 if !(LOCAL_WAVES.get() && lds_fit()) {
                                     s.lds_dwords += 2 * group.div_ceil(64);
                                 }
+                                let shuffles = insts().any(|i| i.name() == "ds_bpermute_b32");
+                                permute_area = lanes::permute_area(&mut s.lds_dwords, group, shuffles, LOCAL_WAVES.get());
                             }
                         }
                     }
@@ -2166,6 +2178,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_borrowed,
             scatter,
+            permute_area,
             lane_blocks: all_lane_blocks(x.st),
             wave_base: None,
             flat: None,
@@ -5256,8 +5269,8 @@ impl<'a> Lower<'a> {
             self.cross_lane(false)?;
             if self.exchange.as_ref().is_some_and(|e| !e.1) {
                 // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
+                // may be in the other one ([`Self::permute_across_halves`])
+                return self.permute_across_halves(inst, addr.as_ref(), data.first(), offset, dst_reg, guard);
             }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];

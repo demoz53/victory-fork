@@ -361,7 +361,6 @@ fn split(m: u64) -> (u32, u32) {
 /// Identity, the 31/32 boundary both ways, XOR-1, XOR-32, and every (source, destination)
 /// pair of the wave (4,096: 64 rotations), all lanes active; then the same in place.
 #[test]
-#[ignore = "fails here: ds_bpermute across the two host waves of a console wave is refused"]
 fn a_shuffle_reads_every_lane_of_the_console_wave() {
     let _one = one_at_a_time();
     for in_place in [false, true] {
@@ -380,10 +379,24 @@ fn a_shuffle_reads_every_lane_of_the_console_wave() {
     }
 }
 
+/// `VICTORY_PERMUTE_HALVES=0`: a shuffle across the two host waves is refused, as before.
+#[test]
+fn a_shuffle_across_the_halves_is_refused_with_the_switch_off() {
+    let native = native_of(&shuffle_program(false), true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let was = lower::TEST_PERMUTE_HALVES.replace(Some(false));
+    let off = lowered(&native, &p, &HashSet::new());
+    lower::TEST_PERMUTE_HALVES.set(Some(true));
+    let on = lowered(&native, &p, &HashSet::new());
+    lower::TEST_PERMUTE_HALVES.set(was);
+    let why = off.err().expect("refused with the switch off").to_string();
+    assert!(why.contains("a lane permute across two host waves"), "{why}");
+    assert!(on.is_ok(), "taken with it on: {:?}", on.err());
+}
+
 /// The same shuffles under random EXEC masks (inactive lanes keep their value; a lane whose
 /// source is inactive is not compared), with random XOR and rotation.
 #[test]
-#[ignore = "fails here: ds_bpermute across the two host waves of a console wave is refused"]
 fn a_shuffle_under_random_masks_keeps_the_inactive_lanes() {
     let _one = one_at_a_time();
     for in_place in [false, true] {
@@ -621,7 +634,7 @@ fn lanes_left_out_by_exec_keep_their_values() {
 /// have is not compared (not there on the console: outside EXEC). The barriers must not
 /// hang with a host wave short.
 #[test]
-#[ignore = "fails here: ds_bpermute across the two host waves of a console wave is refused"]
+#[ignore = "fails here: in a group of 48 the short host wave can take console lanes 0..31, and lanes 16..31 have no thread"]
 fn a_shuffle_in_partial_groups_stays_in_its_console_wave() {
     let _one = one_at_a_time();
     for threads in [48u32, 96] {
@@ -748,7 +761,6 @@ fn three_d(threads: [u32; 3]) {
 }
 
 #[test]
-#[ignore = "fails here: ds_bpermute across the two host waves of a console wave is refused"]
 fn three_dimensional_groups_number_lanes_x_first() {
     let _one = one_at_a_time();
     three_d([4, 4, 4]);
