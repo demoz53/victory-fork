@@ -1359,6 +1359,12 @@ impl HostHeap {
         Some(self.dynamic_first + first as u32)
     }
 
+    /// Tests: how many dynamic slots are free.
+    #[cfg(test)]
+    pub(crate) fn dynamic_free(&self) -> u32 {
+        self.free.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The title slots this heap mirrors at their own index (tables read in
     /// place reach only these: one that reaches past them is made afresh);
     /// fewer than the title's when the host caps its size, and with a heap

@@ -3696,6 +3696,32 @@ struct RelayFetch {
 /// the card, or for a flight. It takes neither the submission lock nor
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
+/// `VICTORY_TABLES_EARLY` (on by default; `0`: off): with [`relay`], the
+/// dynamic descriptor slots of a flight's lists are given back as soon as
+/// the relay takes the flight off the line, which it does only once the
+/// card has run it, before the landing; off, when the landed lists are
+/// reset by the helper thread, as before (Korinocho/victory-fork
+/// eade35662, GPL-3.0-or-later: there the slots were held three to eight
+/// presented frames, one to two after, and a pool of 262,144 no longer
+/// ran out).
+///
+/// Nothing reads those slots after the flight's fence: its host lists were
+/// taken from the title's when it was sent (`crate::list::Detached`, which
+/// owns the state holding the slots; the earlier parts of a list cut at
+/// waits hold none, its last part all of them), they run once and are only
+/// reset afterwards. The same slots were given back by the same call when
+/// that state was dropped; given back here, the drop finds none left.
+fn tables_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TABLES_EARLY").is_none_or(|v| v != "0");
+        if on && relay() {
+            tracing::info!("descriptor tables' dynamic slots are given back when the card has run their flight, before it is landed (VICTORY_TABLES_EARLY=0: when its lists are reset)");
+        }
+        on
+    })
+}
+
 fn relay_worker() {
     let Some(host) = host() else {
         return;
@@ -3741,7 +3767,18 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(mut items) => {
+                // The card has run these flights: their lists' descriptor
+                // tables are given back here, before the landing.
+                if tables_early() {
+                    for item in &mut items {
+                        if let Late::Run(flight) = item {
+                            flight.lists.iter_mut().for_each(crate::list::Detached::tables_done);
+                        }
+                    }
+                }
+                host.relay_land(items, &mut fetch)
+            }
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
