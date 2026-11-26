@@ -231,8 +231,8 @@ impl Blob {
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
+        let path = dir.join(library_file());
+        let next = dir.join(next_file());
         if next.exists() && std::fs::rename(&next, &path).is_err() {
             tracing::warn!("the host pipeline library saved last could not take the old one's place");
         }
@@ -428,6 +428,9 @@ struct Library {
     /// Stores share it and a save takes it alone: the size the library
     /// asks for must still be its size when it is written out.
     saving: RwLock<()>,
+    /// With `VICTORY_LIBRARY_PER_KEY`: the single library file, read only
+    /// ([`fallback`]; the library first, then the bytes it was made from).
+    fallback: Option<(ID3D12PipelineLibrary1, Blob)>,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the library synchronises
@@ -475,6 +478,81 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
+
+/// Whether the library is one file per shader-cache key
+/// (`VICTORY_LIBRARY_PER_KEY=1`; off by default): `host-pipelines-<key>.bin`,
+/// `<key>` the run key's folder name the shader cache uses (the translator
+/// fingerprint and the code-changing switches, `crate::shader_cache`).
+///
+/// Why: pipelines are named by their shader code, root signature and state,
+/// never by the build, so the one file only ever grew: every translator
+/// change and every code-changing switch added its pipelines and nothing
+/// took the old ones out (3 GB by 2026-11-26, all of it mapped and written
+/// again by each save). Per key, a run opens and saves its key's file only;
+/// a key no longer used is a file that can be deleted by hand. The old
+/// single file is never written or deleted: with the switch it is opened
+/// read-only as a second library, and a pipeline found there and not in
+/// the key's file is copied into the key's file ([`pipeline`]).
+fn per_key() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_PER_KEY").is_some_and(|v| v == "1"))
+}
+
+/// The library file's name for `key` (`None`: the single file), and with
+/// `ext` `"next"` the name of the one a save leaves beside it.
+fn file_name(key: Option<&str>, ext: &str) -> String {
+    match key {
+        Some(key) => format!("host-pipelines-{key}.{ext}"),
+        None if ext == "bin" => LIBRARY_FILE.to_owned(),
+        None => NEXT_FILE.to_owned(),
+    }
+}
+
+/// This run's key with [`per_key`], read once.
+fn run_key() -> Option<&'static str> {
+    static KEY: OnceLock<Option<String>> = OnceLock::new();
+    KEY.get_or_init(|| per_key().then(|| crate::shader_cache::run_key().0)).as_deref()
+}
+
+/// The library file of this run ([`per_key`]).
+pub(crate) fn library_file() -> String {
+    file_name(run_key(), "bin")
+}
+
+/// The file a save leaves beside [`library_file`] when it cannot replace it.
+fn next_file() -> String {
+    file_name(run_key(), "next")
+}
+
+/// With [`per_key`]: the old single library file, opened read-only, if it
+/// is there and the host takes it.
+fn fallback(device: &ID3D12Device1) -> Option<(ID3D12PipelineLibrary1, Blob)> {
+    if !per_key() {
+        return None;
+    }
+    let path = DIR.get()?.join(LIBRARY_FILE);
+    let blob = match mapped().then(|| Mapped::open(&path)).flatten() {
+        Some(file) => Blob::Mapped(file),
+        None => Blob::Held(std::fs::read(&path).ok().filter(|b| !b.is_empty())?),
+    };
+    // SAFETY: the bytes outlive the library (kept beside it).
+    let library = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(blob.bytes()) }
+        .and_then(|l| l.cast::<ID3D12PipelineLibrary1>());
+    match library {
+        Ok(library) => {
+            tracing::info!(bytes = blob.bytes().len(), "the single host pipeline library is read as a fallback (VICTORY_LIBRARY_PER_KEY=1)");
+            Some((library, blob))
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "the single host pipeline library was refused as a fallback");
+            None
+        }
+    }
+}
+
+/// Since the start: pipelines found in the fallback ([`fallback`]) and
+/// copied into the key's library.
+pub(crate) static FROM_FALLBACK: AtomicU64 = AtomicU64::new(0);
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
@@ -485,7 +563,10 @@ fn library() -> Option<&'static Library> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let library = open(&device, blob).map(|mut library| {
+                library.fallback = fallback(&device);
+                library
+            });
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -519,6 +600,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     _blob: blob,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
+                    fallback: None,
                 });
             }
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
@@ -535,6 +617,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         _blob: Blob::None,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
+        fallback: None,
     })
 }
 
@@ -553,7 +636,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
@@ -583,6 +666,28 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    // `VICTORY_LIBRARY_PER_KEY`: not in the key's file, but in the single
+    // one: loaded from there and stored into the key's (the same name is
+    // the same code, root signature and state).
+    if let Some((old, _)) = &library.fallback {
+        let from_old = {
+            let _all = one_call();
+            let _call = call("load from the single library", name);
+            load(old, PCWSTR(wide.as_ptr()))
+        };
+        if let Ok(pso) = from_old {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            FROM_FALLBACK.fetch_add(1, Ordering::Relaxed);
+            OUTCOME.with(|o| o.set(LOADED_ONE));
+            let _all = one_call();
+            let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: a live pipeline; a name already stored is refused.
+            if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+                library.added.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(pso);
+        }
+    }
     // Compiles take up to seconds. Keep only this name held.
     let pso = {
         let _call = call("make", name);
@@ -760,7 +865,7 @@ pub(crate) fn save(now: bool) -> bool {
         tracing::info!("host pipeline library save skipped: another process is saving it");
         return true;
     };
-    let tmp = turn.tmp(&dir.join(LIBRARY_FILE));
+    let tmp = turn.tmp(&dir.join(library_file()));
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
@@ -813,7 +918,7 @@ pub(crate) fn save(now: bool) -> bool {
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
+        let in_place = !dir.join(next_file()).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
@@ -836,6 +941,7 @@ pub(crate) fn save(now: bool) -> bool {
                 made = MADE.load(Ordering::Relaxed),
                 loaded = LOADED.load(Ordering::Relaxed),
                 started_early = EARLY.load(Ordering::Relaxed),
+                from_single_library = FROM_FALLBACK.load(Ordering::Relaxed),
                 "host pipeline library saved"
             );
             true
@@ -898,8 +1004,8 @@ fn unique_tmp(path: &std::path::Path) -> std::path::PathBuf {
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    let res = std::fs::rename(tmp, dir.join(LIBRARY_FILE))
-        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)));
+    let res = std::fs::rename(tmp, dir.join(library_file()))
+        .or_else(|_| std::fs::rename(tmp, dir.join(next_file())));
     if res.is_err() {
         let _ = std::fs::remove_file(tmp);
     }
@@ -956,6 +1062,27 @@ pub(crate) fn note_used(key: &str) {
 mod tests {
     use super::*;
 
+    /// `VICTORY_LIBRARY_PER_KEY`: one file per run key, each with its own
+    /// fixed temporary file; without a key, the single file as before.
+    #[test]
+    fn a_keys_library_has_files_of_its_own() {
+        assert_eq!(file_name(None, "bin"), "host-pipelines.bin");
+        assert_eq!(file_name(None, "next"), "host-pipelines.next");
+        let key = "k-ab00000000000001";
+        assert_eq!(file_name(Some(key), "bin"), "host-pipelines-k-ab00000000000001.bin");
+        assert_eq!(file_name(Some(key), "next"), "host-pipelines-k-ab00000000000001.next");
+        let dir = std::path::Path::new("cache");
+        let one = fixed_tmp(&dir.join(file_name(Some(key), "bin")));
+        let other = fixed_tmp(&dir.join(file_name(Some("k-cd00000000000002"), "bin")));
+        let single = fixed_tmp(&dir.join(file_name(None, "bin")));
+        assert_eq!(one.file_name().unwrap(), "host-pipelines-k-ab00000000000001.bin.tmp");
+        assert!(one != other && one != single && other != single, "each file saves through its own temporary file");
+        // The save turn is the folder's, whatever the file.
+        assert_eq!(save_turn_key(dir), save_turn_key(dir));
+        // Off (as in the tests): this run's file is the single one.
+        assert_eq!(library_file(), "host-pipelines.bin");
+    }
+
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
@@ -985,7 +1112,7 @@ mod tests {
     #[test]
     fn the_library_file_is_mapped_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file());
         assert!(matches!(Blob::of(dir.path()), Blob::None), "no file yet");
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(Blob::of(dir.path()), Blob::None), "an empty file");
@@ -1009,7 +1136,7 @@ mod tests {
         drop(blob);
         // The next start reads the new one, wherever the save left it.
         assert_eq!(Blob::of(dir.path()).bytes(), &new[..]);
-        assert!(!dir.path().join(NEXT_FILE).exists());
+        assert!(!dir.path().join(next_file()).exists());
     }
 
     /// The bytes at `at` of the pattern the test below writes.
@@ -1061,7 +1188,7 @@ mod tests {
     fn a_replaced_library_file_still_reads_from_the_disk() {
         const LEN: usize = 8 << 20;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
+        let path = dir.path().join(library_file());
         if !write_uncached(&path, LEN) {
             return; // no uncached writes here: nothing to show
         }
@@ -1186,7 +1313,7 @@ mod tests {
     #[test]
     fn saves_go_through_one_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join(LIBRARY_FILE);
+        let target = dir.path().join(library_file());
         let orphan = fixed_tmp(&target);
         assert_eq!(orphan.file_name().unwrap(), "host-pipelines.bin.tmp");
         std::fs::write(&orphan, vec![0xEEu8; 1 << 16]).unwrap();
@@ -1204,7 +1331,7 @@ mod tests {
                 .filter_map(Result::ok)
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect();
-            assert_eq!(names, [LIBRARY_FILE], "save {k}: only the library is left");
+            assert_eq!(names, [library_file()], "save {k}: only the library is left");
             assert_eq!(std::fs::read(&target).unwrap(), vec![b'A' + k; 4096]);
         }
     }
@@ -1237,7 +1364,7 @@ mod tests {
     #[test]
     fn concurrent_save_io_and_replace_library_never_collide_or_leak_tmp() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join(LIBRARY_FILE);
+        let target = dir.path().join(library_file());
         let threads: Vec<_> = (0..4u8)
             .map(|t| {
                 let dir_path = dir.path().to_path_buf();

@@ -12,9 +12,11 @@
 //!   tables and its tests (tests cannot change output, but telling them
 //!   apart from code is a rule that could go wrong);
 //! - this crate's `Cargo.toml` and this script;
-//! - the workspace's `Cargo.toml` (profiles, dependency versions and
-//!   features) and `Cargo.lock` (the exact version of every crate linked
-//!   in: this crate's own dependencies are `thiserror` and `zlib-rs`);
+//! - of the workspace's `Cargo.toml`, the workspace, package and profile
+//!   sections and the dependency lines of the crates this one links; of
+//!   `Cargo.lock`, this crate's dependency closure (the exact version of
+//!   every crate linked in), not the other crates' lines
+//!   (`fingerprint_inputs.rs`);
 //! - the compiler: `rust-toolchain.toml` and `rustc -vV` (version, commit,
 //!   host, LLVM);
 //! - how this crate is built: target, profile, optimisation level, debug
@@ -27,6 +29,9 @@
 
 use std::path::{Path, PathBuf};
 use std::{env, fs};
+
+#[path = "fingerprint_inputs.rs"]
+mod fingerprint_inputs;
 
 /// FNV-1a, 128 bits (std has no wide hash, and a build script should not
 /// need a dependency): the inputs are our own files, so only accidental
@@ -96,13 +101,27 @@ fn main() {
     for (name, path) in [
         ("Cargo.toml", here.join("Cargo.toml")),
         ("build.rs", here.join("build.rs")),
-        ("workspace Cargo.toml", workspace.join("Cargo.toml")),
-        ("Cargo.lock", workspace.join("Cargo.lock")),
+        ("fingerprint_inputs.rs", here.join("fingerprint_inputs.rs")),
         ("rust-toolchain.toml", workspace.join("rust-toolchain.toml")),
     ] {
         println!("cargo:rerun-if-changed={}", path.display());
         hash.part(name, &fs::read(&path).unwrap_or_default());
     }
+    // Of the lock file, this crate's dependency closure only (each crate it
+    // links, at any depth, with its version and checksum); of the workspace
+    // manifest, the workspace, package and profile sections and the lines of
+    // those crates. A dependency another crate of the workspace takes left
+    // the key as it was not (2026-11-26: `tracing` added to victory-core made
+    // every cache cold).
+    let lock_path = workspace.join("Cargo.lock");
+    let manifest_path = workspace.join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    let lock = fs::read_to_string(&lock_path).unwrap_or_default();
+    let manifest = fs::read_to_string(&manifest_path).unwrap_or_default();
+    let names = fingerprint_inputs::closure_names(&lock, "victory-shader");
+    hash.part("Cargo.lock closure", fingerprint_inputs::lock_closure(&lock, "victory-shader").as_bytes());
+    hash.part("workspace Cargo.toml part", fingerprint_inputs::manifest_part(&manifest, &names).as_bytes());
 
     // The compiler that builds the translator.
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
