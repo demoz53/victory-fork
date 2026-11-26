@@ -2911,7 +2911,13 @@ impl State {
             // uploaded is what is made, `HostHeap::publish_ahead`), and the
             // texture object it names held while a thread the title knows
             // nothing of works on it. (Released meanwhile: nothing to upload.)
-            let record = if ahead { heap.handle(index).and_then(crate::descriptor::view_and_key) } else { None };
+            // (A record that names no view any more is made null at the
+            // submission, as `mirror` makes it below without the worker.)
+            let (record, record_key) = match ahead.then(|| heap.handle(index).and_then(crate::descriptor::record_at)).flatten() {
+                Some((Some(view), key)) => (Some((view, key)), Some(key)),
+                Some((None, key)) => (None, Some(key)),
+                None => (None, None),
+            };
             let mut held = None;
             if let Some((View::Shader(object, _), _)) = &record {
                 match crate::resource::hold(*object as This) {
@@ -3072,14 +3078,16 @@ impl State {
             let view = match &mut into {
                 PassInto::List(_) => heap.handle(index).and_then(|handle| host.mirror(index, handle, true)),
                 // On the worker the slot is made when this pass's list is
-                // handed to a submission, whatever becomes of it below (as
-                // `mirror` makes it here without the worker).
-                PassInto::Ahead(batch) => match (&record, heap.handle(index)) {
-                    (Some((view, key)), Some(handle)) => {
-                        if !batch.publish(index, handle, *key) {
+                // handed to a submission, whatever becomes of it below: with
+                // an upload, or without one (nothing to upload, the card
+                // holds it already, a table draw or the host fills it), as
+                // `mirror` makes it here without the worker.
+                PassInto::Ahead(batch) => match (record_key, heap.handle(index)) {
+                    (Some(key), Some(handle)) => {
+                        if !batch.publish(index, handle, key) {
                             return; // no list
                         }
-                        Some(view.clone())
+                        record.as_ref().map(|(view, _)| view.clone())
                     }
                     _ => None,
                 },
