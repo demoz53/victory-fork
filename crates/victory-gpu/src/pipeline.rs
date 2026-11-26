@@ -381,7 +381,31 @@ fn rays_run() -> bool {
 #[cfg(windows)]
 fn idle_without_rays() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_IDLE_WITHOUT_RAYS").is_some_and(|v| v == "1"))
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_IDLE_WITHOUT_RAYS").is_some_and(|v| v == "1"));
+    // The title's programs without rays read what ActivateRays chose.
+    on && !title_fallbacks()
+}
+
+/// Whether the title was patched to take its own programs without rays
+/// (`VICTORY_RT_FALLBACK`, made by the front end before any title code
+/// runs): its lighting then asks no structure, so what this crate stands in
+/// for the rays' light (`VICTORY_AMBIENT`) and leaves out for them
+/// (`VICTORY_IDLE_WITHOUT_RAYS`) stands down.
+static TITLE_FALLBACKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says the title takes its programs without rays (see [`title_fallbacks`]).
+pub fn set_title_fallbacks(on: bool) {
+    TITLE_FALLBACKS.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        tracing::info!(
+            "the title takes its own lighting programs without rays (VICTORY_RT_FALLBACK): VICTORY_AMBIENT and VICTORY_IDLE_WITHOUT_RAYS stand down"
+        );
+    }
+}
+
+/// Whether [`set_title_fallbacks`] said so.
+pub(crate) fn title_fallbacks() -> bool {
+    TITLE_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a compute program of `shaders` only makes sense with the title's

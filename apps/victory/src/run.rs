@@ -380,38 +380,69 @@ fn hex_str(bytes: &[u8]) -> String {
 /// - `VICTORY_RENDER_SCALE=<0.2..1>`: its own upscaler's render scale fixed
 ///   at that fraction of the output size (vitutu1/victory-perf, from
 ///   ZigZagBoi1/ScarlettPort), on any console. Off unless set.
+/// - `VICTORY_RT_FALLBACK=1`: its lighting takes its own programs without
+///   rays (SonicRaT/XNW `rtfallback`); `=2` also its feature mask without
+///   the ray-tracing structures (XNW `features_nort`). Off unless set. Made,
+///   it also stands the stand-in for the traced light down
+///   (`victory_gpu::pipeline::set_title_fallbacks`).
+/// - `VICTORY_NO_WATCHDOG=1`: its hang watchdog no longer ends the process
+///   (trustno1-coder/VIctory-NVIDIA, from vitutu1/victory-perf and
+///   ZigZagBoi1/ScarlettPort). Off unless set.
+/// - `VICTORY_RESOLUTION=<w>x<h>`: its table of output sizes capped there
+///   (soldsawn/victory-nvidia-8gb). Off unless set.
 ///
 /// `VICTORY_TITLE_PATCHES=0`: none. If a group's bytes are not there
-/// (another build), nothing of it is written and that is said; each patch
-/// made is said once.
+/// (another build), nothing of it is written and that is said once; each
+/// patch made is said once.
 #[cfg(windows)]
 fn apply_title_patches(
     image: &victory_loader::LoadedImage,
     build: Option<&victory_game::KnownBuild>,
     console: Console,
 ) {
-    use victory_loader::patch::MemoryPatch;
-    let switch = std::env::var("VICTORY_TITLE_PATCHES");
-    if switch.as_deref() == Ok("0") {
+    let var = |name: &str| std::env::var(name).ok();
+    let Some(groups) = title_patch_groups(build, console, var) else {
         return;
+    };
+    let size = image.info().size_of_image as usize;
+    // SAFETY: the title's image, mapped and not yet run.
+    let made = unsafe { apply_patch_groups(image.base(), size, &groups) };
+    if made.contains(&RT_FALLBACK) {
+        victory_gpu::pipeline::set_title_fallbacks(true);
     }
-    let upscaler = switch.as_deref() == Ok("1") || matches!(console, Console::SeriesS);
-    let scale = std::env::var("VICTORY_RENDER_SCALE").ok();
-    if !upscaler && scale.is_none() {
-        return;
+}
+
+/// The group `VICTORY_RT_FALLBACK` makes.
+#[cfg(windows)]
+const RT_FALLBACK: &str = "rt fallback";
+
+/// The groups of title patches the switches (`var`) ask for, or `None`
+/// when none is asked for or the build is not known (said then).
+#[cfg(windows)]
+fn title_patch_groups(
+    build: Option<&victory_game::KnownBuild>,
+    console: Console,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<Vec<(&'static str, Vec<victory_game::OwnedPatch>)>> {
+    let switch = var("VICTORY_TITLE_PATCHES");
+    if switch.as_deref() == Some("0") {
+        return None;
+    }
+    let upscaler = switch.as_deref() == Some("1") || matches!(console, Console::SeriesS);
+    let scale = var("VICTORY_RENDER_SCALE");
+    let fallback = var("VICTORY_RT_FALLBACK").filter(|v| !matches!(v.trim(), "" | "0"));
+    let no_watchdog = var("VICTORY_NO_WATCHDOG").is_some_and(|v| v.trim() == "1");
+    let resolution = var("VICTORY_RESOLUTION").filter(|v| !v.trim().is_empty());
+    if !upscaler && scale.is_none() && fallback.is_none() && !no_watchdog && resolution.is_none() {
+        return None;
     }
     let Some(build) = build else {
         println!("title patch    none: not a known build (it runs unpatched)");
-        return;
+        return None;
     };
-    let mut groups: Vec<(&str, Vec<victory_game::OwnedPatch>)> = Vec::new();
+    let mut groups: Vec<(&'static str, Vec<victory_game::OwnedPatch>)> = Vec::new();
     if upscaler {
-        let choice = build
-            .patches
-            .iter()
-            .map(|p| victory_game::OwnedPatch { name: p.name, rva: p.rva, expect: p.expect.to_vec(), write: p.write.to_vec() })
-            .collect();
-        groups.push(("upscaler choice", choice));
+        groups.push(("upscaler choice", victory_game::owned(build.patches)));
     }
     if let Some(text) = scale {
         match victory_game::parse_render_scale(&text) {
@@ -419,7 +450,48 @@ fn apply_title_patches(
             None => println!("title patch    none for VICTORY_RENDER_SCALE={text}: it wants a number from 0.2 to 1"),
         }
     }
-    let size = image.info().size_of_image as usize;
+    if let Some(text) = fallback {
+        match victory_game::parse_rt_fallback(&text) {
+            Some(level) => groups.push((RT_FALLBACK, victory_game::rt_fallback_patches(build, level))),
+            None => println!("title patch    none for VICTORY_RT_FALLBACK={text}: it wants 1 or 2"),
+        }
+    }
+    if no_watchdog {
+        groups.push(("watchdog", victory_game::owned(build.watchdog)));
+    }
+    if let Some(text) = resolution {
+        match victory_game::parse_resolution(&text) {
+            Some((w, h)) => {
+                let patches = victory_game::resolution_patches(build, w, h);
+                if patches.is_empty() && build.resolution.is_some() {
+                    println!("title patch    none for VICTORY_RESOLUTION={text}: no size of the title's is larger");
+                } else {
+                    groups.push(("resolution", patches));
+                }
+            }
+            None => println!(
+                "title patch    none for VICTORY_RESOLUTION={text}: it wants <w>x<h> from 1280x720 to 3840x2160"
+            ),
+        }
+    }
+    Some(groups)
+}
+
+/// Makes each group in the image at `base` (`size` bytes), all or none per
+/// group, says each patch made and each group left out, and returns the
+/// names of the groups made.
+///
+/// # Safety
+/// As [`victory_loader::patch::patch_mapped`]: `base..base + size` is an
+/// image mapped in this process and none of its code runs.
+#[cfg(windows)]
+unsafe fn apply_patch_groups(
+    base: usize,
+    size: usize,
+    groups: &[(&'static str, Vec<victory_game::OwnedPatch>)],
+) -> Vec<&'static str> {
+    use victory_loader::patch::MemoryPatch;
+    let mut made = Vec::new();
     for (group, patches) in groups {
         if patches.is_empty() {
             println!("title patch    none for the {group}: this build has no places for it");
@@ -429,10 +501,10 @@ fn apply_title_patches(
             .iter()
             .map(|p| MemoryPatch { name: p.name, rva: p.rva, expect: &p.expect, write: &p.write })
             .collect();
-        // SAFETY: the title's image, mapped and not yet run.
-        match unsafe { victory_loader::patch::patch_mapped(image.base(), size, &memory) } {
+        // SAFETY: forwarded from this function's contract.
+        match unsafe { victory_loader::patch::patch_mapped(base, size, &memory) } {
             Ok(()) => {
-                for p in &patches {
+                for p in patches {
                     println!(
                         "title patch    +{:#x} {} (in memory): {} -> {}",
                         p.rva,
@@ -441,8 +513,97 @@ fn apply_title_patches(
                         hex_str(&p.write)
                     );
                 }
+                made.push(*group);
             }
             Err(e) => println!("title patch    none for the {group} ({e}): the title runs without it"),
         }
+    }
+    made
+}
+
+#[cfg(all(test, windows))]
+mod patch_tests {
+    use super::*;
+
+    /// A fake image as large as the title's, zeros but for `sites`.
+    fn image_with(sites: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut image = vec![0u8; 0x620_0000];
+        for &(rva, bytes) in sites {
+            image[rva as usize..][..bytes.len()].copy_from_slice(bytes);
+        }
+        image
+    }
+
+    fn vars(set: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |name| set.iter().find(|(n, _)| *n == name).map(|(_, v)| (*v).to_owned())
+    }
+
+    #[test]
+    fn only_asked_groups_are_built() {
+        let build = &victory_game::KNOWN_BUILDS[0];
+        assert!(title_patch_groups(Some(build), Console::SeriesX, vars(&[])).is_none());
+        assert!(title_patch_groups(None, Console::SeriesX, vars(&[("VICTORY_NO_WATCHDOG", "1")])).is_none());
+        let all = &[
+            ("VICTORY_RT_FALLBACK", "2"),
+            ("VICTORY_NO_WATCHDOG", "1"),
+            ("VICTORY_RESOLUTION", "1920x1080"),
+        ];
+        let names = |g: Option<Vec<(&'static str, Vec<victory_game::OwnedPatch>)>>| {
+            g.unwrap().iter().map(|(n, p)| (*n, p.len())).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(title_patch_groups(Some(build), Console::SeriesX, vars(all))),
+            [(RT_FALLBACK, 2), ("watchdog", 2), ("resolution", 3)]
+        );
+        // The one switch that turns them all off.
+        let off = &[("VICTORY_TITLE_PATCHES", "0"), ("VICTORY_RT_FALLBACK", "1"), ("VICTORY_NO_WATCHDOG", "1")];
+        assert!(title_patch_groups(Some(build), Console::SeriesS, vars(off)).is_none());
+        // Values they do not take: nothing.
+        let bad = &[("VICTORY_RT_FALLBACK", "3"), ("VICTORY_NO_WATCHDOG", "yes"), ("VICTORY_RESOLUTION", "640x360")];
+        assert_eq!(names(title_patch_groups(Some(build), Console::SeriesX, vars(bad))), []);
+        assert_eq!(names(title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_RT_FALLBACK", "1")]))), [(RT_FALLBACK, 1)]);
+    }
+
+    #[test]
+    fn groups_with_their_bytes_are_made_and_the_others_left_out() {
+        let build = &victory_game::KNOWN_BUILDS[0];
+        let set = &[("VICTORY_RT_FALLBACK", "2"), ("VICTORY_NO_WATCHDOG", "1"), ("VICTORY_RESOLUTION", "1920x1080")];
+        let groups = title_patch_groups(Some(build), Console::SeriesX, vars(set)).unwrap();
+        let every: Vec<&victory_game::OwnedPatch> = groups.iter().flat_map(|(_, p)| p).collect();
+
+        // The right bytes everywhere: every group made, each site ours now.
+        let sites: Vec<(u32, &[u8])> = every.iter().map(|p| (p.rva, &p.expect[..])).collect();
+        let mut image = image_with(&sites);
+        // SAFETY: our own buffer, nothing runs it.
+        let made = unsafe { apply_patch_groups(image.as_mut_ptr() as usize, image.len(), &groups) };
+        assert_eq!(made, [RT_FALLBACK, "watchdog", "resolution"]);
+        for p in &every {
+            assert_eq!(&image[p.rva as usize..][..p.write.len()], &p.write[..], "{}", p.name);
+        }
+
+        // Another build: the feature mask's bytes differ. The whole rt
+        // fallback group is left out (its set test too); the others are made.
+        let mask = build.features_nort[0];
+        let sites: Vec<(u32, &[u8])> =
+            every.iter().map(|p| (p.rva, if p.rva == mask.rva { &[0xb8, 0x4f, 0xde, 0x01, 0x00][..] } else { &p.expect[..] })).collect();
+        let mut image = image_with(&sites);
+        // SAFETY: as above.
+        let made = unsafe { apply_patch_groups(image.as_mut_ptr() as usize, image.len(), &groups) };
+        assert_eq!(made, ["watchdog", "resolution"]);
+        let test = build.rt_fallback[0];
+        assert_eq!(&image[test.rva as usize..][..test.expect.len()], test.expect, "left as it was");
+        for p in &groups[1].1 {
+            assert_eq!(&image[p.rva as usize..][..p.write.len()], &p.write[..], "{}", p.name);
+        }
+
+        // An image too small for the table: that group is left out.
+        let mut small = vec![0u8; 0x300_0000];
+        let w = build.watchdog;
+        for p in w {
+            small[p.rva as usize..][..p.expect.len()].copy_from_slice(p.expect);
+        }
+        // SAFETY: as above.
+        let made = unsafe { apply_patch_groups(small.as_mut_ptr() as usize, small.len(), &groups[1..]) };
+        assert_eq!(made, ["watchdog"]);
     }
 }
