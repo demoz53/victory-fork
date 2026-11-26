@@ -86,6 +86,11 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/trim2 (on test/leak1: the recording threads' per-draw cost)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_LOOKUP_CACHE` | `1` | off | each thread remembers (weakly) what its asks for a buffer's or window's host copy found, until any lookup table changes (a global count bumped where a buffer is registered or released, a copy taken out, a window made or let go): a copy made again at the same address is never found from memory. A window found so is checked and noted under the windows' lock. Memory line: "asks for a buffer's host copy since the last line: N answered from the asking thread's memory, M from the tables". An ask 745 -> 257 ns with 5 threads asking, 56 -> 44 ns alone | test/trim2 (fxceless 32be36d50, fork PR #1237) | no |
+
 ## New in all22 (merged on top of all21)
 From test/watch3 (holds test/watch2), test/async2 (holds test/async1), test/trim1, test/waits (CONSTANT_WAITS),
 test/spread, test/pic2 (holds test/pic1) and test/prof; each row's "From" names its source.
