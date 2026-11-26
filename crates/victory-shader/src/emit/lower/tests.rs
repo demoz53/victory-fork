@@ -877,6 +877,78 @@ fn an_lds_write_and_read_in_one_lane_branch_meet_around_it_only_when_approximate
     assert!(super::lds_meetings(&p, &st, &all).is_none(), "and refused again after it");
 }
 
+/// LDS atomics in one lane branch: a minimum then an add to the same word give 33 on the
+/// console with 33 lanes, but 1 or 32 when one host wave gets through both before the other
+/// starts. An atomic reads the word too, so the region is refused there (and the program takes
+/// a form with the atomics where every lane runs); one kind of reduction without results is
+/// not. Ported from avatarmanz/VIctory-7900XTX PR #204 (feanorsun, 5e200817b).
+#[test]
+fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32) -> [u32; 2] {
+        [0x36 << 26 | op << 18, vdst << 24 | data0 << 8 | addr]
+    }
+    let program = |first: u32, second: u32| {
+        let mut w = vec![
+            0x7E12_0280, // v_mov_b32 v9, 0 (address and minimum)
+            0x7E04_0281, // v_mov_b32 v2, 1 (increment)
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0006, // s_cbranch_execz past both atomics
+        ];
+        w.extend(ds(first, 0, 9, 9));
+        w.extend([
+            0xBF07_8001, // s_cmp_lg_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 past the second
+        ]);
+        w.extend(ds(second, 0, 9, 2));
+        w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+        w.extend(ds(0x36, 5, 9, 0)); // ds_read_b32 v5, v9
+        w.push(S_ENDPGM);
+        let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        ir::build(&code, true, 16).expect("ir::build")
+    };
+    let meets = |p: &ir::Program| {
+        let st = structure::structure(p).expect("structure");
+        let all = super::all_lane_blocks(&st).expect("all-lane blocks");
+        let names: Vec<&str> = p
+            .blocks
+            .iter()
+            .zip(&all)
+            .filter(|(_, full)| !**full)
+            .flat_map(|(b, _)| &b.insts)
+            .map(|i| i.name())
+            .filter(|n| n.starts_with("ds_"))
+            .collect();
+        (names.join(" "), super::lds_meetings(p, &st, &all).is_some())
+    };
+    let off = |p: &ir::Program| {
+        let was = super::TEST_LDS_ATOMICS_READ.replace(Some(false));
+        let r = meets(p);
+        super::TEST_LDS_ATOMICS_READ.set(was);
+        r.1
+    };
+    // ds_min_u32 then ds_add_u32: refused; taken with the switch off (the race)
+    let p = program(0x07, 0x00);
+    assert_eq!(meets(&p), ("ds_min_u32 ds_add_u32".into(), false));
+    assert!(off(&p));
+    // ds_min_u32 then ds_add_rtn_u32 (the old value back: a slot claimed): refused
+    let p = program(0x07, 0x20);
+    assert_eq!(meets(&p), ("ds_min_u32 ds_add_rtn_u32".into(), false));
+    // ds_add_rtn_u32 then ds_write_b32: an atomic and a store, refused
+    let p = program(0x20, 0x0D);
+    assert_eq!(meets(&p), ("ds_add_rtn_u32 ds_write_b32".into(), false));
+    assert!(off(&p));
+    // two ds_add_u32 (one kind of reduction, no result): any order gives the same word
+    let p = program(0x00, 0x00);
+    assert_eq!(meets(&p), ("ds_add_u32 ds_add_u32".into(), true));
+    // ds_max_u32 then ds_add_u32: two kinds, refused
+    let p = program(0x08, 0x00);
+    assert!(!meets(&p).1);
+    // two ds_write_b32: write-only as before
+    let p = program(0x0D, 0x0D);
+    assert_eq!(meets(&p), ("ds_write_b32 ds_write_b32".into(), true));
+}
+
 /// A lane loop (one block, left per lane on `s_cbranch_execnz`): after the first round only
 /// the lanes still in it run its block, so it is not a block every lane runs, though it
 /// post-dominates its own branch.

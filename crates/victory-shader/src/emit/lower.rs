@@ -1201,6 +1201,8 @@ pub(super) fn with_lds_regions_approx<R>(f: impl FnOnce() -> R) -> R {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+/// An LDS atomic is a read and a write ([`lds_atomics_read`]), except where a region's
+/// accesses are all one kind of order-free reduction ([`LDS_REDUCTIONS`]).
 /// Inside [`with_lds_regions_approx`] (`VICTORY_WAVE_LDS_REGIONS=approx`): a write and a read inside one
 /// region get the meetings around the region all the same, and their order inside it between
 /// the two host waves is left to the card.
@@ -1233,6 +1235,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // per region: LDS reads, LDS writes
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    // per region: the one kind of order-free reduction its accesses all are, if they are
+    let mut reduction: Vec<Option<Option<&str>>> = vec![None; n];
+    let atomics_read = lds_atomics_read();
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
@@ -1247,10 +1252,22 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                // An atomic reads the word it changes, with a result or without one: only
+                // ordinary stores are write-only.
+                reads[r] |= atomics_read && !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
+            let kind = LDS_REDUCTIONS.contains(&name).then_some(name);
+            reduction[r] = match reduction[r] {
+                None => Some(kind),
+                Some(k) if k == kind => Some(k),
+                Some(_) => Some(None),
+            };
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) && !lds_regions_approx() {
+    // A region whose accesses are all one kind of integer reduction with no result for any
+    // lane leaves each word the same whichever half of the console wave gets there first.
+    let ordered = |r: usize| reads[r] && writes[r] && !matches!(reduction[r], Some(Some(_)));
+    if (0..n).any(ordered) && !lds_regions_approx() {
         return None;
     }
     let mut meet = vec![(false, false); n];
@@ -1266,6 +1283,50 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// The LDS atomics without a result whose final value at a word does not depend on the order
+/// of the lanes that change it: integer reductions of one kind ([`lds_meetings`]).
+const LDS_REDUCTIONS: [&str; 18] = [
+    "ds_add_u32",
+    "ds_sub_u32",
+    "ds_and_b32",
+    "ds_or_b32",
+    "ds_xor_b32",
+    "ds_min_i32",
+    "ds_max_i32",
+    "ds_min_u32",
+    "ds_max_u32",
+    "ds_add_u64",
+    "ds_sub_u64",
+    "ds_and_b64",
+    "ds_or_b64",
+    "ds_xor_b64",
+    "ds_min_i64",
+    "ds_max_i64",
+    "ds_min_u64",
+    "ds_max_u64",
+];
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lds_atomics_read`], for its thread only.
+    pub(super) static TEST_LDS_ATOMICS_READ: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether [`lds_meetings`] counts an LDS atomic as a read of the word it changes as well as a
+/// write: two kinds of atomics (a minimum then an add, an add returning the old value then a
+/// store) in one lane-branch region are then refused there, as a write and a read are, and the
+/// program takes a form in which they sit where every lane runs, each with its meeting. Ported
+/// from avatarmanz/VIctory-7900XTX PR #204 (feanorsun, 5e200817b). On; `VICTORY_LDS_ATOMICS_READ=0`
+/// as before (atomics taken as writes only: the two host waves of a console wave race there).
+fn lds_atomics_read() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_ATOMICS_READ.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_ATOMICS_READ").is_none_or(|v| v != "0"))
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
