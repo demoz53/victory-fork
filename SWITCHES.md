@@ -69,6 +69,11 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/prof (on all20)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_PROFILE` (new form) | a number of milliseconds (`2`); a value that is not a number is the old form (a file for the stall profiler) | off | diagnostics builds: a sampler thread (above normal) looks at every thread every <ms>; a thread whose cycle count moved less than 100,000 since the last pass counts as waiting where it was last seen, any other is suspended only to read its registers, cycle count and up to 64 KiB of its stack (no allocation, log or lock meanwhile), and the copy is unwound after it runs again. Log lines `PROFILE ...` every 30 s (the last 30 s) and at the title's exit (the whole run; not after `Stop-Process`): per thread with over 1% of all running samples, its share, running vs waiting, running by leaf module (title, victory, system, d3d, nvidia, other), its top 12 functions of ours innermost under the title's frames (each with its top 2 leaf modules) and where it waits; then a process-wide top 25. The first line of each report gives the sampler's own cost (time a pass, threads suspended a pass and for how long) | test/prof | no |
+
 ## New in all20 (merged on top of all19)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
