@@ -349,6 +349,7 @@ pub(crate) fn forget(resource: usize) {
 /// a keeper, copied from the keeper again. The texture is left readable by
 /// shaders, as the pass over the heap's views leaves the ones it uploads.
 pub(crate) fn restore_due(list: &HostList) {
+    list.meter_ours(crate::meters::Kind::Uploads);
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     if KEPT_NOW.load(Relaxed) == 0 {

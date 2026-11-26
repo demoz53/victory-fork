@@ -261,6 +261,7 @@ pub(crate) static ALIAS_OWED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
 /// the texture from title memory, as before.
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+    list.meter_ours(crate::meters::Kind::Uploads);
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
@@ -764,6 +765,7 @@ pub(crate) static UPLOAD_PARTS: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    list.meter_ours(crate::meters::Kind::Uploads);
     // Before the look at what the host has copied into (`crate::hostcopy`).
     crate::hostcopy::asked(resource);
     let host_written = HOST_WRITTEN

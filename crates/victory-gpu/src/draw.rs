@@ -732,6 +732,8 @@ pub(crate) struct State {
     topology_set: bool,
     target_handles: Vec<u64>,
     depth_handle: u64,
+    /// `VICTORY_METERS`: the bound targets as a pass key, and as text.
+    meter_target: (u64, String),
     targets_set: bool,
     /// The formats of the views [`State::set_targets`] bound on the host
     /// list: a draw's pipeline is one for them
@@ -1535,6 +1537,21 @@ impl State {
     }
 
     /// Render targets and depth, set on the host list at once.
+    /// `VICTORY_METERS`: the title's draw (or dispatch) about to be
+    /// recorded, for the card's split; a draw pass is its render targets, a
+    /// dispatch run (with `=2`) its pipeline.
+    fn meter_mark(&self, list: &HostList, dispatch: bool, work: u64) {
+        if !crate::meters::on() {
+            return;
+        }
+        if dispatch {
+            let key = if crate::meters::level() >= 2 { self.pipeline as u64 } else { 0 };
+            list.meter(crate::meters::Kind::TitleDispatches, key, String::new, (0, 1, work));
+        } else {
+            list.meter(crate::meters::Kind::TitleDraws, self.meter_target.0, || self.meter_target.1.clone(), (1, 0, work));
+        }
+    }
+
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -1599,6 +1616,29 @@ impl State {
             Some(host.dsv(texture, desc.as_ref()))
         });
         self.target_formats = formats;
+        // VICTORY_METERS: the pass these targets make, and what they are.
+        if crate::meters::on() {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (handles, depth).hash(&mut hasher);
+            let first = self.targets.first().copied().or((self.depth != 0).then_some(self.depth));
+            let text = first
+                .and_then(|r| crate::resource::host_resource(r as This))
+                .map(|t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!(
+                        "{}x{} format {} ({} targets{})",
+                        d.Width,
+                        d.Height,
+                        d.Format.0,
+                        self.targets.len(),
+                        if self.depth != 0 { " + depth" } else { "" }
+                    )
+                })
+                .unwrap_or_else(|| "no target".into());
+            self.meter_target = (hasher.finish(), text);
+        }
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -3918,6 +3958,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
         self.may_store(list);
+        self.meter_mark(list, true, u64::from(gx) * u64::from(gy) * u64::from(gz));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -4384,6 +4425,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     self.may_store(list);
+                    self.meter_mark(list, false, u64::from(x));
                     match launch {
                         Some(launch) => {
                             crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
@@ -4901,6 +4943,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             self.may_store(list);
+            self.meter_mark(list, false, u64::from(count) * u64::from(instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -5002,6 +5045,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             self.may_store(list);
+            self.meter_mark(list, false, u64::from(indices) * u64::from(instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -5314,6 +5358,7 @@ impl State {
             list.keep(&args.buffer);
             self.mesh_scissor(list, true);
             self.may_store(list);
+            self.meter_mark(list, false, 0);
             let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
             self.mesh_scissor(list, false);
             if !launched {
@@ -5593,6 +5638,7 @@ impl State {
             self.mesh_scissor(list, true);
         }
         self.may_store(list);
+        self.meter_mark(list, kind == DISPATCH, 0);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -5633,6 +5679,7 @@ impl State {
                 self.host_roots[1] = 0;
                 if self.bind(list, p, true) {
                     self.may_store(list);
+                    self.meter_mark(list, kind == DISPATCH, 0);
                     // SAFETY: an open list with `p`'s root signature and
                     // arguments set; the part's pipeline shares that root
                     // signature, and it and the scratch buffer are kept alive.

@@ -899,6 +899,15 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+/// `VICTORY_METERS`: the card's meter (made at its first use).
+pub(crate) fn meter_card() -> Option<&'static crate::meters::Card> {
+    if !crate::meters::on() {
+        return None;
+    }
+    let host = host()?;
+    crate::meters::card(&host.device, &host.queue)
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
@@ -1208,6 +1217,8 @@ pub(crate) struct HostList {
     /// The first pipeline the list binds (`VICTORY_METERS` names its
     /// submission by it).
     first_pipeline: Mutex<Option<String>>,
+    /// `VICTORY_METERS`: the time stamps the list writes as it is recorded.
+    meter: Mutex<crate::meters::ListStamps>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -6501,6 +6512,7 @@ impl Host {
                 prelude,
                 pipelines: Mutex::default(),
                 first_pipeline: Mutex::default(),
+                meter: Mutex::default(),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -6939,12 +6951,15 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let stamps = std::cell::RefCell::new(crate::meters::ours_begin(list, crate::meters::Kind::BufferCopies));
                     // This plan's bytes would go over its own, not sent yet:
                     // what is recorded so far runs and is waited for, and the
                     // list starts again.
                     let flush = |ring: &mut Ring| -> windows::core::Result<()> {
+                        crate::meters::ours_end(&mut stamps.borrow_mut(), list);
                         list.Close()?;
                         self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        crate::meters::queue(stamps.borrow_mut().take());
                         ring.value += 1;
                         self.queue.Signal(&ring.fence, ring.value)?;
                         if ring.fence.GetCompletedValue() < ring.value {
@@ -6954,6 +6969,7 @@ impl Host {
                         ring.busy.clear();
                         allocator.Reset()?;
                         list.Reset(allocator, None)?;
+                        *stamps.borrow_mut() = crate::meters::ours_begin(list, crate::meters::Kind::BufferCopies);
                         crate::shadow::lean_part();
                         Ok(())
                     };
@@ -6972,6 +6988,7 @@ impl Host {
                                 let split = splits.get(k).and_then(Option::as_ref);
                                 let copies: &[(usize, usize)] = split.map_or(&ranges[..], |(split, _)| &split.copies);
                                 for &(a, b) in copies {
+                                    crate::meters::ours_mark(&mut stamps.borrow_mut(), list, crate::meters::Kind::BufferCopies);
                                     list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                                     crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                                 }
@@ -6989,6 +7006,7 @@ impl Host {
                                     list.SetComputeRootShaderResourceView(0, staging.GetGPUVirtualAddress());
                                     list.SetComputeRootShaderResourceView(1, buffer.GetGPUVirtualAddress() + *section as u64);
                                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                                    crate::meters::ours_mark(&mut stamps.borrow_mut(), list, crate::meters::Kind::Hashes);
                                     list.Dispatch(crate::card_mask::groups_x(split), split.blocks.len() as u32, 1);
                                     list.ResourceBarrier(&[transition(
                                         &shadow.buffer,
@@ -7017,6 +7035,7 @@ impl Host {
                                             n as usize,
                                             false,
                                         );
+                                        crate::meters::ours_mark(&mut stamps.borrow_mut(), list, crate::meters::Kind::BufferCopies);
                                         list.CopyBufferRegion(&shadow.buffer, at as u64, &ring.buffer, into, n);
                                         crate::shadow::CARD_STATS[0].fetch_add(n, Ordering::Relaxed);
                                         crate::shadow::lean_sent(n);
@@ -7064,12 +7083,15 @@ impl Host {
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         // The same length as the compare's (`card_hashed`).
                         let hashed = shadow.card_hashed().unwrap_or(size) as u32;
+                        crate::meters::ours_mark(&mut stamps.borrow_mut(), list, crate::meters::Kind::Hashes);
                         for run in runs {
                             dispatch_card_compare(list, run.first, run.skew, hashed, run.pieces, 0, 0);
                         }
                     }
+                    crate::meters::ours_end(&mut stamps.borrow_mut(), list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    crate::meters::queue(stamps.borrow_mut().take());
                     // Behind the copies: the ring's stretches they read are
                     // free again once this value is reached.
                     if let Some(ring) = ring.as_mut()
@@ -7145,6 +7167,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let mut check_stamps = crate::meters::ours_begin(list, crate::meters::Kind::Hashes);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -7219,6 +7242,8 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
+                    crate::meters::ours_end(&mut check_stamps, list);
+                    crate::meters::queue(check_stamps.take());
                     list.Close()?;
                     list.cast()
                 })()
@@ -7442,9 +7467,17 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                // VICTORY_METERS: a fetch on the direct queue is stamped (a copy
+                // queue has timestamps of its own kind, not taken).
+                let mut stamps = if use_copy_queue && self.copy_queue.is_some() {
+                    None
+                } else {
+                    crate::meters::ours_begin(&list, crate::meters::Kind::CopyBacks)
+                };
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
+                crate::meters::ours_end(&mut stamps, &list);
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 if use_copy_queue && let Some(cq) = &self.copy_queue {
@@ -7466,6 +7499,9 @@ impl Host {
                     drop(order);
                     self.card_sent();
                     self.queue.Signal(&fence, sent)?;
+                    if let Some(card) = crate::meters::made_card() {
+                        card.sent(None, &fence, sent, None, stamps.take().and_then(|mut s| s.take()).into_iter().collect());
+                    }
                     fence.SetEventOnCompletion(sent, event)?;
                     WaitForSingleObject(event, INFINITE);
                     Ok(after)
@@ -7859,14 +7895,19 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let mut stamps = crate::meters::ours_begin(list, crate::meters::Kind::CopyBacks);
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    crate::meters::ours_end(&mut stamps, list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    if let Some(card) = crate::meters::made_card() {
+                        card.sent(None, &self.fence, *submitted, None, stamps.take().and_then(|mut s| s.take()).into_iter().collect());
+                    }
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -8288,6 +8329,7 @@ impl Host {
             (|| -> windows::core::Result<()> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                let mut stamps = crate::meters::ours_begin(&list, crate::meters::Kind::BufferCopies);
                 list.ResourceBarrier(&states(true));
                 for p in alias {
                     list.CopyBufferRegion(
@@ -8299,6 +8341,8 @@ impl Host {
                     );
                 }
                 list.ResourceBarrier(&states(false));
+                crate::meters::ours_end(&mut stamps, &list);
+                crate::meters::queue(stamps.take());
                 list.Close()
             })()
         };
@@ -8587,9 +8631,14 @@ impl Host {
         let prepared = std::time::Instant::now();
         // VICTORY_METERS=1: the submission's card time, between a stamp list
         // of ours ahead of its lists and one after them (and the compare).
-        let stamp = crate::meters::card(&self.device, &self.queue).and_then(|c| c.stamp().map(|s| (c, s)));
-        let meter_name = stamp.as_ref().and_then(|_| runs.iter().find_map(|r| r.first_pipeline()));
-        if let Some((_, s)) = &stamp {
+        let meter = crate::meters::card(&self.device, &self.queue);
+        let stamp = meter.and_then(crate::meters::Card::stamp);
+        let meter_records: Vec<crate::meters::ListStamps> = match meter {
+            Some(_) => runs.iter().filter_map(|r| r.meter_take()).chain(crate::meters::take_queued()).collect(),
+            None => Vec::new(),
+        };
+        let meter_name = meter.and_then(|_| runs.iter().find_map(|r| r.first_pipeline()));
+        if let Some(s) = &stamp {
             lists.insert(0, Some(s.begin.clone()));
         }
         // Waits for staging buffers a flight still copies from, inside this
@@ -8608,7 +8657,7 @@ impl Host {
                 }
             }
             *submitted += 1;
-            if let Some((_, s)) = &stamp
+            if let Some(s) = &stamp
                 && check_alone.is_none()
             {
                 lists.push(Some(s.end.clone()));
@@ -8618,14 +8667,14 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 if let Some(check) = &check_alone {
                     match &stamp {
-                        Some((_, s)) => self.queue.ExecuteCommandLists(&[check[0].clone(), Some(s.end.clone())]),
+                        Some(s) => self.queue.ExecuteCommandLists(&[check[0].clone(), Some(s.end.clone())]),
                         None => self.queue.ExecuteCommandLists(check),
                     }
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
-            if let Some((card, s)) = stamp {
-                card.sent(s, &self.fence, *submitted, meter_name);
+            if let Some(card) = meter {
+                card.sent(stamp, &self.fence, *submitted, meter_name, meter_records);
             }
             awake::sent(&self.device);
             self.card_sent();
@@ -8704,7 +8753,7 @@ impl Host {
                     self.queue.ExecuteCommandLists(check);
                 }
                 if i + 1 == groups.len()
-                    && let Some((_, s)) = &stamp
+                    && let Some(s) = &stamp
                 {
                     self.queue.ExecuteCommandLists(&[Some(s.end.clone())]);
                 }
@@ -8757,8 +8806,8 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        if let Some((card, s)) = stamp {
-            card.sent(s, &self.fence, *submitted, meter_name);
+        if let Some(card) = meter {
+            card.sent(stamp, &self.fence, *submitted, meter_name, meter_records);
         }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -9177,14 +9226,21 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // VICTORY_METERS: what a closing list adds after the title's work.
+        self.meter_more(crate::meters::Kind::Uploads);
         self.twins_to_depth();
+        self.meter_more(crate::meters::Kind::CopyBacks);
         self.textures_back();
+        self.meter_more(crate::meters::Kind::OursInList);
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
         }
         self.batches_common();
         self.card_budget_out();
+        if let Some(card) = meter_card() {
+            self.meter.lock().unwrap_or_else(|e| e.into_inner()).close(card, &self.list);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -9215,6 +9271,8 @@ impl HostList {
         self.plane_reset.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         *self.first_pipeline.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Stamps of a recording never sent (a sent one's went with it).
+        self.meter.lock().unwrap_or_else(|e| e.into_inner()).forget(crate::meters::made_card());
         // (A recording that was closed left none: one that was not never ran,
         // and its batches' buffers are as they were.)
         self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).1 = 0;
@@ -9778,6 +9836,11 @@ impl HostList {
 
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
+        if crate::meters::on() {
+            let mut meter = self.meter.lock().unwrap_or_else(|e| e.into_inner());
+            meter.pipeline.clear();
+            meter.pipeline.push_str(name);
+        }
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             if pipelines.is_empty() && crate::meters::on() {
@@ -9790,6 +9853,34 @@ impl HostList {
     /// The first pipeline the list binds (with `VICTORY_METERS`).
     fn first_pipeline(&self) -> Option<String> {
         self.first_pipeline.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `VICTORY_METERS`: the command about to be recorded is of `kind` (of
+    /// the title's pass `key`, with the targets' text and its counts).
+    pub(crate) fn meter(&self, kind: crate::meters::Kind, key: u64, target: impl FnOnce() -> String, add: (u64, u64, u64)) {
+        if !crate::meters::on() {
+            return;
+        }
+        let Some(card) = meter_card() else { return };
+        self.meter.lock().unwrap_or_else(|e| e.into_inner()).mark(card, &self.list, kind, key, target, add);
+    }
+
+    /// [`HostList::meter`] for work of ours.
+    pub(crate) fn meter_ours(&self, kind: crate::meters::Kind) {
+        self.meter(kind, 0, String::new, (0, 0, 0));
+    }
+
+    /// [`HostList::meter_ours`], in a list that has stamps already (the
+    /// work a closing list adds after the title's).
+    fn meter_more(&self, kind: crate::meters::Kind) {
+        if crate::meters::on() && self.meter.lock().unwrap_or_else(|e| e.into_inner()).has_any() {
+            self.meter_ours(kind);
+        }
+    }
+
+    /// The list's stamps, for its submission.
+    fn meter_take(&self) -> Option<crate::meters::ListStamps> {
+        self.meter.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
@@ -9863,6 +9954,7 @@ impl HostList {
         }
         let at = *used;
         *used += room;
+        self.meter_ours(crate::meters::Kind::BufferCopies);
         let constants = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
         // SAFETY: an open list; both buffers are live and the ranges inside
         // them (checked above).

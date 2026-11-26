@@ -859,6 +859,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = Vec::with_capacity(barriers.len());
+        // VICTORY_METERS=2: the title's barriers are segments of their own.
+        if crate::meters::level() >= 2 {
+            list.meter_ours(crate::meters::Kind::TitleBarriers);
+        }
         for b in barriers {
             host_barrier(list, b, &mut host);
         }
@@ -960,6 +964,13 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    // VICTORY_METERS: the card's time of the title's TitleCopies.
+    #[cfg(windows)]
+    if crate::meters::on()
+        && let Some(list) = host_list(this)
+    {
+        list.meter_ours(crate::meters::Kind::TitleCopies);
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -999,6 +1010,13 @@ fn unlike(dst: This, src: This, mapped: bool) -> bool {
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    // VICTORY_METERS: the card's time of the title's TitleCopies.
+    #[cfg(windows)]
+    if crate::meters::on()
+        && let Some(list) = host_list(this)
+    {
+        list.meter_ours(crate::meters::Kind::TitleCopies);
+    }
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -1120,6 +1138,13 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    // VICTORY_METERS: the card's time of the title's TitleCopies.
+    #[cfg(windows)]
+    if crate::meters::on()
+        && let Some(list) = host_list(this)
+    {
+        list.meter_ours(crate::meters::Kind::TitleCopies);
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1401,6 +1426,13 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    // VICTORY_METERS: the card's time of the title's ClearsResolves.
+    #[cfg(windows)]
+    if crate::meters::on()
+        && let Some(list) = host_list(this)
+    {
+        list.meter_ours(crate::meters::Kind::ClearsResolves);
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1477,6 +1509,13 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    // VICTORY_METERS: the card's time of the title's ClearsResolves.
+    #[cfg(windows)]
+    if crate::meters::on()
+        && let Some(list) = host_list(this)
+    {
+        list.meter_ours(crate::meters::Kind::ClearsResolves);
+    }
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -1527,6 +1566,13 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    // VICTORY_METERS: the card's time of the title's ClearsResolves.
+    #[cfg(windows)]
+    if crate::meters::on()
+        && let Some(list) = host_list(this)
+    {
+        list.meter_ours(crate::meters::Kind::ClearsResolves);
+    }
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -2305,6 +2351,13 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    // VICTORY_METERS=2: the title's barriers are segments of their own.
+    #[cfg(windows)]
+    if crate::meters::level() >= 2
+        && let Some(list) = host_list(this)
+    {
+        list.meter_ours(crate::meters::Kind::TitleBarriers);
+    }
     // (`VICTORY_INDIRECT_BATCH=2`: the title waits for its dispatches.)
     #[cfg(windows)]
     if count > 0 && crate::draw::batches() == 2 {
