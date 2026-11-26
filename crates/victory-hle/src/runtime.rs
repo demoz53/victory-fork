@@ -185,13 +185,31 @@ pub fn title() -> Title {
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
+    // `VICTORY_EXECUTION_SPEED=1` (off by default): the system does not run
+    // the process at reduced speed either (its "efficiency mode", EcoQoS:
+    // lower clocks and the slow cores of a hybrid processor) when its
+    // window is not the one in front or is hidden. The console has eight
+    // cores alike and no such mode. Process-wide, every thread included
+    // (none of ours sets its own). Beside `VICTORY_PROCESS_PRIORITY=above`
+    // (the priority class) and `VICTORY_FAST_CORES` (which threads prefer
+    // the fast cores' processor sets) it is a third, separate setting: the
+    // other two say who runs first and where, this whether the system may
+    // slow the process down at all. After avatarmanz/VIctory-7900XTX
+    // 51d3f4da0 and fxceless/victory-fork a25370661 (fxceless; GPL-3.0),
+    // which do it by default (`VICTORY_EFFICIENCY_MODE=1` there: not).
+    let execution = if std::env::var_os("VICTORY_EXECUTION_SPEED").is_some_and(|v| v == "1") {
+        tracing::info!("VICTORY_EXECUTION_SPEED=1: the process is kept out of the system's efficiency mode");
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    } else {
+        0
+    };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
