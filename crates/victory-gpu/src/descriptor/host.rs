@@ -548,6 +548,92 @@ impl Spans {
             .flat_map(|span| span.1.iter().copied())
             .collect()
     }
+
+    /// The slots of the textures that hold bytes of `[start, end)`, for a
+    /// read there: as [`Spans::slots_in`], but when a texture starts at
+    /// `start` itself the one before it is left out (a request that fills a
+    /// texture begins at its first byte, and `slots_in` would name its
+    /// neighbour with every such read). fxceless/victory-fork e4245f3c1.
+    fn slots_holding(&self, start: u64, end: u64) -> Vec<u32> {
+        if end <= start {
+            return Vec::new();
+        }
+        let before = if self.by_start.contains_key(&start) {
+            None
+        } else {
+            self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start).map(|(_, span)| span)
+        };
+        before
+            .into_iter()
+            .chain(self.by_start.range(start..end).map(|(_, span)| span))
+            .flat_map(|span| span.1.iter().copied())
+            .collect()
+    }
+}
+
+/// Whether a read that has landed in title memory makes the placed textures
+/// uploaded before it due again (`VICTORY_PAGE_WRITES=0`: no, as before; on
+/// by default, a bug fix). Ported from fxceless/victory-fork e4245f3c1
+/// (fxceless; GPL-3.0), its bit 8, for our tree. A DirectStorage read to a
+/// plain address (not physical pages) tells the GPU side before it begins
+/// (`crate::watch::writing`): the placed textures under it are due from the
+/// next frame, and a texture pass (the recording thread's, or the heap
+/// worker's) can upload them while the read is under way, from memory that
+/// does not hold the bytes yet; nothing asked again once they were there.
+/// There, at the opening cutscene, 282 slots were uploaded before the
+/// bytes landed and kept them as they were: black faces. Reads into
+/// physical pages need nothing of this here: ours tell the GPU side after
+/// the bytes landed, at every title view of them (`crate::watch::
+/// title_memory_written`, whichever way `xmem` wrote them, kept view or
+/// not), and every slot there is due again then.
+pub(crate) fn page_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// Title memory a read has landed in since a texture pass last took the
+/// ranges ([`page_written`]); kept apart from [`REMAPPED`], which is told
+/// before a read, so that what reads that landed do is counted by itself.
+static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Since the start: ranges kept for a pass; ranges dropped because no pass
+/// took them; slots of placed textures that held bytes of them when a pass
+/// took them; of those, the slots whose texture had been uploaded before
+/// the read had landed (out of the queue, or in it after an upload): those
+/// that kept the bytes from before, made due again.
+pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Frames from the pass that takes a range a read landed in to the look at
+/// its slots: the levels of one texture arrive in a few requests, and a
+/// look two frames on takes those of the next frame with it.
+const PAGE_WRITE_AFTER: u64 = 2;
+
+/// A read's bytes are in title memory `[at, at + len)` ([`page_writes`]):
+/// kept for the next texture pass
+/// ([`HostHeap::texture_slots_page_written`]), as [`remapped`] keeps its
+/// ranges; locks one mutex and calls nothing.
+pub(crate) fn page_written(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// Ranges kept until a pass takes them.
+    const MOST: usize = 1 << 15;
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= start || end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+        return;
+    }
+    let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    PAGE_WRITES[0].fetch_add(1, Relaxed);
+    if let Some(last) = ranges.last_mut()
+        && last.1 == start
+    {
+        last.1 = end;
+        return;
+    }
+    if ranges.len() >= MOST {
+        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -1971,6 +2057,7 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        self.texture_slots_page_written(frame);
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -1988,6 +2075,47 @@ impl HostHeap {
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
+    }
+
+    /// Takes the ranges reads landed in since the last call
+    /// ([`page_written`]) and makes the slots whose placed texture holds
+    /// bytes of them and was uploaded before due again [`PAGE_WRITE_AFTER`]
+    /// frames on ([`page_writes`]); its host copy exists, so the upload
+    /// needs no room on the card. A slot still waiting for its first upload
+    /// is left as it is: that upload takes the bytes that are there by
+    /// then. Slots tables read are left to their draws. Returns how many
+    /// slots it made due. (fxceless/victory-fork e4245f3c1.)
+    fn texture_slots_page_written(&self, frame: u64) -> usize {
+        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return 0;
+        }
+        self.slots_written_under(&ranges, frame)[1]
+    }
+
+    /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
+    /// the slots that held bytes of them, and those of them uploaded before
+    /// (made due).
+    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64) -> [usize; 2] {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let held = slots.len();
+        let mut textures = crate::lockstat::lock(&self.textures, crate::lockstat::Lock::Textures);
+        // Uploaded before: out of the queue, or in it after an upload (in
+        // part, or whole and being looked at again).
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        for &slot in &slots {
+            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+        }
+        PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
+        PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
+        [held, slots.len()]
     }
 
     /// Whether host slot `index` is made from the very record the title
@@ -4622,6 +4750,56 @@ mod tests {
 
     /// A look at a slot's old texture memory that found nothing mapped
     /// leaves a replacement view mirrored since then in place; a look for
+    /// A read that landed makes due again the slots under it whose texture
+    /// was uploaded before (out of the queue, or in it after an upload),
+    /// not one still waiting for its first upload, nor the texture that
+    /// ends where the read begins (fxceless/victory-fork e4245f3c1).
+    #[test]
+    fn a_landed_read_makes_textures_uploaded_before_it_due_again() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        const AT: u64 = 0x7fed_0000_0000;
+        const K64: u64 = 1 << 16;
+        {
+            let mut placed = heap.placed.lock().unwrap();
+            for (slot, at) in [(1, AT), (2, AT + K64), (3, AT + 2 * K64), (4, AT + 3 * K64)] {
+                placed.note(slot, at, at + K64, true);
+            }
+        }
+        let frame = 100;
+        {
+            let mut q = heap.textures.lock().unwrap();
+            // 1: uploaded and out of the queue. 2: written, never uploaded.
+            // 3: uploaded whole and waiting for its next look. 4: uploaded.
+            for slot in [1, 2, 3, 4] {
+                q.written(slot, frame - 10, frame - 9, false);
+            }
+            let write = |q: &TextureQueue, slot| q.slots[&slot].write;
+            let (w1, w3, w4) = (write(&q, 1), write(&q, 3), write(&q, 4));
+            q.done(1, w1);
+            q.recheck(3, w3, frame + 400, (AT + 2 * K64, K64), 0x55, 4, frame - 5);
+            q.done(4, w4);
+        }
+        // Bytes of 1 (its tail), 2 and 3; 4 starts where the read ends.
+        let held = heap.slots_written_under(&[(AT + K64 / 2, AT + 3 * K64)], frame);
+        assert_eq!(held, [3, 2], "slots holding the bytes, uploaded before");
+        let due: Vec<u32> = heap.texture_slots_due(frame + PAGE_WRITE_AFTER, 8).0.into_iter().map(|d| d.0).collect();
+        assert!(due.contains(&1) && due.contains(&3), "{due:?}");
+        assert!(!due.contains(&4), "the texture after the read");
+        assert!(!heap.texture_slots_due(frame + PAGE_WRITE_AFTER - 1, 8).0.iter().any(|d| d.0 == 1 || d.0 == 3));
+        // A read that starts where 4 starts names 4 and not 3 before it.
+        let mut q = heap.textures.lock().unwrap();
+        let w3 = q.slots[&3].write;
+        q.done(3, w3);
+        drop(q);
+        assert_eq!(heap.slots_written_under(&[(AT + 3 * K64, AT + 3 * K64 + 16)], frame), [1, 1]);
+        let spans = heap.placed.lock().unwrap();
+        assert_eq!(spans.slots_holding(AT + 3 * K64, AT + 3 * K64 + 16), [4]);
+        assert_eq!(spans.slots_holding(AT + 3 * K64 - 1, AT + 3 * K64 + 16), [3, 4]);
+        assert!(spans.slots_holding(AT, AT).is_empty());
+    }
+
     /// a write already done does too; one for the queued write clears.
     /// fxceless/victory-fork PR #632's test (ryotdev), on our heap.
     #[test]

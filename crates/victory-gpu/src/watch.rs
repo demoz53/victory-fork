@@ -2522,6 +2522,24 @@ pub fn title_memory_written(section: usize, offset: u64, len: usize) {
     }
 }
 
+/// A read the runtime did into title memory `[at, at + len)` at a plain
+/// address (DirectStorage, not physical pages), of which [`writing`] was
+/// told before it began, has landed: the placed textures under it that a
+/// texture pass uploaded meanwhile are due again
+/// (`crate::descriptor::host::page_writes`; `VICTORY_PAGE_WRITES=0`: not).
+pub fn title_memory_read_done(at: usize, len: usize) {
+    if len != 0 && crate::descriptor::host::page_writes() {
+        crate::descriptor::host::page_written(at, len);
+    }
+}
+
+/// Since the start ([`title_memory_read_done`]): ranges kept for a texture
+/// pass, ranges dropped, slots of placed textures under them, slots of
+/// those uploaded before the read landed and so uploaded again.
+pub fn page_write_counts() -> [u64; 4] {
+    std::array::from_fn(|i| crate::descriptor::host::PAGE_WRITES[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
