@@ -22,6 +22,9 @@ use windows::core::{Interface, PCWSTR, w};
 #[cfg(feature = "diagnostics")]
 mod card_verify;
 
+/// `VICTORY_CARD_AWAKE`: the card's clocks kept up between submissions.
+mod awake;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -5977,6 +5980,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            awake::sent(&self.device);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6041,6 +6045,7 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                awake::sent(&self.device);
                 self.card_sent();
                 let waited = self
                     .queue
