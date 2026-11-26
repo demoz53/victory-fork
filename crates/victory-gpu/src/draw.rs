@@ -1328,6 +1328,11 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // The textures this draw's material record names are wanted
+        // (`VICTORY_MATERIAL_TEXTURE_DEMAND=1`): before the pass below.
+        if !compute && crate::material_demand::enabled() {
+            self.material_demand(p);
+        }
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -2082,6 +2087,80 @@ impl State {
         BAKE_SOURCES.with_borrow_mut(Vec::clear);
     }
 
+    /// For a draw whose pixel shader takes its textures' slots from a
+    /// material record (`crate::material_demand::fields`): reads the record
+    /// from title memory and notes the slots it names that the queue of
+    /// textures picked by index holds due, for the next texture pass to
+    /// serve ahead ([`State::heap_textures`]).
+    ///
+    /// The shader's own layout is checked as the source does (DexNom/VIctory
+    /// b8ff22e4c `draw.rs`): user-data word 8 is the place of the first
+    /// table, word 14 a root constant, the record's byte offset in the
+    /// buffer whose view is 688 dwords into that table.
+    fn material_demand(&self, p: &HostPipeline) {
+        use crate::material_demand as demand;
+        for stage in &p.stages {
+            let Some(fields) = demand::fields(&stage.shader.hash) else {
+                continue;
+            };
+            let t = stage.translated();
+            let roots = self.roots_ref(false);
+            if !t.host.user_data.iter().any(|u| u.index == 8 && u.root == RootType::Table && u.slot == 0) {
+                continue;
+            }
+            let Some(u) = t.host.user_data.iter().find(|u| u.index == 14 && u.root == RootType::Constants) else {
+                continue;
+            };
+            let Some(Root::Constants(words)) = roots.get(usize::from(u.slot)) else {
+                continue;
+            };
+            let (Some(&record), Some(Root::Table(table))) = (words.get(u.dword as usize), roots.first()) else {
+                continue;
+            };
+            let Some(heap) = self.heap_of(*table).filter(|h| !h.samplers()) else {
+                continue;
+            };
+            let Some(host) = heap.host() else {
+                continue;
+            };
+            // The material buffer's view: a whole slot of this heap.
+            let Some(handle) = table.checked_add(demand::TABLE_DWORDS * 4) else {
+                continue;
+            };
+            if heap.index(handle).and_then(|slot| heap.handle(slot)) != Some(handle) {
+                continue;
+            }
+            let Some(view @ View::Placed(false, _, _)) = crate::descriptor::view(handle) else {
+                continue;
+            };
+            let Some((address, len)) = crate::descriptor::host::buffer_range(&view) else {
+                continue;
+            };
+            let Some((at, bytes)) = demand::byte_range(record, fields, len) else {
+                continue;
+            };
+            let Some(at) = address.checked_add(at) else {
+                continue;
+            };
+            let key = std::ptr::from_ref(heap) as usize;
+            let frame = crate::frame::current();
+            if !demand::mailbox().asks(key, frame, at) {
+                continue;
+            }
+            // Through the kernel: a page that is not there reads as zeros.
+            let mut raw = [0u32; demand::RECORD_WORDS];
+            crate::host::copy_mapped(raw.as_mut_ptr().cast(), at as *const u8, bytes, false);
+            demand::SEEN[0].fetch_add(1, Ordering::Relaxed);
+            let named = demand::indices(&raw[..bytes / 4], fields, heap.count());
+            let due: Vec<u32> = host.texture_slots_due_of(frame, &named).into_iter().map(|d| d.0).collect();
+            if due.is_empty() {
+                continue;
+            }
+            demand::SEEN[1].fetch_add(1, Ordering::Relaxed);
+            demand::mailbox().note(key, frame, &due);
+        }
+    }
+
     /// The title slots a bake draw's data names that hold a texture view:
     /// the textures its pixel shader picks by index. A dword that only
     /// looks like such a slot is one more texture made ready, no more.
@@ -2359,6 +2438,16 @@ impl State {
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
         let (mut due, census) = host.texture_slots_due(frame, 4096);
+        // What the material records of the last frames' draws name goes
+        // ahead (`VICTORY_MATERIAL_TEXTURE_DEMAND=1`), three other slots
+        // between each two of them.
+        if crate::material_demand::enabled() {
+            let wanted = crate::material_demand::mailbox().wanted(std::ptr::from_ref(heap) as usize, frame);
+            if !wanted.is_empty() {
+                let wanted = host.texture_slots_due_of(frame, &wanted);
+                crate::material_demand::promote(&mut due, &wanted, frame);
+            }
+        }
         // Before a bake draw: its own sources first ([`bake_sources_first`]).
         let first = BAKE_SOURCES.with_borrow(|sources| {
             if sources.is_empty() {
