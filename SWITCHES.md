@@ -1,4 +1,8 @@
-# SWITCHES.md - every switch added since test/all14n, in test/all19
+# SWITCHES.md - every switch added since test/all14n, in test/all20
+
+`test/all20` = `test/all19` (0045f4def) + merges, in this order, of test/small3 (ed9ad620b; based on all17) and
+test/locks (27c580714; based on all18). Two new default-on changes (rows 21 and 22 below): `VICTORY_HEAP_FORGET`
+and `VICTORY_SDWA_SEXT` (the second changes translated shader code).
 
 `test/all19` = `test/all18` (ddb959c0e) + merges, in this order, of test/meshclamp (9e5d01b28), test/scrub
 (b9ebab139), test/room1 (f424f55f8, then again to its tip 849247e67) and test/heapw (b3a6e21c2, then again to its tip
@@ -46,9 +50,11 @@ anything. Every new executable (this one too) translates and warms once anyway.
 | 18 | `VICTORY_CLEAR_CHECKED` is on (a slot found unmapped is made null only while the write looked at is still the queued one) | test/bake2 53231fab3 (all18) | `VICTORY_CLEAR_CHECKED=0` |
 | 19 | `VICTORY_TARGET_VARIANTS` is on (a draw into render targets of other formats than its pipeline declares gets a host pipeline made for the bound formats) | test/variants 7c52fed2b (all18) | `VICTORY_TARGET_VARIANTS=0` |
 | 20 | `VICTORY_AMBIENT_SETTLE` is 250,3 (with `VICTORY_AMBIENT` only: the stand-in's mean of the light around follows by the clock, a jump taken at once; before: 0.04 a frame) | test/room1 4ef159e3f (all19) | `VICTORY_AMBIENT_SETTLE=0` |
+| 21 | `VICTORY_HEAP_FORGET` is on (a dropped host view heap takes its entries out of the heap passes' caches keyed by its address) | test/small3 a939d5a72 (all20) | `VICTORY_HEAP_FORGET=0` |
+| 22 | `VICTORY_SDWA_SEXT` is on (an SDWA WORD_0 destination with UNUSED_SEXT sign-extends a 16-bit result) | test/small3 c5dd98428 (all20) | `VICTORY_SDWA_SEXT=0` (shader code changes: warm) |
 
-Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE):
-`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_SHADER_CACHE_KEY=exe`
+Everything restored (all15b behaviour, one line; all18 added BAKE_WIDE, CLEAR_CHECKED, TARGET_VARIANTS, all19 AMBIENT_SETTLE, all20 HEAP_FORGET and SDWA_SEXT):
+`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0 VICTORY_PERMUTE_HALVES=0 VICTORY_SHORT_WAVE_LAST=0 VICTORY_LANE_MODULO=0 VICTORY_THREAD_TICKET=0 VICTORY_BAKE_WIDE=0 VICTORY_CLEAR_CHECKED=0 VICTORY_TARGET_VARIANTS=0 VICTORY_AMBIENT_SETTLE=0 VICTORY_HEAP_FORGET=0 VICTORY_SDWA_SEXT=0 VICTORY_SHADER_CACHE_KEY=exe`
 (leave `VICTORY_SHADER_CACHE_KEY=exe` out to keep the shared cache: it changes no picture, only which cache
 entries a build finds. Five of these change translated code - LOOP_EXITS and the four lane fixes of test/loops2,
 343 compute programs by its agent's count - so a run with them restored needs a warm of its own.)
@@ -62,6 +68,17 @@ buffer views that cannot be made raw (they read zeros on NVIDIA) warned and all 
 the bound render targets kept at each set of targets (for TARGET_VARIANTS), and the skipped-pipeline test made once
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
+
+## New in all20 (merged on top of all19)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_CARD_FETCH_INFLIGHT` | `1` (+ `VICTORY_CARD_FETCH_INFLIGHT_MB`, MiB, 64) | off (only with the relay) | with the relay, the pieces a flight's compare flags are copied to PC memory inside the flight's own compare list (no fetch on the copy queue beside later flights: no torn fetches); a landing that cannot use them fetches the old way on the main queue. Works with `VICTORY_INDIRECT_WINDOW=1` (see the commit) | test/small3 ee81b4916 (fxceless 9376fd60c, PR #648 Jonirulah) | no |
+| `VICTORY_CARD_HASH_LEN` | `1` | off | the card's hash pass and compare of a title buffer's copy cover the title buffer's own bytes (16-byte steps) instead of the whole 64 KiB-rounded buffer; for small copies, pair with `VICTORY_CARD_BUFFERS_MIN_KB=64`. Our form of CARD_HASH_WIDE is the 64-lane CARD_COMPARE, always on (no switch) | test/small3 2d156d0de (fxceless c36971b21) | no |
+| `VICTORY_RT_SKIP_RESOLVE` | `1` | off | while the structure builder does not run, pipelines whose compute container names `CS_RaytracingResolve` (about 1,000) are not made ahead and their dispatches (direct or indirect, before the clamp) are left out. By by name, no list, traced shadows kept, follows the builder (test/speed2's `VICTORY_SKIP_RT` is a 1,034-hash list, always). Frame line: "dispatches of the ray-tracing resolve programs ... left out per frame" | test/small3 355ef67fd (lordon1a c7dc354e3, after cool_fox 8cc31ab3) | no |
+| `VICTORY_HEAP_FORGET` | `0` off | ON | a dropped host view heap takes its entries out of the heap passes' caches keyed by its address (slot ranges, unordered spans, "same as sent" notes): a new heap at the same address no longer inherits stale buffer copies, and the old copies are let go. | test/small3 a939d5a72 (after fxceless PR #1276, UwUCammie) | no |
+| `VICTORY_SDWA_SEXT` | `0` off | ON | a 16-bit operation's SDWA destination WORD_0 with UNUSED_SEXT sign-extends bit 15 into bits 31:16 (was zero-filled); reserved dst_unused 3 refused. | test/small3 c5dd98428 (Marvisak PR #3124, KainanP) | YES (in the cache key) |
+| `VICTORY_LOCK_STATS` | `1` | off | waits on the recording path's shared locks (slots, kept, ring, textures, heaps, views, buffers, placed, retired, submit), per lock, on the 5 s frame line; without it a lock is taken as before after one load of a once-set flag | test/locks adf68f33c | no |
+| `VICTORY_HEAP_LOCKS` | `1`; `alt` 20 s each way in turn (logged) | off | `HostHeap::made` read under the shared side of a reader-writer lock for slots already made, `descriptor::VIEWS` and `SHADER_HEAPS` read shared, `HostHeap::kept` cut into 64 locks; without it every path takes the writer side alone, as the one lock before | test/locks 27c580714 (fxceless 5d659e0c8, PR #1146 part 1) | no |
 
 ## New in all19 (merged on top of all18)
 | Switch | Values | Default | What it does | From | Shader |
@@ -209,6 +226,20 @@ switch.
   `watch::tests::a_write_through_another_view_is_reported_at_the_guarded_one`) fail by design: a resting block is
   told as written at every asking. Run `cargo test` with no `VICTORY_*` switch exported.
 
+## Combining them in all20
+- `VICTORY_HEAP_WORKER=1` with `VICTORY_HEAP_LOCKS=1`: allowed together. The heap worker's lock
+  (`heap_worker::order`, taken in `host::Host::execute_late` with no lock of descriptor/host.rs and not the
+  submission lock held) comes before every lock of that file; under it `take_ready` makes the uploaded slots through
+  `mirror` (shared side of `made` first with HEAP_LOCKS, let go before the writer side: no upgrade), lets `made` go,
+  and only then the submission lock is taken. HEAP_LOCKS changes no order, only who shares `made` and how `kept` is
+  cut; the order comment at the top of descriptor/host.rs now names the worker's lock. Not run together in a game.
+- `VICTORY_RT_SKIP_RESOLVE=1` beside `VICTORY_SKIP_RT=1`: both leave out the resolve programs (by name, and by the
+  1,034-hash list that also holds the traced shadows); together they leave out the union, harmless. RT_SKIP_RESOLVE
+  follows the structure builder, SKIP_RT does not. Both beside `VICTORY_IDLE_WITHOUT_RAYS`: one `no_rays` kind per
+  pipeline (the activate program is no resolve), and a pipeline left out by any is not made ahead.
+- `VICTORY_CARD_FETCH_INFLIGHT` reads nothing without `VICTORY_RELAY` (the run lines set RELAY=2).
+- Translator changed (SDWA_SEXT, default on): the cache key folder with nothing set differs from all19's.
+
 ## Combining them in all19
 - No pair refuses at start-up beyond `VICTORY_HEAP_WORKER=1` without `VICTORY_RELAY`/`VICTORY_LATE_WAIT` (refused
   with a warning, by its design; the run lines' `VICTORY_RELAY=2` satisfies it).
@@ -268,11 +299,3 @@ switch.
 - Tests on the software adapter take turns through ONE lock, `crate::warp_alone` (test/avfix); test/clamps' own
   `warp_turn` was not taken over.
 
-## New in test/small3 (on top of all17)
-| Switch | Default | What | Shader |
-|---|---|---|---|
-| `VICTORY_CARD_FETCH_INFLIGHT=1` (+ `VICTORY_CARD_FETCH_INFLIGHT_MB`, 64) | off | with the relay, the pieces a flight's compare flags are copied to PC memory inside the flight's own compare list (no fetch on the copy queue beside later flights: no torn fetches); a landing that cannot use them fetches the old way on the main queue. fxceless 9376fd60c / PR #648 (Jonirulah). Works with `VICTORY_INDIRECT_WINDOW=1` (see the commit) | no |
-| `VICTORY_CARD_HASH_LEN=1` | off | the card's hash pass and compare of a title buffer's copy cover the title buffer's own bytes (16-byte steps) instead of the whole 64 KiB-rounded buffer; for small copies, pair with `VICTORY_CARD_BUFFERS_MIN_KB=64`. fxceless c36971b21. Our form of CARD_HASH_WIDE is the 64-lane CARD_COMPARE, always on (no switch) | no |
-| `VICTORY_RT_SKIP_RESOLVE=1` | off | while the structure builder does not run, pipelines whose compute container names `CS_RaytracingResolve` (about 1,000) are not made ahead and their dispatches (direct or indirect, before the clamp) are left out. Rule of lordon1a c7dc354e3 (after cool_fox 8cc31ab3); by name, no list, traced shadows kept, follows the builder (test/speed2's `VICTORY_SKIP_RT` is a 1,034-hash list, always). Frame line: "dispatches of the ray-tracing resolve programs ... left out per frame" | no |
-| `VICTORY_HEAP_FORGET` | **on** (`=0` the old way) | a dropped host view heap takes its entries out of the heap passes' caches keyed by its address (slot ranges, unordered spans, "same as sent" notes): a new heap at the same address no longer inherits stale buffer copies, and the old copies are let go. After fxceless PR #1276 (UwUCammie) | no |
-| `VICTORY_SDWA_SEXT` | **on** (`=0` the old way) | a 16-bit operation's SDWA destination WORD_0 with UNUSED_SEXT sign-extends bit 15 into bits 31:16 (was zero-filled); reserved dst_unused 3 refused. Upstream Marvisak/VIctory PR #3124 (KainanP). In the shader cache key's list | **yes** (warm) |
