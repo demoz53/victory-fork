@@ -1387,6 +1387,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        if !srv {
+            list.audit_kind(&shadow, address, crate::host::audit::CONSTANTS);
+        }
         return Some(gpu);
     }
     // A fill reads title memory at submission, and settles the flights
@@ -1402,6 +1405,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     }
     if (flights || written) && crate::host::fill_on_card() {
         shadow.refresh(list, address, len);
+        list.audit_kind(&shadow, address, crate::host::audit::CONSTANTS);
         if let Some(gpu) = list.card_constants(&shadow, address, len, crate::waitstat::Cause::ConstantsRoot) {
             FILL_FLIGHTS[1].fetch_add(1, Ordering::Relaxed);
             return Some(gpu);
@@ -1838,6 +1842,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.audit_kind(&shadow, v.address, crate::host::audit::VERTICES);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1856,6 +1861,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.audit_kind(&shadow, v.address, crate::host::audit::VERTICES);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -4594,6 +4600,7 @@ impl State {
                             })
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));
+                                list.audit_kind(&shadow, address, crate::host::audit::CONSTANTS);
                                 list.card_constants(&shadow, address, u64::from(size), crate::waitstat::Cause::ConstantsTable)
                             } =>
                     {
@@ -4617,6 +4624,7 @@ impl State {
                             && shadow.left(address) >= u64::from(aligned_size)
                         {
                             shadow.refresh(list, address, u64::from(aligned_size));
+                            list.audit_kind(&shadow, address, crate::host::audit::CONSTANTS);
                             host.constant_at(index, shadow.gpu(address), size);
                         } else {
                             let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -5145,6 +5153,7 @@ impl State {
             }
             self.draw_ends_windows();
             args.refresh(list, arguments, len);
+            list.audit_kind(&args, arguments, crate::host::audit::INDIRECT);
             if !self.prepare_for(list, false, true) {
                 why("prepare failed");
                 return false;
@@ -5200,6 +5209,7 @@ impl State {
             None
         } else {
             args.refresh(list, arguments, len);
+            list.audit_kind(&args, arguments, crate::host::audit::INDIRECT);
             let batch = self.batched(list, &args, arguments, (kind, stride), stores);
             if batch.is_some() && kind == DISPATCH {
                 // (as the clamp of its own notes a watched pipeline's)
@@ -5350,8 +5360,10 @@ impl State {
                     (0, 0)
                 };
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                list.audit_kind(&args, arguments, crate::host::audit::INDIRECT);
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
+                    list.audit_kind(s, *at, crate::host::audit::INDIRECT);
                 }
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into the scratch

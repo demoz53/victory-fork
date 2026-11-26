@@ -205,6 +205,18 @@ fn submit_cut(this: This, lists: &[This]) {
     }
     if first < lists.len() {
         let parts = crate::list::detach_parts(&lists[first..]);
+        // The submit audit (`VICTORY_SUBMIT_AUDIT`): with [`behind`] the
+        // parts are prepared later, by another thread; what that will read
+        // of title memory is fingerprinted now, on the title's thread.
+        if behind() && crate::host::audit::on() {
+            // (Behind a wait of the title's: its own, or one the line holds.)
+            let waited = parts.iter().any(|p| !p.0.is_empty())
+                || lock(&queue(this).held).iter().any(|h| matches!(h, Held::Wait(..) | Held::Value(_)));
+            crate::host::audit::called(
+                parts.iter().flat_map(|(_, taken, _)| taken.iter().map(crate::list::Detached::host)),
+                waited,
+            );
+        }
         static SEEN: AtomicU64 = AtomicU64::new(0);
         if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
             tracing::info!(

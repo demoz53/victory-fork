@@ -25,6 +25,10 @@ mod card_verify;
 /// `VICTORY_CARD_AWAKE`: the card's clocks kept up between submissions.
 mod awake;
 
+/// `VICTORY_SUBMIT_AUDIT`: title memory read at preparing against what it
+/// was at the title's submit call.
+pub(crate) mod audit;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -2817,6 +2821,13 @@ struct Deferred {
     memory_read_seen: usize,
     memory_write_seen: usize,
     named_writes: crate::fasthash::Set<usize>,
+    /// With the submit audit ([`audit`]): what the refreshes recorded are
+    /// for, by host copy and address (none: a buffer given to shaders).
+    refresh_kinds: crate::fasthash::Map<(usize, usize), u8>,
+    /// With the submit audit: the title memory the list's steps read, as it
+    /// was at the title's submit call, and that call.
+    audit: Vec<audit::Print>,
+    audit_call: Option<audit::Call>,
 }
 
 impl Deferred {
@@ -2873,6 +2884,9 @@ impl Deferred {
         self.memory_read_seen = 0;
         self.memory_write_seen = 0;
         self.named_writes.clear();
+        self.refresh_kinds.clear();
+        self.audit.clear();
+        self.audit_call = None;
     }
 
     /// Advances the list's title-memory copy watermarks to `total` (`writes`:
@@ -6019,6 +6033,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::queue::behind_line(frames);
+    audit::line(frames);
     flip_line(frames);
 }
 
@@ -6236,6 +6251,7 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                audit::wrote(*at, rows.saturating_sub(1).saturating_mul(*pitch).saturating_add(*row));
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
@@ -7729,7 +7745,10 @@ impl Host {
                     }
                     landed.push((flight.lists, flight.order));
                 }
-                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Write(at, what, bytes) => {
+                    audit::wrote(at, bytes);
+                    what.write(at as *mut u8, bytes)
+                }
                 Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
             }
         }
@@ -8206,7 +8225,10 @@ impl Host {
                         }
                         landed.push((flight.lists, flight.order));
                     }
-                    Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                    Late::Write(at, what, bytes) => {
+                        audit::wrote(at, bytes);
+                        what.write(at as *mut u8, bytes)
+                    }
                     Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
@@ -8520,6 +8542,9 @@ impl Host {
             settle_stale(self, &mut submitted, until);
             settled += settling.elapsed();
         }
+        // The submit audit: what these steps read of title memory, against
+        // what it was at the title's submit call.
+        audit::prepared(runs);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -8791,6 +8816,7 @@ impl Host {
             // may be what tells the title that they are there.
             read_backs(list);
             for &(at, what, bytes) in &list.deferred().writes {
+                audit::wrote(at, bytes);
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -9903,6 +9929,14 @@ impl HostList {
         }
     }
 
+    /// With the submit audit ([`audit`]): the refresh of `shadow` from
+    /// `address` this list records is for `kind` (one of `audit`'s kinds).
+    pub(crate) fn audit_kind(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, kind: u8) {
+        if audit::on() {
+            self.deferred().refresh_kinds.insert((std::sync::Arc::as_ptr(shadow) as usize, address as usize), kind);
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -10346,6 +10380,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    audit::wrote(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -10372,6 +10407,7 @@ impl HostList {
                     let ran = started.began().unwrap_or_else(std::time::Instant::now);
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        audit::wrote_anywhere();
                     }
                     work();
                     // It wrote title memory, where is not known here: the

@@ -1396,6 +1396,8 @@ fn put_back(at: usize, merged: &[u8]) -> usize {
     crate::host::shaders_write(at, merged);
     put_back_by(at, merged, back_blocks(), |at, bytes| {
         let _writing = crate::watch::writing(at, bytes.len());
+        // The submit audit: a write of ours, not the title's.
+        crate::host::audit::wrote(at, bytes.len());
         crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
     })
 }
