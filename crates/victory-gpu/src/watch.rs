@@ -904,7 +904,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 }
 
 fn guard_after_faults(g: &mut Guards, first: usize, last: usize, rest: std::time::Duration) -> Vec<usize> {
-    if g.faulted.range(first..last).next().is_none() {
+    // Without `VICTORY_GUARD_REST` and `VICTORY_OPEN_ONE_VIEW` nothing is
+    // ever in `faulted`: the walk as it was, with no look at the map (which
+    // panics over a range that ends before it starts).
+    if g.faulted.is_empty() || first >= last || g.faulted.range(first..last).next().is_none() {
         return guard_range(g, first, last);
     }
     let mut written = Vec::new();
@@ -1701,9 +1704,15 @@ fn install() {
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: the handler only touches our guard state and protections.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
+    ONCE.call_once(|| {
+        // The handler's switches are read here, ahead of it (`guard_rest`
+        // by every `guard` as well): `open_one_view`, read first inside a
+        // fault, was the environment looked up, and memory asked for, in
+        // the middle of whatever the title's thread was doing when it wrote
+        // the block.
+        let _ = (open_one_view(), guard_rest());
+        // SAFETY: the handler only touches our guard state and protections.
+        unsafe { AddVectoredExceptionHandler(1, Some(on_write)) };
     });
 }
 
