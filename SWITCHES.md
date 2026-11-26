@@ -1,23 +1,68 @@
-# SWITCHES.md - every switch added since test/all14n, in test/all16
+# SWITCHES.md - every switch added since test/all14n, in test/all17
 
-`test/all16` = `test/all15b` (3b9488230) + merges of test/lx, test/cxall, test/stream1 (holds test/fairq),
-test/shirt1, test/speed1, test/compose. One build, every feature behind its switch: set several in one run line.
+`test/all17` = `test/all16` (fb98a3eda) + merges of test/avfix, test/slots, test/stream2 (to 5fe884eb9), test/res1,
+test/split, test/loops2 (its first commit 9e9272327 only), two commits of test/testkit (0600708fa, 5867481c7), the two
+new commits of test/speed1 (to 4e2e1f6e1) and test/clamps (d4b2d6324). `test/all16` = `test/all15b` (3b9488230) +
+test/lx, test/cxall, test/stream1 (holds test/fairq), test/shirt1, test/speed1 (to 625bc32b6), test/compose.
+One build, every feature behind its switch: set several in one run line.
 
 How this list was made: `git diff test/all14n..HEAD | grep -oE '"VICTORY_[A-Z0-9_]+"'` (added lines), then each
 switch read at its definition. "Shader" = the switch changes translated shader code: the shader cache keys on it, and
 a run with a value not used before on this executable needs a pipeline warm before its picture or speed means
 anything. Every new executable (this one too) translates and warms once anyway.
 
-## With nothing set, all16 differs from all15b in three ways
-| Change | Came with | Back to all15b behaviour |
-|---|---|---|
-| `VICTORY_LOOP_EXITS` is on | test/lx | `VICTORY_LOOP_EXITS=0` (shader code changes: warm) |
-| `VICTORY_FAIR_DUE` is on | test/stream1 (fairq) | `VICTORY_FAIR_DUE=0` |
-| `VICTORY_RELOOK_MS` is 20000 (all15b: a fixed 4000, cap 256 frames) | test/stream1 (fairq) | `VICTORY_RELOOK_MS=4000` |
+## DEFAULT-ON changes since test/all15b (what a run with nothing set does differently)
+| # | Change | Came with | Back to the old behaviour |
+|---|---|---|---|
+| 1 | `VICTORY_LOOP_EXITS` is on (wave64 loop limit tested at the loop's exits) | test/lx (all16) | `VICTORY_LOOP_EXITS=0` (shader code changes: warm) |
+| 2 | `VICTORY_FAIR_DUE` is on (looked-at and fresh texture slots served in turns) | test/stream1 (all16) | `VICTORY_FAIR_DUE=0` |
+| 3 | `VICTORY_RELOOK_MS` is 20000 (all15b: a fixed 4000, cap 256 frames) | test/stream1 (all16) | `VICTORY_RELOOK_MS=4000` |
+| 4 | `VICTORY_REMAP_REOPEN` is on (a remap notice gives write access back to the blocks it forgets) | test/avfix | `VICTORY_REMAP_REOPEN=0` |
+| 5 | `VICTORY_DYNAMIC_SLOTS` unset = 606,784 dynamic descriptor slots on a capped view heap with a heap map (before: 262,144) | test/slots | `VICTORY_DYNAMIC_SLOTS=262144` |
+| 6 | `VICTORY_TEXTURE_BACK_CHECK` is on (a texture copy-back lands only where its texture still lies, and only over the bytes it covers) | test/slots | `VICTORY_TEXTURE_BACK_CHECK=0` |
+| 7 | `VICTORY_DYNAMIC_ACROSS` is on (the search for free dynamic slots finds a run across its starting place) | test/slots | `VICTORY_DYNAMIC_ACROSS=0` |
+| 8 | `VICTORY_TABLES_EARLY` is on (with VICTORY_RELAY: a flight's dynamic slots are given back when the card has run it) | test/slots | `VICTORY_TABLES_EARLY=0` |
+| 9 | `VICTORY_ALIAS_ALWAYS` is on (a view of a texture the card wrote is copied from it even if the list already uploaded the view) | test/slots | `VICTORY_ALIAS_ALWAYS=0` |
+| 10 | `VICTORY_QUEUE_AGE` is on (log only: histogram of frames between a slot's write and its texture on the card) | test/stream2 | `VICTORY_QUEUE_AGE=0` |
+| 11 | `VICTORY_MAPPED_EXACT` is on (a texture with only pages in its middle mapped counts as there; looked at in turns) | test/stream2 5fe884eb9 | `VICTORY_MAPPED_EXACT=0` |
 
-Exactly all15b: `VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000`.
+Everything restored (all15b behaviour, one line):
+`VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000 VICTORY_REMAP_REOPEN=0 VICTORY_DYNAMIC_SLOTS=262144 VICTORY_TEXTURE_BACK_CHECK=0 VICTORY_DYNAMIC_ACROSS=0 VICTORY_TABLES_EARLY=0 VICTORY_ALIAS_ALWAYS=0 VICTORY_QUEUE_AGE=0 VICTORY_MAPPED_EXACT=0`
 
-## New in all16 (merged on top of all15b)
+Always on, with no switch (no behaviour change, some cost): the "title memory remapped" work line every 5 s and the
+look it needs at every mapping call, whether the pages are there already (test/speed1 ec85139be); the "dstorage:
+workers" line's two extra fields; a trace string built at each composed present.
+
+## New in all17 (merged on top of all16)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_REMAP_REOPEN` | `0` off | ON | the runtime's notice of a new mapping makes blocks a guard had made read-only writable again, not only forgotten (a write there was an access violation nobody took) | test/avfix | no |
+| `VICTORY_DYNAMIC_SLOTS` | a number of slots, at least 262144 | unset: 606,784 with a heap map on a capped heap; 262,144 without a map | dynamic descriptor slots a capped host view heap takes from the title's pool (262,144 ran dry in the open world: tables refused, draws dropped) | test/slots (fxceless PR #1258) | no |
+| `VICTORY_TEXTURE_BACK_CHECK` | `0` off | ON | a texture copy-back takes its place in title memory when its first writer is recorded, lands only if the texture still lies there, and overwrites only the bytes it covers | test/slots (DexNom PR #63) | no |
+| `VICTORY_DYNAMIC_ACROSS` | `0` off | ON | the search for free dynamic slots also finds a run lying across the place it starts from | test/slots | no |
+| `VICTORY_TABLES_EARLY` | `0` off | ON | with the relay, a flight's dynamic descriptor slots are given back once the card has run it, before its landing | test/slots (Korinocho eade35662) | no |
+| `VICTORY_ALIAS_ALWAYS` | `0` off | ON | a placed view owes its copy from the card-written source until the list has made that copy, even after an upload of the view earlier in the list | test/slots (fxceless PR #1241) | no |
+| `VICTORY_QUEUE_AGE` | `0` off | ON | log only: histogram of how many frames after its slot's write a texture is on the card | test/stream2 | no |
+| `VICTORY_MAPPED_EXACT` | `0` off | ON | "how much of this texture is mapped" also looks between the first and last page (in turns, at most 1,024 blocks a frame); a line every 5 s counts the textures that had memory only there | test/stream2 5fe884eb9 (DexNom 921d8d3b4) | no |
+| `VICTORY_MATERIAL_TEXTURE_DEMAND` | `1` | off | the textures a draw's material record names go ahead in the texture queue | test/stream2 (DexNom) | no |
+| `VICTORY_TEXTURE_CATCH_UP_MS` | `<least>[,<most>]` ms (Neptune runs 2; most 20 unless said) | off | more texture passes within a frame when the title has written slots since the last one | test/stream2 (Neptune) | no |
+| `VICTORY_STALE_KEEP_MS` | ms; 0 off | off | a slot goes on showing its old texture until the new one is made or its memory is mapped again, at most that long, while the card has room | test/stream2 (Neptune) | no |
+| `VICTORY_STALE_KEEP_MAX_MS` | ms | 120000 | the cap of STALE_KEEP_MS; only read with it | test/stream2 | no |
+| `VICTORY_VRAM_IDLE_MS` | `<normal>[,<moderate>[,<high>]]` ms (Neptune runs 15000,2500,1000) | unset: as before (5 s) | idle times after which host copies of textures are let go; NOT USED with `VICTORY_TEXTURE_KEEP=1` | test/stream2 (Neptune) | no |
+| `VICTORY_TEXTURE_DROP_MIPS` | `1`-`4` | 0 | the host copy of a title-filled 2D texture (512 texels and up, 5 levels and up) leaves out its N largest levels; for 8 GB cards; the picture gets softer | test/res1 (soldsawn) | no |
+| `VICTORY_COPY_PLAIN` | `1` | off | shader output goes back into title memory with a plain copy (the kernel's write behind it); small reads and reads from blocks that faulted go straight to the kernel; needs the guarded reads (on unless `VICTORY_GUARDED_READS=0`) | test/res1 (soldsawn) | no |
+| `VICTORY_GROUP_SPLIT` | `1` | off | a wave64 compute program whose thread groups hold several console waves that share nothing runs each console wave as a host thread group of its own (else it does not translate: the water tile-mask writer f133e35efed2a48a is one) | test/split (Corgansm/victory-corgi) | YES |
+| `VICTORY_AFTER_LOOP` | `1` | off | the loops a per-lane branch leaves count as that branch's region | test/loops2 9e9272327 (fxceless PR #1249) | YES |
+| `VICTORY_REMAP_SAME` | `0`, `1`, `2` | 0 | a mapping of pages that are shown there already: 0 views taken away and made again (as before); 1 no view touched, the GPU side told of the bytes; 2 nor is the GPU side told | test/speed1 ec85139be (Neptune) | no |
+| `VICTORY_ALIAS_RUNS` | `1` | off | a copy of page mappings makes one view for a run of pages that follow one another, not one a page | test/speed1 ec85139be (Neptune) | no |
+| `VICTORY_IDLE_WITHOUT_RAYS` | `1` | off | the dispatches of compute program 39f0e9aeb156a61c (activates the screen probes' rays) are left out while the structure builder does not run (no `VICTORY_BVH_BUILDER=1`); the picture may change | test/speed1 4e2e1f6e1 (Belobug, Neptune) | no |
+| `VICTORY_INDIRECT_BATCH` | `1` exact batches; `2` the source fork's default (a dispatch does not end a batch: KNOWN stale-argument risk); `3` as 1, but a dispatch that stores to no buffer does not end a batch | off | argument clamps of indirect executions of one record are made in batches by one compute pass of ours | test/clamps (avatarmanz 037596241) | no |
+
+Not switches: build profiles `release-lto` and `diag-lto` (thin LTO; test/res1; the runner's `diag` profile is
+unchanged); `victory translate --digest` and `tools/shader-sweep.sh` (test/testkit: which programs a translation
+switch changes, offline).
+
+## Came with all16 (merged on top of all15b)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
 | `VICTORY_LOOP_EXITS` | `0` off; unset or anything else on | ON (all15b: on only with `=1`) | wave64 compute programs test the loop iteration limit at the loop's own exits, not in the latch (removes the dark tiles on water) | test/lx (rule from all15b ec51e9045, darkworldhm 08fdf0b47) | YES |
@@ -69,7 +114,7 @@ Exactly all15b: `VICTORY_LOOP_EXITS=0 VICTORY_FAIR_DUE=0 VICTORY_RELOOK_MS=4000`
 `VICTORY_HOST_LOCK_CHILD` also appears in the diff: it is a marker a unit test sets for its own child process, not a
 switch.
 
-## Combining them
+## Combining them (all16 notes)
 - No pair of the new switches has to stay apart: each merged cleanly and they act on different paths. Nothing refuses
   at startup.
 - Pairs meant to go together: `VICTORY_GUARD_REST=1 VICTORY_OPEN_ONE_VIEW=1`; `VICTORY_TEXTURE_KEEP_SECS` and
@@ -88,3 +133,24 @@ switch.
   (`watch::tests::a_range_that_begins_in_an_unmapped_block_is_guarded`,
   `watch::tests::a_write_through_another_view_is_reported_at_the_guarded_one`) fail by design: a resting block is
   told as written at every asking. Run `cargo test` with no `VICTORY_*` switch exported.
+
+## Combining them in all17
+- No pair has to stay apart, and nothing refuses at startup. Three pairs needed care in the merge:
+  - `VICTORY_GROUP_SPLIT=1` with `VICTORY_INDIRECT_BATCH`: a split program's indirect dispatches keep their own clamp
+    (it multiplies z by the split; the batched clamp does not) and are counted as refused in the batch line.
+  - `VICTORY_TEXTURE_DROP_MIPS` with `VICTORY_COPY_KEEP=1`: a whole-texture copy made level by level (host copies
+    that leave out different numbers of levels) is not kept: the keeper goes, as at a resolve.
+  - `VICTORY_STREAM_PRIORITY=1` with the new mapping path: the scatter call lifts the thread itself.
+- One of two is used: with `VICTORY_TEXTURE_KEEP=1`, `VICTORY_VRAM_IDLE_MS` is ignored (by test/stream2's design).
+- Streaming group judged safe together: `VICTORY_TEXTURE_KEEP=1 VICTORY_MATERIAL_TEXTURE_DEMAND=1
+  VICTORY_TEXTURE_CATCH_UP_MS=2 VICTORY_STALE_KEEP_MS=10000`. Left out on purpose: STREAM_PRIORITY, DSTORAGE_* and
+  PARTIAL_PROMPT (cs-all1's culprit is among them), VRAM_IDLE_MS (ignored beside TEXTURE_KEEP), DROP_MIPS (softer
+  picture; for 8 GB cards), REMAP_SAME and ALIAS_RUNS (runtime mapping: a line of their own).
+- Shader-changing switches now: LOOP_EXITS, NORM_EXACT, HEAP_BELOW_ZERO, LOCAL_LDS_SYNC, NAN_GUARD, GROUP_SPLIT,
+  AFTER_LOOP. `tools/shader-sweep.sh` says offline which programs one of them changes.
+- Swept offline (tools/shader-sweep.sh, the 3,605 programs of shaders-save-boat, VICTORY_HOST_MAX_WAVE=32):
+  `VICTORY_GROUP_SPLIT=1 VICTORY_AFTER_LOOP=1` together change 3 compute programs (20b78ee12ecdb57d,
+  ce79e9eba7ae0348, fa0bd10a35bfef3c) and let one more translate (f133e35efed2a48a, refused without them); all 4
+  pass the validator and make pipelines on this card. Nothing else changes, nothing is lost.
+- Tests on the software adapter take turns through ONE lock, `crate::warp_alone` (test/avfix); test/clamps' own
+  `warp_turn` was not taken over.
