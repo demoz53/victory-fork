@@ -2102,6 +2102,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The source last copied into each view's host texture by
+    /// `crate::texture::alias` in this list (both by address).
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2176,6 +2179,7 @@ impl Deferred {
         crate::copystat::add(crate::copystat::C::ResetDropNs, dropping.elapsed().as_nanos() as u64);
         self.refreshed.clear();
         self.textures.clear();
+        self.texture_aliases.clear();
         self.writes.clear();
         self.budget_zeroed = false;
         // As a new list's (fxceless #205: the watermarks start again at
@@ -7383,6 +7387,15 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Notes that the list copies `source` into `view` (host textures,
+    /// `crate::texture::alias`): whether the last such copy into `view` in
+    /// this list, if any, was from another source.
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = windows::core::Interface::as_raw(view) as usize;
+        let source = windows::core::Interface::as_raw(source) as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Advances the list's title-memory copy watermarks to `total` (`writes`:
