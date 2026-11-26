@@ -43,6 +43,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod material_demand;
+#[cfg(windows)]
+mod room_waits;
 mod lockstat;
 mod waitstat;
 #[cfg(windows)]

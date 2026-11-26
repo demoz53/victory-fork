@@ -3011,6 +3011,74 @@ impl State {
         true
     }
 
+    /// Slot `index` (the queue's `write`) is refused for lack of room on
+    /// the card in `frame`: its wait is noted, with the texture `view`
+    /// shows, and said once it reaches five seconds
+    /// (`crate::room_waits`, `VICTORY_ROOM_WAITS=1`).
+    fn room_wait(index: u32, write: u64, frame: u64, view: Option<View>) {
+        let what = match &view {
+            Some(View::Placed(false, resource, _)) => crate::room_waits::What {
+                width: u64::from(resource[4]) | u64::from(resource[5]) << 32,
+                height: resource[6],
+                format: resource[8],
+                bytes: crate::resource::placed_bytes(resource).unwrap_or(0),
+            },
+            Some(View::Shader(object, _)) => match crate::resource::texture_kind(*object as This) {
+                Some((width, height, format)) => crate::room_waits::What { width, height, format, bytes: 0 },
+                None => Default::default(),
+            },
+            _ => Default::default(),
+        };
+        let slow = crate::room_waits::waits().refused(index, write, crate::host::now_ms(), frame, what);
+        if let Some((what, waited_ms, frames)) = slow {
+            tracing::info!(
+                slot = index,
+                width = what.width,
+                height = what.height,
+                format = what.format,
+                bytes = what.bytes,
+                waited_ms,
+                frames,
+                "a texture picked by index whose memory is there has waited five seconds for room on the card (VICTORY_ROOM_WAITS=1): its slot shows nothing or an older texture meanwhile"
+            );
+        }
+    }
+
+    /// The five-second line of the waits for room (`crate::room_waits`):
+    /// first the slots that are due no more leave the count.
+    fn room_waits_line(host: &crate::descriptor::host::HostHeap, frame: u64, room: bool) {
+        let now = crate::host::now_ms();
+        if !crate::room_waits::line_due(now) {
+            return;
+        }
+        let waiting = crate::room_waits::waits().waiting();
+        if !waiting.is_empty() {
+            let due = host.texture_slots_due_of(frame, &waiting);
+            crate::room_waits::waits().keep(&due);
+        }
+        let c = crate::room_waits::waits().census(now);
+        if c.refusals == 0 {
+            return;
+        }
+        tracing::info!(
+            frame,
+            room,
+            waiting = c.waiting,
+            waiting_mb = c.waiting_mb,
+            not_reached_for_3_s = c.not_reached,
+            longest_wait_ms = c.longest_ms,
+            longest_slot = c.longest_slot,
+            longest_width = c.longest.width,
+            longest_height = c.longest.height,
+            longest_format = c.longest.format,
+            made_after_a_wait_so_far = c.made_after_wait,
+            longest_wait_made_ms = c.longest_made_ms,
+            left_unmade_so_far = c.left_unmade,
+            refusals_so_far = c.refusals,
+            "textures picked by index kept off the card for lack of room (VICTORY_ROOM_WAITS=1): slots whose memory is there and that wait for a host texture; those the passes have not come back to (a pass ends at its 256th refusal); the longest wait"
+        );
+    }
+
     /// The queue's side of the card accounting line
     /// (`crate::resource::card_accounting`, which says what the line
     /// holds): the slots that are due, by what their texture has on the
@@ -3205,6 +3273,11 @@ impl State {
             // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
             // room, and every five seconds after it).
             Self::card_accounting(heap, host, frame, room);
+            // The waits for room (`VICTORY_ROOM_WAITS=1`): a line every
+            // five seconds while any slot waits.
+            if crate::room_waits::enabled() {
+                Self::room_waits_line(host, frame, room);
+            }
         }
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
@@ -3465,6 +3538,10 @@ impl State {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
+                    // How long it waits for room (`VICTORY_ROOM_WAITS=1`).
+                    if crate::room_waits::enabled() {
+                        Self::room_wait(index, write, frame, current());
+                    }
                     refused += 1;
                     if refused > 256 {
                         break;
@@ -3479,6 +3556,11 @@ impl State {
                         "a texture already on the card is brought up to date although the card has no room for new ones"
                     );
                 }
+            }
+            // A slot that waited for room goes on to be made: its wait is
+            // over (`VICTORY_ROOM_WAITS=1`).
+            if crate::room_waits::enabled() {
+                crate::room_waits::waits().served(index, crate::host::now_ms());
             }
             // A texture placed in title memory whose host copy is not made
             // yet: the makers make it (`resource::texture_makers`), and the
