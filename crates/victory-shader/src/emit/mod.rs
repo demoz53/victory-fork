@@ -1161,7 +1161,7 @@ fn emit_program(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.make_comparison();
                 }
                 s
             })
@@ -2642,7 +2642,7 @@ mod static_sampler_tests {
             assert_eq!(shader.samplers, [WORDS, WORDS], "cmp_first {cmp_first}");
             let plain = StaticSampler::from_words(WORDS);
             let mut cmp = plain;
-            cmp.filter |= 0x80;
+            cmp.make_comparison();
             let want = if cmp_first { [cmp, plain] } else { [plain, cmp] };
             assert_eq!(shader.static_samplers, want, "cmp_first {cmp_first}");
             #[cfg(windows)]
@@ -2653,6 +2653,62 @@ mod static_sampler_tests {
                     .unwrap_or_else(|e| panic!("cmp_first {cmp_first}: {e}"));
             }
         }
+    }
+}
+
+/// An offline count for `VICTORY_COMPARE_REDUCTION`: the programs of a folder of saved
+/// containers (`VICTORY_SAMPLER_SWEEP=<folder>`) with a comparison sampler whose filter the
+/// switch changes (the old filter is the sampler words' own with 0x80 ORed in). Ignored: run
+/// it with `--ignored` and the variable set (four threads).
+#[cfg(test)]
+#[test]
+#[ignore]
+fn comparison_samplers_in_a_folder_of_containers() {
+    let Some(dir) = std::env::var_os("VICTORY_SAMPLER_SWEEP") else { return };
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "cdxil"))
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out = std::sync::Mutex::new((0usize, 0usize, Vec::new()));
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(path) = files.get(k) else { break };
+                let bytes = std::fs::read(path).unwrap();
+                let Ok(shader) = translate(&bytes) else { continue };
+                let mut cmp = 0;
+                let mut changes = Vec::new();
+                for (w, new) in shader.samplers.iter().zip(&shader.static_samplers) {
+                    let plain = StaticSampler::from_words(*w);
+                    if new.filter == plain.filter {
+                        continue;
+                    }
+                    cmp += 1;
+                    let old = plain.filter | 0x80;
+                    if old != new.filter {
+                        changes.push(format!("{old:#x}->{:#x}", new.filter));
+                    }
+                }
+                let mut o = out.lock().unwrap();
+                o.0 += 1;
+                o.1 += usize::from(cmp > 0);
+                if !changes.is_empty() {
+                    o.2.push(format!("{} {}", path.file_name().unwrap().to_string_lossy(), changes.join(" ")));
+                }
+            });
+        }
+    });
+    let (programs, with_cmp, changed) = out.into_inner().unwrap();
+    eprintln!(
+        "SAMPLER-SWEEP {programs} programs, {with_cmp} with a comparison sampler, {} whose filter changes",
+        changed.len()
+    );
+    for c in &changed {
+        eprintln!("SAMPLER-SWEEP {c}");
     }
 }
 

@@ -33,7 +33,38 @@ pub struct StaticSampler {
 // The floats come from fixed-point fields: never NaN.
 impl Eq for StaticSampler {}
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`comparison_replaces`], for its thread only.
+    static TEST_COMPARISON_REPLACES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether [`StaticSampler::make_comparison`] replaces the filter's reduction
+/// (D3D12_FILTER bits 7-8: 0 standard, 1 comparison, 2 minimum, 3 maximum)
+/// instead of ORing comparison into it, which made a minimum (0x100) a maximum
+/// (0x180) and left a maximum a maximum, with no comparison at all. Port of
+/// TaynanGT/Vice-Tay 037c53152 (rayane-creato1r), via Kamiloj9/victory-dlss
+/// 883971644 (Kamil Ojdana). On; `VICTORY_COMPARE_REDUCTION=0` ORs, as before.
+fn comparison_replaces() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COMPARISON_REPLACES.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_REDUCTION").is_none_or(|v| v != "0"))
+}
+
 impl StaticSampler {
+    /// The sampler of a comparison sample (`image_sample_c`): the filter's
+    /// reduction becomes comparison, its tap modes kept ([`comparison_replaces`]).
+    pub(crate) fn make_comparison(&mut self) {
+        if comparison_replaces() {
+            self.filter = (self.filter & !0x180) | 0x80;
+        } else {
+            self.filter |= 0x80;
+        }
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -76,6 +107,31 @@ impl StaticSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A comparison replaces the reduction: standard, minimum and maximum all
+    /// become comparison, the tap modes kept (TaynanGT/Vice-Tay 037c53152 via
+    /// Kamiloj9/victory-dlss 883971644).
+    #[test]
+    fn comparison_replaces_previous_reduction() {
+        for (filter, expected) in [(0x14, 0x94), (0x115, 0x95), (0x1d5, 0xd5), (0x94, 0x94)] {
+            let mut sampler = StaticSampler::from_words([0; 4]);
+            sampler.filter = filter;
+            sampler.make_comparison();
+            assert_eq!(sampler.filter, expected, "{filter:#x}");
+        }
+        // `VICTORY_COMPARE_REDUCTION=0`: a minimum became a maximum, the fault
+        let was = TEST_COMPARISON_REPLACES.replace(Some(false));
+        let mut sampler = StaticSampler::from_words([0; 4]);
+        sampler.filter = 0x115;
+        sampler.make_comparison();
+        TEST_COMPARISON_REPLACES.set(was);
+        assert_eq!(sampler.filter, 0x195);
+        // the console's minimum sampler words (console_compiled_samplers_decode) used for a
+        // comparison sample: a linear comparison filter
+        let mut minimum = StaticSampler::from_words([0x2000_3003, 0x00FF_F000, 0x1850_0000, 0x8000_0000]);
+        minimum.make_comparison();
+        assert_eq!(minimum.filter, 0x95);
+    }
 
     #[test]
     fn console_compiled_samplers_decode() {
