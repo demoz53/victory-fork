@@ -131,7 +131,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// The order, and `VICTORY_WAVE_LOCAL` being here twice, are kept as they
 /// were: with `VICTORY_SHADER_CACHE_KEY=exe` the key is, byte for byte,
 /// what it was while the executable was the identity.
-const SWITCHES: [&str; 44] = [
+const SWITCHES: [&str; 46] = [
     "VICTORY_WAVE_WIDE",
     "VICTORY_WAVE_DEEP_SKIPS",
     "VICTORY_WAVE_LDS_REGIONS",
@@ -185,6 +185,10 @@ const SWITCHES: [&str; 44] = [
     "VICTORY_MESH_CLAMP_IN_DRAW",
     // (test/small3: SDWA WORD_0 UNUSED_SEXT sign-extends; on unless "0")
     "VICTORY_SDWA_SEXT",
+    // (test/shader3: NaN told by its bits in float compares, Corgansm/victory-corgi 8b6671cc2)
+    "VICTORY_NAN_EXACT",
+    // (test/shader3: the tiled cascade shadow programs' exact form, fxceless PR #1002)
+    "VICTORY_CASCADES_EXACT",
 ];
 
 /// The translation settings of this process that are in the run's key by
