@@ -17,6 +17,7 @@ blake3.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
+    "Wdk_System_SystemInformation",
     "Wdk_System_SystemServices",
     "Wdk_System_Threading",
     "Win32_Foundation",

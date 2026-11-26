@@ -613,6 +613,10 @@ impl Names {
         if let Some(k) = self.known.get(&f) {
             return k.clone();
         }
+        // dbghelp is single-threaded and one per process: the stall
+        // profiler, the log sampler and tests side by side take turns.
+        static DBGHELP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _turn = DBGHELP.lock().unwrap_or_else(|e| e.into_inner());
         self.init();
         let located = crate::crash::locate(f as usize);
         let file = located.split('+').next().unwrap_or("");
