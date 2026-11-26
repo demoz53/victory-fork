@@ -1327,6 +1327,27 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
     );
+    // Why dynamic descriptor slots were refused (`HostHeap::dynamic`).
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let why: Vec<f64> = crate::descriptor::host::DYNAMIC_WHY
+            .iter()
+            .map(|n| n.swap(0, Relaxed) as f64 / frames)
+            .collect();
+        let low = crate::descriptor::host::DYNAMIC_LOW[0].swap(u32::MAX, Relaxed);
+        let low = if low == u32::MAX { "no table asked".to_owned() } else { format!("{low}") };
+        tracing::info!(
+            "dynamic slots per frame, tables refused by cause: {:.0} asked more slots than were free (the ring was full), {:.0} had room \
+             but a search for a table no longer had failed since the last release (not searched), {:.0} were searched for and no run of \
+             free slots was that long (the free slots lay apart); {:.0} tables got a run lying across the place the search starts from \
+             (missed by the search as it was before, VICTORY_DYNAMIC_ACROSS=0); the fewest free slots seen since the last line: {low} of {}",
+            why[0],
+            why[1],
+            why[2],
+            why[3],
+            crate::descriptor::host::DYNAMIC_LOW[1].load(Relaxed),
+        );
+    }
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
     // recording thread did.

@@ -112,6 +112,62 @@ pub(crate) struct HostHeap {
     placed: Mutex<Spans>,
 }
 
+/// Diagnostics, since the last line (`crate::copystat::log`): why
+/// [`HostHeap::dynamic`] refused a table. 0: fewer slots were free than it
+/// asked (the ring is full: nothing to search); 1: enough were free but a
+/// search for a table no longer had failed since the last release, so none
+/// was made (`too_long`); 2: a search found no run of free slots that long
+/// (the free slots lie apart). 3: tables that got a run lying across the
+/// place the search starts from, which the search missed before it went on
+/// past that place.
+#[cfg(feature = "diagnostics")]
+pub(crate) static DYNAMIC_WHY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Diagnostics: the fewest free dynamic slots [`HostHeap::dynamic`] saw
+/// since the last line (`u32::MAX`: it was not called), and the dynamic
+/// slots of the heap it was last asked of.
+#[cfg(feature = "diagnostics")]
+pub(crate) static DYNAMIC_LOW: [std::sync::atomic::AtomicU32; 2] =
+    [std::sync::atomic::AtomicU32::new(u32::MAX), std::sync::atomic::AtomicU32::new(0)];
+
+/// `VICTORY_DYNAMIC_ACROSS` (on by default; `0`: off): the search for free
+/// dynamic slots also finds a run lying across the place it starts from
+/// ([`free_run`]).
+fn across() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_ACROSS").is_none_or(|v| v != "0"))
+}
+
+/// A run of `n` free slots among `taken` (`n` at least 1), searched from
+/// `cursor` on and then from the start: its first slot, and whether it
+/// lies across `cursor`. A run cannot wrap past the end.
+///
+/// `across`: the second part goes on past `cursor` by `n - 1` slots, so a
+/// free run that lies across it is found (the first part sees only its
+/// end, the second, stopping at `cursor`, only its start). Without that
+/// such a table was refused with room for it, and `too_long` then refused
+/// every table as long without a search until the next release
+/// (fxceless/victory-fork 4d0c63455, by hand from upstream c1c32819e9;
+/// GPL-3.0).
+fn free_run(taken: &[bool], cursor: usize, n: usize, across: bool) -> Option<(usize, bool)> {
+    let end = taken.len();
+    let second = if across { (cursor + n - 1).min(end) } else { cursor };
+    let mut run = 0;
+    let mut last = usize::MAX;
+    for at in (cursor..end).chain(0..second) {
+        if at != last.wrapping_add(1) {
+            run = 0;
+        }
+        last = at;
+        run = if taken[at] { 0 } else { run + 1 };
+        if run == n {
+            let first = at + 1 - n;
+            return Some((first, first < cursor && cursor < first + n));
+        }
+    }
+    None
+}
+
 /// Host-slot state behind one lock: every write of a host slot for a title
 /// slot takes it, so a pool slot is taken, made and published (or given
 /// back) at once.
@@ -1256,30 +1312,35 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
+        let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            DYNAMIC_LOW[0].fetch_min(free, std::sync::atomic::Ordering::Relaxed);
+            DYNAMIC_LOW[1].store(self.dynamic, std::sync::atomic::Ordering::Relaxed);
         }
-        let Some(first) = found else {
+        let room = free >= n;
+        let enough = room && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let n = n as usize;
+        // Search from `next` on, then from the start (and on past `next`
+        // for a run across it).
+        let found = if enough { free_run(taken, *next as usize, n, across()) } else { None };
+        #[cfg(feature = "diagnostics")]
+        if matches!(found, Some((_, true))) {
+            DYNAMIC_WHY[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some((first, _)) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            #[cfg(feature = "diagnostics")]
+            DYNAMIC_WHY[if !room {
+                0
+            } else if !enough {
+                1
+            } else {
+                2
+            }]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -3767,6 +3828,62 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// (fxceless/victory-fork 4d0c63455.)
+    #[test]
+    fn a_free_run_across_the_place_the_search_starts_from_is_found() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Slots 0..8 and 8..16 of the ring: the search now starts at 16.
+        assert_eq!((heap.dynamic(8), heap.dynamic(8)), (Some(4), Some(12)));
+        // Everything after them, so that only what is given back is free.
+        let rest = heap.dynamic - 16;
+        assert_eq!(heap.dynamic(rest), Some(4 + 16));
+        // The search starts at 0 again. Slots 0..16 back, then 0..12 taken:
+        // it starts at 12, with 12..16 free.
+        heap.release(4, 16);
+        assert_eq!(heap.dynamic(12), Some(4));
+        // 10..12 back: the free run 10..16 lies across 12. Six slots fit
+        // only there.
+        heap.release(4 + 10, 2);
+        assert_eq!(heap.dynamic(6), Some(4 + 10));
+        // And nothing is found where nothing is.
+        assert_eq!(heap.dynamic(1), None);
+    }
+
+    /// The search itself: a run across the place it starts from is found
+    /// only by the search that goes on past that place; the search as it
+    /// was (`VICTORY_DYNAMIC_ACROSS=0`) finds what it found before, and
+    /// neither finds a run that wraps past the end.
+    #[test]
+    fn the_search_goes_on_past_its_starting_place() {
+        // Free: 10..16 of 32. The search starts at 12.
+        let mut taken = [true; 32];
+        taken[10..16].fill(false);
+        assert_eq!(free_run(&taken, 12, 6, true), Some((10, true)));
+        assert_eq!(free_run(&taken, 12, 6, false), None);
+        // A run that does not need the slots before 12: found either way,
+        // in the first part.
+        assert_eq!(free_run(&taken, 12, 4, true), Some((12, false)));
+        assert_eq!(free_run(&taken, 12, 4, false), Some((12, false)));
+        // Longer than what is free: no run.
+        assert_eq!(free_run(&taken, 12, 7, true), None);
+        // Free at both ends: no run wraps past the end.
+        let mut ends = [true; 32];
+        ends[..3].fill(false);
+        ends[29..].fill(false);
+        assert_eq!(free_run(&ends, 30, 4, true), None);
+        assert_eq!(free_run(&ends, 30, 3, true), Some((0, false)));
+        assert_eq!(free_run(&ends, 1, 3, true), Some((29, false)));
+        // From the start and from the end of the ring.
+        let free = [false; 8];
+        assert_eq!(free_run(&free, 0, 8, true), Some((0, false)));
+        assert_eq!(free_run(&free, 0, 8, false), Some((0, false)));
+        assert_eq!(free_run(&free, 5, 8, true), Some((0, true)));
+        assert_eq!(free_run(&free, 5, 8, false), None);
+        assert_eq!(free_run(&free, 8, 1, true), Some((0, false)));
     }
 
     #[test]
