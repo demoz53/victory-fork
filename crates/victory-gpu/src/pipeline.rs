@@ -340,6 +340,69 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// Whether the structure builder may run at all (`VICTORY_BVH_BUILDER=1`).
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether the title's rays have structures to hit: the structure builder
+/// may run and has not been turned off for the run. Without them every ray
+/// the title traces finds nothing. (Asks only; [`builder_runs`] also
+/// decides.)
+#[cfg(windows)]
+fn rays_run() -> bool {
+    builder_allowed() && !BUILDER.lock().unwrap_or_else(|e| e.into_inner()).off
+}
+
+/// Whether programs that only serve the title's rays are left out while the
+/// rays do not run (`VICTORY_IDLE_WITHOUT_RAYS=1`; off by default).
+#[cfg(windows)]
+fn idle_without_rays() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IDLE_WITHOUT_RAYS").is_some_and(|v| v == "1"))
+}
+
+/// Whether a compute program of `shaders` only makes sense with the title's
+/// rays: the one that tells the screen probes which rays to trace, known by
+/// the name its container carries (`CS_ScreenProbes_ActivateRays`; in this
+/// title's shaders one container holds it, hash 39f0e9aeb156a61c).
+///
+/// Ported from Belobug/VIctory-Belobug-AMD (6986a5714, where the rule is
+/// from) and zm0kiemedia/Neptune_VI (`idle_without_rays`, as of b900c6467;
+/// both GPL-3.0): there it is left out unless `VICTORY_RAYS` has the rays
+/// run, since "once it ran, with no rays behind it, the whole picture lost
+/// light, shadows and reflections". Here it is a switch to try, off by
+/// default, and it holds only while the structure builder does not run
+/// ([`rays_run`]): with `VICTORY_BVH_BUILDER=1` and the builder whole the
+/// program runs as before.
+///
+/// What is left out is the program's dispatch, direct or indirect, and
+/// nothing else: its host pipeline is still made, the title's other passes
+/// run. It stores to five buffers and no texture (a list of 12-byte
+/// records, four buffers of dwords, a count it adds to): those keep what
+/// the title or its other passes last put there, so the passes that read
+/// them find the rays the title cleared them to, not rays nothing traces.
+/// shortcut: work left out; whether the picture is better or worse for it
+/// here is for a game run to say (another fork saw a haze with it out).
+#[cfg(windows)]
+fn serves_rays(shaders: &[Arc<Shader>]) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    shaders.iter().any(|s| s.stage == "compute" && s.container.windows(NAME.len()).any(|w| w == NAME))
+}
+
+/// Whether the dispatches of the title's pipeline `this` are left out
+/// because the rays it serves do not run ([`serves_rays`]).
+#[cfg(windows)]
+pub(crate) fn left_without_rays(this: This) -> bool {
+    !this.is_null() && pipeline(this).no_rays && !rays_run()
+}
+
+/// Since the last frame line: dispatches left out by [`left_without_rays`].
+#[cfg(windows)]
+pub(crate) static LEFT_WITHOUT_RAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
@@ -354,8 +417,7 @@ pub(crate) fn builder_off(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -427,6 +489,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// With `VICTORY_IDLE_WITHOUT_RAYS=1`: it only serves the title's rays
+    /// ([`serves_rays`]); its dispatches are left out while they do not run.
+    #[cfg(windows)]
+    no_rays: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -596,6 +662,17 @@ fn hand_out(
     make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
+    // Looked for only with the switch: a walk over the container.
+    #[cfg(windows)]
+    let no_rays = idle_without_rays() && serves_rays(&shaders);
+    #[cfg(windows)]
+    if no_rays {
+        let hashes: Vec<&str> = shaders.iter().map(|s| s.hash.as_str()).collect();
+        tracing::info!(
+            ?hashes,
+            "a pipeline of the program that activates the screen probes' rays: its dispatches are left out while the structure builder does not run (VICTORY_IDLE_WITHOUT_RAYS=1)"
+        );
+    }
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -610,6 +687,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        no_rays,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -847,6 +926,19 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    /// The program that activates the screen probes' rays is known by the
+    /// name in its container, and only as a compute program.
+    #[cfg(windows)]
+    #[test]
+    fn the_program_that_serves_rays_is_known_by_its_name() {
+        let named = b"  DXBC...CS_ScreenProbes_ActivateRays ...";
+        assert!(serves_rays(&[shader("compute", named)]));
+        // (Other bytes: a container is kept once, with its first stage.)
+        assert!(!serves_rays(&[shader("pixel", b"  DXBC.pixel.CS_ScreenProbes_ActivateRays ")]));
+        assert!(!serves_rays(&[shader("compute", b"...CS_ScreenProbes_TraceRays ")]));
+        assert!(!serves_rays(&[]));
     }
 
     #[test]

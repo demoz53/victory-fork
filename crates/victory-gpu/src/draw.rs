@@ -2773,6 +2773,12 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // A program that only serves rays that do not run is left out
+        // (`VICTORY_IDLE_WITHOUT_RAYS=1`).
+        if crate::pipeline::left_without_rays(self.pipeline as This) {
+            crate::pipeline::LEFT_WITHOUT_RAYS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3699,6 +3705,13 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
+        }
+        // As a direct dispatch of it: left out, before the clamp of its
+        // arguments (`VICTORY_IDLE_WITHOUT_RAYS=1`). Counted there, not as
+        // an execution the host could not run.
+        if crate::pipeline::left_without_rays(self.pipeline as This) {
+            crate::pipeline::LEFT_WITHOUT_RAYS.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
