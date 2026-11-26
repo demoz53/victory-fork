@@ -5276,8 +5276,10 @@ impl Host {
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        // The same length as the compare's (`card_hashed`).
+                        let hashed = shadow.card_hashed().unwrap_or(size) as u32;
                         for run in runs {
-                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
+                            dispatch_card_compare(list, run.first, run.skew, hashed, run.pieces, 0, 0);
                         }
                     }
                     list.Close()?;
@@ -5379,7 +5381,7 @@ impl Host {
                             list,
                             r.span.first,
                             r.span.skew,
-                            size as u32,
+                            r.shadow.card_hashed().unwrap_or(size) as u32,
                             r.span.pieces,
                             r.at * 4,
                             if flown { 2 } else { 1 },

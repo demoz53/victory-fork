@@ -193,3 +193,4 @@ switch.
 | Switch | Default | What | Shader |
 |---|---|---|---|
 | `VICTORY_CARD_FETCH_INFLIGHT=1` (+ `VICTORY_CARD_FETCH_INFLIGHT_MB`, 64) | off | with the relay, the pieces a flight's compare flags are copied to PC memory inside the flight's own compare list (no fetch on the copy queue beside later flights: no torn fetches); a landing that cannot use them fetches the old way on the main queue. fxceless 9376fd60c / PR #648 (Jonirulah). Works with `VICTORY_INDIRECT_WINDOW=1` (see the commit) | no |
+| `VICTORY_CARD_HASH_LEN=1` | off | the card's hash pass and compare of a title buffer's copy cover the title buffer's own bytes (16-byte steps) instead of the whole 64 KiB-rounded buffer; for small copies, pair with `VICTORY_CARD_BUFFERS_MIN_KB=64`. fxceless c36971b21. Our form of CARD_HASH_WIDE is the 64-lane CARD_COMPARE, always on (no switch) | no |
