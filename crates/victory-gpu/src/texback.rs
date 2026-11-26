@@ -419,6 +419,8 @@ fn write_covered(at: usize, tiled: &[u8], runs: &[std::ops::Range<usize>]) {
 /// title's layout, into the texture's title memory, if the texture still
 /// lies there ([`checked`]): only the bytes the texels cover.
 pub(crate) fn land(back: &Back) {
+    // The submit audit: a write of ours, not the title's.
+    crate::host::audit::wrote(back.at, back.size);
     let Some(ticket) = &back.ticket else {
         return land_whole(back);
     };

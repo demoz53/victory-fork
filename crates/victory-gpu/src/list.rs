@@ -2229,6 +2229,13 @@ impl ValueWait {
         !unmet || !(1..=7).contains(&self.comparison)
     }
 
+    /// Tests: a wait for the 32 bits at `address` to compare as
+    /// `comparison` says (3: equal) with `reference`.
+    #[cfg(all(windows, test))]
+    pub(crate) fn of(address: u64, comparison: u32, reference: u64) -> Self {
+        ValueWait { address, comparison, reference, wide: false }
+    }
+
     /// Where the value waited for is: address and bytes.
     #[cfg(windows)]
     pub(crate) fn place(&self) -> (usize, usize) {

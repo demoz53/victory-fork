@@ -25,6 +25,14 @@ mod card_verify;
 /// `VICTORY_CARD_AWAKE`: the card's clocks kept up between submissions.
 mod awake;
 
+/// `VICTORY_SUBMIT_AUDIT`: title memory read at preparing against what it
+/// was at the title's submit call.
+pub(crate) mod audit;
+
+/// `VICTORY_GROUP_COMMIT`: what the queues ask while they gather queued
+/// parts into one host submission.
+pub(crate) mod group;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -2831,6 +2839,13 @@ struct Deferred {
     memory_read_seen: usize,
     memory_write_seen: usize,
     named_writes: crate::fasthash::Set<usize>,
+    /// With the submit audit ([`audit`]): what the refreshes recorded are
+    /// for, by host copy and address (none: a buffer given to shaders).
+    refresh_kinds: crate::fasthash::Map<(usize, usize), u8>,
+    /// With the submit audit: the title memory the list's steps read, as it
+    /// was at the title's submit call, and that call.
+    audit: Vec<audit::Print>,
+    audit_call: Option<audit::Call>,
 }
 
 impl Deferred {
@@ -2887,6 +2902,9 @@ impl Deferred {
         self.memory_read_seen = 0;
         self.memory_write_seen = 0;
         self.named_writes.clear();
+        self.refresh_kinds.clear();
+        self.audit.clear();
+        self.audit_call = None;
     }
 
     /// Advances the list's title-memory copy watermarks to `total` (`writes`:
@@ -4274,6 +4292,35 @@ fn blocked_by_steps_noting<'a>(
     read_stat.map(|stat| (WHY_READ, stat))
 }
 
+/// The fills of `runs` that [`blocked_by_steps_noting`] lets read ahead of
+/// the shader writes in `written` (`VICTORY_FILL_AHEAD`): source and bytes.
+/// For the parts of a batch ([`group`]), whose fills ahead of an earlier
+/// part of the same batch are noted when the batch gets its number.
+fn fills_ahead(
+    written: &[(usize, usize)],
+    by_copy: &[(usize, usize, usize)],
+    immed: &[(usize, usize)],
+    runs: &[&HostList],
+) -> Vec<(usize, usize)> {
+    let mut ahead = Vec::new();
+    if written.is_empty() {
+        return ahead;
+    }
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let &Step::Fill(_, src, len) = step
+                && fill_ahead::on(src, len)
+                && touches(written, src, src + len)
+                && !touches(immed, src, src + len)
+                && !by_copy.iter().any(|&(owner, a, b)| owner == 0 && a < src + len && b > src)
+            {
+                ahead.push((src, len));
+            }
+        }
+    }
+    ahead
+}
+
 /// What a fill of upload memory is for ([`HostList::defer_fill_as`]), and
 /// the settles for "a fill of upload memory" told apart by it: which kind
 /// of read still meets flights at its submission although
@@ -4594,6 +4641,13 @@ mod fill_ahead {
     /// A fill reads `len` bytes at `src` ahead of flights that may write
     /// them.
     pub(super) fn read(src: usize, len: usize) {
+        read_before(src, len, super::STARTED.load(Relaxed));
+    }
+
+    /// [`read`], ahead of submission `number` and those before it (group
+    /// commit: a fill of a batch ahead of an earlier part of the same batch
+    /// reads ahead of its own submission).
+    pub(super) fn read_before(src: usize, len: usize, number: u64) {
         if len == 0 {
             return;
         }
@@ -4608,7 +4662,7 @@ mod fill_ahead {
                 p.pruned = frame;
                 p.fills.retain(|f| f.2 + KEEP >= frame);
             }
-            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed), print));
+            p.fills.push((src, src + len, frame, number, print));
         }
     }
 
@@ -4801,6 +4855,42 @@ mod fill_ahead {
                 "a read-only title copy went ahead of shader writes"
             );
             TEST_MODE.set(None);
+        }
+
+        /// Group commit: a fill over what an earlier part of its own batch
+        /// writes joins the batch only with the switch, and is then kept for
+        /// the check at the batch's landing; without the switch it starts
+        /// the next batch, and so waits for the landing.
+        #[cfg(windows)]
+        #[test]
+        fn a_fill_ahead_of_its_own_batch_is_kept_for_the_landing() {
+            let Some(host) = super::super::host() else {
+                return; // no host GPU here
+            };
+            let memory: &'static mut [u8] = Box::leak(vec![0x22u8; 1 << 16].into_boxed_slice());
+            let base = memory.as_ptr() as usize;
+            let resource = 0x6c00_0002usize;
+            crate::shadow::register(resource, base as u64, 1 << 16);
+            let copy = crate::shadow::find(base as u64, 1 << 16).expect("a host copy");
+            let to = Box::leak(vec![0u8; 256].into_boxed_slice()).as_mut_ptr();
+            let writer = host.new_list().unwrap();
+            copy.refresh(&writer, base as u64, 256);
+            copy.gpu_writes(&writer, base as u64 + 64, 64);
+            writer.close();
+            let reader = host.new_list().unwrap();
+            reader.defer_fill_as(to, (base + 80) as *const u8, 16, super::super::fill_kind::OTHER);
+            reader.defer_fill_as(to, (base + 4096) as *const u8, 16, super::super::fill_kind::OTHER);
+            reader.close();
+            let mut gathered = super::super::group::Gathered::default();
+            gathered.add(&[&writer]);
+            TEST_MODE.set(Some(0));
+            assert!(gathered.blocks(&[&reader]), "a fill of what the batch writes joined it");
+            TEST_MODE.set(Some(1));
+            assert!(!gathered.blocks(&[&reader]));
+            gathered.add(&[&reader]);
+            assert_eq!(gathered.ahead(), [(base + 80, 16)], "the fill ahead of the batch's own part, and only it");
+            TEST_MODE.set(None);
+            crate::shadow::unregister(resource, base as u64);
         }
     }
 }
@@ -6039,6 +6129,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::queue::behind_line(frames);
+    audit::line(frames);
     flip_line(frames);
 }
 
@@ -6256,6 +6347,7 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                audit::wrote(*at, rows.saturating_sub(1).saturating_mul(*pitch).saturating_add(*row));
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
@@ -7775,7 +7867,10 @@ impl Host {
                     }
                     landed.push((flight.lists, flight.order));
                 }
-                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Write(at, what, bytes) => {
+                    audit::wrote(at, bytes);
+                    what.write(at as *mut u8, bytes)
+                }
                 Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
             }
         }
@@ -8073,6 +8168,19 @@ impl Host {
         land();
     }
 
+    /// Tests: from here on the host's queue stands at a fence of ours until
+    /// the fence is signalled with 1: what is sent meanwhile stays in the
+    /// air.
+    #[cfg(test)]
+    pub(crate) fn test_gate(&self) -> ID3D12Fence {
+        // SAFETY: plain creation; the queue waits for a fence the test signals.
+        unsafe {
+            let gate: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            self.queue.Wait(&gate, 1).unwrap();
+            gate
+        }
+    }
+
     /// Sends `list`, a closed list of ours (the present's copy), as a
     /// flight ([`late_free_present`]): not waited for, settled with the
     /// others. The caller keeps the list and does not reset it before the
@@ -8257,7 +8365,10 @@ impl Host {
                         }
                         landed.push((flight.lists, flight.order));
                     }
-                    Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                    Late::Write(at, what, bytes) => {
+                        audit::wrote(at, bytes);
+                        what.write(at as *mut u8, bytes)
+                    }
                     Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
@@ -8505,6 +8616,12 @@ impl Host {
         // lists that may read them run.
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        // Group commit with VICTORY_FILL_AHEAD: the fills of this batch
+        // that read ahead of an earlier part of it are checked when it
+        // lands, as those ahead of flights are.
+        for (src, len) in group::take_ahead() {
+            fill_ahead::read_before(src, len, this_submission);
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -8574,6 +8691,9 @@ impl Host {
             settle_stale(self, &mut submitted, until);
             settled += settling.elapsed();
         }
+        // The submit audit: what these steps read of title memory, against
+        // what it was at the title's submit call.
+        audit::prepared(runs);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -8876,6 +8996,7 @@ impl Host {
             // may be what tells the title that they are there.
             read_backs(list);
             for &(at, what, bytes) in &list.deferred().writes {
+                audit::wrote(at, bytes);
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -10040,6 +10161,14 @@ impl HostList {
         }
     }
 
+    /// With the submit audit ([`audit`]): the refresh of `shadow` from
+    /// `address` this list records is for `kind` (one of `audit`'s kinds).
+    pub(crate) fn audit_kind(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, kind: u8) {
+        if audit::on() {
+            self.deferred().refresh_kinds.insert((std::sync::Arc::as_ptr(shadow) as usize, address as usize), kind);
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -10483,6 +10612,7 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    audit::wrote(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -10509,6 +10639,7 @@ impl HostList {
                     let ran = started.began().unwrap_or_else(std::time::Instant::now);
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        audit::wrote_anywhere();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
