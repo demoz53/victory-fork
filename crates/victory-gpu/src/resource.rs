@@ -1215,13 +1215,24 @@ impl Drop for Held {
 }
 
 /// Holds title texture `this` alive, for work on a thread the title knows
-/// nothing of (`crate::heap_worker`). `None` if it is no texture, or is
-/// being released. (fxceless/victory-fork d4a528ba0.)
+/// nothing of (`crate::heap_worker`). `None` if it is no texture (null
+/// among them), or is being released. (fxceless/victory-fork d4a528ba0.)
 #[cfg(windows)]
 pub(crate) fn hold(this: This) -> Option<Held> {
+    if this.is_null() {
+        return None;
+    }
     // A texture leaves the table before it is freed, under this lock.
     let all = textures();
-    (all.contains(&(this as usize)) && object::try_add_ref(this)).then_some(Held(this))
+    // A `Held` is made only once its reference is taken: one made for
+    // nothing (`then_some` builds its value first) is dropped at once and
+    // gives back a reference it never had (VICTORY_HEAP_WORKER=1 ended
+    // every run 10 s in, in `Held::drop` of a null texture).
+    if all.contains(&(this as usize)) && object::try_add_ref(this) {
+        Some(Held(this))
+    } else {
+        None
+    }
 }
 
 /// The title textures the title fills, by the memory they take ([`Resource::data`]
@@ -3634,6 +3645,40 @@ mod tests {
             create(device, 0, &desc, u32::MAX, null, &RESOURCE_IIDS[0], &mut r),
             0
         );
+    }
+
+    /// `hold` (`VICTORY_HEAP_WORKER=1`) of what is no texture gives `None`
+    /// and leaves its reference count alone, null among them (that crashed
+    /// every run with the worker); a texture's is one more while held.
+    #[test]
+    fn hold_takes_a_reference_only_of_a_texture() {
+        assert!(hold(std::ptr::null()).is_none());
+        let device = crate::device::device();
+        type At = extern "system" fn(This, u64, *const ResourceDesc, u32, *const c_void, *const Iid, *mut This) -> HRESULT;
+        let create = slot::<At>(device, 0x428);
+        // The count now: one taken and given back.
+        let refs = |r: This| {
+            let n = crate::object::add_ref(r);
+            slot::<Release>(r, 0x10)(r);
+            n - 1
+        };
+        let memory = vec![0u8; 0x2_0000];
+        let address = (memory.as_ptr() as u64).next_multiple_of(0x1_0000);
+        let null = std::ptr::null();
+        let mut b = std::ptr::null();
+        assert_eq!(create(device, address, &buffer(0x1_0000), u32::MAX, null, &RESOURCE_IIDS[0], &mut b), 0);
+        let before = refs(b);
+        assert!(hold(b).is_none(), "a buffer is no texture");
+        assert_eq!(refs(b), before);
+        assert_eq!(slot::<Release>(b, 0x10)(b), 0);
+        let mut t = std::ptr::null();
+        assert_eq!(create(device, address, &texture(64, 64, 28, 1), u32::MAX, null, &RESOURCE_IIDS[0], &mut t), 0);
+        let before = refs(t);
+        let held = hold(t).expect("a texture");
+        assert_eq!(refs(t), before + 1);
+        drop(held);
+        assert_eq!(refs(t), before);
+        assert_eq!(slot::<Release>(t, 0x10)(t), 0);
     }
 
     #[test]
