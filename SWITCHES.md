@@ -111,6 +111,20 @@ One new default-on change: `VICTORY_GUARD_VIEWS_ONLY` (a clear bug fix with test
 | `VICTORY_DESC_CACHE` | `1` | off | a host copy's buffer width and flags come from its own record (read once when the copy is made) instead of a `GetDesc` call per buffer view made for a bind (buffer SRV/UAV views, root UAVs, title-memory views): 19.3 ns a call saved, one or two per view | test/trim1 | no |
 | `VICTORY_BIND_LEAN` | `1` | off | diagnostics builds: a bound texture shader view no longer looks its host texture up again (table lock, reference counted, clock read) and asks its description only for the debug line "a shader reads a texture the title fills", unless debug lines are on (then as before). Log output unchanged at the usual levels | test/trim1 | no |
 
+## On test/spread (from all21; not yet merged)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_SPREAD` | `1`; `alt` (20 s as usual, 20 s widened, in turn, each change in the log) | off | every 500 ms a thread of ours looks at the title's threads: those the title pinned inside logical processors 0-15 (`SetThreadGroupAffinity`, which reaches Windows unchanged) are grouped by mask, and a group with more threads than processors also gets the spare processors (here 11 threads on 0x1F00 = logical 8-12 -> 0xFFFF1F00); smaller groups keep their mask. Log: `spread: the title's pinned threads by its mask: ...` | fxceless/victory-fork 39731795d (fxceless) | no |
+| `VICTORY_SPREAD_SPARE` | hex mask (`0x` optional) | the slow cores (0xFFFF0000 here) | the processors SPREAD adds instead; only read with SPREAD (darkworldhm's sessions name every processor) | fxceless 39731795d | no |
+
+With `VICTORY_FAST_CORES`: FAST_CORES selects CPU sets (fast cores 0-15), SPREAD sets affinity masks; Windows runs a
+thread on the part of its mask that is also selected. So a title thread that submits, selected by FAST_CORES=3 or 4,
+keeps to the fast processors of its (widened) mask, 8-12, and SPREAD changes nothing for it; the title's other
+pinned threads (its recording and job threads) get the full widened mask either way. Our own threads are not pinned
+and never touched. `VICTORY_PROCESS_PRIORITY=above` is independent (priority class, not processors). While a test
+runs, the governor keeps compilers on 16-31 at idle priority: those are SPREAD's default spare processors, so give a
+SPREAD run no build beside it (or `VICTORY_SPREAD_SPARE=FFFFC000`: fast core 7 = logical 14-15, which fxceless found free of pinned threads, plus the slow cores).
+
 ## New in all21 (merged on top of all20)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
