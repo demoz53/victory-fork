@@ -17,6 +17,11 @@ use crate::{ShaderError, io, ir, resource, structure};
 #[path = "wave64_after_loop.rs"]
 mod after_loop;
 
+/// A CPU model of one console wave of 64 lanes, and every lane of synthetic one-wave programs
+/// run as two host waves of 32 compared with it.
+#[path = "lane_tests.rs"]
+mod lanes;
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads

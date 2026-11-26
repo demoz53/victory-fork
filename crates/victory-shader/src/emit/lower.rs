@@ -31,6 +31,11 @@ mod loop_regions;
 pub(super) use loop_regions::TEST_AFTER_LOOP;
 pub(super) use loop_regions::scope as after_loop_scope;
 
+/// Lane fixes of wave64 compute on 32-lane hosts that the lane tests found.
+mod lanes;
+#[cfg(test)]
+pub(super) use lanes::{TEST_LANE_MODULO, TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST, TEST_THREAD_TICKET};
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -341,6 +346,9 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// A program with console lanes in a group of several host waves, not on the `halves`
+    /// path: the LDS dword of `wave_base`'s counter ([`lanes::ticket`]).
+    ticket: Option<u32>,
     /// Whether `halves` is the program's own first LDS dword, borrowed because the group's
     /// LDS had no room past the program's ([`lds_fit`]).
     halves_borrowed: bool,
@@ -351,6 +359,9 @@ struct Lower<'a> {
     /// The first dword of the scatter's scratch, a dword per lane of every console wave in the
     /// group (`ds_permute_b32`), allocated past the program's LDS.
     scatter: Option<u32>,
+    /// `ds_bpermute_b32` across two host waves: the first LDS dword of the area the lanes
+    /// write their data into ([`lanes::permute_area`]).
+    permute_area: Option<u32>,
     /// Per IR block, whether every lane runs it ([`all_lane_blocks`]); none without a computable
     /// flow (an indirect exit). A scatter's barriers need it.
     lane_blocks: Option<Vec<bool>>,
@@ -1870,8 +1881,12 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // console lanes in a group of several host waves: `wave_base`'s counter ([`lanes::ticket`])
+        let mut ticket: Option<u32> = None;
         // the scatter's scratch base (`ds_permute_b32`)
         let mut scatter: Option<u32> = None;
+        // the area of `ds_bpermute_b32` across two host waves ([`lanes::permute_area`])
+        let mut permute_area: Option<u32> = None;
         // whether `halves` borrows the program's first LDS dword ([`lds_fit`])
         let mut halves_borrowed = false;
         // host groups per console group, and the console's group ([`with_group_split`])
@@ -1996,6 +2011,8 @@ impl<'a> Lower<'a> {
                                 if !(LOCAL_WAVES.get() && lds_fit()) {
                                     s.lds_dwords += 2 * group.div_ceil(64);
                                 }
+                                let shuffles = insts().any(|i| i.name() == "ds_bpermute_b32");
+                                permute_area = lanes::permute_area(&mut s.lds_dwords, group, shuffles, LOCAL_WAVES.get());
                             }
                         }
                     }
@@ -2051,6 +2068,9 @@ impl<'a> Lower<'a> {
                     halves = Some(s.lds_dwords);
                     s.lds_dwords += 1;
                 }
+            }
+            if halves.is_none() {
+                ticket = lanes::ticket(&mut s.lds_dwords, false, console_lanes, group, wave);
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -2226,10 +2246,12 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            ticket,
             halves_borrowed,
             split,
             console_threads,
             scatter,
+            permute_area,
             lane_blocks: all_lane_blocks(x.st),
             wave_base: None,
             flat: None,
@@ -4336,7 +4358,7 @@ impl<'a> Lower<'a> {
     /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
     /// found. Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.ticket)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -4349,12 +4371,17 @@ impl<'a> Lower<'a> {
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
-        // (the paired form: a host wave takes a whole console wave, 64 threads)
+        // (a group that is not a multiple of 32 threads: only its full host waves count off
+        // the counter and the short one takes the last run, [`lanes::short_wave_last`])
+        let (first, full) = self.full_waves_count(first);
+        // (the paired form: a host wave takes a whole console wave, 64 threads; its groups
+        // are rows of full host waves, so none is short)
         let k32 = self.s.m.i32(if self.twin.is_some() { 64 } else { 32 });
         let add = self.s.m.select(e, first, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let base = self.short_wave_base(full, base);
         if self.halves_borrowed {
             // every wave has taken its base before the program's code writes the dword
             self.group_sync(e);
@@ -4996,7 +5023,7 @@ impl<'a> Lower<'a> {
                 _ => self.s.m.bin(e, Bin::UDiv, f, xy),
             });
         }
-        if self.halves.is_some() || self.twin.is_some() {
+        if self.halves.is_some() || self.twin.is_some() || self.ticket.is_some() {
             let f = self.console_thread();
             let f = self.split_thread(f);
             self.s.flags |= flags::WAVE_OPS;
@@ -5419,8 +5446,8 @@ impl<'a> Lower<'a> {
             self.cross_lane(false)?;
             if self.exchange.as_ref().is_some_and(|e| !e.1) {
                 // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
+                // may be in the other one ([`Self::permute_across_halves`])
+                return self.permute_across_halves(inst, addr.as_ref(), data.first(), offset, dst_reg, guard);
             }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
@@ -9143,6 +9170,7 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let lane = self.lane_mod(lane);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -9223,6 +9251,7 @@ impl<'a> Lower<'a> {
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let lane = self.lane_mod(lane);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
