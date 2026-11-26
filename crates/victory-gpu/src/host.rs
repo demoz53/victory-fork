@@ -3782,14 +3782,6 @@ fn blocked_by_steps_noting<'a>(
     let mut read_stat: Option<Option<usize>> = None;
     for step in steps {
         let stat = match step {
-            &Step::Copy(dst, src, len)
-                if fill_ahead::copies(src, len) && ahead(src, src + len) && !any_written(dst, dst + len) =>
-            {
-                if count {
-                    fill_ahead::read(src, len);
-                }
-                None
-            }
             &Step::Fill(_, src, len) if fill_ahead::on(src, len) && ahead(src, src + len) => {
                 if count {
                     fill_ahead::read(src, len);
@@ -3985,9 +3977,8 @@ pub(crate) mod declared {
 }
 
 /// Fills of upload memory (constant buffers copied into the list's own
-/// memory when it is submitted), and with `=2` title buffer copies that
-/// only READ title memory flights "may write", are no longer waited for
-/// with `VICTORY_FILL_AHEAD=1` (off by default); what the flights then
+/// memory when it is submitted) over what flights "may write" are no
+/// longer waited for with `VICTORY_FILL_AHEAD=1` (off by default); what the flights then
 /// write is checked against them when they land. Our port of fxceless main
 /// f85101b60 (there on by default, `VICTORY_FILL_WAIT=1` turning it off)
 /// with fxceless #860 (turbinedogbla-creator): a fill keeps a fingerprint
@@ -4045,9 +4036,9 @@ mod fill_ahead {
     }
 
     /// `VICTORY_FILL_AHEAD`: 0 (unset) waits as before; 1 fills read ahead
-    /// of flights; 2 also title buffer copies that only read where flights
-    /// may write (their destination, title memory, keeps what they copied:
-    /// a late finding leaves it stale until the title writes it again).
+    /// of flights. (`=2`, read-only title buffer copies ahead too, is gone:
+    /// such a copy puts what it read into title memory, and a miss found at
+    /// the landing left its destination wrong for good; 2 now means 1.)
     fn mode() -> u8 {
         #[cfg(test)]
         if let Some(mode) = TEST_MODE.get() {
@@ -4055,12 +4046,12 @@ mod fill_ahead {
         }
         static MODE: OnceLock<u8> = OnceLock::new();
         *MODE.get_or_init(|| {
-            let mode = std::env::var("VICTORY_FILL_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(2);
+            let mode = std::env::var("VICTORY_FILL_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(1);
             if mode > 0 {
                 tracing::info!(
                     mode,
-                    "fills of upload memory (and with 2 read-only title buffer copies) over what flights may write are not \
-                     waited for, and checked when the flights land (VICTORY_FILL_AHEAD)"
+                    "fills of upload memory over what flights may write are not waited for, and checked when the flights \
+                     land (VICTORY_FILL_AHEAD)"
                 );
             }
             mode
@@ -4099,11 +4090,6 @@ mod fill_ahead {
     /// is held back.
     pub(super) fn on(src: usize, len: usize) -> bool {
         mode() > 0 && free(src, len)
-    }
-
-    /// Whether a read-only copy of `len` bytes from `src` does too.
-    pub(super) fn copies(src: usize, len: usize) -> bool {
-        mode() > 1 && free(src, len)
     }
 
     fn free(src: usize, len: usize) -> bool {
@@ -4309,10 +4295,6 @@ mod fill_ahead {
             wrote(same, &[1; LEN]);
             assert!(!held(same));
             assert!(on(same, LEN));
-            // Copies only with mode 2.
-            assert!(!copies(same, LEN));
-            TEST_MODE.set(Some(2));
-            assert!(copies(same, LEN) && !copies(missed, LEN));
             TEST_MODE.set(None);
             drop(memory);
         }
@@ -4338,6 +4320,16 @@ mod fill_ahead {
                 blocked_by_steps(&written, &[(7, 0x10_0000, 0x20_0000)], &[(0x18_0040, 0x18_0048)], &fill),
                 Some((WHY_READ, Some(16))),
                 "a bottom-of-pipe write is waited for"
+            );
+            // A title buffer copy reading shader output still waits, at any
+            // value: it puts what it read into title memory, where a miss
+            // found at the landing could not be undone.
+            TEST_MODE.set(Some(2));
+            let copy = [Step::Copy(0x40_0000, 0x18_0000, 0x100)];
+            assert_eq!(
+                blocked_by_steps(&written, &[(7, 0x10_0000, 0x20_0000)], &[], &copy),
+                Some((WHY_READ, Some(15))),
+                "a read-only title copy went ahead of shader writes"
             );
             TEST_MODE.set(None);
         }
