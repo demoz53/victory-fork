@@ -65,8 +65,8 @@ pub enum Command {
     VehicleList,
     /// `vehicle enter`: the player into the driver's seat of the vehicle last spawned.
     Enter,
-    /// `native <target> [args...]`.
-    Native { target: Target, args: Vec<Arg> },
+    /// `native <target> [args...] [r:<n>]`: `results` slots asked for (0 to 8, default 3).
+    Native { target: Target, args: Vec<Arg>, results: u32 },
     /// `status`: write the status file now.
     Status,
 }
@@ -111,13 +111,15 @@ pub enum Arg {
     Player,
     /// `h:vehicle`: the player's vehicle's handle (zero when on foot), two slots.
     Vehicle,
+    /// `h:none`: the zero handle ("no entity"), two slots.
+    NoEntity,
 }
 
 impl Arg {
     /// How many 8-byte slots it takes.
     pub fn slots(&self) -> usize {
         match self {
-            Arg::Vec3(_) | Arg::Player | Arg::Vehicle => 2,
+            Arg::Vec3(_) | Arg::Player | Arg::Vehicle | Arg::NoEntity => 2,
             _ => 1,
         }
     }
@@ -250,7 +252,8 @@ fn arg(w: &str) -> Result<Arg, String> {
         "h" => match v {
             "player" => Arg::Player,
             "vehicle" => Arg::Vehicle,
-            _ => return Err(format!("argument {w:?}: h: takes player or vehicle")),
+            "none" => Arg::NoEntity,
+            _ => return Err(format!("argument {w:?}: h: takes player, vehicle or none")),
         },
         _ => return Err(format!("argument {w:?}: unknown type {kind}: (i: u: f: b: s: v: h:)")),
     })
@@ -332,13 +335,20 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
             } else {
                 Target::Name(t.to_ascii_uppercase())
             };
-            let args = args.iter().map(|a| arg(a)).collect::<Result<Vec<_>, _>>()?;
-            if args.iter().map(Arg::slots).sum::<usize>() > MOST_SLOTS {
+            let mut results = 3;
+            let mut typed = Vec::new();
+            for a in args {
+                match a.strip_prefix("r:") {
+                    Some(n) => results = n.parse::<u32>().ok().filter(|&n| n <= 8).ok_or_else(|| format!("{a:?}: r: wants 0 to 8 result slots"))?,
+                    None => typed.push(arg(a)?),
+                }
+            }
+            if typed.iter().map(Arg::slots).sum::<usize>() > MOST_SLOTS {
                 return Err(format!("the arguments take more than {MOST_SLOTS} slots"));
             }
-            Command::Native { target, args }
+            Command::Native { target, args: typed, results }
         }
-        ("native", _) => return Err("native wants <0xrva|hash:0x...|NAME> [i: u: f: b: s: v: h: arguments]".into()),
+        ("native", _) => return Err("native wants <0xrva|hash:0x...|NAME> [i: u: f: b: s: v: h: arguments] [r:<result slots>]".into()),
         ("status", []) => Command::Status,
         (other, _) if WORDS.contains(&other) => return Err(format!("{other}: wrong arguments")),
         (other, _) => return Err(format!("unknown command {other:?}")),
@@ -612,18 +622,27 @@ mod tests {
     #[test]
     fn native_forms_and_slots() {
         let c = p(r#"native 0x3cd69a0 i:6 i:30 i:0 b:0"#);
-        assert_eq!(c, Command::Native { target: Target::Rva(0x3cd_69a0), args: vec![Arg::Int(6), Arg::Int(30), Arg::Int(0), Arg::Bool(false)] });
-        assert_eq!(p("native 0x143cd69a0").clone(), Command::Native { target: Target::Rva(0x3cd_69a0), args: vec![] });
-        assert_eq!(p("native hash:0x6471F11FF69D8A77"), Command::Native { target: Target::Hash(0x6471_F11F_F69D_8A77), args: vec![] });
-        assert_eq!(p("native get_entity_coords h:player b:0"), Command::Native { target: Target::Name("GET_ENTITY_COORDS".into()), args: vec![Arg::Player, Arg::Bool(false)] });
+        assert_eq!(c, Command::Native { target: Target::Rva(0x3cd_69a0), args: vec![Arg::Int(6), Arg::Int(30), Arg::Int(0), Arg::Bool(false)], results: 3 });
+        assert_eq!(p("native 0x143cd69a0").clone(), Command::Native { target: Target::Rva(0x3cd_69a0), args: vec![], results: 3 });
+        assert_eq!(p("native hash:0x6471F11FF69D8A77"), Command::Native { target: Target::Hash(0x6471_F11F_F69D_8A77), args: vec![], results: 3 });
+        assert_eq!(p("native get_entity_coords h:player b:0"), Command::Native { target: Target::Name("GET_ENTITY_COORDS".into()), args: vec![Arg::Player, Arg::Bool(false)], results: 3 });
         assert_eq!(
             p(r#"native 0x10 s:"two words" f:1.5 v:1,2,3 u:0xff i:-3 h:vehicle"#),
             Command::Native {
                 target: Target::Rva(0x10),
-                args: vec![Arg::Str("two words".into()), Arg::Float(1.5), Arg::Vec3([1.0, 2.0, 3.0]), Arg::U64(255), Arg::Int(-3), Arg::Vehicle]
+                args: vec![Arg::Str("two words".into()), Arg::Float(1.5), Arg::Vec3([1.0, 2.0, 3.0]), Arg::U64(255), Arg::Int(-3), Arg::Vehicle],
+                results: 3
             }
         );
-        for bad in ["native", "native 0x10 7", "native 0x10 x:1", "native 0x10 f:nan", "native 0x10 v:1,2", "native 0x10 h:cat", r#"native 0x10 s:"open"#] {
+        assert_eq!(
+            p("native SET_ENTITY_HEALTH h:player i:200 h:none b:0 b:0 r:0"),
+            Command::Native {
+                target: Target::Name("SET_ENTITY_HEALTH".into()),
+                args: vec![Arg::Player, Arg::Int(200), Arg::NoEntity, Arg::Bool(false), Arg::Bool(false)],
+                results: 0
+            }
+        );
+        for bad in ["native", "native 0x10 7", "native 0x10 x:1", "native 0x10 f:nan", "native 0x10 v:1,2", "native 0x10 h:cat", r#"native 0x10 s:"open"#, "native 0x10 r:9"] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         let many = format!("native 0x10 {}", ["v:1,2,3"; 16].join(" "));

@@ -58,13 +58,82 @@ Every command answers in the status file (`last_command`, `last_result`) and in 
 | `vehicle repair` | `vehicle repair` | The player's vehicle: the game's own full repair (applied the next frame), every part to full health, cleaned. |
 | `status` | `status` | Rewrite the status file now. |
 
-Coming in the next piece: `native`. It is already parsed and answers "not in this build yet".
+| `native <target> [args] [r:<n>]` | `native GET_ENTITY_COORDS h:player b:0` | Calls one of the game's script-command handlers (see below) and writes what it returned to `native_result` and the log. |
+
+## `native`: calling a script command
+
+Target, one of:
+- a NAME from the table below (the handler there must decode to that command's hash, or it is refused);
+- `hash:0x<64-bit command hash>`: the handler that stores this hash (the first such call indexes all of the game's
+  roughly 6800 handlers, which takes a moment, said in the log);
+- `0x<address>`: a handler's RVA (or its address at the preferred base 0x140000000). The code there must decode as a
+  handler (it tests its argument count, then stores its own hash), or it is refused.
+
+Arguments, in order, each with its type: `i:<int>` (also `i:0x..`), `u:<u64>`, `f:<float>`, `b:<0|1>`, `s:<text>` or
+`s:"two words"` (a pointer to a NUL-terminated copy), `v:<x>,<y>,<z>` (a vector: two slots), `h:player`,
+`h:vehicle` (the player's vehicle, zero on foot), `h:none` (the zero handle; handles are two slots). At most 32 slots.
+`r:<n>`: how many result slots the call is told it may write (0 to 8, default 3).
+
+The context built is exactly what the game's script VM hands a handler: `{u64* args, u64* result, u32 arg_count,
+u32 result_count}` in rcx, 8-byte argument slots (ints and floats in the low bytes), an 8-slot zeroed result buffer.
+It is called on the frame hook's thread, once. Its result is shown as slots and as i32, f32 and vec3.
+
+Limits: no script is made current, so commands that act for a running script (creating script-owned entities, script
+events, anything that needs a script's own memory) do nothing or may crash the game. Wrong arguments may crash the
+game: nothing checks them against the command's signature. Commands that set something the game later sets again
+(missions) are not re-applied.
+
+Checked table (name, signature; from VIper's notes, every handler and hash verified in this executable):
+
+| Name | Signature |
+|---|---|
+| `PLAYER_PED_ID` | `() -> Handle` |
+| `GET_ENTITY_COORDS` | `(Handle entity, bool) -> Vec3` |
+| `GET_ENTITY_HEALTH` | `(Handle entity) -> i32` |
+| `SET_ENTITY_HEALTH` | `(Handle entity, i32 health, Handle source, bool, bool as_damage)` |
+| `GET_PED_MAX_HEALTH` | `(Handle ped) -> i32` |
+| `SET_PED_MAX_HEALTH` | `(Handle ped, i32 max)` |
+| `RESURRECT_PED` | `(Handle ped)` |
+| `SET_PED_CAN_RAGDOLL` | `(Handle ped, bool can)` |
+| `GET_CLOCK_HOURS` | `() -> i32` |
+| `GET_CLOCK_MINUTES` | `() -> i32` |
+| `SET_CLOCK_TIME` | `(i32 hour, i32 minute, i32 second, bool)` |
+| `SET_CLOCK_DATE` | `(i32 day, i32 month, i32 year)` |
+| `ADD_TO_CLOCK_TIME` | `(i32 hours, i32 minutes, i32 seconds)` |
+| `SET_MILLISECONDS_PER_GAME_MINUTE` | `(i32 ms)` |
+| `RESET_MILLISECONDS_PER_GAME_MINUTE` | `()` |
+| `SET_WEATHER_TYPE` | `(u32 weather, bool now, bool hold, bool blend, f32 blend_seconds, bool, bool)` |
+| `SET_WEATHER_TYPE_OVERTIME` | `(u32 weather, f32 seconds, f32)` |
+| `SET_RAIN_LEVEL` | `(f32)` |
+| `CLEAR_RAIN_LEVEL` | `()` |
+| `FORCE_LIGHTNING_FLASH` | `()` |
+| `ADD_EXPLOSION` | `(Vec3 at, i32 kind, i32, f32 damage_scale, bool audible, bool invisible, f32 camera_shake)` |
+| `SET_RANDOM_VEHICLE_DENSITY` | `(f32)` |
+| `SET_PARKED_VEHICLE_DENSITY` | `(f32)` |
+| `RESET_RANDOM_VEHICLE_DENSITY` | `()` |
+| `RESET_PARKED_VEHICLE_DENSITY` | `()` |
+| `GET_PLAYER_VEHICLE` | `() -> Handle` |
+| `SET_VEHICLE_ENGINE_ON` | `(Handle vehicle, bool on, bool instantly, bool stay_off)` |
+| `SET_VEHICLE_DIRT_LEVEL` | `(Handle vehicle, f32 dirt)` |
+| `MODIFY_VEHICLE_TOP_SPEED` | `(Handle vehicle, f32 percent)` |
+| `SET_TIMECYCLE_MODIFIER` | `(u32 nameHash)` |
+| `CLEAR_TIMECYCLE_MODIFIER` | `()` |
+| `GET_GAME_TIMER` | `() -> i32` |
+| `GET_FRAME_TIME` | `() -> f32` |
+| `GET_GAMEPLAY_CAM_COORD` | `() -> Vec3` |
+| `GET_WATER_HEIGHT` | `(Vec3 at, f32* height) -> bool` |
+| `IS_MODEL_VALID` | `(u64 model) -> bool` |
+| `IS_MODEL_A_VEHICLE` | `(u64 model) -> bool` |
+| `ACTIVATE_PHYSICS` | `(Handle e)` |
+| `SET_ENTITY_ALPHA` | `(Handle e, i32 alpha 0..=255, bool skin)` |
+| `RESET_ENTITY_ALPHA` | `(Handle e)` |
+
 
 ## The status file
 
 `key=value` lines, rewritten twice a second (through a temporary file and a rename, so it is never half written):
 `game updated_unix_ms frame player x y z heading heading_deg in_vehicle health max_health wanted clock clock_frozen
-weather freeze_held weather_held invincible never_wanted teleport spawn last_command last_source last_frame last_result commands_ok commands_refused`.
+weather freeze_held weather_held invincible never_wanted teleport spawn native_result last_command last_source last_frame last_result commands_ok commands_refused`.
 
 ## Safety
 
@@ -83,6 +152,7 @@ weather freeze_held weather_held invincible never_wanted teleport spawn last_com
 | Mod file, status file, parser, teleports | parser, tail (partial lines, new file), atomic status write, the far teleport's steps with a fake world | not yet |
 | Time, weather, heal, invincible, wanted | parser; every address's bytes and every data word's pin checked against the executable | not yet |
 | Vehicles | parser, name matching, pins | not yet |
+| `native` | parser, handler decoding on a made-up image, the table's handlers and hashes against the executable | not yet |
 
 Sources: viper-community/viper e44573c6e (LGPL-2.1-or-later): addresses, signatures and recipes, all checked again
 against the executable's bytes.

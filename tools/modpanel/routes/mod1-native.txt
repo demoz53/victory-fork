@@ -1,0 +1,18 @@
+# mod1-native: script commands called by name, hash and address from the keys file (VICTORY_MOD=1
+# VICTORY_TITLE_COMMANDS=1), about 7 s after control, beside the house facing the water.
+teleport -2357.4 -5525.4 3.0 2.17
+wait 8f
+native PLAYER_PED_ID
+native GET_ENTITY_COORDS h:player b:0
+native GET_CLOCK_HOURS r:1
+native hash:0x47dc2440b1e9ddce r:1
+native 0x3cd69a0 i:18 i:30 i:0 b:0 r:0
+wait 12f
+native SET_RAIN_LEVEL f:1.0 r:0
+wait 15f
+J 8f
+native CLEAR_RAIN_LEVEL r:0
+native FORCE_LIGHTNING_FLASH r:0
+wait 10f
+native 0x4504490
+wait 4f

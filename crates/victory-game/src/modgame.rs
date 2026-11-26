@@ -179,6 +179,10 @@ pub mod sites {
     /// `void SetPedIntoVehicle_Impl(CPed*, CVehicle*, bool anySeat, u32 seat)`: what the put-ped-in-vehicle
     /// script command runs (it clears the ped's tasks first).
     pub const PED_INTO_VEHICLE: Site = Site { name: "PED_INTO_VEHICLE", rva: 0x4c03280, bytes: &[0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xec, 0x38, 0x44, 0x89, 0xcd, 0x45, 0x89, 0xc6, 0x48, 0x89, 0xd6, 0x49, 0x89, 0xcf] };
+    /// The exception table's first entries (function start, end, unwind RVAs).
+    pub const EXCEPTION_TABLE: Site = Site { name: "EXCEPTION_TABLE", rva: 0xabcf000, bytes: &[0x00, 0x10, 0x00, 0x00, 0xec, 0x10, 0x00, 0x00, 0x58, 0x0d, 0x7a, 0x06, 0xf0, 0x10, 0x00, 0x00, 0x34, 0x11, 0x00, 0x00, 0xc4, 0x0c, 0x7a, 0x06] };
+    /// `void EntityToScriptHandle(CEntity*, Handle16* out, int mode)`; the natives use mode 2.
+    pub const ENTITY_TO_SCRIPT_HANDLE: Site = Site { name: "ENTITY_TO_SCRIPT_HANDLE", rva: 0x02a6520, bytes: &[0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x83, 0xec, 0x38, 0xc5, 0xf8, 0x57, 0xc0, 0x48, 0x89, 0xd6] };
     pub const VEHICLE_MODEL_POOL: Pin = Pin { site: VEHICLE_MODEL_HASH_AT, disp: 5, end: 9, target: 0x0a4b_9c40 };
     pub const MODEL_REQUEST_DEFAULTS: Pin = Pin { site: MODEL_REQUEST_DEFAULTS_READ, disp: 3, end: 7, target: 0x0aae_b6ec };
     pub const WORLD_ENTITY_MANAGER: Pin = Pin { site: WORLD_MANAGER_READ, disp: 3, end: 7, target: 0x099a_ad30 };
@@ -276,6 +280,9 @@ struct State {
     wanted_check: Option<(u32, Instant, String)>,
     /// Times never wanted was put back since it was set (said once, then counted).
     never_again: u32,
+    /// Every script-command handler (hash, rva), indexed on the first `native hash:`.
+    handlers: Option<Vec<(u64, u32)>>,
+    native_result: Option<String>,
 }
 
 #[derive(Default)]
@@ -341,6 +348,8 @@ pub fn configure(var: &dyn Fn(&str) -> Option<String>) -> bool {
         spawned: 0,
         wanted_check: None,
         never_again: 0,
+        handlers: None,
+        native_result: None,
     });
     true
 }
@@ -1008,6 +1017,246 @@ fn vehicle_list(st: &mut State, base: usize) -> Result<String, String> {
     Ok(format!("{} vehicle models written to {}", models.len(), path.display()))
 }
 
+// ---- script commands (`native`) -------------------------------------------------------
+
+/// Script commands checked in our executable: (name, command hash, handler RVA,
+/// signature), from VIper's verified command table (viper-layout game.rs
+/// `command!`). A call by name also decodes the handler and requires its
+/// self-stored hash to be this one.
+pub const NATIVES: &[(&str, u64, u32, &str)] = &[
+    ("PLAYER_PED_ID", 0x6471f11ff69d8a77, 0x4504480, "() -> Handle"),
+    ("GET_ENTITY_COORDS", 0x6c660bb25792a0f9, 0x3c09d00, "(Handle entity, bool) -> Vec3"),
+    ("GET_ENTITY_HEALTH", 0x158c3f087dc97878, 0x3c09f50, "(Handle entity) -> i32"),
+    ("SET_ENTITY_HEALTH", 0x742054ea53d89812, 0x3c13be0, "(Handle entity, i32 health, Handle source, bool, bool as_damage)"),
+    ("GET_PED_MAX_HEALTH", 0x17cdb10cb8ff5be9, 0x4bcd2c0, "(Handle ped) -> i32"),
+    ("SET_PED_MAX_HEALTH", 0xb0cbe62c0a09c873, 0x4bd9830, "(Handle ped, i32 max)"),
+    ("RESURRECT_PED", 0x74639fca8e43717c, 0x4bd5550, "(Handle ped)"),
+    ("SET_PED_CAN_RAGDOLL", 0xec4b37be93c4b292, 0x4bd7ef0, "(Handle ped, bool can)"),
+    ("GET_CLOCK_HOURS", 0x3d4e6e6637d30df7, 0x3cd0e10, "() -> i32"),
+    ("GET_CLOCK_MINUTES", 0x47dc2440b1e9ddce, 0x3cd0e60, "() -> i32"),
+    ("SET_CLOCK_TIME", 0x4d21127c5ad3a60, 0x3cd69a0, "(i32 hour, i32 minute, i32 second, bool)"),
+    ("SET_CLOCK_DATE", 0xa9d6be1dfd52cf6d, 0x3cd68f0, "(i32 day, i32 month, i32 year)"),
+    ("ADD_TO_CLOCK_TIME", 0x88fe2cc95483dae3, 0x3ccd6d0, "(i32 hours, i32 minutes, i32 seconds)"),
+    ("SET_MILLISECONDS_PER_GAME_MINUTE", 0xb7253097fb1124c7, 0x3cd7780, "(i32 ms)"),
+    ("RESET_MILLISECONDS_PER_GAME_MINUTE", 0xd20e6baf34f4cf18, 0x3cd62d0, "()"),
+    ("SET_WEATHER_TYPE", 0x1f6a4a5a6e8b0e5, 0x3e920d0, "(u32 weather, bool now, bool hold, bool blend, f32 blend_seconds, bool, bool)"),
+    ("SET_WEATHER_TYPE_OVERTIME", 0xb271e5bc174bba1f, 0x3e92070, "(u32 weather, f32 seconds, f32)"),
+    ("SET_RAIN_LEVEL", 0xa0a82dd5d52bbf6e, 0x3e92150, "(f32)"),
+    ("CLEAR_RAIN_LEVEL", 0xa117af47cf2c2e11, 0x3e834b0, "()"),
+    ("FORCE_LIGHTNING_FLASH", 0xaef05f7fc9624a4d, 0x3e84720, "()"),
+    ("ADD_EXPLOSION", 0xc5985661ac45da60, 0x3c048a0, "(Vec3 at, i32 kind, i32, f32 damage_scale, bool audible, bool invisible, f32 camera_shake)"),
+    ("SET_RANDOM_VEHICLE_DENSITY", 0xfa3ff61b2cbda50c, 0x4a8e170, "(f32)"),
+    ("SET_PARKED_VEHICLE_DENSITY", 0xe0650b81a99ac517, 0x4a90870, "(f32)"),
+    ("RESET_RANDOM_VEHICLE_DENSITY", 0x3210eacb106acab4, 0x4a7f920, "()"),
+    ("RESET_PARKED_VEHICLE_DENSITY", 0xeddcdddd92a5c845, 0x4a7fb90, "()"),
+    ("GET_PLAYER_VEHICLE", 0x4696a1e656b0c1f5, 0x4a83e40, "() -> Handle"),
+    ("SET_VEHICLE_ENGINE_ON", 0x3465d18749b305eb, 0x4a93160, "(Handle vehicle, bool on, bool instantly, bool stay_off)"),
+    ("SET_VEHICLE_DIRT_LEVEL", 0xab0eae71bc5183fc, 0x4a95500, "(Handle vehicle, f32 dirt)"),
+    ("MODIFY_VEHICLE_TOP_SPEED", 0x8b353295ca526c73, 0x4a8be20, "(Handle vehicle, f32 percent)"),
+    ("SET_TIMECYCLE_MODIFIER", 0xdf6b189febc2f881, 0x3c16530, "(u32 nameHash)"),
+    ("CLEAR_TIMECYCLE_MODIFIER", 0x29cb6e04f1c0b50d, 0x3c066f0, "()"),
+    ("GET_GAME_TIMER", 0x582c0998b0981713, 0x3e85810, "() -> i32"),
+    ("GET_FRAME_TIME", 0xeb31c3c7a18dfdd6, 0x3e85740, "() -> f32"),
+    ("GET_GAMEPLAY_CAM_COORD", 0xf467a691a6acdfdf, 0x3cd1e40, "() -> Vec3"),
+    ("GET_WATER_HEIGHT", 0x5d9d3fc0230c96f5, 0x4a87930, "(Vec3 at, f32* height) -> bool"),
+    ("IS_MODEL_VALID", 0xf848f103c6d37271, 0x445f9b0, "(u64 model) -> bool"),
+    ("IS_MODEL_A_VEHICLE", 0xd21824f5cab09d98, 0x4460540, "(u64 model) -> bool"),
+    ("ACTIVATE_PHYSICS", 0xf1df8cf8efcee52, 0x44fbb70, "(Handle e)"),
+    ("SET_ENTITY_ALPHA", 0xe2618458f20896d4, 0x3c12e30, "(Handle e, i32 alpha 0..=255, bool skin)"),
+    ("RESET_ENTITY_ALPHA", 0xb88626548bb4610b, 0x3c11d20, "(Handle e)"),
+];
+
+/// The title's code section and its exception table (VIper CODE_START / CODE_END, EXCEPTION_TABLE).
+const CODE_START: u32 = 0x1000;
+const CODE_END: u32 = 0x05f4_0966;
+const PDATA_ENTRIES: u32 = 0x0036_cbac / 12;
+/// Most argument and result slots (VIper `command::MAX_ARGS`, `MAX_RESULT`).
+const MOST_RESULTS: usize = 8;
+
+/// The call context every handler takes in rcx (VIper `command::Ctx`, = modpapi's ViNativeContext).
+#[repr(C)]
+struct Ctx {
+    args: *mut u64,
+    result: *mut u64,
+    arg_count: u32,
+    result_count: u32,
+}
+
+#[repr(C, align(16))]
+struct Slots<const N: usize>([u64; N]);
+
+/// Code bytes inside the title's code section, or `None`.
+fn code(base: usize, rva: u32, len: usize) -> Option<&'static [u8]> {
+    let end = (rva as usize).checked_add(len)?;
+    // SAFETY: inside the mapped title's code section, readable for its whole life.
+    (rva >= CODE_START && end <= CODE_END as usize).then(|| unsafe { std::slice::from_raw_parts((base + rva as usize) as *const u8, len) })
+}
+
+/// If the function at `rva` is a script-command handler, its command hash:
+/// it starts by testing its context's argument count (`cmp dword [rcx+0x10], 0`
+/// then `js`, possibly after one 3-byte instruction), and the branch target
+/// stores the hash with a `movabs` (VIper `command::decode_handler`). Reads
+/// code only; never calls it.
+fn decode_handler(base: usize, rva: u32) -> Option<u64> {
+    let b = code(base, rva, 64 + 4 + 3 + 6)?;
+    let i = b[..64 + 4].windows(4).position(|w| w == [0x83, 0x79, 0x10, 0x00])?;
+    let j = i + 4;
+    let mut target = None;
+    for k in [j, j + 3] {
+        if b[k] == 0x78 {
+            target = Some(i64::from(rva) + k as i64 + 2 + i64::from(b[k + 1] as i8));
+            break;
+        }
+        if b[k] == 0x0f && b[k + 1] == 0x88 {
+            let d = i32::from_le_bytes([b[k + 2], b[k + 3], b[k + 4], b[k + 5]]);
+            target = Some(i64::from(rva) + k as i64 + 6 + i64::from(d));
+            break;
+        }
+    }
+    let t = u32::try_from(target?).ok()?;
+    let c = code(base, t, 40 + 10)?;
+    (0..40).find_map(|m| (matches!(c[m], 0x48 | 0x49) && (0xb8..=0xbf).contains(&c[m + 1])).then(|| u64::from_le_bytes(c[m + 2..m + 10].try_into().unwrap())))
+}
+
+/// Every handler in the exception table's functions: (hash, rva) sorted by
+/// hash, a hash found at two addresses dropped (VIper `index_handlers`).
+fn index_handlers(st: &mut State, base: usize) -> Result<&Vec<(u64, u32)>, String> {
+    if st.handlers.is_none() {
+        st.need(base, &[sites::EXCEPTION_TABLE])?;
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        for n in 0..PDATA_ENTRIES {
+            // SAFETY: the exception table (its first bytes checked), mapped readable; 12-byte entries below its count.
+            let begin = unsafe { ((base + (sites::EXCEPTION_TABLE.rva + 12 * n) as usize) as *const u32).read_unaligned() };
+            if (CODE_START..CODE_END).contains(&begin)
+                && let Some(h) = decode_handler(base, begin)
+            {
+                out.push((h, begin));
+            }
+        }
+        out.sort_unstable();
+        let mut dup = std::collections::HashSet::new();
+        for w in out.windows(2) {
+            if w[0].0 == w[1].0 && w[0].1 != w[1].1 {
+                dup.insert(w[0].0);
+            }
+        }
+        out.dedup();
+        out.retain(|e| !dup.contains(&e.0));
+        say(false, &format!("VICTORY_MOD: {} script-command handlers indexed in {} ms", out.len(), t0.elapsed().as_millis()));
+        st.handlers = Some(out);
+    }
+    Ok(st.handlers.as_ref().unwrap())
+}
+
+/// The handler a `native` names, with its decoded hash.
+fn resolve(st: &mut State, base: usize, target: &modcmd::Target) -> Result<(u32, u64, String), String> {
+    match target {
+        modcmd::Target::Rva(rva) => {
+            let h = decode_handler(base, *rva).ok_or_else(|| format!("+{rva:#x} is not a script-command handler (its start does not decode as one): refused"))?;
+            let name = NATIVES.iter().find(|n| n.1 == h).map_or(String::new(), |n| n.0.to_owned());
+            Ok((*rva, h, name))
+        }
+        modcmd::Target::Hash(h) => {
+            let idx = index_handlers(st, base)?;
+            let i = idx.binary_search_by_key(h, |e| e.0).map_err(|_| format!("no handler stores the hash {h:#018x}"))?;
+            let rva = idx[i].1;
+            let name = NATIVES.iter().find(|n| n.1 == *h).map_or(String::new(), |n| n.0.to_owned());
+            Ok((rva, *h, name))
+        }
+        modcmd::Target::Name(n) => {
+            let &(name, hash, rva, _) = NATIVES.iter().find(|e| e.0 == n).ok_or_else(|| format!("{n} is not in the table of checked commands (use its address or hash:)"))?;
+            match decode_handler(base, rva) {
+                Some(h) if h == hash => Ok((rva, hash, name.to_owned())),
+                _ => Err(format!("{name} (+{rva:#x}) does not decode to its hash {hash:#018x} in this executable: refused")),
+            }
+        }
+    }
+}
+
+/// The player's (or its vehicle's) 16-byte script handle.
+///
+/// # Safety
+/// `ent` a live entity, on its thread.
+unsafe fn script_handle(base: usize, ent: usize) -> [u64; 2] {
+    let mut h = [0u64; 2];
+    // SAFETY: EntityToScriptHandle (checked by the caller), mode 2 as the natives use.
+    unsafe {
+        let f: extern "C" fn(usize, *mut [u64; 2], i32) = std::mem::transmute(base + sites::ENTITY_TO_SCRIPT_HANDLE.rva as usize);
+        f(ent, &mut h, 2);
+    }
+    h
+}
+
+/// Calls a script-command handler with typed arguments in the context it
+/// takes: 8-byte argument slots (ints and floats in the low bytes, vectors
+/// and handles two slots), a zeroed 8-slot result buffer, the argument and
+/// result counts. No script is made current: commands that act for a running
+/// script (script-owned entities, script events) do nothing or are unsafe.
+fn native(st: &mut State, base: usize, ped: usize, target: &modcmd::Target, args: &[modcmd::Arg], results: u32) -> Result<String, String> {
+    use modcmd::Arg;
+    let (rva, hash, name) = resolve(st, base, target)?;
+    let handles = args.iter().any(|a| matches!(a, Arg::Player | Arg::Vehicle));
+    if handles {
+        st.need(base, &[sites::ENTITY_TO_SCRIPT_HANDLE, sites::PED_COMPONENT_51, sites::VEHICLE_FROM_ID])?;
+    }
+    let mut slots = Slots([0u64; modcmd::MOST_SLOTS]);
+    let mut texts = Vec::new();
+    let mut n = 0;
+    for a in args {
+        let put: Vec<u64> = match a {
+            Arg::Int(v) => vec![u64::from(*v as u32)],
+            Arg::U64(v) => vec![*v],
+            Arg::Float(v) => vec![u64::from(v.to_bits())],
+            Arg::Bool(v) => vec![u64::from(*v)],
+            Arg::Str(s) => {
+                let c = std::ffi::CString::new(s.as_bytes()).map_err(|_| "a string argument holds a NUL")?;
+                let p = c.as_ptr() as u64;
+                texts.push(c);
+                vec![p]
+            }
+            Arg::Vec3([x, y, z]) => vec![u64::from(x.to_bits()) | u64::from(y.to_bits()) << 32, u64::from(z.to_bits())],
+            // SAFETY: the live player, on its thread; the sites checked above.
+            Arg::Player => unsafe { script_handle(base, ped) }.to_vec(),
+            Arg::Vehicle => {
+                // SAFETY: as above.
+                let v = unsafe { ped_vehicle(base, ped) };
+                // SAFETY: the player's live vehicle.
+                if v == 0 { vec![0, 0] } else { unsafe { script_handle(base, v) }.to_vec() }
+            }
+            Arg::NoEntity => vec![0, 0],
+        };
+        slots.0[n..n + put.len()].copy_from_slice(&put);
+        n += put.len();
+    }
+    let mut out = Slots([0u64; MOST_RESULTS]);
+    let mut ctx = Ctx { args: slots.0.as_mut_ptr(), result: out.0.as_mut_ptr(), arg_count: n as u32, result_count: results.min(MOST_RESULTS as u32) };
+    // SAFETY: a script-command handler of this executable (its start decoded as one, with this hash), called as the
+    // game's script VM calls it, on the frame hook's thread; the arguments are what the user typed (their meaning is
+    // theirs to get right; strings stay alive until it returns).
+    unsafe {
+        let f: extern "C" fn(*mut Ctx) = std::mem::transmute(base + rva as usize);
+        f(&mut ctx);
+    }
+    drop(texts);
+    let r = out.0;
+    let lo = r[0] as u32;
+    let text = format!(
+        "{} +{rva:#x} hash {hash:#018x}: slots {:#x} {:#x} {:#x}; as i32 {}, f32 {}, vec3 ({}, {}, {})",
+        if name.is_empty() { "handler" } else { &name },
+        r[0],
+        r[1],
+        r[2],
+        lo as i32,
+        f32::from_bits(lo),
+        f32::from_bits(lo),
+        f32::from_bits((r[0] >> 32) as u32),
+        f32::from_bits(r[1] as u32)
+    );
+    st.native_result = Some(text.clone());
+    Ok(text)
+}
+
 // ---- the frame's work ---------------------------------------------------------------
 
 fn now_ms(st: &State) -> u64 {
@@ -1223,8 +1472,8 @@ fn run(st: &mut State, base: usize, ped: usize, frame_no: u64, line: &str, cmd: 
             let now = unsafe { ped_vehicle(base, ped) };
             Ok(if now == veh { "the player is in the driver's seat".into() } else { "asked; the in-vehicle state shows it a frame or two later (see in_vehicle)".into() })
         }
+        Command::Native { target, args, results } => native(st, base, ped, &target, &args, results),
         Command::Status => unreachable!(),
-        _ => Err("not in this build yet".into()),
     }
 }
 
@@ -1657,6 +1906,9 @@ fn write_status(st: &mut State, base: usize, ped: usize, frame_no: u64) {
     if let Some(l) = &st.last {
         s.put("last_command", &l.line).put("last_source", l.source).put("last_frame", l.frame).put("last_result", &l.result);
     }
+    if let Some(r) = &st.native_result {
+        s.put("native_result", r);
+    }
     s.put("commands_ok", st.ok).put("commands_refused", st.refused);
     if let Err(e) = modcmd::write_atomic(&path, s.text())
         && !std::mem::replace(&mut st.status_said, true)
@@ -1722,6 +1974,8 @@ mod tests {
             spawned: 0,
             wanted_check: None,
             never_again: 0,
+            handlers: None,
+            native_result: None,
         };
         assert!(st.need(base, &[s]).is_ok());
         assert!(st.pin(base, sites::CLOCK_PAUSED_BY_SCRIPT).is_ok_and(|a| a == base + 0x092e_0031));
@@ -1730,6 +1984,30 @@ mod tests {
         std::mem::swap(&mut st.checked, &mut fresh);
         let e = st.need(base, &[s]).unwrap_err();
         assert!(e.contains("CLOCK_IS_PAUSED") && e.contains("refused"), "{e}");
+    }
+
+    #[test]
+    fn handlers_decode_from_their_first_bytes() {
+        // A handler at 0x2000: mov eax, 1 (3 bytes, skipped), cmp dword [rcx+0x10], 0; js +0x10; at the target
+        // a movabs rax, <hash>.
+        let mut image = vec![0xccu8; 0x3000];
+        let f = 0x2000;
+        image[f..f + 3].copy_from_slice(&[0x31, 0xc0, 0x90]);
+        image[f + 3..f + 7].copy_from_slice(&[0x83, 0x79, 0x10, 0x00]);
+        image[f + 7..f + 9].copy_from_slice(&[0x78, 0x10]);
+        let t = f + 9 + 0x10;
+        image[t] = 0x48;
+        image[t + 1] = 0xb8;
+        image[t + 2..t + 10].copy_from_slice(&0x6471_f11f_f69d_8a77u64.to_le_bytes());
+        let base = image.as_ptr() as usize;
+        assert_eq!(decode_handler(base, f as u32), Some(0x6471_f11f_f69d_8a77));
+        assert_eq!(decode_handler(base, 0x1000), None, "int3 filler is no handler");
+        assert_eq!(decode_handler(base, 0x800), None, "below the code section");
+        // The table's names are unique and its hashes all different.
+        let mut names: Vec<_> = NATIVES.iter().map(|n| n.0).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), NATIVES.len());
     }
 
     #[test]

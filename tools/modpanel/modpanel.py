@@ -33,6 +33,33 @@ DEFAULT_PLACES = [
 DEFAULT_VEHICLES = []
 WEATHERS = ["sunny", "clear", "misty", "fog", "clouds", "overcast", "darkovercast", "drizzle",
             "shower", "rain", "thunder", "thunderstorm", "hurricane", "hail", "sandstorm"]
+# Script commands the game side has in its checked table (names, hashes and
+# handler addresses verified against the executable; arguments from VIper's
+# notes). Picking one puts an example line in the command box to edit.
+NATIVES = {
+    "PLAYER_PED_ID": "native PLAYER_PED_ID",
+    "GET_ENTITY_COORDS": "native GET_ENTITY_COORDS h:player b:0",
+    "GET_ENTITY_HEALTH": "native GET_ENTITY_HEALTH h:player r:1",
+    "SET_ENTITY_HEALTH": "native SET_ENTITY_HEALTH h:player i:200 h:none b:0 b:0 r:0",
+    "SET_PED_MAX_HEALTH": "native SET_PED_MAX_HEALTH h:player i:300 r:0",
+    "SET_PED_CAN_RAGDOLL": "native SET_PED_CAN_RAGDOLL h:player b:0 r:0",
+    "GET_CLOCK_HOURS": "native GET_CLOCK_HOURS r:1",
+    "SET_CLOCK_TIME": "native SET_CLOCK_TIME i:18 i:30 i:0 b:0 r:0",
+    "ADD_TO_CLOCK_TIME": "native ADD_TO_CLOCK_TIME i:1 i:0 i:0 r:0",
+    "SET_MILLISECONDS_PER_GAME_MINUTE": "native SET_MILLISECONDS_PER_GAME_MINUTE i:1000 r:0",
+    "RESET_MILLISECONDS_PER_GAME_MINUTE": "native RESET_MILLISECONDS_PER_GAME_MINUTE r:0",
+    "SET_RAIN_LEVEL": "native SET_RAIN_LEVEL f:1.0 r:0",
+    "CLEAR_RAIN_LEVEL": "native CLEAR_RAIN_LEVEL r:0",
+    "FORCE_LIGHTNING_FLASH": "native FORCE_LIGHTNING_FLASH r:0",
+    "SET_RANDOM_VEHICLE_DENSITY": "native SET_RANDOM_VEHICLE_DENSITY f:0.0 r:0",
+    "RESET_RANDOM_VEHICLE_DENSITY": "native RESET_RANDOM_VEHICLE_DENSITY r:0",
+    "SET_PARKED_VEHICLE_DENSITY": "native SET_PARKED_VEHICLE_DENSITY f:0.0 r:0",
+    "RESET_PARKED_VEHICLE_DENSITY": "native RESET_PARKED_VEHICLE_DENSITY r:0",
+    "SET_VEHICLE_ENGINE_ON": "native SET_VEHICLE_ENGINE_ON h:vehicle b:1 b:1 b:0 r:0",
+    "MODIFY_VEHICLE_TOP_SPEED": "native MODIFY_VEHICLE_TOP_SPEED h:vehicle f:50 r:0",
+    "SET_VEHICLE_DIRT_LEVEL": "native SET_VEHICLE_DIRT_LEVEL h:vehicle f:0 r:0",
+    "GET_GAMEPLAY_CAM_COORD": "native GET_GAMEPLAY_CAM_COORD",
+}
 # A status file older than this means the game is not running (it is rewritten every 0.5 s).
 STALE_S = 3.0
 
@@ -202,6 +229,12 @@ class Panel:
         e.grid(row=0, column=1, sticky="ew")
         e.bind("<Return>", lambda ev: self.send_raw())
         ttk.Button(raw, text="Send", command=self.send_raw).grid(row=0, column=2)
+        ttk.Label(raw, text="Native").grid(row=1, column=0)
+        self.native = tk.StringVar()
+        nb = ttk.Combobox(raw, textvariable=self.native, values=sorted(NATIVES), state="readonly")
+        nb.grid(row=1, column=1, sticky="w")
+        nb.bind("<<ComboboxSelected>>", lambda ev: self.raw.set(NATIVES.get(self.native.get(), "")))
+        ttk.Label(raw, text="(fills the command box: edit, then Send)", foreground="#666").grid(row=1, column=2)
         lg = ttk.LabelFrame(outer, text="Log", padding=2)
         lg.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
         outer.rowconfigure(3, weight=1)
