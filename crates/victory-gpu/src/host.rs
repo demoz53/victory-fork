@@ -2100,6 +2100,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Recorded GPU write declarations per host copy and range. A new
+    /// refresh of that copy must still be flushed by its next declaration.
+    gpu_written: std::collections::HashMap<usize, std::collections::HashSet<(usize, usize)>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2173,6 +2176,7 @@ impl Deferred {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetDropNs, dropping.elapsed().as_nanos() as u64);
         self.refreshed.clear();
+        self.gpu_written.clear();
         self.textures.clear();
         self.writes.clear();
         self.budget_zeroed = false;
@@ -6958,6 +6962,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
         deferred.memory_read_seen = 0;
     }
 
@@ -7032,6 +7037,9 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
+            if let Some(ranges) = deferred.gpu_written.get_mut(&key.0) {
+                ranges.clear();
+            }
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -7046,9 +7054,16 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        static ON: OnceLock<bool> = OnceLock::new();
+        let once = *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_some_and(|v| v == "1"));
+        let mut deferred = self.deferred();
+        if once {
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            if !deferred.gpu_written.entry(key).or_default().insert((address, len)) {
+                return;
+            }
+        }
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7348,6 +7363,7 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
         deferred.memory_read_seen = 0;
     }
 
