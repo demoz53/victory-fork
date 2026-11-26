@@ -370,6 +370,185 @@ fn windows() -> bool {
     window_mode() > 0
 }
 
+/// Whether indirect executions of one record are clamped in batches
+/// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=1`, `2` or `3`; off
+/// by default: each on its own, or in windows ([`windows`])). Ported from
+/// avatarmanz/VIctory-7900XTX 037596241 (GPL-3.0-or-later), where it is on.
+///
+/// A frame of the boat scene has some 2,400 clamps even with the windows
+/// (run speed1: 2,441 against 151 in that fork's build with `=2`): each a
+/// dispatch of ours between two full waits, with the scratch buffer moved
+/// twice, in the middle of the title's drawing. Of a frame's indirect
+/// executions 480-660 are by shaders that store to buffers (dispatches, by
+/// where they stand: they hardly ever end a window) and 260-360 are
+/// dispatches that store to none (the frame lines of runs all15-base2,
+/// cs-base1, sx-base1); the rest are draws. So `1` should leave about a
+/// pass for each dispatch (740-1,020), `3` one for each execution that
+/// stores, and `2` about 150 as in that fork: none of it measured here.
+///
+/// `1`: a batch is opened by the first execution after a point where
+/// arguments may have changed, and all executions up to the next such point
+/// read theirs from it, each exactly the record it asks for (windows guess
+/// which are next, and clamp what they do not know). Arguments in buffers
+/// change by dispatches and by draws whose shaders store to buffers; those
+/// end the batch, so the record an execution reads is clamped after all
+/// that was recorded before it, and the pass waits for all of it, exactly
+/// as the clamp of its own did. Between two executions of a batch is no
+/// wait of ours: there is nothing between them to wait for but draws that
+/// store to no buffer. (What the title's CPU side writes is seen as before,
+/// at the next submission: host copies are brought up to date before their
+/// list runs, wherever in it they are read.)
+///
+/// `2`: a dispatch does not end the batch before the title waits for it (a
+/// barrier, a pipeline sync) or draws: what a dispatch writes is not there
+/// for a later command without a wait, and dispatches the title runs side
+/// by side (its tile classes, up to 92 at a time) are not held up by waits
+/// of ours. What that gives up: a dispatch that reads arguments an earlier
+/// dispatch of the same run wrote, with no barrier of the title's between
+/// them, reads them as they were before that run (the clamp of its own read
+/// them after it, having waited for every earlier shader write); and the
+/// dispatches of such a run are no longer ordered by waits of ours, so one
+/// that reads what another writes through unordered access, again with no
+/// barrier of the title's, may run beside it. Whether the title has ways to
+/// wait that do not pass through its lists' methods is not known.
+///
+/// `3`: as `1`, but a dispatch whose shaders store to no buffer does not
+/// end the batch: it cannot change arguments (it writes textures only; the
+/// same word of its shaders, `stores`, already decides what is copied back
+/// from the card, `VICTORY_WRITE_SKIP`). Every record is still clamped
+/// after all that could have written it. What it gives up is only the
+/// second half of `2`'s: around such a dispatch there is no wait of ours
+/// any more, so it is ordered against its neighbours by the title's
+/// barriers and the texture state changes alone. (The rule of
+/// fxceless/victory-fork #995, tunczzz: "a run ends only at work that can
+/// store to a buffer"; written here from that sentence, not from its code.)
+///
+/// Not batched, and clamped as before: executions with a count buffer or of
+/// more than one record; the dispatches of pipelines that run in parts
+/// (`VICTORY_INDIRECT_SPLIT`, `_AUTO`); and an execution that finds no batch
+/// with its record and would end its own at once ([`batch_opens`]: with `1`
+/// every dispatch after a dispatch), for which a pass of a batch would cost
+/// more than its own clamp.
+pub(crate) fn batches() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok("3") => 3,
+        _ => 0,
+    })
+}
+
+/// What a batch meets after it was opened ([`batch_after`]): a dispatch
+/// or a draw (direct or indirect, whose shaders store to buffers or not),
+/// a wait of the title's for earlier work (a barrier, a pipeline sync).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Met {
+    Dispatch { stores: bool },
+    Draw { stores: bool },
+    Wait,
+}
+
+/// Whether a batch lives on after `met`, in `mode` (`VICTORY_INDIRECT_BATCH`:
+/// 1, 2 or 3): `None` if it ends there, so that the next execution's record
+/// is clamped anew, after everything recorded up to it; else whether
+/// dispatches have run since it was opened (`wrote`: only ever with 2).
+///
+/// 1: a dispatch ends it, and a draw whose shaders store. 2: a dispatch
+/// only marks it, and it ends when the title waits or draws after one (a
+/// draw waits for the dispatches before it: here also a direct one, which
+/// the source of the port lets by). 3: as 1, but a dispatch whose shaders
+/// store to no buffer leaves it as it is.
+fn batch_after(mode: u8, wrote: bool, met: Met) -> Option<bool> {
+    match met {
+        Met::Dispatch { stores: false } if mode == 3 => Some(wrote),
+        Met::Dispatch { .. } => (mode == 2).then_some(true),
+        Met::Wait => (!wrote).then_some(false),
+        Met::Draw { stores } => (!wrote && !stores).then_some(false),
+    }
+}
+
+/// Whether an execution that is met as `met` once it has run opens a batch
+/// for its record when none holds it: not if that batch would end with this
+/// very execution (in `mode` 1 a dispatch; a draw whose shaders store): its
+/// pass would clamp one record, and costs more than the clamp of one
+/// (11.0 ms against 8.3 for 2,400 on this card:
+/// `crate::indirect::tests::batch_costs_on_this_card`). Such an execution
+/// is clamped on its own, as without batches.
+fn batch_opens(mode: u8, met: Met) -> bool {
+    batch_after(mode, false, met).is_some()
+}
+
+/// The records clamped by the pass opened last ([`batches`]).
+struct Batch {
+    table: crate::indirect::batch::Table,
+    scratch: ID3D12Resource,
+    /// The host list the pass is in.
+    list: usize,
+    /// Dispatches since, which may have written arguments
+    /// (`VICTORY_INDIRECT_BATCH=2`).
+    wrote: bool,
+}
+
+/// The host copies arguments were read from last: what a batch opens with,
+/// as the executions after the first may read theirs from another one.
+static ARGUMENT_COPIES: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> = std::sync::Mutex::new(Vec::new());
+
+/// [`ARGUMENT_COPIES`] that live, and `first` put in front of them.
+fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource)> {
+    let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let live: Vec<_> = copies.iter().filter_map(std::sync::Weak::upgrade).filter(|s| s.id() != first.id()).collect();
+    *copies = std::iter::once(first)
+        .chain(&live)
+        .take(crate::indirect::batch::SOURCES)
+        .map(std::sync::Arc::downgrade)
+        .collect();
+    live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
+}
+
+/// Since the last frame-rate line, by the `B_` names: what indirect
+/// executions did with batches ([`batches`]).
+static BATCH_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const B_OPENED: usize = 0;
+const B_READ: usize = 1;
+const B_NOT_ONE: usize = 2;
+const B_PARTS: usize = 3;
+const B_REFUSED: usize = 4;
+const B_END_WRITE: usize = 5;
+const B_END_STORE: usize = 6;
+const B_END_SYNC: usize = 7;
+const B_ALONE: usize = 8;
+
+fn batch_count(what: usize) {
+    BATCH_STATS[what].fetch_add(1, Ordering::Relaxed);
+}
+
+/// For the frame-rate line, with [`batches`]: what indirect executions did
+/// with batches per frame since the last one.
+pub(crate) fn batch_line(frames: f64) {
+    if batches() == 0 {
+        return;
+    }
+    let b: Vec<f64> = BATCH_STATS.iter().map(|b| b.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "indirect batches per frame (VICTORY_INDIRECT_BATCH={}): {:.0} passes clamped the records of {:.0} executions; \
+         clamped on their own: {:.0} with a count buffer or of more than one record, {:.0} dispatches that run in \
+         parts, {:.0} a batch could not take, {:.0} whose own batch would have ended with them (dispatches; with 3, \
+         those whose shaders store; draws whose shaders store); batches ended by {:.0} dispatches (=3: those whose \
+         shaders store), {:.0} draws whose shaders store, {:.0} waits of the title's or draws after dispatches (=2)",
+        batches(),
+        b[B_OPENED],
+        b[B_READ],
+        b[B_NOT_ONE],
+        b[B_PARTS],
+        b[B_REFUSED],
+        b[B_ALONE],
+        b[B_END_WRITE],
+        b[B_END_STORE],
+        b[B_END_SYNC],
+    );
+}
+
 /// Whether the pass over the heap's buffer views looks at a sixteenth of
 /// all their slots each pass instead of all of them every sixteenth pass
 /// (`VICTORY_BUFFER_PASS_SPREAD=0`: all of them every sixteenth, as before).
@@ -421,6 +600,9 @@ pub(crate) struct State {
     /// may still read ([`windows`]: the last one; [`wide_windows`]: up to
     /// [`WINDOW_SLOTS`]).
     windows: Vec<Window>,
+    /// The records clamped in a batch, if later executions may still read
+    /// them ([`batches`]).
+    batch: Option<Batch>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -3032,6 +3214,7 @@ impl State {
     fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.draw_ends_windows();
+        self.buffers_written();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3393,6 +3576,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.draw_ends_windows();
+        self.drew();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3834,6 +4018,7 @@ impl State {
         first_instance: u32,
     ) {
         self.draw_ends_windows();
+        self.drew();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3937,6 +4122,7 @@ impl State {
         first_instance: u32,
     ) {
         self.draw_ends_windows();
+        self.drew();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3965,6 +4151,139 @@ impl State {
 }
 
 impl State {
+    /// The open batch meets `met` ([`batch_after`]). Nothing without a batch.
+    fn batch_meets(&mut self, met: Met) {
+        let Some(batch) = &mut self.batch else {
+            return;
+        };
+        match batch_after(batches(), batch.wrote, met) {
+            Some(wrote) => batch.wrote = wrote,
+            None => {
+                batch_count(match met {
+                    Met::Dispatch { .. } => B_END_WRITE,
+                    Met::Draw { stores: true } if !batch.wrote => B_END_STORE,
+                    _ => B_END_SYNC,
+                });
+                self.batch = None;
+            }
+        }
+    }
+
+    /// A direct dispatch with the pipeline set is recorded: shaders that
+    /// can write buffers, so arguments may be others from here on
+    /// ([`batches`]; no host pipeline: nothing runs, nothing is stored).
+    fn buffers_written(&mut self) {
+        if self.batch.is_none() {
+            return;
+        }
+        self.dispatched_as(pipeline_stores(self.pipeline));
+    }
+
+    /// [`State::buffers_written`] for a dispatch whose shaders are known to
+    /// store to buffers or not.
+    fn dispatched_as(&mut self, stores: bool) {
+        self.batch_meets(Met::Dispatch { stores });
+    }
+
+    /// A direct draw with the pipeline set is recorded: as
+    /// [`State::buffers_written`] if its shaders can store to buffers, or
+    /// if it has no host pipeline to tell by.
+    fn drew(&mut self) {
+        if self.batch.is_none() {
+            return;
+        }
+        let stores = crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores));
+        self.drew_as(stores);
+    }
+
+    /// [`State::drew`] for a draw whose shaders are known to store to
+    /// buffers or not.
+    fn drew_as(&mut self, stores: bool) {
+        self.batch_meets(Met::Draw { stores });
+    }
+
+    /// The title waits for earlier work (a barrier or a pipeline sync):
+    /// what dispatches since the batch was opened wrote is there for what
+    /// follows (`VICTORY_INDIRECT_BATCH=2`).
+    pub(crate) fn synced(&mut self) {
+        self.batch_meets(Met::Wait);
+    }
+
+    /// Where the clamped record of `kind` at `arguments` of the copy `args`
+    /// is, from the open batch or a new one ([`batches`]). `None` if it
+    /// cannot be clamped in one.
+    fn batched(
+        &mut self,
+        list: &HostList,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        (kind, stride): (u32, u32),
+        stores: bool,
+    ) -> Option<(ID3D12Resource, u64)> {
+        const BATCH_USE: usize = usize::MAX - 0x78;
+        const DISPATCH: u32 = 2;
+        // Another host list, or this one after its reset ([`windows`]).
+        let host_list = list.list.as_raw() as usize;
+        if list.first_use(BATCH_USE) || self.batch.as_ref().is_some_and(|b| b.list != host_list) {
+            self.batch = None;
+        }
+        // A draw after dispatches waits for them.
+        if kind != DISPATCH {
+            self.synced();
+        }
+        let (id, offset) = (args.id(), args.offset(arguments));
+        // A record no job can name (past 32 bits of its copy, off 4 bytes),
+        // or records further apart than a place has room for: clamped on
+        // its own, and the batch stays for the others.
+        if !crate::indirect::batch::fits(offset, kind) || stride > crate::indirect::batch::STRIDE {
+            batch_count(B_REFUSED);
+            return None;
+        }
+        // A dispatch's record is noted with its execution, as its own clamp
+        // notes it (`crate::indirect::with_dispatch`): a job for each
+        // pipeline that reads it.
+        let this = self.pipeline as This;
+        let who = if kind == DISPATCH { self.pipeline as u64 } else { 0 };
+        let execution = || {
+            if kind == DISPATCH {
+                crate::indirect::note_dispatch(|| crate::pipeline::shaders_label(this))
+            } else {
+                0
+            }
+        };
+        if let Some(b) = &mut self.batch
+            && let Some(at) = b.table.place_noted(id, offset, kind, who, execution)
+        {
+            batch_count(B_READ);
+            return Some((b.scratch.clone(), at));
+        }
+        // A batch of its own would end with it (`batch_opens`): clamped on
+        // its own. (A batch that could not take it ends with it too, once
+        // it has run.)
+        let met = if kind == DISPATCH { Met::Dispatch { stores } } else { Met::Draw { stores } };
+        if !batch_opens(batches(), met) {
+            batch_count(B_ALONE);
+            return None;
+        }
+        self.batch = None;
+        let opened = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args));
+        let Some((mut table, scratch)) = opened else {
+            batch_count(B_REFUSED);
+            return None;
+        };
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let Some(at) = table.place_noted(id, offset, kind, who, execution) else {
+            batch_count(B_REFUSED);
+            return None;
+        };
+        batch_count(B_OPENED);
+        batch_count(B_READ);
+        self.batch = Some(Batch { table, scratch: scratch.clone(), list: host_list, wrote: false });
+        Some((scratch, at))
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -4073,7 +4392,36 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let stores = p.stages.iter().any(|stage| stage.translated().stores);
-        let windowed = windows() && kind != DISPATCH && max == 1 && count.is_none() && !stores;
+        // One record without a count buffer: clamped in a batch (`batches`),
+        // unless it is a dispatch of a pipeline that runs in parts (each
+        // part's records are clamped where the first part's were, below).
+        let batch = if batches() == 0 {
+            None
+        } else if max != 1 || count.is_some() {
+            batch_count(B_NOT_ONE);
+            None
+        } else if kind == DISPATCH
+            && crate::indirect::parts(|| crate::pipeline::shaders_label(self.pipeline as This)) > 1
+        {
+            batch_count(B_PARTS);
+            None
+        } else {
+            args.refresh(list, arguments, len);
+            let batch = self.batched(list, &args, arguments, (kind, stride), stores);
+            if batch.is_some() && kind == DISPATCH {
+                // (as the clamp of its own notes a watched pipeline's)
+                let this = self.pipeline as This;
+                crate::indirect::note_watched(|| crate::pipeline::shaders_label(this), arguments, count);
+            }
+            batch
+        };
+        // Its record is not in a window, and windows are not kept beside
+        // batches: what ends one is not what ends the other.
+        let batched = batch.is_some();
+        if batched {
+            self.windows.clear();
+        }
+        let windowed = !batched && windows() && kind != DISPATCH && max == 1 && count.is_none() && !stores;
         let wide = wide_windows();
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
@@ -4090,7 +4438,7 @@ impl State {
         // A record of one whose shaders store, that a window holds clamped
         // (`window_stores`): read from there; the window ends after it, as
         // it does now, since its shaders may write the arguments.
-        let store_hit = if window_stores() && windows() && kind != DISPATCH && max == 1 && count.is_none() && stores {
+        let store_hit = if !batched && window_stores() && windows() && kind != DISPATCH && max == 1 && count.is_none() && stores {
             self.windows.iter().rev().find(|w| holds(w)).map(|w| (w.scratch.clone(), w.at + (offset - w.base)))
         } else {
             None
@@ -4098,7 +4446,7 @@ impl State {
         if store_hit.is_some() {
             window_count(W_STORE_HIT);
         }
-        if windows() && !windowed {
+        if windows() && !windowed && !batched {
             window_count(if count.is_some() {
                 W_COUNTED
             } else if max != 1 {
@@ -4120,9 +4468,11 @@ impl State {
         } else {
             store_hit
         };
-        let (bounded, at) = match hit {
+        let (bounded, at) = match batch.or(hit) {
             Some(hit) => {
-                window_count(W_HIT);
+                if !batched {
+                    window_count(W_HIT);
+                }
                 hit
             }
             None => {
@@ -4306,7 +4656,7 @@ impl State {
         // clamped where the first parts were (the clamp's barrier waits for the
         // execution that read them) and run by the program translated with that
         // group base, on the same root arguments.
-        let parts = if kind == DISPATCH && !windowed {
+        let parts = if kind == DISPATCH && !windowed && !batched {
             crate::indirect::parts(|| crate::pipeline::shaders_label(self.pipeline as This))
         } else {
             1
@@ -4344,6 +4694,13 @@ impl State {
                     SPLIT.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+        // What a batch holds clamped (`batches`) may be other from here on:
+        // as after a direct dispatch or draw. Nothing without a batch.
+        if kind == DISPATCH {
+            self.dispatched_as(stores);
+        } else {
+            self.drew_as(stores);
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
@@ -5118,5 +5475,147 @@ mod early_textures_tests {
         );
         // Zero threads along any axis is a no-op.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{Met, batch_after, batch_opens};
+
+    /// An execution opens a batch only if the batch outlives it: not a
+    /// dispatch with 1, not one whose shaders store with 3, never a draw
+    /// whose shaders store.
+    #[test]
+    fn an_execution_that_would_end_its_own_batch_opens_none() {
+        for mode in [1, 2, 3] {
+            assert!(batch_opens(mode, Met::Draw { stores: false }));
+            assert!(!batch_opens(mode, Met::Draw { stores: true }));
+        }
+        for stores in [false, true] {
+            assert!(!batch_opens(1, Met::Dispatch { stores }));
+            assert!(batch_opens(2, Met::Dispatch { stores }));
+        }
+        assert!(batch_opens(3, Met::Dispatch { stores: false }));
+        assert!(!batch_opens(3, Met::Dispatch { stores: true }));
+    }
+
+    /// `VICTORY_INDIRECT_BATCH=1`: a batch ends at a dispatch and at a draw
+    /// whose shaders store, and at nothing else.
+    #[test]
+    fn an_exact_batch_ends_where_arguments_may_change() {
+        assert_eq!(batch_after(1, false, Met::Dispatch { stores: true }), None);
+        assert_eq!(batch_after(1, false, Met::Dispatch { stores: false }), None);
+        assert_eq!(batch_after(1, false, Met::Draw { stores: true }), None);
+        assert_eq!(batch_after(1, false, Met::Draw { stores: false }), Some(false));
+        assert_eq!(batch_after(1, false, Met::Wait), Some(false));
+    }
+
+    /// `VICTORY_INDIRECT_BATCH=2`: a dispatch marks the batch, which then
+    /// ends when the title waits or draws; a draw whose shaders store ends
+    /// it as before.
+    #[test]
+    fn a_batch_of_dispatches_ends_when_the_title_waits_or_draws() {
+        for stores in [false, true] {
+            assert_eq!(batch_after(2, false, Met::Dispatch { stores }), Some(true));
+            assert_eq!(batch_after(2, true, Met::Dispatch { stores }), Some(true));
+        }
+        assert_eq!(batch_after(2, true, Met::Wait), None);
+        assert_eq!(batch_after(2, true, Met::Draw { stores: false }), None);
+        assert_eq!(batch_after(2, true, Met::Draw { stores: true }), None);
+        assert_eq!(batch_after(2, false, Met::Wait), Some(false));
+        assert_eq!(batch_after(2, false, Met::Draw { stores: false }), Some(false));
+        assert_eq!(batch_after(2, false, Met::Draw { stores: true }), None);
+    }
+
+    /// `VICTORY_INDIRECT_BATCH=3`: as 1, but a dispatch whose shaders store
+    /// to no buffer leaves the batch as it is; the title's waits end nothing.
+    #[test]
+    fn a_batch_outlives_dispatches_that_store_to_no_buffer() {
+        assert_eq!(batch_after(3, false, Met::Dispatch { stores: false }), Some(false));
+        assert_eq!(batch_after(3, false, Met::Dispatch { stores: true }), None);
+        assert_eq!(batch_after(3, false, Met::Draw { stores: true }), None);
+        assert_eq!(batch_after(3, false, Met::Draw { stores: false }), Some(false));
+        assert_eq!(batch_after(3, false, Met::Wait), Some(false));
+    }
+
+    /// What the list records, as `State` meets it.
+    #[derive(Clone, Copy)]
+    enum Op {
+        /// An indirect execution of one record: a dispatch or a draw, whose
+        /// shaders store or not.
+        IndirectDispatch { stores: bool },
+        IndirectDraw { stores: bool },
+        /// A direct dispatch or draw, a barrier of the title's.
+        Direct(Met),
+    }
+
+    /// The passes of ours a list of `ops` takes in `mode` (those of batches
+    /// and the clamps of executions that open none: `batch_opens`), by the
+    /// order `State::execute_indirect` and the direct calls meet things in:
+    /// an indirect draw waits first, an execution without a batch opens one
+    /// or is clamped on its own, and then it is met as a dispatch or draw
+    /// itself.
+    fn passes(mode: u8, ops: &[Op]) -> u32 {
+        let mut batch: Option<bool> = None;
+        let mut passes = 0;
+        let meet = |batch: &mut Option<bool>, met| {
+            if let Some(wrote) = *batch {
+                *batch = batch_after(mode, wrote, met);
+            }
+        };
+        for op in ops {
+            let met = match *op {
+                Op::Direct(met) => met,
+                Op::IndirectDispatch { stores } => Met::Dispatch { stores },
+                Op::IndirectDraw { stores } => Met::Draw { stores },
+            };
+            if !matches!(op, Op::Direct(_)) {
+                if matches!(op, Op::IndirectDraw { .. }) {
+                    meet(&mut batch, Met::Wait);
+                }
+                if batch.is_none() {
+                    passes += 1;
+                    if batch_opens(mode, met) {
+                        batch = Some(false);
+                    }
+                }
+            }
+            meet(&mut batch, met);
+        }
+        passes
+    }
+
+    /// A stretch of a frame as the title records it: mesh draws one record
+    /// a call, the tile classes side by side (the third and fourth store to
+    /// buffers), a barrier, more dispatches that store, a draw whose shaders
+    /// store among plain ones. One clamp each without batches (22); in
+    /// batches: 10 exact, 4 with dispatches side by side, 7 ending at stores.
+    #[test]
+    fn executions_between_two_points_where_arguments_change_share_a_pass() {
+        let draw = Op::IndirectDraw { stores: false };
+        let (plain, storing) = (Op::IndirectDispatch { stores: false }, Op::IndirectDispatch { stores: true });
+        let mut ops = vec![draw; 6];
+        ops.push(Op::Direct(Met::Draw { stores: false }));
+        ops.extend([draw; 3]);
+        ops.extend([plain, plain, storing, storing, plain]);
+        ops.push(Op::Direct(Met::Wait));
+        ops.extend([storing; 3]);
+        ops.push(Op::Direct(Met::Dispatch { stores: true }));
+        ops.extend([draw, draw, Op::IndirectDraw { stores: true }, draw, draw]);
+        let executions = ops.iter().filter(|op| !matches!(op, Op::Direct(_))).count();
+        assert_eq!(executions, 22);
+        // Exact: the nine draws and the first dispatch (nothing wrote
+        // buffers since the pass); each dispatch after a dispatch on its own
+        // (seven); the draws up to and with the one that stores; the two
+        // after it.
+        assert_eq!(passes(1, &ops), 1 + 7 + 2);
+        // Side by side: the draws and the five dispatches; the three after
+        // the barrier; the draws up to the one that stores; the two after.
+        assert_eq!(passes(2, &ops), 1 + 1 + 2);
+        // Ending at stores: the draws and the dispatches up to and with the
+        // first that stores; the second that stores; the plain one after it
+        // and the first after the barrier; the two after that; then the
+        // draws as before.
+        assert_eq!(passes(3, &ops), 1 + 1 + 1 + 2 + 2);
     }
 }

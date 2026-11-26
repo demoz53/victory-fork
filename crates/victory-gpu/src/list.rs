@@ -812,6 +812,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        // (`VICTORY_INDIRECT_BATCH=2`: the title waits for its dispatches.)
+        if count > 0 && crate::draw::batches() == 2 {
+            with_state(this, |_, state| state.synced());
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = Vec::with_capacity(barriers.len());
@@ -1603,7 +1607,16 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// (With `VICTORY_INDIRECT_BATCH=2` arguments may be what earlier dispatches
+/// wrote from here on: `State::synced`.)
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if crate::draw::batches() == 2 {
+        with_state(this, |_, state| state.synced());
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2170,6 +2183,11 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    // (`VICTORY_INDIRECT_BATCH=2`: the title waits for its dispatches.)
+    #[cfg(windows)]
+    if count > 0 && crate::draw::batches() == 2 {
+        with_state(this, |_, state| state.synced());
+    }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
