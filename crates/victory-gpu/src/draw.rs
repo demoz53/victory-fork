@@ -705,6 +705,15 @@ pub(crate) mod sets;
 pub(crate) struct State {
     /// What the host list was last given ([`sets`]).
     sets: sets::Sets,
+    /// (`VICTORY_TABLE_MEMO`) Table entries made ready in this list, by what
+    /// they are ([`EntryKey`]): the list's memo number and the host slots'
+    /// change count after them, whether they read the depth target the draw
+    /// tests, and what they saw ([`Seen`]).
+    entry_memo: crate::fasthash::Map<EntryKey, (u64, u64, bool, Seen)>,
+    /// (`VICTORY_TABLE_MEMO`) Root views found and brought up to date in
+    /// this list: (address, kind) -> (memo number after, lookup table count,
+    /// host address).
+    view_memo: crate::fasthash::Map<(u64, bool), (u64, u64, Option<u64>)>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -2111,7 +2120,7 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some(mut gpu) = self.root_view_memo(list, address, srv) else {
                         continue;
                     };
                     if biased {
@@ -4365,24 +4374,160 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
-        let Some(heap) = self.heap_of(handle) else {
-            return;
-        };
+        self.memo_entry(list, handle, u.kind, |state| state.table_entry_whole(list, u.kind, handle));
+    }
+
+    /// What [`State::table_entry`] does for the entry at `handle`: its host
+    /// slot made from the title's, made ready to read; the view.
+    fn table_entry_whole(&self, list: &HostList, kind: ResourceType, handle: u64) -> Option<View> {
+        let heap = self.heap_of(handle)?;
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return None;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+        let view = host.mirror(index, handle, true)?;
+        readable(list, kind, &view);
+        // Up to date by this draw: not the texture pass's to make.
+        if crate::descriptor::host::is_texture_view(&view) {
+            host.texture_slot_tabled(index, true);
+        }
+        Some(view)
+    }
+
+    /// (`VICTORY_TABLE_MEMO`) The table entry at `handle` read as `kind`,
+    /// made ready by `whole` unless this list made the same entry (the same
+    /// 32 descriptor bytes at the same place, read the same way, by a shader
+    /// that stores or not alike, with the same depth target tested) ready
+    /// earlier and nothing it depends on changed since:
+    /// - the list's memo number (`HostList::memo_moved`: texture states,
+    ///   title memory written by a step, twins, alias sources, a refresh of
+    ///   a copy with declared shader writes, a reset);
+    /// - no host slot of any heap made, emptied or made null since
+    ///   (`descriptor::host::slot_changes`);
+    /// - the texture it read has the same host copy, and a placed view
+    ///   finds the same texture (`Seen`); views of textures read through
+    ///   another format's alias are never remembered.
+    ///
+    /// `=verify` runs `whole` for a remembered entry anyway and counts any
+    /// that changed the list (memo number, steps, the tested depth's read),
+    /// which must be none.
+    fn memo_entry(&mut self, list: &HostList, handle: u64, kind: ResourceType, whole: impl FnOnce(&Self) -> Option<View>) {
+        let mode = table_memo();
+        if mode == 0 {
+            whole(self);
+            return;
+        }
+        // SAFETY: a descriptor slot in title memory, as the tables read it.
+        let bytes = unsafe { (handle as *const [u64; 4]).read_unaligned() };
+        let tested = TESTED_DEPTH.get();
+        let key: EntryKey = (handle, bytes, kind, STORES.get(), tested.0);
+        let epoch = list.memo_epoch();
+        let slots = crate::descriptor::host::slot_changes();
+        memo_count(M_ENTRIES);
+        let found = self.entry_memo.get(&key).copied();
+        let hit = match found {
+            None => {
+                memo_count(M_FIRST);
+                None
+            }
+            Some((e, s, _, _)) if e != epoch || s != slots => {
+                memo_count(M_CHANGED);
+                None
+            }
+            Some((_, _, depth, seen)) if seen.stands(handle) => Some(depth),
+            Some(_) => {
+                memo_count(M_COPY);
+                None
+            }
+        };
+        if let Some(depth) = hit {
+            memo_count(M_HITS);
+            if mode == 1 {
+                if depth {
+                    TESTED_DEPTH.set((tested.0, true));
+                }
+                return;
             }
         }
+        let steps = list.deferred_steps();
+        TESTED_DEPTH.set((tested.0, false));
+        let view = whole(self);
+        let read = TESTED_DEPTH.get().1;
+        TESTED_DEPTH.set((tested.0, tested.1 || read));
+        if let Some(depth) = hit {
+            let moved = list.memo_epoch() != epoch;
+            let stepped = list.deferred_steps() != steps;
+            if moved {
+                memo_count(M_VERIFY_EPOCH);
+            }
+            if stepped {
+                memo_count(M_VERIFY_STEPS);
+            }
+            if read != depth {
+                memo_count(M_VERIFY_DEPTH);
+            }
+            if moved || stepped || read != depth {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
+                    tracing::warn!(
+                        handle = format_args!("{handle:#x}"),
+                        ?kind,
+                        moved,
+                        stepped,
+                        ?view,
+                        "table memo (verify): a remembered entry's whole path changed the list"
+                    );
+                }
+            }
+        }
+        if self.entry_memo.len() >= 1 << 16 {
+            self.entry_memo.clear();
+        }
+        match view.as_ref().and_then(Seen::of) {
+            Some(seen) => {
+                self.entry_memo.insert(key, (list.memo_epoch(), crate::descriptor::host::slot_changes(), read, seen));
+            }
+            None => {
+                memo_count(M_NOT_KEPT);
+                self.entry_memo.remove(&key);
+            }
+        }
+    }
+
+    /// (`VICTORY_TABLE_MEMO`) [`root_view`] once per list for the same
+    /// address and kind while the list's memo number and the lookup tables
+    /// are as they were (the copy found and its refresh are the same).
+    fn root_view_memo(&mut self, list: &HostList, address: u64, srv: bool) -> Option<u64> {
+        let mode = table_memo();
+        if mode == 0 {
+            return root_view(list, address, srv);
+        }
+        let key = (address, srv);
+        let (epoch, tables) = (list.memo_epoch(), crate::shadow::table_changes());
+        memo_count(M_VIEWS);
+        let known = self.view_memo.get(&key).copied().filter(|&(e, t, _)| e == epoch && t == tables);
+        if let Some((_, _, gpu)) = known {
+            memo_count(M_VIEW_HITS);
+            if mode == 1 {
+                return gpu;
+            }
+        }
+        let steps = list.deferred_steps();
+        let gpu = root_view(list, address, srv);
+        if let Some((_, _, was)) = known
+            && (list.memo_epoch() != epoch || list.deferred_steps() != steps || was != gpu)
+        {
+            memo_count(M_VERIFY_VIEWS);
+        }
+        if self.view_memo.len() >= 1 << 14 {
+            self.view_memo.clear();
+        }
+        self.view_memo.insert(key, (list.memo_epoch(), tables, gpu));
+        gpu
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -4549,9 +4694,12 @@ impl State {
                 // draw too (those copied were filled for the first).
                 for u in entries.iter().filter(|u| in_place || u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
-                    }
+                    let kind = u.kind;
+                    self.memo_entry(list, handle, kind, |_| {
+                        let view = crate::descriptor::view(handle)?;
+                        readable(list, kind, &view);
+                        Some(view)
+                    });
                 }
                 for k in selected {
                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
@@ -5701,6 +5849,226 @@ fn bind_lean() -> bool {
 fn targets_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TARGETS_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// (`VICTORY_TABLE_MEMO`) A table entry as it is made ready: the
+/// descriptor's address and its 32 bytes in title memory, how the shader
+/// reads it, whether the shader stores, and the depth target the draw tests.
+type EntryKey = (u64, [u64; 4], ResourceType, bool, usize);
+
+/// (`VICTORY_TABLE_MEMO`) What a remembered entry's work depended on beyond
+/// the list: nothing more (a buffer: its refresh is the list's, done once
+/// until title memory is written); a texture and its host copy as it was; a
+/// texture placed in memory, found by the view's memory, and its copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seen {
+    Nothing,
+    Texture(usize, usize),
+    Placed(usize, usize),
+}
+
+fn copy_of(r: usize) -> usize {
+    crate::resource::made_copy(r as This).map_or(0, |c| std::sync::Arc::as_ptr(&c) as usize)
+}
+
+impl Seen {
+    /// What an entry of `view` is remembered with; `None`: not at all (a
+    /// texture read through another format's alias: its texels are copied
+    /// in when the source was written, which no change of the list says).
+    fn of(view: &View) -> Option<Seen> {
+        let texture = |r: usize| (crate::resource::buffer_bytes(r as This).is_none()).then(|| (r, copy_of(r)));
+        let aliased = |r: usize| crate::resource::alias_of(r as This).is_some();
+        if let View::Shader(r, _) | View::Unordered(r, _, _) = view
+            && aliased(*r)
+        {
+            return None;
+        }
+        let placed = matches!(view, View::Placed(..)).then(|| crate::descriptor::host::placed_texture(view)).flatten();
+        if let Some(View::Shader(r, _) | View::Unordered(r, _, _)) = &placed
+            && aliased(*r)
+        {
+            return None;
+        }
+        match view {
+            View::Shader(r, _) | View::Unordered(r, _, _) => Some(texture(*r).map_or(Seen::Nothing, |(r, c)| Seen::Texture(r, c))),
+            View::Constant(..) => Some(Seen::Nothing),
+            View::Placed(..) => match placed {
+                Some(View::Shader(r, _) | View::Unordered(r, _, _)) => Some(texture(r).map_or(Seen::Nothing, |(r, c)| Seen::Placed(r, c))),
+                Some(_) => None,
+                None => Some(Seen::Nothing),
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether what a remembered entry at `handle` saw still stands.
+    fn stands(self, handle: u64) -> bool {
+        match self {
+            Seen::Nothing => true,
+            Seen::Texture(r, copy) => copy_of(r) == copy,
+            Seen::Placed(r, copy) => crate::descriptor::view(handle).is_some_and(|view| {
+                matches!(
+                    crate::descriptor::host::placed_texture(&view),
+                    Some(View::Shader(p, _) | View::Unordered(p, _, _)) if p == r
+                ) && copy_of(r) == copy
+            }),
+        }
+    }
+}
+
+/// `VICTORY_TABLE_MEMO`: 0 off (default), 1 on, 2 verify (a remembered
+/// entry is made ready whole anyway; one that changed something is counted
+/// and warned, which must be none).
+///
+/// After Op-lite/victory-scarlett c45b43e96 (Oplite; GPL-3.0; draw.rs
+/// `entry_begin`/`entry_end`/`root_view_memo`): 81% of some 54,000 table
+/// entries a frame not made ready twice there. Our tree's own memories it
+/// sits on: the tables made afresh are kept per list by contents
+/// (`fresh_tables`), a host slot made from a record is found on the shared
+/// side (`VICTORY_HEAP_LOCKS`), a refresh is deferred once per list until
+/// title memory is written (`Deferred::refreshed`), a texture upload once
+/// per list (`first_use`); what this adds is skipping the whole per-entry
+/// walk (the slot look-up, `readable`'s lookups of the host copy, alias,
+/// twin and state) for an entry already made ready.
+fn table_memo() -> u8 {
+    #[cfg(test)]
+    if let forced @ 1..=2 = TEST_MEMO.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_TABLE_MEMO").as_deref() {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`table_memo`]'s mode on this thread (0: as the switch says).
+    static TEST_MEMO: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod table_memo_tests {
+    use super::*;
+
+    /// A remembered entry is left out only while nothing it depends on
+    /// changed: the same descriptor bytes at the same place, read the same
+    /// way, on the same list with its memo number and every heap's slots
+    /// as they were. Each change below makes the whole path run again.
+    #[test]
+    fn a_remembered_entry_runs_again_after_each_invalidation() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        TEST_MEMO.set(1);
+        let list = host.new_list().unwrap();
+        let other = host.new_list().unwrap();
+        let mut state = State::default();
+        // A "descriptor slot" of the test's own: 32 bytes, no view in them
+        // (the path below is a counter, not the real one).
+        let mut slot = [0x1111u64, 0x2222, 0x3333, 0x4444];
+        let handle = slot.as_ptr() as u64;
+        let runs = std::cell::Cell::new(0);
+        let entry = |state: &mut State, list: &HostList, kind: ResourceType| {
+            state.memo_entry(list, handle, kind, |_| {
+                runs.set(runs.get() + 1);
+                Some(View::Constant(0x1000, 256))
+            });
+            runs.get()
+        };
+        assert_eq!(entry(&mut state, &list, ResourceType::Srv), 1, "the first time: whole");
+        assert_eq!(entry(&mut state, &list, ResourceType::Srv), 1, "again, nothing changed: left out");
+        assert_eq!(entry(&mut state, &list, ResourceType::Uav), 2, "read another way: whole");
+        // The list's memo number (a texture state moved, title memory
+        // written by a step, a twin used, an alias noted, a reset).
+        list.memo_moved();
+        assert_eq!(entry(&mut state, &list, ResourceType::Srv), 3, "after the list moved: whole");
+        assert_eq!(entry(&mut state, &list, ResourceType::Srv), 3);
+        // The title wrote the descriptor.
+        std::hint::black_box(&mut slot)[1] = 0x9999;
+        assert_eq!(entry(&mut state, &list, ResourceType::Srv), 4, "other descriptor bytes: whole");
+        // A host slot of some heap was made again.
+        crate::descriptor::host::slots_changed_for_test();
+        assert_eq!(entry(&mut state, &list, ResourceType::Srv), 5, "a slot changed: whole");
+        // Another host list (a cut, a list from the pool).
+        assert_eq!(entry(&mut state, &other, ResourceType::Srv), 6, "another list: whole");
+        // The tested depth target is part of what an entry is.
+        TESTED_DEPTH.set((0x5000, false));
+        assert_eq!(entry(&mut state, &other, ResourceType::Srv), 7, "another tested depth: whole");
+        TESTED_DEPTH.set((0, false));
+        // Verify: a remembered entry runs whole anyway.
+        TEST_MEMO.set(2);
+        let now = runs.get();
+        assert_eq!(entry(&mut state, &other, ResourceType::Srv), now + 1, "verify runs it");
+        TEST_MEMO.set(0);
+        list.close();
+        other.close();
+    }
+}
+
+/// (`VICTORY_TABLE_MEMO`) Counters, per thread, added every 4,096.
+const M_ENTRIES: usize = 0;
+const M_HITS: usize = 1;
+const M_FIRST: usize = 2;
+const M_CHANGED: usize = 3;
+const M_COPY: usize = 4;
+const M_NOT_KEPT: usize = 5;
+const M_VERIFY_EPOCH: usize = 6;
+const M_VERIFY_STEPS: usize = 7;
+const M_VERIFY_DEPTH: usize = 8;
+const M_VIEWS: usize = 9;
+const M_VIEW_HITS: usize = 10;
+const M_VERIFY_VIEWS: usize = 11;
+static MEMO: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
+thread_local! {
+    static MEMO_HERE: std::cell::Cell<([u64; 12], u32)> = const { std::cell::Cell::new(([0; 12], 0)) };
+}
+
+fn memo_count(i: usize) {
+    MEMO_HERE.with(|c| {
+        let (mut n, mut k) = c.get();
+        n[i] += 1;
+        k += 1;
+        if k >= 4096 {
+            for (total, v) in MEMO.iter().zip(&mut n) {
+                total.fetch_add(std::mem::take(v), Ordering::Relaxed);
+            }
+            k = 0;
+        }
+        c.set((n, k));
+    });
+}
+
+/// For the frame line (diagnostics): the table memo's counts per frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn table_memo_line(frames: f64) {
+    if table_memo() == 0 {
+        return;
+    }
+    let v: [u64; 12] = std::array::from_fn(|i| MEMO[i].swap(0, Ordering::Relaxed));
+    let f = frames.max(1.0);
+    tracing::info!(
+        "table memo (VICTORY_TABLE_MEMO={}) per frame: table entries {:.0}, of them made ready earlier in the list with nothing changed since {:.0} ({:.1}%){}; misses: first in the list {:.0}, list or slots changed {:.0}, host copy changed {:.0}, not remembered {:.0}; root views {:.0}, found again {:.0} ({:.1}%); verify, remembered ones whose whole path changed something: entries memo number {:.1}, steps {:.1}, tested depth {:.1}, root views {:.1} (all must be 0)",
+        if table_memo() == 2 { "verify" } else { "1" },
+        v[M_ENTRIES] as f64 / f,
+        v[M_HITS] as f64 / f,
+        100.0 * v[M_HITS] as f64 / v[M_ENTRIES].max(1) as f64,
+        if table_memo() == 2 { ", each made ready whole anyway" } else { ", left out" },
+        v[M_FIRST] as f64 / f,
+        v[M_CHANGED] as f64 / f,
+        v[M_COPY] as f64 / f,
+        v[M_NOT_KEPT] as f64 / f,
+        v[M_VIEWS] as f64 / f,
+        v[M_VIEW_HITS] as f64 / f,
+        100.0 * v[M_VIEW_HITS] as f64 / v[M_VIEWS].max(1) as f64,
+        v[M_VERIFY_EPOCH] as f64 / f,
+        v[M_VERIFY_STEPS] as f64 / f,
+        v[M_VERIFY_DEPTH] as f64 / f,
+        v[M_VERIFY_VIEWS] as f64 / f,
+    );
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {

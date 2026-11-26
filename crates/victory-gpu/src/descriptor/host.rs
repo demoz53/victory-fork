@@ -1759,6 +1759,7 @@ impl HostHeap {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         map.free(title, crate::host::submissions().0);
         made.keys[host as usize] = 0;
+        slots_changed();
     }
 
     /// Title slot `title` holds no view (`made` locked): its host slot reads
@@ -1769,6 +1770,7 @@ impl HostHeap {
         match made.host(title) {
             Some(host) if made.keys[host as usize] != 0 => {
                 made.keys[host as usize] = 0;
+                slots_changed();
                 self.make_null(host);
                 let _ = self.note_buffer(title, None, false);
             }
@@ -2716,6 +2718,7 @@ impl HostHeap {
                 STALE_KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             made.keys[host as usize] = if later { 0 } else { key };
+            slots_changed();
             let kept = if later {
                 None
             } else {
@@ -2728,6 +2731,7 @@ impl HostHeap {
                 // slot's next use makes it again.
                 if crate::resource::host_retrying(view.resources()[0] as crate::object::This) {
                     made.keys[host as usize] = 0;
+                    slots_changed();
                 }
             }
             self.keep(host, kept.flatten());
@@ -3856,6 +3860,26 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Changes of host slots' records (made, emptied, made null) since the
+/// start, of every heap (`VICTORY_TABLE_MEMO`: a table entry made ready
+/// earlier in a list stands only while no slot changed).
+static SLOTS_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn slots_changed() {
+    SLOTS_CHANGED.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Tests: a host slot changed.
+#[cfg(test)]
+pub(crate) fn slots_changed_for_test() {
+    slots_changed();
+}
+
+/// [`SLOTS_CHANGED`] now.
+pub(crate) fn slot_changes() -> u64 {
+    SLOTS_CHANGED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(test)]

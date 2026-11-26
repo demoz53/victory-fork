@@ -1192,6 +1192,11 @@ pub(crate) struct HostList {
     /// had, changed at every reset: what `crate::draw::sets` knows of the
     /// list's bindings is of one value (`VICTORY_SET_CACHE`).
     binds_serial: std::sync::atomic::AtomicU64,
+    /// Changed (to a number no list has had) whenever something the list
+    /// holds changes in a way that can make a table entry's work, done
+    /// earlier in the list, not enough any more (`VICTORY_TABLE_MEMO`,
+    /// [`HostList::memo_moved`]).
+    memo_epoch: std::sync::atomic::AtomicU64,
     /// Changed (to a number no list has had) whenever `states` gains or
     /// changes an entry, and at a reset: a draw that moved its render
     /// targets at this number need not move them again
@@ -6495,6 +6500,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 binds_serial: std::sync::atomic::AtomicU64::new(next_binds_serial()),
+                memo_epoch: std::sync::atomic::AtomicU64::new(next_binds_serial()),
                 states_generation: std::sync::atomic::AtomicU64::new(next_states_generation()),
                 twins: Mutex::default(),
                 plane_reset: std::sync::atomic::AtomicBool::new(false),
@@ -9184,6 +9190,7 @@ impl HostList {
         let started = std::time::Instant::now();
         // What was bound before the reset is not bound after it.
         self.binds_serial.store(next_binds_serial(), Ordering::Relaxed);
+        self.memo_moved();
         self._alive.used();
         self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -9291,12 +9298,34 @@ impl HostList {
         self.binds_serial.load(Ordering::Relaxed)
     }
 
+    /// The list's memo number now ([`HostList::memo_moved`]).
+    pub(crate) fn memo_epoch(&self) -> u64 {
+        self.memo_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Something changed that can make a table entry's work done earlier in
+    /// the list not enough (`VICTORY_TABLE_MEMO`): a texture state moved
+    /// ([`HostList::states_moved`]), title memory written by a step (a buffer
+    /// copy, work that writes it), a depth texture's twin used, an alias
+    /// source noted, a refresh of a copy with declared shader writes, a
+    /// reset.
+    pub(crate) fn memo_moved(&self) {
+        self.memo_epoch.store(next_binds_serial(), Ordering::Relaxed);
+    }
+
+    /// The steps the list does at submission so far (`VICTORY_TABLE_MEMO`
+    /// verify: a remembered entry's whole path must add none).
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
     pub(crate) fn states_generation(&self) -> u64 {
         self.states_generation.load(Ordering::Relaxed)
     }
 
     fn states_moved(&self) {
         self.states_generation.store(next_states_generation(), Ordering::Relaxed);
+        self.memo_moved();
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -9354,6 +9383,8 @@ impl HostList {
         let Some(twin) = crate::resource::twin(resource) else {
             return false;
         };
+        // A twin's sides change with each use (`VICTORY_TABLE_MEMO`).
+        self.memo_moved();
         let Some(depth) = crate::resource::host_copy(resource) else {
             return false;
         };
@@ -9584,9 +9615,15 @@ impl HostList {
 
     pub(crate) fn twins_written(&self) {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let mut moved = false;
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
+            moved = true;
+        }
+        drop(twins);
+        if moved {
+            self.memo_moved();
         }
     }
 
@@ -9788,6 +9825,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        // (An atomic: no lock of the list's taken.)
+        self.memo_moved();
         deferred.gpu_written.clear();
         deferred.memory_read_seen = 0;
     }
@@ -9912,6 +9951,9 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             if let Some(ranges) = deferred.gpu_written.get_mut(&key.0) {
+                // A declaration of shader writes must come again after this
+                // refresh: entries done earlier in the list are not enough.
+                self.memo_epoch.store(next_binds_serial(), Ordering::Relaxed);
                 ranges.clear();
             }
             deferred
@@ -10287,7 +10329,11 @@ impl HostList {
     pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
         let view = windows::core::Interface::as_raw(view) as usize;
         let source = windows::core::Interface::as_raw(source) as usize;
-        self.deferred().texture_aliases.insert(view, source) != Some(source)
+        let changed = self.deferred().texture_aliases.insert(view, source) != Some(source);
+        if changed {
+            self.memo_moved();
+        }
+        changed
     }
 
     /// Advances the list's title-memory copy watermarks to `total` (`writes`:
@@ -10310,6 +10356,8 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        // (An atomic: no lock of the list's taken.)
+        self.memo_moved();
         deferred.gpu_written.clear();
         deferred.memory_read_seen = 0;
     }

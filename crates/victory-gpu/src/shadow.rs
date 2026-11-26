@@ -4481,6 +4481,12 @@ fn tables_changed() {
     TABLES_CHANGED.fetch_add(1, Ordering::Release);
 }
 
+/// [`TABLES_CHANGED`] now (`VICTORY_TABLE_MEMO`: a root view found earlier
+/// in a list stands while the tables are as they were).
+pub(crate) fn table_changes() -> u64 {
+    TABLES_CHANGED.load(Ordering::Acquire)
+}
+
 /// Title memory in grains of 64 KiB for [`find_buckets`].
 const GRAIN_SHIFT: u32 = 16;
 /// The longest span (grains, from an answer's buffer's first grain to the

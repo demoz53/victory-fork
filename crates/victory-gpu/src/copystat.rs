@@ -1508,6 +1508,7 @@ pub(crate) fn log(frames: f64) {
         c[C::GuardAbsentQueries as usize],
         ms(c[C::GuardAbsentUs as usize]),
     );
+    crate::draw::table_memo_line(frames);
     {
         let (sent, skipped) = crate::draw::sets::take_counts();
         if sent + skipped > 0 {

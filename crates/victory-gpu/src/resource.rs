@@ -1818,6 +1818,16 @@ pub(crate) fn host_retrying(this: This) -> bool {
 }
 
 /// The host copy of title texture `this` if it is made, without making it
+/// (`VICTORY_TABLE_MEMO`: which copy a remembered table entry saw).
+#[cfg(windows)]
+pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, false).map(|made| made.0)
+}
+
+/// The host copy of title texture `this` if it is made, without making it
 /// (for diagnostics, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn host_made<'a>(
