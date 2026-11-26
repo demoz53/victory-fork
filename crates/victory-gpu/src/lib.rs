@@ -94,7 +94,7 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 #[cfg(windows)]
 pub use watch::{
     KernelWrite, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_same,
-    title_memory_written, title_writing as kernel_will_write,
+    page_write_counts, title_memory_read_done, title_memory_written, title_writing as kernel_will_write,
 };
 
 /// Tests: held by a test from before it asks for a device on the software

@@ -731,6 +731,7 @@ fn view_line(requests: u64, elapsed: std::time::Duration) {
         return;
     }
     let now = super::xmem::view_counts();
+    let [read_ranges, _, under_reads, again] = victory_gpu::page_write_counts();
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let d: [u64; 5] = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
     *last = now;
@@ -744,7 +745,10 @@ fn view_line(requests: u64, elapsed: std::time::Duration) {
         kept_commits = d[4],
         slow_requests = slow,
         slowest_ms = slowest,
-        "dstorage views: last {secs:.1} s (slow: over {SLOW_MS} ms)"
+        read_ranges,
+        slots_under_reads = under_reads,
+        slots_uploaded_again_after_read = again,
+        "dstorage views: last {secs:.1} s (slow: over {SLOW_MS} ms; the last three since the start, VICTORY_PAGE_WRITES)"
     );
 }
 
@@ -1415,7 +1419,12 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let filled = fill(out).map(drop);
+        // Said again now that the bytes are there: a texture pass that took
+        // the memory while the read was under way took what was there
+        // before (`VICTORY_PAGE_WRITES`, fxceless e4245f3c1).
+        victory_gpu::title_memory_read_done(request.destination as usize, len);
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
