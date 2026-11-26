@@ -620,6 +620,26 @@ fn vcc_loop_polarity_old() -> bool {
     *OLD.get_or_init(|| std::env::var_os("VICTORY_VCC_LOOP_POLARITY").is_some_and(|v| v == "old"))
 }
 
+/// Whether a wave64 compute program's loop iteration limit is tested at the loop's own exits
+/// ([`limit_exits`]) rather than in its latch, where wave operations after the loop lose lanes
+/// on a 32-lane host. On by default (proven to remove dark tile artifacts on water);
+/// `VICTORY_LOOP_EXITS=0` restores the latch test. Part of the translation: the shader cache
+/// keys on the raw switch and on the executable.
+pub fn loop_exits() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LOOP_EXITS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_EXITS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's setting of [`loop_exits`] for this thread.
+    static TEST_LOOP_EXITS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether a lane loop's own branch block counts as in its branch's region, not as a block
 /// every lane runs ([`lane_regions`]): after the first round only the lanes still in the loop
 /// run it, so two host waves cannot meet there (a group barrier, an exchange), nor are values
@@ -1966,7 +1986,7 @@ impl<'a> Lower<'a> {
             }
         }
         let limit = if p.wave64 && console_lanes && x.native.stage == HwStage::Cs
-            && std::env::var_os("VICTORY_LOOP_EXITS").is_some_and(|v| v == "1")
+            && loop_exits()
         {
             limit_exits(&crate::ir::reverse_postorder(&p.blocks), &x.st.exits)
         } else {

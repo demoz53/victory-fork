@@ -87,6 +87,9 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_LOCAL",
                     "VICTORY_FIRST_HALF",
                     "VICTORY_LANE_LOOP_FIX",
+                    // On unless "0" since the default flipped: the key also
+                    // holds the executable's hash, so a cache made with the
+                    // old (off) default is not served to this build.
                     "VICTORY_LOOP_EXITS",
                     "VICTORY_VCC_LOOP_POLARITY",
                     "VICTORY_SKIP_DESCRIPTORS",
