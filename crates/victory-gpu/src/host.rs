@@ -339,7 +339,68 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
+    // With `VICTORY_DROP_LATER=1` on the reaper's thread: every submission
+    // that could use them has finished, so the last releases (some a kernel
+    // call that frees the card's memory) can be anyone's.
+    if drop_later() {
+        reap_later(done);
+        return;
+    }
     drop(done);
+}
+
+/// Whether what the submitting thread lets go of after its submissions ran
+/// goes to the reaper's thread ([`reap_later`]) instead of being dropped
+/// there (`VICTORY_DROP_LATER=1`; off by default): the objects retired
+/// until a submission finished ([`bury`]), and the landed lists' draw
+/// state, uploads and the lists not kept for reuse
+/// (`crate::list::recycle`). The profiler found 8.2% of that thread's
+/// running time in `Arc::drop_slow`, 96% of it in system code (the last
+/// releases of host objects). Nothing is dropped earlier than before, only
+/// later and elsewhere; descriptor slots are given back where they were
+/// (`crate::draw::State::tables_done`), not by the reaper.
+pub(crate) fn drop_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DROP_LATER").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_DROP_LATER=1: retired objects and landed lists' leftovers are let go on the reaper's thread");
+        }
+        on
+    })
+}
+
+/// Objects handed to the reaper's thread by [`reap_later`] since the start,
+/// and of them dropped there.
+pub(crate) static REAPED_LATER: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Drops `object` on the reaper's thread ([`reap`]), or here if there is
+/// no such thread. Only for what nothing will use any more: the card has
+/// run every submission that names it.
+pub(crate) fn reap_later<T: Send + 'static>(object: T) {
+    REAPED_LATER[0].fetch_add(1, Ordering::Relaxed);
+    send_to_reaper(Reaping::Any(Box::new(object)));
+}
+
+#[cfg(test)]
+mod reap_later_tests {
+    /// What [`super::reap_later`] is given is dropped on the reaper's
+    /// thread, not the caller's, and counted there.
+    #[test]
+    fn handed_objects_drop_on_the_reaper() {
+        struct Noted(std::sync::mpsc::Sender<Option<String>>);
+        impl Drop for Noted {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().name().map(str::to_owned));
+            }
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let before = super::REAPED_LATER[0].load(std::sync::atomic::Ordering::Relaxed);
+        super::reap_later(Noted(send));
+        let name = receive.recv_timeout(std::time::Duration::from_secs(10)).expect("dropped");
+        assert_eq!(name.as_deref(), Some("victory-reaper"));
+        assert!(super::REAPED_LATER[0].load(std::sync::atomic::Ordering::Relaxed) > before);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -2496,6 +2557,13 @@ struct Reaped {
 // dropped there.
 unsafe impl Send for Reaped {}
 
+/// What the reaper's thread drops: a list's leftovers at its reset, or
+/// anything else [`reap_later`] hands it.
+enum Reaping {
+    List(#[allow(dead_code)] Reaped),
+    Any(#[allow(dead_code)] Box<dyn Send>),
+}
+
 /// Whether what host lists held is let go on a thread of its own, not where
 /// the title resets them (`VICTORY_RESET_REAPER=0`: where they are reset,
 /// as before).
@@ -2516,14 +2584,22 @@ fn reaper() -> bool {
 /// Hands `reaped` to the thread that lets go of it ([`reaper`]); drops it
 /// here if there is no such thread.
 fn reap(reaped: Reaped) {
-    static LINE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Reaped>>>> = OnceLock::new();
+    send_to_reaper(Reaping::List(reaped));
+}
+
+fn send_to_reaper(reaped: Reaping) {
+    static LINE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Reaping>>>> = OnceLock::new();
     let line = LINE.get_or_init(|| {
-        let (send, receive) = std::sync::mpsc::channel::<Reaped>();
+        let (send, receive) = std::sync::mpsc::channel::<Reaping>();
         std::thread::Builder::new()
             .name("victory-reaper".into())
             .spawn(move || {
                 for reaped in receive {
+                    let any = matches!(reaped, Reaping::Any(_));
                     drop(reaped);
+                    if any {
+                        REAPED_LATER[1].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             })
             .ok()

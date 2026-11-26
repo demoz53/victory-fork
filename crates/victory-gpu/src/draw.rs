@@ -781,6 +781,15 @@ impl Drop for State {
 }
 
 impl State {
+    /// Gives back the dynamic slots the list holds now, as its drop would
+    /// (`VICTORY_DROP_LATER=1`: the rest of it is dropped on the reaper's
+    /// thread, the slots here).
+    pub(crate) fn give_back_slots(&mut self) {
+        for (heap, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
