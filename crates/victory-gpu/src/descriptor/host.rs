@@ -2464,7 +2464,8 @@ impl HostHeap {
     /// in the queue of textures picked by index was settled when the upload
     /// was recorded and stays as it is. False if the title wrote the slot
     /// again since (that write is queued and looked at in its own turn), or
-    /// the slot cannot be made.
+    /// the slot cannot be made, or `key` names no view (the slot is then made
+    /// null, as the pass on the recording thread makes it).
     pub(crate) fn publish_ahead(&self, index: u32, handle: u64, key: u64) -> bool {
         struct Publishing;
         impl Drop for Publishing {
@@ -2528,7 +2529,8 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        if expect.is_some_and(|expect| tag != VIEW_TAG || expect != key) {
+        // (A record that names no view is made null, as without `expect`.)
+        if expect.is_some_and(|expect| expect != key) {
             return None;
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -4609,6 +4611,50 @@ mod tests {
         assert!(heap.publish_ahead(1, handle, again));
         assert_eq!(heap.made_key(1), again);
         assert_eq!(due(), [] as [u32; 0]);
+    }
+
+    /// `VICTORY_HEAP_WORKER=1`: a slot the worker's pass takes out of the
+    /// queue without an upload is made all the same when the list is handed
+    /// over, as the pass on the recording thread makes it: one with a view
+    /// shows it, one whose record names no view any more is made null; and
+    /// a record the title wrote after the pass read it is not made then.
+    #[test]
+    fn a_slot_taken_without_an_upload_is_made_too() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        // Taken with no upload (as when the card holds its bytes already):
+        // made from the record the pass read.
+        crate::descriptor::record_for_test(handle, view(0x7fea_0000_0000));
+        let (Some(first), key) = crate::descriptor::record_at(handle).unwrap() else {
+            panic!("a view")
+        };
+        let _ = heap.note_buffer(2, Some(&first), false);
+        let (_, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        heap.texture_slot_done(2, write, None);
+        assert_eq!(heap.made_key(2), 0);
+        assert!(heap.publish_ahead(2, handle, key));
+        assert_eq!(heap.made_key(2), key);
+        // The record names no view any more when the pass reads it: made
+        // null when the list is handed over, as `mirror` makes it.
+        // SAFETY: the test's own slot.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned([0, 0, 0]) };
+        let (none, gone) = crate::descriptor::record_at(handle).unwrap();
+        assert!(none.is_none());
+        assert!(!heap.publish_ahead(2, handle, gone));
+        assert_eq!(heap.made_key(2), 0);
+        // Written after the pass read the empty record: not made from it.
+        crate::descriptor::record_for_test(handle, view(0x7fe9_0000_0000));
+        assert!(!heap.publish_ahead(2, handle, gone));
+        assert_eq!(heap.made_key(2), 0);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due

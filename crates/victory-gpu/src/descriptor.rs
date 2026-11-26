@@ -787,7 +787,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
 
 /// The view recorded at `handle`, and the key that names that record
 /// (`host::HostHeap::publish_ahead`): a write of the slot makes another.
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
     if handle == 0 {
         return None;
@@ -798,6 +798,21 @@ pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
         return None;
     }
     Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
+}
+
+/// The record at `handle` read once: the view it names (`None`: none any
+/// more, or never one), and the key that names that record, of whatever
+/// words are there: a write of the slot makes another
+/// (`host::HostHeap::publish_ahead`).
+#[cfg(windows)]
+pub(crate) fn record_at(handle: u64) -> Option<(Option<View>, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let view = if tag == VIEW_TAG { view_at(i, generation) } else { None };
+    Some((view, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// Writes `view` at `handle` as a title's descriptor write does (tests).
