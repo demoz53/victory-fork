@@ -7,6 +7,8 @@
 pub mod hooks;
 pub mod sgd5;
 
+pub mod cpu_sites;
+
 /// A specific build of the title executable we know how to run.
 #[derive(Debug, Clone, Copy)]
 pub struct KnownBuild {

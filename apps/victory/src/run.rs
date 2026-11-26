@@ -33,6 +33,9 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     // In memory, before any of the title's code runs: no file is written.
     apply_title_patches(&image, build, console);
+    // At the same moment, the instructions this PC's CPU lacks
+    // (`VICTORY_CPU_REWRITE`): no thread of the title exists yet.
+    crate::cpu_rewrite::rewrite(&image, &hash);
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in

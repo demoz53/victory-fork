@@ -27,6 +27,8 @@ mod crash;
 pub mod patch;
 pub mod prepare;
 pub mod resolve;
+#[cfg(windows)]
+pub mod rewrite;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
