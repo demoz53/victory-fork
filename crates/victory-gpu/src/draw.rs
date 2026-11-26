@@ -2554,6 +2554,10 @@ impl State {
         } else {
             let room = crate::resource::room();
             ROOM.store(room, Ordering::Relaxed);
+            // Slots that go on showing a texture past their view
+            // (`VICTORY_STALE_KEEP_MS`) do so while there is room.
+            crate::descriptor::host::CARD_ROOM.store(room, Ordering::Relaxed);
+            host.stale_expire(room);
             room
         };
         if !room && !light {

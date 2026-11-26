@@ -8592,6 +8592,15 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                let [kept, nulled, again] =
+                    crate::descriptor::host::STALE_KEPT.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if kept + nulled + again != 0 {
+                    tracing::info!(
+                        "slots that would have been made null, since the last line: {kept} went on showing their texture \
+                         (VICTORY_STALE_KEEP_MS), {again} kept ones were made again with their new texture, {nulled} were \
+                         made null at the cap or to make room (VICTORY_STALE_KEEP_MAX_MS)"
+                    );
+                }
                 let [catch_ups, catch_up_micros] =
                     crate::draw::CATCH_UPS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
                 if catch_ups != 0 {
