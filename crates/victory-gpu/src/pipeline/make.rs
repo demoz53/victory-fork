@@ -271,11 +271,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             Some(most) if p.graphics.is_none() => {
                 // Asked again in a frame whose long wait for it ran out:
                 // not waited for again in that frame.
-                if p.gave_up.load(Ordering::Relaxed) != frame + 1 {
-                    match reserve_compute(frame, most) {
-                        Some(take) => wait_made(p, take, frame),
-                        None => wait(p, frame),
-                    }
+                // When the frame's budget for such waits is spent before
+                // this one could wait its bound, the usual wait follows.
+                if p.gave_up.load(Ordering::Relaxed) != frame + 1
+                    && !wait_made(p, most, frame, &COMPUTE_BUDGET, compute_queued_wait())
+                {
+                    wait(p, frame);
                 }
             }
             _ => wait(p, frame),
@@ -320,8 +321,9 @@ fn compute_wait() -> Option<Duration> {
 /// and threads (`VICTORY_PIPELINE_COMPUTE_WAIT_FRAME_MS`, 6000): many
 /// programs met for the first time in one frame must not add up to the
 /// title's 30-s watchdog, beside the frame's other waits (the screen
-/// passes' 8 s, the others' 0.5 s). Reserved before a wait
-/// ([`ComputeBudget::reserve`]), so that threads waiting at once share it.
+/// passes' 8 s, the others' 0.5 s). Taken a slice at a time
+/// ([`ComputeBudget::enter`]), in wall time, so that threads waiting at once
+/// share it.
 fn compute_frame_budget() -> Duration {
     static MOST: OnceLock<Duration> = OnceLock::new();
     *MOST.get_or_init(|| {
@@ -353,47 +355,59 @@ fn compute_queued_wait() -> Duration {
     }
 }
 
-/// A frame's budget for [`wait_made`]: the frame it belongs to and what is
-/// reserved of it (by waits running now, or what finished waits took).
+/// A frame's budget for [`wait_made`], counted in wall time: the frame it
+/// belongs to, the time spent so far with at least one dispatch waiting,
+/// and the waits running now (and since when one has been). Waits on
+/// several threads at once count once: the title's watchdog looks at the
+/// frame's length, not at the sum of its threads' waits.
 #[derive(Default)]
 struct ComputeBudget {
     frame: u64,
-    reserved: Duration,
+    spent: Duration,
+    active: u32,
+    since: Option<Instant>,
 }
 
 impl ComputeBudget {
-    /// Takes at most `most` of frame `frame`'s `budget` for one wait;
-    /// `None` when nothing is left. A newer frame starts afresh; an older
-    /// one (a thread still in a frame gone by) gets nothing.
-    fn reserve(&mut self, frame: u64, budget: Duration, most: Duration) -> Option<Duration> {
+    /// One slice of a wait of frame `frame` begins at `now`: at most `want`,
+    /// within what is left of `budget`; `None` when nothing is left (or the
+    /// frame is gone by). A newer frame starts afresh. Each call is paired
+    /// with a [`ComputeBudget::leave`].
+    fn enter(&mut self, frame: u64, now: Instant, budget: Duration, want: Duration) -> Option<Duration> {
         if frame > self.frame {
-            *self = ComputeBudget { frame, reserved: Duration::ZERO };
+            *self = ComputeBudget { frame, ..ComputeBudget::default() };
         } else if frame < self.frame {
             return None;
         }
-        let take = budget.saturating_sub(self.reserved).min(most);
-        if take.is_zero() {
+        let running = self.since.map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+        let left = budget.saturating_sub(self.spent + running);
+        if left.is_zero() {
             return None;
         }
-        self.reserved += take;
-        Some(take)
+        if self.active == 0 {
+            self.since = Some(now);
+        }
+        self.active += 1;
+        Some(left.min(want))
     }
 
-    /// Gives back what a wait of frame `frame` reserved (`took`) and did
-    /// not use (`waited`).
-    fn finish(&mut self, frame: u64, took: Duration, waited: Duration) {
-        if frame == self.frame {
-            self.reserved = self.reserved.saturating_sub(took.saturating_sub(waited));
+    /// The slice [`ComputeBudget::enter`] gave for frame `frame` ends at
+    /// `now`.
+    fn leave(&mut self, frame: u64, now: Instant) {
+        if frame != self.frame || self.active == 0 {
+            return;
+        }
+        self.active -= 1;
+        if self.active == 0
+            && let Some(since) = self.since.take()
+        {
+            self.spent += now.saturating_duration_since(since);
         }
     }
 }
 
-static COMPUTE_BUDGET: Mutex<ComputeBudget> = Mutex::new(ComputeBudget { frame: 0, reserved: Duration::ZERO });
-
-/// [`ComputeBudget::reserve`] of the shared budget.
-fn reserve_compute(frame: u64, most: Duration) -> Option<Duration> {
-    COMPUTE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).reserve(frame, compute_frame_budget(), most)
-}
+static COMPUTE_BUDGET: Mutex<ComputeBudget> =
+    Mutex::new(ComputeBudget { frame: 0, spent: Duration::ZERO, active: 0, since: None });
 
 /// Dispatches that waited for their compute pipeline past the frame's
 /// budget ([`compute_wait`]): how many waited, the longest wait (ms), and
@@ -401,50 +415,72 @@ fn reserve_compute(frame: u64, most: Duration) -> Option<Duration> {
 /// stuck).
 static COMPUTE_WAITED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// Waits for `p` until it is made, its compile is [`stuck`], or `most`
-/// (reserved of frame `frame`'s budget) has passed; a pipeline no worker
-/// has begun is waited for at most [`compute_queued_wait`] unless one
-/// begins it meanwhile. What was not used goes back to the frame.
-fn wait_made(p: &Pending, most: Duration, frame: u64) {
+/// Waits for `p` until it is made, its compile is [`stuck`], or `most` has
+/// passed (`queued` for a pipeline no worker has begun, unless one begins
+/// it meanwhile), one [`STUCK_POLL`] slice of frame `frame`'s `budget` at a
+/// time: every dispatch waiting at once takes its slices beside the others,
+/// so one wait cannot hold the whole frame's budget while others meet new
+/// pipelines. False if the budget ran out first: the caller then waits the
+/// usual way ([`wait`]); a wait that reached its own bound marks the
+/// pipeline given up for the frame ([`Pending::gave_up`]).
+fn wait_made(p: &Pending, most: Duration, frame: u64, budget: &Mutex<ComputeBudget>, queued: Duration) -> bool {
     let started = Instant::now();
-    if !stuck(p) {
+    let mut ran_out = false;
+    let mut budget_out = false;
+    if stuck(p) {
+        ran_out = true;
+    } else {
         let (lock, done) = &p.completion;
         let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
         while p.made.get().is_none() {
-            let bound = if p.begun.get().is_some() { most } else { most.min(compute_queued_wait()) };
+            let bound = if p.begun.get().is_some() { most } else { most.min(queued) };
             let rest = bound.saturating_sub(started.elapsed());
             if rest.is_zero() {
+                ran_out = true;
                 break;
             }
-            held = done.wait_timeout(held, rest.min(STUCK_POLL)).unwrap_or_else(|e| e.into_inner()).0;
+            let want = rest.min(STUCK_POLL);
+            let entered = budget.lock().unwrap_or_else(|e| e.into_inner()).enter(
+                frame,
+                Instant::now(),
+                compute_frame_budget(),
+                want,
+            );
+            let Some(slice) = entered else {
+                budget_out = true;
+                break;
+            };
+            held = done.wait_timeout(held, slice).unwrap_or_else(|e| e.into_inner()).0;
+            budget.lock().unwrap_or_else(|e| e.into_inner()).leave(frame, Instant::now());
             if stuck(p) {
+                ran_out = true;
                 break;
             }
         }
         drop(held);
     }
-    let waited = started.elapsed().min(most);
-    COMPUTE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).finish(frame, most, waited);
+    let waited = started.elapsed();
     let made = p.made.get().is_some();
-    if !made {
+    if ran_out && !made {
         p.gave_up.store(frame + 1, Ordering::Relaxed);
     }
     let ms = waited.as_millis() as u64;
     let n = COMPUTE_WAITED[0].fetch_add(1, Ordering::Relaxed) + 1;
     let longest = COMPUTE_WAITED[1].fetch_max(ms, Ordering::Relaxed).max(ms);
-    let dropped = COMPUTE_WAITED[2].fetch_add(u64::from(!made), Ordering::Relaxed) + u64::from(!made);
-    if (!made && (dropped <= 16 || dropped.is_power_of_two())) || (made && (ms >= 500 || n.is_power_of_two())) {
+    let dropped = COMPUTE_WAITED[2].fetch_add(u64::from(ran_out && !made), Ordering::Relaxed) + u64::from(ran_out && !made);
+    if (ran_out && !made && (dropped <= 16 || dropped.is_power_of_two())) || (made && (ms >= 500 || n.is_power_of_two())) {
         tracing::info!(
             pipeline = %p.key,
             shaders = %p.names(),
             waited_ms = ms,
             made,
             begun = p.begun.get().is_some(),
-            "a dispatch waited for its compute pipeline (VICTORY_PIPELINE_COMPUTE_WAIT; 0: within the frame's budget); since the start {n} waited, the longest {longest} ms, {dropped} dropped all the same"
+            "a dispatch waited for its compute pipeline (VICTORY_PIPELINE_COMPUTE_WAIT; 0: within the frame's budget); since the start {n} waited, the longest {longest} ms, {dropped} given up for their frame"
         );
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::PipelineWaitUs, started.elapsed().as_micros() as u64);
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
+    made || !budget_out
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start
@@ -985,70 +1021,98 @@ mod tests {
         assert!(p.made.get().is_none());
     }
 
-    /// Threads waiting at once share a frame's compute budget: what they
-    /// reserve together never passes it, what a wait did not use goes
-    /// back, and a new frame starts afresh.
+    /// The frame's budget is wall time: waits at once count once, slices
+    /// end where the budget does, a new frame starts afresh, an old one
+    /// gets nothing.
     #[test]
-    fn compute_waits_share_the_frames_budget() {
+    fn compute_waits_share_the_frames_budget_in_wall_time() {
         let ms = Duration::from_millis;
-        let budget = std::sync::Arc::new(Mutex::new(ComputeBudget::default()));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let budget = budget.clone();
-                std::thread::spawn(move || budget.lock().unwrap().reserve(7, ms(6000), ms(10_000)))
-            })
-            .collect();
-        let taken: Vec<Duration> = threads.into_iter().filter_map(|t| t.join().unwrap()).collect();
-        assert_eq!(taken.iter().sum::<Duration>(), ms(6000), "reserved together: {taken:?}");
-        assert_eq!(taken.len(), 1, "the first takes it all (its bound is longer than the budget)");
-        let mut b = budget.lock().unwrap();
-        assert_eq!(b.reserve(7, ms(6000), ms(10)), None);
-        // The wait used 1 s of its 6: 5 s come back, for two waits of 2 s
-        // and one of what is left.
-        b.finish(7, ms(6000), ms(1000));
-        assert_eq!(b.reserve(7, ms(6000), ms(2000)), Some(ms(2000)));
-        assert_eq!(b.reserve(7, ms(6000), ms(2000)), Some(ms(2000)));
-        assert_eq!(b.reserve(7, ms(6000), ms(2000)), Some(ms(1000)));
-        assert_eq!(b.reserve(7, ms(6000), ms(2000)), None);
-        // A thread of a frame gone by gets nothing; a new frame all of it.
-        assert_eq!(b.reserve(6, ms(6000), ms(2000)), None);
-        assert_eq!(b.reserve(8, ms(6000), ms(2000)), Some(ms(2000)));
-        b.finish(7, ms(2000), ms(0));
-        assert_eq!(b.reserved, ms(2000), "an old frame's return is not the new frame's");
+        let t0 = Instant::now();
+        let mut b = ComputeBudget::default();
+        // Three waits at once for 1 s: 1 s of the frame, not 3.
+        for _ in 0..3 {
+            assert_eq!(b.enter(5, t0, ms(6000), ms(250)), Some(ms(250)));
+        }
+        for _ in 0..3 {
+            b.leave(5, t0 + ms(1000));
+        }
+        assert_eq!(b.spent, ms(1000));
+        // What is left bounds a slice; then nothing.
+        assert_eq!(b.enter(5, t0 + ms(2000), ms(6000), ms(9000)), Some(ms(5000)));
+        b.leave(5, t0 + ms(7000));
+        assert_eq!(b.enter(5, t0 + ms(7000), ms(6000), ms(250)), None);
+        // A frame gone by gets nothing; a new frame all of it; an old
+        // frame's leave changes nothing.
+        assert_eq!(b.enter(4, t0, ms(6000), ms(250)), None);
+        assert_eq!(b.enter(6, t0 + ms(7000), ms(6000), ms(250)), Some(ms(250)));
+        b.leave(5, t0 + ms(8000));
+        assert_eq!(b.active, 1);
+        b.leave(6, t0 + ms(7100));
+        assert_eq!((b.active, b.spent), (0, ms(100)));
     }
 
-    /// Several threads reserving and waiting at once never hold more than
-    /// the budget between them.
+    /// Eight dispatches waiting at once for eight pipelines that are made
+    /// a second later all get them, inside one frame's budget: no wait
+    /// holds the budget the others need.
     #[test]
-    fn concurrent_compute_reservations_stay_inside_the_budget() {
-        let ms = Duration::from_millis;
-        let budget = std::sync::Arc::new(Mutex::new(ComputeBudget::default()));
-        let held = std::sync::Arc::new(Mutex::new(Duration::ZERO));
-        let threads: Vec<_> = (0..16)
+    fn eight_waits_for_eight_pipelines_all_get_them() {
+        let budget = Arc::new(Mutex::new(ComputeBudget::default()));
+        let pipelines: Vec<Arc<Pending>> = (0..8)
             .map(|_| {
-                let (budget, held) = (budget.clone(), held.clone());
+                let p = Pending::new(Vec::new(), None);
+                p.queue_state.store(MAKING, Ordering::Relaxed);
+                Arc::new(p)
+            })
+            .collect();
+        let started = Instant::now();
+        let makers: Vec<_> = pipelines
+            .iter()
+            .map(|p| {
+                let p = p.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..200 {
-                        let Some(take) = budget.lock().unwrap().reserve(1, ms(600), ms(100)) else {
-                            std::thread::yield_now();
-                            continue;
-                        };
-                        {
-                            let mut h = held.lock().unwrap();
-                            *h += take;
-                            assert!(*h <= ms(600), "held {h:?} past the budget");
-                        }
-                        std::thread::yield_now();
-                        *held.lock().unwrap() -= take;
-                        budget.lock().unwrap().finish(1, take, Duration::ZERO);
-                    }
+                    std::thread::sleep(Duration::from_millis(1000));
+                    p.make();
                 })
             })
             .collect();
-        for t in threads {
-            t.join().unwrap();
+        let waiters: Vec<_> = pipelines
+            .iter()
+            .map(|p| {
+                let (p, budget) = (p.clone(), budget.clone());
+                std::thread::spawn(move || {
+                    let handled = wait_made(&p, Duration::from_secs(10), 1, &budget, Duration::from_secs(10));
+                    (handled, p.made.get().is_some())
+                })
+            })
+            .collect();
+        for w in waiters {
+            assert_eq!(w.join().unwrap(), (true, true), "a dispatch lost its pipeline");
         }
-        assert_eq!(budget.lock().unwrap().reserved, Duration::ZERO);
+        for m in makers {
+            m.join().unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let b = budget.lock().unwrap();
+        assert_eq!(b.active, 0);
+        assert!(b.spent < compute_frame_budget(), "spent {:?} of the frame", b.spent);
+        assert!(b.spent >= Duration::from_millis(900) && b.spent < Duration::from_millis(2500), "{:?}", b.spent);
+    }
+
+    /// With the frame's budget spent, a wait is not marked given up: the
+    /// caller waits the usual way.
+    #[test]
+    fn a_spent_budget_leaves_the_usual_wait() {
+        let budget = Mutex::new(ComputeBudget::default());
+        {
+            let mut b = budget.lock().unwrap();
+            let t = Instant::now();
+            b.enter(3, t - compute_frame_budget(), compute_frame_budget(), Duration::from_secs(1));
+            b.leave(3, t);
+        }
+        let p = Pending::new(Vec::new(), None);
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        assert!(!wait_made(&p, Duration::from_secs(1), 3, &budget, Duration::from_secs(1)));
+        assert_eq!(p.gave_up.load(Ordering::Relaxed), 0);
     }
 
     /// A dispatch's wait that ran out is not repeated by the same frame's
