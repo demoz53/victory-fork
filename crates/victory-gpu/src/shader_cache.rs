@@ -95,6 +95,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_SKIP_DESCRIPTORS",
                     "VICTORY_DIV_FIXUP",
                     "VICTORY_WAVE_EXACT",
+                    "VICTORY_WAVE_PAIRS",
                     "VICTORY_WAVE_WIDE_LANE_RESOURCES",
                     "VICTORY_EARLY_DEPTH",
                     "VICTORY_PIXEL_HELPERS",

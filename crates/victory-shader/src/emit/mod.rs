@@ -98,6 +98,9 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+mod pairs;
+#[cfg(all(test, windows))]
+mod pairs_tests;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod per_program;
@@ -122,6 +125,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{heap_half_bits, host_uses_wave32, lane_loop_fix, set_host_max_wave, with_group_base};
+pub use pairs::{Mode as WavePairs, mode as wave_pairs};
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried, wave_wide_first};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -507,6 +511,14 @@ fn emit_once(
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
         // (why the program as it is did not do: the first line of each program's retries)
         report("as it is", &original);
+        // `VICTORY_WAVE_PAIRS=first`: the paired form ([`pairs::paired`]) before every other.
+        if pairs::mode() == pairs::Mode::First {
+            let again = pairs::paired(c, native, p, io, res);
+            report("paired lanes (VICTORY_WAVE_PAIRS=first)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -588,6 +600,17 @@ fn emit_once(
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+                // `VICTORY_WAVE_PAIRS=1`: the paired form ([`pairs::paired`]) for a program
+                // the forms above refuse, before the wave-wide form and before every
+                // approximate one: each console wave as one host wave of 32 lanes, each thread
+                // two of its lanes, with no barrier added inside a branch.
+                if pairs::mode() == pairs::Mode::BeforeWide {
+                    let again = pairs::paired(c, native, p, io, res);
+                    report("paired lanes (VICTORY_WAVE_PAIRS)", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
                     }
