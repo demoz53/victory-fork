@@ -879,6 +879,51 @@ struct Sent {
     mark: (u64, u64),
 }
 
+/// Per host heap (its address): the host copy and range each slot's buffer
+/// view reads, kept from pass to pass by [`State::heap_buffers`], with the
+/// heap's count of passes.
+type HeapRanges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)>;
+#[allow(clippy::type_complexity)]
+static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, HeapRanges)>>> = std::sync::Mutex::new(None);
+
+/// Whether a host view heap that goes takes its entries out of the heap
+/// passes' caches (`VICTORY_HEAP_FORGET`; on by default, `=0` the old way).
+///
+/// [`HEAP_RANGES`], [`HEAP_UNORDERED`] and [`SENT`] are keyed by the host
+/// heap's address, and nothing took a heap's entries out when it was
+/// dropped: a heap made later at the same address started with the old
+/// heap's slot -> (copy, range) map (its buffer views read the old host
+/// copies until the slot was written again or its 1/16 sweep came round,
+/// up to 16 passes; its unordered spans declared written; its "same as
+/// sent" notes), and the old copies (title-buffer copies, card memory
+/// among them) were never let go. Fixed after fxceless/victory-fork pull
+/// request #1276 (UwUCammie, 0e21fcfb6, GPL-3.0), which forgets RANGES and
+/// its MARKED; here the three caches our tree keys so.
+fn heap_forget() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_FORGET").is_none_or(|v| v != "0"))
+}
+
+/// A host view heap is dropped ([`heap_forget`]): its entries leave the
+/// heap passes' caches before its address can belong to another heap.
+pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
+    if !heap_forget() {
+        return;
+    }
+    forget_heap_key(std::ptr::from_ref(heap) as usize);
+}
+
+/// [`forget_heap_ranges`] by the heap's address.
+fn forget_heap_key(key: usize) {
+    let ranges = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|heaps| heaps.remove(&key));
+    let unordered = HEAP_UNORDERED.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|heaps| heaps.remove(&key));
+    if let Some(sent) = SENT.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        sent.retain(|&(heap, _), _| heap != key);
+    }
+    // Letting a host copy go can release card memory: outside the locks.
+    drop((ranges, unordered));
+}
+
 /// [`Sent`] by host heap and title slot.
 static SENT: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32), Sent>>> = std::sync::Mutex::new(None);
 
@@ -2101,14 +2146,12 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        // (`HEAP_RANGES`, `HeapRanges`.)
+        let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, HeapRanges::new()));
         let changed = host.buffer_changes();
         let slots = if spread_buffer_passes() {
             // A sixteenth of all the slots each pass, in turn (and those
@@ -5130,6 +5173,61 @@ fn dispatch_dimensions(
 
 #[cfg(test)]
 mod tests {
+    /// A dropped host view heap leaves none of its entries in the heap
+    /// passes' caches, and its host copy goes with it (`VICTORY_HEAP_FORGET`,
+    /// after fxceless pull request #1276's test); another heap's stay.
+    #[test]
+    fn dropping_a_descriptor_heap_releases_the_heap_pass_caches() {
+        use super::{HEAP_RANGES, HEAP_UNORDERED, HeapRanges, SENT, Sent};
+        use crate::descriptor::host::HostHeap;
+        use crate::resource::Memory;
+        use std::sync::Arc;
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        let heap = Box::new(HostHeap::new(false, 4).expect("view heap"));
+        let key = std::ptr::from_ref(heap.as_ref()) as usize;
+        let other = key ^ 0x10;
+        let memory = Memory::zeroed(4096, 4096).expect("test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 4096);
+        let copy = crate::shadow::find(start, 4096).expect("host copy");
+        crate::shadow::unregister(start as usize, start);
+        let weak = Arc::downgrade(&copy);
+        let sent = Sent {
+            view: [0; 30],
+            memory: (start, 4096),
+            print: 1,
+            texture: 0,
+            mark: (0, 0),
+        };
+        {
+            let mut ranges = HeapRanges::new();
+            ranges.insert(0, (copy.clone(), start, start + 4096, true));
+            HEAP_RANGES.lock().unwrap().get_or_insert_with(Default::default).insert(key, (1, ranges));
+            let mut unordered = HEAP_UNORDERED.lock().unwrap();
+            let unordered = unordered.get_or_insert_with(Default::default);
+            unordered.insert(key, vec![(copy.clone(), start, start + 4096)]);
+            unordered.insert(other, Vec::new());
+            let mut all = SENT.lock().unwrap();
+            let all = all.get_or_insert_with(Default::default);
+            all.insert((key, 3), sent);
+            all.insert((other, 3), sent);
+        }
+        drop(copy);
+        assert!(weak.upgrade().is_some());
+        drop(heap);
+        assert!(weak.upgrade().is_none(), "a freed descriptor heap still owns the buffer copy");
+        assert!(HEAP_RANGES.lock().unwrap().as_ref().is_none_or(|m| !m.contains_key(&key)));
+        let unordered = HEAP_UNORDERED.lock().unwrap();
+        assert!(!unordered.as_ref().unwrap().contains_key(&key));
+        assert!(unordered.as_ref().unwrap().contains_key(&other), "another heap's entry went too");
+        let all = SENT.lock().unwrap();
+        assert!(!all.as_ref().unwrap().contains_key(&(key, 3)));
+        assert!(all.as_ref().unwrap().contains_key(&(other, 3)));
+    }
+
     use super::*;
 
     /// `VICTORY_TEXTURE_SAME_SKIP`: a whole upload is left out only when the
