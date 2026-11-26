@@ -87,7 +87,6 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>, which: Lock) -> MutexGuard<'_, T> {
 }
 
 /// `lock`'s shared side, read.
-#[allow(dead_code)] // used by VICTORY_HEAP_LOCKS
 pub(crate) fn read<T>(lock: &RwLock<T>, which: Lock) -> RwLockReadGuard<'_, T> {
     if !on() {
         return lock.read().unwrap_or_else(|e| e.into_inner());
@@ -106,7 +105,6 @@ pub(crate) fn read<T>(lock: &RwLock<T>, which: Lock) -> RwLockReadGuard<'_, T> {
 }
 
 /// `lock`'s exclusive side, for writing.
-#[allow(dead_code)] // used by VICTORY_HEAP_LOCKS
 pub(crate) fn write<T>(lock: &RwLock<T>, which: Lock) -> RwLockWriteGuard<'_, T> {
     if !on() {
         return lock.write().unwrap_or_else(|e| e.into_inner());
@@ -123,6 +121,85 @@ pub(crate) fn write<T>(lock: &RwLock<T>, which: Lock) -> RwLockWriteGuard<'_, T>
         }
     }
 }
+
+/// A reader-writer lock held for reading: on its shared side, or alone.
+pub(crate) enum Shared<'a, T> {
+    Read(RwLockReadGuard<'a, T>),
+    Alone(RwLockWriteGuard<'a, T>),
+}
+
+impl<T> std::ops::Deref for Shared<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Shared::Read(g) => g,
+            Shared::Alone(g) => g,
+        }
+    }
+}
+
+/// `lock` held to read it: on its shared side if `shared`, else alone (as
+/// a plain lock would be).
+pub(crate) fn read_if<T>(lock: &RwLock<T>, which: Lock, shared: bool) -> Shared<'_, T> {
+    if shared {
+        Shared::Read(read(lock, which))
+    } else {
+        Shared::Alone(write(lock, which))
+    }
+}
+
+/// Whether the recording threads are spared the busiest shared locks
+/// (`VICTORY_HEAP_LOCKS=1`; `alt`: twenty seconds with, twenty without, in
+/// turn, each change in the log; off unless set).
+///
+/// After fxceless/victory-fork 5d659e0c8 (fxceless, after fork pull request
+/// #1146 part 1; GPL-3.0), adapted to our tree: our host heap's `made`
+/// holds the heap map too, so instead of an atomic copy of the records a
+/// slot already made from its record is found under the shared side of
+/// `made` (a reader-writer lock); the heap's `kept` is in 64 pieces, with
+/// the old resource let go outside its piece (as there). Also on the
+/// shared side with it: the table of views (`descriptor::VIEWS`, every
+/// record looked up) and the shader-visible heaps by address
+/// (`descriptor::SHADER_HEAPS`, every descriptor write and copy). Without
+/// it every path takes each of these locks alone, as before, and every use
+/// of `kept` stands in one line.
+pub(crate) fn heap_locks() -> bool {
+    #[cfg(test)]
+    match TEST_HEAP_LOCKS.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_LOCKS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "slots made, views and heaps read under shared locks, kept resources behind 64 locks, from now (VICTORY_HEAP_LOCKS=alt): {}",
+                    if on { "ON" } else { "off, each lock taken alone as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Tests: [`heap_locks`] as set here (0: as the environment says, 1: off,
+/// 2: on). Both ways are correct for every caller, so other tests running
+/// meanwhile may see either.
+#[cfg(test)]
+pub(crate) static TEST_HEAP_LOCKS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// The counts since the last call, per lock: (taken, waits, nanoseconds).
 pub(crate) fn take() -> [(u64, u64, u64); COUNT] {

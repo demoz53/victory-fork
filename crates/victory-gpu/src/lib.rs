@@ -39,7 +39,6 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod material_demand;
-#[cfg(windows)]
 mod lockstat;
 #[cfg(windows)]
 mod inplace;
