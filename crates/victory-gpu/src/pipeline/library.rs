@@ -659,6 +659,18 @@ fn fixed_tmp(path: &std::path::Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
+/// What names the save turn of folder `dir` ([`SaveTurn::take`]): the
+/// folder itself, under any spelling. Two processes may reach one folder
+/// through a junction (the pipeline cache folder is one on this PC), a
+/// short name, `.` and `..` or other case; named by the spelling, they took
+/// different mutexes and wrote the same `host-pipelines.bin.tmp` at once.
+/// The final path the system resolves (`std::fs::canonicalize`: junctions
+/// and links followed, short names made long), in lower case; the spelling
+/// given, in lower case, if the folder cannot be opened.
+fn save_turn_key(dir: &std::path::Path) -> String {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).to_string_lossy().to_lowercase()
+}
+
 /// The turn of this process to save the library in a folder, among all
 /// processes on the PC (a game and a warm, say, sharing a cache folder): a
 /// named mutex, which the system gives up when its process ends however it
@@ -674,9 +686,9 @@ impl SaveTurn {
         use std::hash::{Hash, Hasher};
         use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
         use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
-        // Named by the folder (the same folder under any spelling of case).
+        // Named by the folder under any spelling (`save_turn_key`).
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        dir.to_string_lossy().to_lowercase().hash(&mut hasher);
+        save_turn_key(dir).hash(&mut hasher);
         let name: Vec<u16> = format!("Local\\victory-pipeline-library-save-{:016x}", hasher.finish())
             .encode_utf16()
             .chain([0])
@@ -1132,6 +1144,40 @@ mod tests {
         assert!(room_for(Some(u64::MAX), u64::MAX, u64::MAX), "no overflow");
         let dir = tempfile::tempdir().unwrap();
         assert!(free_bytes(dir.path()).is_some_and(|b| b > 0));
+    }
+
+    /// One folder reached under other spellings (`..`, other case, a
+    /// junction to it) has one save turn: the second process waits for the
+    /// first instead of writing the same temporary file beside it.
+    #[test]
+    fn one_folder_has_one_save_turn_under_any_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("pipelines");
+        std::fs::create_dir(&real).unwrap();
+        let key = save_turn_key(&real);
+        assert_eq!(save_turn_key(&real.join("..").join("pipelines")), key);
+        let upper = std::path::PathBuf::from(real.to_string_lossy().to_uppercase());
+        assert_eq!(save_turn_key(&upper), key);
+        // A junction to it (made by cmd's mklink; skipped where it cannot be).
+        let link = dir.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if made {
+            assert_eq!(save_turn_key(&link), key, "a junction names the same turn");
+            let turn = SaveTurn::take(&real, 0).expect("the turn");
+            assert!(turn.0.is_some());
+            // Another taker through the junction finds the turn taken (a
+            // mutex is its owner thread's again: asked from another one).
+            let link2 = link.clone();
+            let other = std::thread::spawn(move || SaveTurn::take(&link2, 0).is_none()).join().unwrap();
+            assert!(other, "the turn was free through the junction");
+            drop(turn);
+            let _ = std::fs::remove_dir(&link);
+        }
     }
 
     /// A library is saved through one fixed temporary file: an orphan of a
