@@ -848,10 +848,24 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
         // SAFETY: a buffer of the size the library asks for.
         return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
     }
-    let mut bytes = vec![0u8; size];
+    // A buffer the host has no memory for is left for a later save, not
+    // taken as fatal: an infallible allocation of the library's size (1.7 GB
+    // on NVIDIA there, 3 GB here) aborted the whole process mid-run
+    // ("memory allocation of 2650101862 bytes failed"; fxceless PR #1326,
+    // after upstream #2007). The pipelines stay counted as added.
+    let mut bytes = zeroed(size)
+        .ok_or_else(|| std::io::Error::other("no memory for the serialised host pipeline library; saved later"))?;
     // SAFETY: a buffer of the size the library asks for.
     unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
     std::fs::write(tmp, &bytes)
+}
+
+/// `n` zero bytes, or `None` when the host has no memory for them.
+fn zeroed(n: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v)
 }
 
 /// Unique staging path beside `path` so overlapping writes never share a
@@ -1082,6 +1096,14 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
+    }
+
+    /// A buffer the host cannot give is refused, not fatal; others are
+    /// zeros (fxceless PR #1326's test).
+    #[test]
+    fn a_save_buffer_the_host_cannot_give_is_refused() {
+        assert!(zeroed(usize::MAX / 2).is_none());
+        assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
     }
 
     /// `VICTORY_LIBRARY_SAVE_SECS`: 300 s unless set; `0` none; a number
