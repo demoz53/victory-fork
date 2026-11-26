@@ -1487,6 +1487,9 @@ mod tests {
 
     #[test]
     fn heap_bytes_retains_allocation_across_apu_free() {
+        // (as every test of the heap: another test's allocation beside this one took
+        // the range just freed, and the address below was mapped again)
+        let _serial = lock(&CONTEXT_TESTS);
         let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
         assert_eq!(ApuAlloc(&mut ptr, &mut apu, 4096, 256, 1), S_OK);
 
