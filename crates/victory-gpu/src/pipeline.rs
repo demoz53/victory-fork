@@ -427,6 +427,8 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Its draws and dispatches are left out ([`skip_set`]).
+    skipped: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -483,12 +485,11 @@ pub(crate) fn note_slow_makes() {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Shader hashes as printed in the pipeline diagnostics, separated by commas
+/// or white space.
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
-        .split(',')
-        .map(str::trim)
+        .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -504,25 +505,72 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
-    });
-    if hashes.is_empty() {
+/// The title's ray-tracing resolve programs (1,000 variants of its
+/// `CS_RaytracingResolve`) and its 34 traced-shadow programs, by shader
+/// hash: the list `VICTORY_SKIP_RT=1` leaves out. From
+/// trustno1-coder/VIctory-NVIDIA `scripts/rt_off_hashes.txt` (77e13a974),
+/// made there by name from the title's shader archive after the rule of
+/// fxceless/victory-fork pull request 465 (LeonardoS11), without that rule's
+/// screen-probe and visibility traces (skipping those left their outputs as
+/// garbage, "rainbow glitter").
+///
+/// Why: the structure builder those passes' rays walk does not run here
+/// (`VICTORY_BVH_BUILDER` is off), so what they resolve is not the title's
+/// light anyway; fx 465 measured "on the GPU" 163 -> 133 ms with them left
+/// out (RTX 3080 Ti, Series X profile). What the picture loses: the traced
+/// indirect light and the traced shadows of lamps and sun; their targets
+/// keep what they held.
+const RT_OFF: &str = include_str!("pipeline/rt_off.txt");
+
+/// Whether `VICTORY_SKIP_RT=1` asks to leave out [`RT_OFF`]'s programs
+/// (opt-in; release and diagnostics builds alike).
+fn skip_rt() -> bool {
+    std::env::var_os("VICTORY_SKIP_RT").is_some_and(|v| v == "1")
+}
+
+/// The shader hashes whose pipelines' draws and dispatches do not run:
+/// [`RT_OFF`] with `VICTORY_SKIP_RT=1`, and in diagnostics builds those of
+/// `VICTORY_SKIP_PIPELINES`. Looked at once per pipeline, when the title
+/// creates it ([`Pipeline::skipped`]), not at every draw.
+fn skip_set() -> &'static std::collections::HashSet<String> {
+    static SET: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| {
+        let mut set = std::collections::HashSet::new();
+        if skip_rt() {
+            set.extend(parse_skip_hashes(RT_OFF));
+            tracing::info!(
+                shaders = set.len(),
+                "VICTORY_SKIP_RT=1: draws and dispatches with the title's ray-tracing resolve and traced-shadow programs are left out"
+            );
+        }
+        #[cfg(feature = "diagnostics")]
+        set.extend(parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default()));
+        set
+    })
+}
+
+/// The first of `shaders` that [`skip_set`] names.
+fn skipped_in(shaders: &[Arc<Shader>]) -> Option<&str> {
+    let set = skip_set();
+    if set.is_empty() {
         return None;
     }
-    p.shaders
-        .iter()
-        .find(|shader| hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
+    shaders.iter().find(|shader| set.contains(&shader.hash)).map(|shader| shader.hash.as_str())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    if !p.skipped {
+        return None;
+    }
+    skipped_in(&p.shaders)
+}
+
+/// Whether the title's pipeline `this` is one whose draws and dispatches
+/// are left out ([`skip_set`]).
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && pipeline(this).skipped
 }
 
 /// The shaders of the title's pipeline `this` as the log names them
@@ -590,10 +638,14 @@ fn hand_out(
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    let skipped = skipped_in(&shaders).is_some();
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    // One whose draws never run is not made ahead either.
     #[cfg(windows)]
-    make::early(&host);
+    if !skipped {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -610,6 +662,7 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        skipped,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -828,7 +881,6 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -836,6 +888,20 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+        assert_eq!(
+            super::parse_skip_hashes("0123456789abcdef\r\n0011223344556677\n"),
+            ["0123456789abcdef", "0011223344556677"]
+        );
+    }
+
+    #[test]
+    fn the_ray_tracing_list_is_1034_distinct_hashes() {
+        let hashes = super::parse_skip_hashes(super::RT_OFF);
+        assert_eq!(hashes.len(), 1034);
+        let distinct: std::collections::HashSet<_> = hashes.iter().collect();
+        assert_eq!(distinct.len(), 1034);
+        // The grid march VICTORY_IDLE_WITHOUT_RAYS is about is not one.
+        assert!(!distinct.contains(&"39f0e9aeb156a61c".to_owned()));
     }
 
     use super::*;
