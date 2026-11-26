@@ -8714,10 +8714,11 @@ impl Meter {
                 let per_frame = (syncs[0] - syncs_then) as f64 / (self.presented - presented_then).max(1) as f64;
                 self.syncs_logged = [syncs[0], self.presented];
                 tracing::info!(
-                    "pipelines made for the render target formats bound at their draws: {} so far; the title's pipeline syncs: {per_frame:.1} a frame, {} so far, {} of them given a barrier",
+                    "pipelines made for the render target formats bound at their draws: {} so far; the title's pipeline syncs: {per_frame:.1} a frame, {} so far, {} of them given a barrier; structured buffer views that could not be made raw (read zeros on NVIDIA): {} so far",
                     crate::pipeline::target_variants(),
                     syncs[0],
-                    syncs[1]
+                    syncs[1],
+                    crate::descriptor::host::NOT_RAW.load(Ordering::Relaxed)
                 );
             }
             #[cfg(feature = "diagnostics")]
