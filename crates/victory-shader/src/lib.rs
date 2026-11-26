@@ -18,6 +18,13 @@ pub mod resource;
 pub mod spill;
 pub mod structure;
 
+/// What this build's translator is, as its build script hashed it (32 hex
+/// digits): the crate's sources, manifests, lock file, compiler and build
+/// settings (`build.rs` lists them and says why). Two builds with the same
+/// fingerprint translate every container to the same host shader under the
+/// same settings; `victory-gpu` keys its translated-shader cache on it.
+pub const TRANSLATOR_FINGERPRINT: &str = env!("VICTORY_TRANSLATOR_FINGERPRINT");
+
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
