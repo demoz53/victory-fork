@@ -64,6 +64,9 @@ struct Journal {
     /// An answer of a range one of them overlaps, under a number above
     /// its, waits for it ([`settle`]).
     flying: Vec<(usize, usize, u64)>,
+    /// Blocks [`publish`] passed over because an asking in flight covered
+    /// them: looked at again when an asking lands ([`land`]).
+    unpublished: Vec<usize>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -75,6 +78,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
     pieces: BTreeMap::new(),
     flying: Vec::new(),
+    unpublished: Vec::new(),
 });
 
 /// Told when an asking in [`Journal::flying`] has noted what it found.
@@ -183,6 +187,23 @@ fn settle(
         JOURNAL_STATS[4].fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
     }
     j
+}
+
+/// The asking numbered `asking` has landed ([`unlocked`]): out of flight,
+/// the askings waiting for it told, and the blocks [`publish`] passed over
+/// because of it looked at again (the light refresh's bits of those still
+/// clean; the journal holds what this asking found, noted or about to be
+/// under the same hold, and [`publish`] passes over any that another
+/// asking in flight still covers).
+fn land(j: &mut Journal, asking: u64) {
+    j.flying.retain(|&(_, _, n)| n != asking);
+    LANDED_ASKING.notify_all();
+    if !j.unpublished.is_empty() && (light_kept() || cfg!(test)) {
+        let mut again = std::mem::take(&mut j.unpublished);
+        again.sort_unstable();
+        again.dedup();
+        publish(j, &again);
+    }
 }
 
 thread_local! {
@@ -1010,8 +1031,7 @@ fn writes_unlocked(
         slow(started.elapsed().as_micros() as u64);
     }
     let mut held = journal();
-    held.flying.retain(|&(_, _, n)| n != now);
-    LANDED_ASKING.notify_all();
+    land(&mut held, now);
     if found.is_none() && viewed.is_none() {
         return None;
     }
@@ -1366,7 +1386,12 @@ static PUBLISHED: Bits = Bits::new();
 /// With [`unlocked`], not a block that an asking still in flight covers:
 /// its guards may have found the block written again and made it clean
 /// after this asking's guards did, and the journal does not hold that yet.
-fn publish(noted: &Journal, written: &[usize]) {
+///
+/// Such a block is kept (`Journal::unpublished`) and looked at again when
+/// an asking lands ([`land`]): passed over for good, it would be asked of
+/// the guards at every refresh until written again, and the light
+/// refresh's share would fall the longer a run lasts.
+fn publish(noted: &mut Journal, written: &[usize]) {
     if written.is_empty() {
         return;
     }
@@ -1379,6 +1404,11 @@ fn publish(noted: &Journal, written: &[usize]) {
         }
         last = block;
         if noted.flying.iter().any(|&(a, b, _)| a <= page && page < b) {
+            // (A bounded list: past it, such blocks wait for their next
+            // write, as before.)
+            if noted.unpublished.len() < 1 << 16 {
+                noted.unpublished.push(page);
+            }
             continue;
         }
         // (Not one that a write has opened since the guards were asked,
@@ -2217,8 +2247,8 @@ impl Arming {
         // asking waiting for these blocks may hold it, so not before they
         // are out of `arming`), then the guards'.
         let pages: Vec<usize> = runs.iter().flat_map(|&(from, to)| from * BLOCK / PAGE..to * BLOCK / PAGE).collect();
-        let j = journal();
-        publish(&j, &pages);
+        let mut j = journal();
+        publish(&mut j, &pages);
     }
 }
 
@@ -4195,6 +4225,40 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// `VICTORY_JOURNAL_UNLOCKED` with the light refresh: a block an asking
+    /// in flight covered when the guards made it clean gets its bit once
+    /// that asking lands, not only at the block's next write.
+    #[test]
+    fn a_block_passed_over_for_an_asking_in_flight_gets_its_bit_later() {
+        let _turn = light_turn();
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        forget_pages(one, one + SIZE);
+        let other = {
+            let mut j = journal();
+            j.asked += 1;
+            let n = j.asked;
+            j.flying.push((one / PAGE, one / PAGE + 2, n));
+            n
+        };
+        std::thread::scope(|scope| {
+            // The guards take the range in and its answer waits for the
+            // asking in flight.
+            let asking = scope.spawn(|| writes_as(one, one + SIZE, true, 2, false, false));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!known(one, one + SIZE), "passed over: an asking in flight covers it");
+            {
+                let mut j = journal();
+                land(&mut j, other);
+            }
+            assert!(asking.join().expect("the asking").is_some());
+        });
+        assert!(known(one, one + SIZE), "its bits once that asking landed");
+        drop_views(section, &[one, two], SIZE);
+        forget_pages(one, one + SIZE);
+        forget_pages(two, two + SIZE);
+    }
+
     /// `VICTORY_JOURNAL_UNLOCKED`, the review finding on a2b96a048: two
     /// askings of one range, the lower-numbered one (`low`) started first,
     /// the higher (`high`) reaching the kernel first. `high` resets the
@@ -4935,6 +4999,7 @@ mod piece_tests {
             kept: false,
             pieces: Default::default(),
             flying: Vec::new(),
+            unpublished: Vec::new(),
         };
         super::note_pieces(&mut j, 7, 10, 1);
         super::note_pieces(&mut j, 7, 12, 1 << 3);
