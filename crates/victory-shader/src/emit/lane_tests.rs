@@ -31,15 +31,24 @@ pub(super) mod model {
         exec >> lane & 1 != 0
     }
 
-    /// `ds_bpermute_b32 dst, addr, data` for each active lane: the lane `addr[l] / 4 mod 64`
-    /// is read. The ISA's rule for a source lane that is not active is not relied on here:
-    /// such lanes are `None`. Lanes not active keep `old`.
+    /// `ds_bpermute_b32 dst, addr, data` for each active lane: the lane `addr[l] / 4 mod 32`
+    /// of the lane's own 32-lane half is read (RDNA 2 ISA 10.4.4: a wave64 permutes lanes 0..31
+    /// and 32..63 independently; confirmed on gfx1036, Marvisak/VIctory #573). With
+    /// `VICTORY_PERMUTE_HALF_LOCAL=0` this model reads `addr[l] / 4 mod 64`, the rule the
+    /// lowering followed before, so the old form's tests still check what it does. The ISA's
+    /// rule for a source lane that is not active is not relied on here: such lanes are `None`.
+    /// Lanes not active keep `old`.
     pub fn bpermute(old: &[u32; 64], addr: &[u32; 64], data: &[u32; 64], exec: u64) -> [Option<u32>; 64] {
+        let half_local = super::super::super::lower::permute_half_local();
         std::array::from_fn(|l| {
             if !active(exec, l) {
                 return Some(old[l]);
             }
-            let src = (addr[l] >> 2 & 63) as usize;
+            let src = if half_local {
+                l & !31 | (addr[l] >> 2 & 31) as usize
+            } else {
+                (addr[l] >> 2 & 63) as usize
+            };
             active(exec, src).then(|| data[src])
         })
     }
@@ -96,11 +105,22 @@ fn the_model_gives_the_handovers_expected_values() {
     let all = u64::MAX;
     let shuffle = |x, y| bpermute(&[0; 64], &shuffle_addr(x, y), &d, all);
     assert_eq!(shuffle(0, 0)[17], Some(0x1011), "identity");
-    assert_eq!(shuffle(0, 1)[31], Some(0x1020), "lane 31 reads lane 32");
-    assert_eq!(shuffle(0, 63)[32], Some(0x101F), "lane 32 reads lane 31");
     for g in 0..64 {
-        assert_eq!(shuffle(32, 0)[g], Some(0x1000 + (g as u32 ^ 32)), "XOR-32");
         assert_eq!(shuffle(1, 0)[g], Some(0x1000 + (g as u32 ^ 1)), "XOR-1");
+    }
+    if super::super::lower::permute_half_local() {
+        // within each half: address 32 names lane 0 of the lane's own half
+        assert_eq!(shuffle(0, 1)[31], Some(0x1000), "lane 31 reads lane 0 (32 mod 32)");
+        assert_eq!(shuffle(0, 63)[32], Some(0x103F), "lane 32 reads lane 63 (31 of its half)");
+        for g in 0..64 {
+            assert_eq!(shuffle(32, 0)[g], Some(0x1000 + g as u32), "XOR-32 is the identity");
+        }
+    } else {
+        assert_eq!(shuffle(0, 1)[31], Some(0x1020), "lane 31 reads lane 32");
+        assert_eq!(shuffle(0, 63)[32], Some(0x101F), "lane 32 reads lane 31");
+        for g in 0..64 {
+            assert_eq!(shuffle(32, 0)[g], Some(0x1000 + (g as u32 ^ 32)), "XOR-32");
+        }
     }
     let set = |lanes: &[usize]| lanes.iter().fold(0u64, |m, &l| m | 1 << l);
     let b = ballot(set(&[0, 31, 32, 63]), |_| true);
@@ -109,8 +129,10 @@ fn the_model_gives_the_handovers_expected_values() {
     assert_eq!(readfirstlane(&d, 1 << 37), Some(0x1025));
     assert_eq!(d.iter().map(|v| v - 0x1000).sum::<u32>(), 2016, "sum of lane ids");
     assert_eq!(mbcnt(u64::MAX), std::array::from_fn(|g| g as u32), "exclusive prefix of ones");
-    // a source lane that is not active is not claimed
-    assert_eq!(bpermute(&[7; 64], &shuffle_addr(0, 1), &d, !(1 << 32))[31], None);
+    // a source lane that is not active is not claimed (lane 31's source: lane 0 of its half
+    // within each half, lane 32 across)
+    let src31 = if super::super::lower::permute_half_local() { 0 } else { 32 };
+    assert_eq!(bpermute(&[7; 64], &shuffle_addr(0, 1), &d, !(1 << src31))[31], None);
     assert_eq!(bpermute(&[7; 64], &shuffle_addr(0, 1), &d, !(1 << 31))[31], Some(7));
 }
 
@@ -427,11 +449,14 @@ fn a_shuffle_reads_every_lane_of_the_console_wave() {
 fn a_shuffle_across_the_halves_is_refused_with_the_switch_off() {
     let native = native_of(&shuffle_program(false), true, 64);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    // (the across-halves form only: `VICTORY_PERMUTE_HALF_LOCAL=0`)
+    let local = lower::TEST_PERMUTE_HALF_LOCAL.replace(Some(false));
     let was = lower::TEST_PERMUTE_HALVES.replace(Some(false));
     let off = lowered(&native, &p, &HashSet::new());
     lower::TEST_PERMUTE_HALVES.set(Some(true));
     let on = lowered(&native, &p, &HashSet::new());
     lower::TEST_PERMUTE_HALVES.set(was);
+    lower::TEST_PERMUTE_HALF_LOCAL.set(local);
     let Err(why) = off else {
         panic!("refused with the switch off");
     };
@@ -1351,3 +1376,43 @@ fn a_select_on_an_all_or_none_mask_is_every_lanes() {
     }
     eprintln!("a select on all or none: every lane the same side, as the model");
 }
+
+/// A wave64 `ds_bpermute_b32` reads within the lane's own half (`VICTORY_PERMUTE_HALF_LOCAL`):
+/// in host waves of 32 it is no cross-half code, so a program whose only such code it is runs
+/// in plain waves of 32 with no exchange, no LDS area and no group barrier (the old form had
+/// two barriers and 64 LDS dwords a console wave), and every lane matches the model, the
+/// 31/32 boundary and XOR-32 included (in each half: lane 31 reads lane 0). The old form is
+/// run too and reads across the halves, as its model says.
+#[test]
+fn a_backward_permute_stays_in_its_half() {
+    let _one = one_at_a_time();
+    let native = native_of(&shuffle_program(false), true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let barriers = |s: &HostShader| {
+        let c = crate::Container::parse(&s.dxil).expect("container");
+        let d = c.part(crate::FourCC::DXIL).expect("DXIL").data;
+        d.windows(7).filter(|w| w == b"barrier").count()
+    };
+    let new = lowered(&native, &p, &HashSet::new()).expect("half-local form");
+    let was = lower::TEST_PERMUTE_HALF_LOCAL.replace(Some(false));
+    let old = lowered(&native, &p, &HashSet::new()).expect("across-halves form");
+    lower::TEST_PERMUTE_HALF_LOCAL.set(was);
+    assert_ne!(new.dxil, old.dxil, "the rule is in the translation");
+    eprintln!("ds_bpermute: 'barrier' names in the DXIL: {} half-local, {} across halves", barriers(&new), barriers(&old));
+    for (local, what) in [(true, "ds_bpermute within each half"), (false, "ds_bpermute across halves (old)")] {
+        let was = lower::TEST_PERMUTE_HALF_LOCAL.replace(Some(local));
+        let card = card(what, &shuffle_program(false));
+        let Some(card) = card else {
+            lower::TEST_PERMUTE_HALF_LOCAL.set(was);
+            return;
+        };
+        let all = u64::MAX;
+        for (x, y) in [(0, 0), (0, 1), (0, 63), (1, 0), (32, 0), (63, 0), (0, 17), (5, 40)] {
+            let got = card.run([x, y, u32::MAX, u32::MAX]);
+            compare(&format!("{what}, x {x}, y {y}"), &got, &shuffle_want(x, y, all));
+        }
+        lower::TEST_PERMUTE_HALF_LOCAL.set(was);
+        eprintln!("{what}: every lane as its model");
+    }
+}
+

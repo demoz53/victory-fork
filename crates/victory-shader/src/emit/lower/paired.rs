@@ -678,6 +678,16 @@ impl<'a> Lower<'a> {
                     };
                     Ok((from, x, guard))
                 })?;
+                // each half reads within itself ([`super::lanes::permute_half_local`]): the lower
+                // lane from the lower half, the upper from the upper
+                let (from_lo, from_hi) = if super::lanes::permute_half_local() {
+                    let (k31, k32) = (self.s.m.i32(31), self.s.m.i32(32));
+                    let lo = self.s.m.bin(c, Bin::And, from_lo, k31);
+                    let hi = self.s.m.bin(c, Bin::And, from_hi, k31);
+                    (lo, self.s.m.bin(c, Bin::Or, hi, k32))
+                } else {
+                    (from_lo, from_hi)
+                };
                 let read = [pick(self, x_lo, x_hi, from_lo), pick(self, x_lo, x_hi, from_hi)];
                 let guards = [g_lo, g_hi];
                 let reg = *reg;

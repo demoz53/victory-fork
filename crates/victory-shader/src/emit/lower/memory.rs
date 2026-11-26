@@ -1142,9 +1142,11 @@ impl<'a> Lower<'a> {
                 None => self.s.m.extract(c, r, ch),
             };
             xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even, [`Self::f16_narrow`]); integer formats would keep 16 bits.
-                self.f16_narrow(x)
+                // d16 results are taken as floats (rounded to nearest even,
+                // [`Self::f16_narrow`]); a load or gather through an integer view keeps its
+                // 16 bits ([`Self::d16_bits`], `VICTORY_D16_BITS`).
+                // shortcut: samples are always floats.
+                if matches!(op, 66 | 73) { self.d16_bits(x) } else { self.f16_narrow(x) }
             } else {
                 self.as_int(x)
             });
