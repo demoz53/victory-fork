@@ -1293,7 +1293,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         }
     }
     let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    list.defer_fill_as(to, address as *const u8, len as usize, crate::host::fill_kind::ROOT_CBV);
     Some(gpu)
 }
 
@@ -2048,6 +2048,7 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
+                crate::host::declared::note(crate::host::declared::ROOT_UAV, s, a, len);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2273,6 +2274,7 @@ impl State {
             return;
         }
         for (shadow, from, to) in spans {
+            crate::host::declared::note(crate::host::declared::HEAP, &shadow, from, to - from);
             shadow.gpu_writes(list, from, to - from);
         }
     }
@@ -4367,7 +4369,7 @@ impl State {
                             host.make_at(index, &view);
                             readable(list, ResourceType::Cbv, &view);
                         } else if let Some((buffer, offset, to)) = list.scratch_view(u64::from(size)) {
-                            list.defer_fill(to, address as *const u8, size as usize);
+                            list.defer_fill_as(to, address as *const u8, size as usize, crate::host::fill_kind::RAW_CBV);
                             host.raw_at(index, &buffer, offset, u64::from(size.next_multiple_of(4)));
                         } else {
                             host.null_raw_at(index);
@@ -4411,7 +4413,7 @@ impl State {
                                 host.make_null(index);
                                 continue;
                             };
-                            list.defer_fill(to, address as *const u8, size as usize);
+                            list.defer_fill_as(to, address as *const u8, size as usize, crate::host::fill_kind::TABLE_CBV);
                             host.constant_at(index, gpu, size);
                         }
                     }
@@ -5419,6 +5421,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
+                crate::host::declared::note(crate::host::declared::VIEW, &shadow, address, len);
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

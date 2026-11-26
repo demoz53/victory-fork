@@ -1150,7 +1150,7 @@ extern "system" fn copy_texture_region(
             if crate::host::late() && crate::host::flights_write(data as usize, data as usize + bytes as usize) {
                 crate::draw::FILL_FLIGHTS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            list.defer_fill(staging, data, bytes as usize);
+            list.defer_fill_as(staging, data, bytes as usize, crate::host::fill_kind::TEXTURE_SOURCE);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]

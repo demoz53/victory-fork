@@ -1305,6 +1305,8 @@ fn remember_read(at: usize, bytes: Option<&[u8]>) {
 fn put_back(at: usize, merged: &[u8]) -> usize {
     // VICTORY_FILL_TITLE=1: where and when shader writes landed.
     crate::watch::landing(at, merged.len());
+    // VICTORY_FILL_AHEAD: fills that read these bytes ahead of the flight.
+    crate::host::shaders_write(at, merged);
     put_back_by(at, merged, back_blocks(), |at, bytes| {
         let _writing = crate::watch::writing(at, bytes.len());
         crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
