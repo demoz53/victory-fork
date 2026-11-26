@@ -23,6 +23,30 @@ pub fn permute_halves() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PERMUTE_HALVES").is_none_or(|v| v != "0"))
 }
 
+/// Whether a wave64 `ds_bpermute_b32` reads within the lane's own 32-lane half, as the
+/// hardware does: lanes 0..31 and 32..63 are permuted independently (RDNA 2 ISA 10.4.4;
+/// confirmed on gfx1036 in Marvisak/VIctory #573 by QB, 0665a0e85; ported as in
+/// TaynanGT/Vice-Tay 9bb7dbff7; the same rule in fxceless/victory-fork PR #1166 by Lkxex and
+/// JMAN730/project-flamingo bc06faf56). A permute then never leaves its half: it is no
+/// cross-half code, needs no exchange, no LDS and no group barrier in host waves of 32. On;
+/// `VICTORY_PERMUTE_HALF_LOCAL=0`: the source lane is taken modulo the console wave (a lane
+/// of one half could read the other), through [`Lower::permute_across_halves`] in host waves
+/// of 32 ([`permute_halves`]), as before. Part of the translation (the shader cache keys on it).
+pub fn permute_half_local() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PERMUTE_HALF_LOCAL.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PERMUTE_HALF_LOCAL").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's setting of [`permute_half_local`] for this thread.
+    pub(in crate::emit) static TEST_PERMUTE_HALF_LOCAL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's setting of [`permute_halves`] for this thread.

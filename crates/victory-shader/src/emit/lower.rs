@@ -34,7 +34,9 @@ pub(super) use loop_regions::scope as after_loop_scope;
 /// Lane fixes of wave64 compute on 32-lane hosts that the lane tests found.
 mod lanes;
 #[cfg(test)]
-pub(super) use lanes::{TEST_LANE_MODULO, TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST, TEST_THREAD_TICKET};
+pub(super) use lanes::{TEST_LANE_MODULO, TEST_PERMUTE_HALF_LOCAL, TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST, TEST_THREAD_TICKET};
+#[cfg(test)]
+pub(super) use lanes::permute_half_local;
 
 type Why = &'static str;
 
@@ -1443,6 +1445,23 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`d16_bits_on`], for its thread only.
+    pub(super) static TEST_D16_BITS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_D16_BITS` (on; `=0` as before): d16 image loads and gathers through views of
+/// integer formats keep their 16 bits ([`Lower::d16_bits`]).
+fn d16_bits_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_D16_BITS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_BITS").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -2074,7 +2093,8 @@ impl<'a> Lower<'a> {
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
+                        // (a backward permute stays in its half: [`lanes::permute_half_local`])
+                        || n.starts_with("ds_bpermute") && !lanes::permute_half_local()
                         || reads_mask_as_data(x.st, &masks, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -2126,7 +2146,8 @@ impl<'a> Lower<'a> {
                                 if !(LOCAL_WAVES.get() && lds_fit()) {
                                     s.lds_dwords += 2 * group.div_ceil(64);
                                 }
-                                let shuffles = insts().any(|i| i.name() == "ds_bpermute_b32");
+                                let shuffles = !lanes::permute_half_local()
+                                    && insts().any(|i| i.name() == "ds_bpermute_b32");
                                 permute_area = lanes::permute_area(&mut s.lds_dwords, group, shuffles, LOCAL_WAVES.get());
                             }
                         }
@@ -2143,7 +2164,9 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+                        } else if n.starts_with("ds_permute")
+                            || n.starts_with("ds_bpermute") && !lanes::permute_half_local()
+                        {
                             "ds_(b)permute"
                         } else if reads_mask_as_data(x.st, &masks, i) {
                             "mask as data"
@@ -4205,6 +4228,32 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// A d16 image load's or gather's 16 bits from `x`, the 32-bit value a float-typed load
+    /// returned. Through a view of an integer format the host passes the integer's bits
+    /// unconverted: a 16-bit unsigned (or non-negative signed) value is a tiny denormal there
+    /// (bits up to 0xFFFF), a negative signed one sign-extended (bits from 0xFFFF8000), and the
+    /// console's d16 load gives its low 16 bits; narrowing them as a float gave 0 (or NaN).
+    /// Every other value is narrowed to a half as before ([`Self::f16_narrow`]). From
+    /// avatarmanz/VIctory-7900XTX PR #329 item 2 (Giovanni Fadanelli, zocram4cc 32a7e6f84; from
+    /// YukiRyuu/RYUKI-7900XT f6dc189, Op-lite/victory-scarlett). `VICTORY_D16_BITS=0`: every
+    /// d16 result narrowed as a float, as before.
+    // shortcut: a float texel whose bits fall in those two ranges (a denormal, or a negative
+    // NaN) is taken as an integer; the host flushes such denormals anyway.
+    fn d16_bits(&mut self, x: V) -> V {
+        let half = self.f16_narrow(x);
+        if !d16_bits_on() {
+            return half;
+        }
+        let c = self.cur;
+        let bits = self.as_int(x);
+        let (top, neg) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_7FFF));
+        let small = self.s.m.cmp(c, pred::IULE, bits, top);
+        let negative = self.s.m.cmp(c, pred::IUGT, bits, neg);
+        let integer = self.s.m.bin(c, Bin::Or, small, negative);
+        let low = self.s.m.bin(c, Bin::And, bits, top);
+        self.s.m.select(c, integer, low, half)
+    }
+
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
     /// top bit when `signed`; widths from 32 on take every bit. A signed
     /// field that runs past bit 31 extends from bit 31, as the hardware
@@ -5601,7 +5650,12 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
+            // A wave64 permutes lanes 0..31 and 32..63 independently (RDNA 2 ISA 10.4.4;
+            // confirmed on gfx1036, Marvisak/VIctory #573): with [`lanes::permute_half_local`]
+            // the source lane is `((address + offset) >> 2) & 31` in this lane's own half, so in
+            // host waves of 32 (each one half of the console wave) it is always in this host wave.
+            let half_local = lanes::permute_half_local();
+            if !half_local && self.exchange.as_ref().is_some_and(|e| !e.1) {
                 // a console wave of 64 run as two host waves: the lane named
                 // may be in the other one ([`Self::permute_across_halves`])
                 return self.permute_across_halves(inst, addr.as_ref(), data.first(), offset, dst_reg, guard);
@@ -5612,8 +5666,19 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let src = if half_local && self.x.native.wave64 {
+                // this lane's half (0 in a host wave of 32, which holds one half), and the
+                // lane named in it
+                let k31 = self.s.m.i32(31);
+                let src = self.s.m.bin(c, Bin::And, src, k31);
+                let me = self.lane_index();
+                let half = self.s.m.i32(!31);
+                let base = self.s.m.bin(c, Bin::And, me, half);
+                self.s.m.bin(c, Bin::Or, base, src)
+            } else {
+                let last = self.s.m.i32(self.wave() - 1);
+                self.s.m.bin(c, Bin::And, src, last)
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);

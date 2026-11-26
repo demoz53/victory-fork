@@ -2803,6 +2803,12 @@ const fn image_store_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8, d16: bool) -
 }
 
 fn try_build_image_store_cs(dmask: u8, d16: bool) -> Result<HostShader, crate::ShaderError> {
+    try_build_image_cs(&image_store_2d(1, 5, 8, dmask, d16))
+}
+
+/// One thread with the image of a table at s[8:15], data in v1..v4 from root constants s0..s3,
+/// the 2D texel coordinate (0, 0) in v5..v6, then `body`.
+fn try_build_image_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -2813,7 +2819,7 @@ fn try_build_image_store_cs(dmask: u8, d16: bool) -> Result<HostShader, crate::S
     }
     words.push(vop1(0x001, 5, 0x80)); // v5 = 0
     words.push(vop1(0x001, 6, 0x80)); // v6 = 0
-    words.extend_from_slice(&image_store_2d(1, 5, 8, dmask, d16));
+    words.extend_from_slice(body);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -5178,3 +5184,26 @@ fn ds_past_the_program_lds_reads_zero_and_drops_writes() {
         );
     });
 }
+
+/// A d16 image load keeps the low 16 bits of what an integer view returns (bits up to 0xFFFF,
+/// or from 0xFFFF8000) instead of narrowing them as a float (`VICTORY_D16_BITS`; =0 narrowed,
+/// as before). From avatarmanz/VIctory-7900XTX PR #329 item 2 (Giovanni Fadanelli; Op-lite,
+/// ryuki): the translation has the integer-bits select only with the switch on, and validates.
+#[test]
+fn a_d16_image_load_keeps_an_integer_views_bits() {
+    // image_load v1, v[5:6], s[8:15] dmask:0x1 dim:2D unorm d16, then image_store v1 (not d16)
+    let load = {
+        let [w0, w1] = image_store_2d(1, 5, 8, 1, true);
+        [w0 & !(0x7F << 18), w1] // image_load: MIMG opcode 0
+    };
+    let mut body = load.to_vec();
+    body.push(0xBF8C_0000); // s_waitcnt 0
+    body.extend(image_store_2d(1, 5, 8, 1, false));
+    let on = try_build_image_cs(&body).expect("d16 image load");
+    let was = lower::TEST_D16_BITS.replace(Some(false));
+    let off = try_build_image_cs(&body).expect("d16 image load, switch off");
+    lower::TEST_D16_BITS.set(was);
+    assert_ne!(on.dxil, off.dxil, "the integer bits are kept only with the switch on");
+    assert!(on.dxil.len() > off.dxil.len(), "the select on the bits adds code");
+}
+
