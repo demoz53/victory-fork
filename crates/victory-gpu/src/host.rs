@@ -8697,6 +8697,14 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            {
+                // Since the start: pipelines made again for the formats bound
+                // at their draws (VICTORY_TARGET_VARIANTS).
+                tracing::info!(
+                    "pipelines made for the render target formats bound at their draws: {} so far",
+                    crate::pipeline::target_variants()
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
