@@ -86,6 +86,33 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/stream3 (on top of all22; late assets and streaming stalls)
+All three opt-in; none changes translated shader code. A run with nothing set behaves as all22, but for one new
+log-only line, "dstorage views" (below).
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_XMEM_PERSISTENT_VIEW` | `1` (also `true`/`yes`/`on`) | off | DirectStorage writes into the title's physical pages (in place, or copied for runs that cross sections) go through ONE kept view of each section, mapped whole at its first such write and kept until the section goes, instead of a view mapped, committed and unmapped (every unmap a TLB flush on every core) for every request and run of pages. Pages are committed once through it (the per-page bits of `VICTORY_REMAP_LEAN`, shared: a commit holds for every view of the section). A writer holds exactly its bytes; one whose bytes touch a live writer's takes a view of its own (counted `kept_refused`), as does a section the host will not map whole (a warn once a section) | fxceless PR #231 (HailLucifer666, 5c60b8906 / df57b2899 / 20d88e6fe / ad67d2557; idea also EFriseer) | no |
+| `VICTORY_HEAP_RECHECK_EVERY` | `<frames>[,<looks a frame>]`; looks 128 unless said | off | once the look schedule of a texture picked by index (4, 12, 40, 120, 400 frames = 576; `VICTORY_HEAP_RECHECK=dense`: 5,376) is through, the slot is looked at again every `<frames>` frames for as long as it shows that texture instead of leaving the queue; at most `<looks>` such looks a frame (the rest put off 1 to `<frames>` frames, unhashed). A look reads at most 48 KiB (3 x 16 KiB; dense: 4 KiB a 64 KiB) and hashes it: 128 looks = 6 MiB a frame at most. Line: "changed after its look schedule ended" (first 50, then every 500th) with looks made and put off; the existing "changed after its upload" line shows such finds as `looks=5` | ryancase94/victory-Rycas 920423a97 (Rycas; the cap a frame is ours) | no |
+| `VICTORY_TITLE_PRIORITIES` | `1` | off | the title's `SetThreadPriority` with "idle" (-15) or "lowest" (-2) gives "below normal" (-1); the rest as asked. Six title threads run at idle, the streaming pager among them; on a busy PC they ran once in seconds. The first 16 lifted are said in the log | avatarmanz/VIctory-7900XTX 0d065d352 (there default on, `=0` off) | no |
+| `VICTORY_VIEW_STATS` | `0` | ON (log only) | every 5 s while DirectStorage works, an info line "dstorage views": requests, views of ours mapped per second, writes through a kept view, kept views refused, sections kept whole (since the start), commits through kept views, requests over 250 ms from a worker's start to their end and the slowest ms. `=0`: no line | test/stream3 | no |
+
+Notes for stream3:
+- `VICTORY_SECTION_MB=2` and `VICTORY_XMEM_PERSISTENT_VIEW=1` attack the same address-space and section locks from two
+  sides: SECTION_MB makes each section 2 MiB (so the title's 6.1 GiB is ~3,100 sections and the large-page worker
+  looks through a few dozen views of one), the kept view takes our per-request views away. Together: one kept view of
+  2 MiB per section touched by DirectStorage (~3,100 views at most, the sections' total size in address space, no
+  extra commit). Without SECTION_MB the kept view of the largest section is 6.1 GiB of address space at once.
+- Requests whose destination pages cross from one section into the next are written run by run, each run through its
+  section's kept view (with SECTION_MB=2 more requests cross: they still map nothing).
+- `VICTORY_DSTORAGE_WORKERS` / `_HANDLES` / `_PRIORITY` act on the reading side and combine as they are; more
+  workers writing one section's pages at once share its kept view while their bytes are apart.
+  `VICTORY_DSTORAGE_RETRIES` still applies: a write that fails on the kept path takes a view of its own first.
+- `VICTORY_HEAP_RECHECK_EVERY` keeps the slots it looks at in the texture queue: the frame line's queued and "waiting"
+  counts include them (as they already included slots inside the schedule). Pick `<frames>` so that shown slots /
+  frames stays under ~500 (the due list's catch-up mode starts at 1,024 due slots): 120 for tens of thousands.
+- `VICTORY_TITLE_PRIORITIES=1` with `VICTORY_STREAM_PRIORITY=1`: the streaming thread is lifted from below normal to
+  above normal as before (the lift asks for a priority under normal, which below normal still is).
+
 ## New in all22 (merged on top of all21)
 From test/watch3 (holds test/watch2), test/async2 (holds test/async1), test/trim1, test/waits (CONSTANT_WAITS),
 test/spread, test/pic2 (holds test/pic1) and test/prof; each row's "From" names its source.

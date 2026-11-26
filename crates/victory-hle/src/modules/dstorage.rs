@@ -702,6 +702,52 @@ impl IoStats {
     }
 }
 
+/// A request that took longer than this from a worker's start to its end
+/// is slow (fxceless PR #231's measure: 1,012 against 1).
+const SLOW_MS: u64 = 250;
+/// Since the last [`view_line`]: requests slower than [`SLOW_MS`], and the
+/// slowest one's ms.
+static SLOW: AtomicU64 = AtomicU64::new(0);
+static SLOWEST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the DirectStorage views line is written (`VICTORY_VIEW_STATS=0`:
+/// no; log only).
+fn view_stats() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_STATS").is_none_or(|v| v != "0"))
+}
+
+/// The DirectStorage views line, every 5 s while requests are done: how
+/// the writes into physical pages reached them (views of ours mapped per
+/// second, writes through a section's kept view, kept views refused,
+/// sections kept whole, `super::xmem::view_counts`), and requests slower
+/// than [`SLOW_MS`] with the slowest. With `VICTORY_XMEM_PERSISTENT_VIEW=1`
+/// views mapped falls to the writes that crossed sections or met another
+/// writer's bytes; the slow requests are what that is for.
+fn view_line(requests: u64, elapsed: std::time::Duration) {
+    static LAST: Mutex<[u64; 5]> = Mutex::new([0; 5]);
+    let (slow, slowest) = (SLOW.swap(0, Ordering::Relaxed), SLOWEST_MS.swap(0, Ordering::Relaxed));
+    if !view_stats() {
+        return;
+    }
+    let now = super::xmem::view_counts();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let d: [u64; 5] = std::array::from_fn(|i| now[i].saturating_sub(last[i]));
+    *last = now;
+    let secs = elapsed.as_secs_f64().max(1e-3);
+    tracing::info!(
+        requests,
+        views_mapped_per_s = format_args!("{:.1}", d[0] as f64 / secs),
+        kept_writes = d[1],
+        kept_refused = d[2],
+        kept_sections = now[3],
+        kept_commits = d[4],
+        slow_requests = slow,
+        slowest_ms = slowest,
+        "dstorage views: last {secs:.1} s (slow: over {SLOW_MS} ms)"
+    );
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
@@ -740,7 +786,13 @@ impl Lanes {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.read.request.destination_size);
-        *busy += started.elapsed();
+        let took = started.elapsed();
+        *busy += took;
+        let took_ms = took.as_millis() as u64;
+        SLOWEST_MS.fetch_max(took_ms, Ordering::Relaxed);
+        if took_ms > SLOW_MS {
+            SLOW.fetch_add(1, Ordering::Relaxed);
+        }
         if job.read.request.options & BCPACK != 0 {
             self.bcpack.0 += u64::from(job.read.request.destination_size);
             self.bcpack.1 += started.elapsed();
@@ -749,6 +801,7 @@ impl Lanes {
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
+            view_line(*requests, elapsed);
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
             tracing::debug!(
                 requests = *requests,
