@@ -132,6 +132,7 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     victory_loader::profile_final_report();
+    victory_gpu::meters_final_report();
     println!("title exited with {code}");
     Ok(())
 }

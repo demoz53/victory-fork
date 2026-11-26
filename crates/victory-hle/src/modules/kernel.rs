@@ -539,6 +539,8 @@ mod host {
     pub(super) fn exit(code: i32) -> ! {
         // VICTORY_PROFILE=<ms>: the sampler's report of the whole run.
         victory_loader::profile_final_report();
+        // VICTORY_METERS=1: the meters' summary of the run.
+        victory_gpu::meters_final_report();
         // SAFETY: see above.
         unsafe { crt_exit(code) }
     }
@@ -551,6 +553,8 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         if process as isize == -1 {
             victory_loader::profile_final_report();
+            // VICTORY_METERS=1: the meters' summary of the run.
+            victory_gpu::meters_final_report();
         }
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
