@@ -593,6 +593,7 @@ mod host {
     }
 
     pub(super) fn exit(code: i32) -> ! {
+        victory_loader::flush_log();
         std::process::exit(code)
     }
 
@@ -601,6 +602,7 @@ mod host {
     }
 
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
+        victory_loader::flush_log();
         std::process::exit(code as i32)
     }
 
