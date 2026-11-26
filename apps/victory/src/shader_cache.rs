@@ -254,7 +254,7 @@ pub fn run(a: Args) -> Result<()> {
     }
     if !a.yes {
         println!(
-            "would remove {files} files, {} (nothing newer than {days} days). Nothing was removed: add --yes to remove them.",
+            "would remove {files} files, {} (groups with no file newer than {days} days). Nothing was removed: add --yes to remove them.",
             size_text(bytes)
         );
         return Ok(());
