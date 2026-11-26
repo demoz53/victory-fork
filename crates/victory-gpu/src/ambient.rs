@@ -140,6 +140,45 @@ fn skip_dark() -> f32 {
     })
 }
 
+/// `VICTORY_AMBIENT_AIR_FINITE` (ON by default; `0` as before): the air
+/// pass ([`air`]) counts a NaN the title left in the volume as nothing and an
+/// infinity as the most the volume's format holds. Before, next to a very
+/// bright lamp or window the title's value could be infinite: `cap / has` was
+/// 0, infinity times 0 NaN, and that NaN was written back and drawn black or
+/// as a stray colour (purple, pink) where the light is brightest. Ported from
+/// Ranxanat0r/cool_fox-dlss-ranxanat0r dfc88ffc7 (Humb8l, GPL-3.0), with the
+/// bound at 64512 (the 10-bit float's most) instead of 65504 (a half's, which
+/// R11G11B10 turns into infinity again).
+fn air_finite() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_AMBIENT_AIR_FINITE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// `VICTORY_AMBIENT_MAGENTA=1` (off by default): texels whose green is far
+/// below their red and blue (magenta: what the probes' memory held when no
+/// ray found anything, not light) are not shown. In the resolve's diffuse
+/// light the title's leftover there counts as nothing (Belobug's
+/// VIctory-Belobug-AMD 81ebb7bdc, GPL-3.0, its filter in raise); in the
+/// reflections the hold ([`reflect`], so only with `VICTORY_AMBIENT_REFLECT`)
+/// puts the held light around in their place (the purple curtain panel and
+/// lavender white cloth: avatarmanz/VIctory-7900XTX issue #71's reading,
+/// ideas only).
+fn magenta_filter() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_AMBIENT_MAGENTA").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("magenta leftovers in the indirect light and the reflections are not shown (VICTORY_AMBIENT_MAGENTA)");
+        }
+        on
+    })
+}
+
+/// The flags word of the passes' constants.
+fn flags(air_finite: bool, magenta: bool) -> u32 {
+    u32::from(air_finite) | u32::from(magenta) << 1
+}
+
 fn parse_skip_dark(set: &str) -> f32 {
     set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).map_or(0.0, |v| v.min(1.0))
 }
@@ -320,7 +359,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -333,6 +372,8 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float held;
     float jump; float fresh; float dt; float skip_dark;
+    // Bit 0: `VICTORY_AMBIENT_AIR_FINITE`; bit 1: `VICTORY_AMBIENT_MAGENTA`.
+    uint flags;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -342,6 +383,26 @@ RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+
+// NaN and infinity by their bits (the compiler may fold `isnan`).
+bool3 not_a_number(float3 c) { return (asuint(c) & 0x7fffffff) > 0x7f800000; }
+bool3 infinite(float3 c) { return (asuint(c) & 0x7fffffff) == 0x7f800000; }
+
+// What the air pass leaves of `c` under `cap`. With `finite` (the default):
+// NaN counts as nothing and infinity as the most the volume's format holds,
+// so a lamp's infinite value is bounded, not scaled by 0 into NaN, which was
+// drawn black or purple where the light is brightest (Ranxanat0r dfc88ffc7).
+float3 air_bound(float3 c, float cap, bool finite) {
+    if (finite) c = any(not_a_number(c)) ? 0.0 : min(max(c, 0.0), 64512.0);
+    float has = dot(c, LUMA);
+    return has > cap ? c * (cap / has) : c;
+}
+
+// Magenta (green far below red and blue) is what the probes' memory held
+// when rays found nothing, not light (Belobug 81ebb7bdc).
+bool magenta(float3 c) {
+    return c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02;
+}
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -459,7 +520,19 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
-    if (has > cap) scattered[at] = c * (cap / has);
+    bool finite = (flags & 1) != 0;
+    if (has > cap || finite && (any(not_a_number(c)) || any(infinite(c)))) scattered[at] = air_bound(c, cap, finite);
+}
+#endif
+
+#ifdef AIRTEST
+// `air_bound` and `magenta` over a buffer (tests): in at FRESH_CELLS + i
+// (colour, cap), out at i (what is left, 1 if magenta).
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void air_test(uint3 at : SV_DispatchThreadID) {
+    float4 c = cells[FRESH_CELLS + at.x];
+    cells[at.x] = float4(air_bound(c.rgb, c.a, (flags & 1) != 0), magenta(c.rgb) ? 1.0 : 0.0);
 }
 #endif
 
@@ -488,6 +561,11 @@ void hold(uint3 at : SV_DispatchThreadID) {
     float3 around = constant > 0.0 ? float3(1.0, 0.98, 0.94) * constant : cells[CELLS].rgb * level;
     float top = max(dot(around, LUMA) * held, 1e-6);
     float3 c = unpack(light[at.xy]);
+    // (`VICTORY_AMBIENT_MAGENTA`: what the memory held is the light around.)
+    if ((flags & 2) != 0 && magenta(c)) {
+        light[at.xy] = pack(around * held);
+        return;
+    }
     float has = dot(c, LUMA);
     if (has > top) light[at.xy] = pack(c * (top / has));
 }
@@ -553,6 +631,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    if ((flags & 2) != 0 && magenta(was)) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     // For `fresh` seconds after the light around jumped (a new room) the
@@ -700,7 +779,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 16];
+    let mut words = [0u32; 17];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -715,6 +794,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (dt / 1000.0).to_bits();
     words[15] = skip_dark().to_bits();
+    words[16] = flags(air_finite(), magenta_filter());
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -722,7 +802,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -817,16 +897,78 @@ mod tests {
         assert!(followed[0] < 1e-5, "without the switch the dark frame is taken as a jump: {followed:?}");
     }
 
+    /// The air pass's bound on the card: an infinite or NaN value comes out
+    /// finite with `VICTORY_AMBIENT_AIR_FINITE` (the default), and infinity
+    /// times 0 is NaN without it; the magenta test.
+    #[test]
+    fn the_air_bound_is_finite() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; skipping");
+            return;
+        };
+        let pass = make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        let code = crate::host::compile(&format!("#define AIRTEST
+{SOURCE}"), s!("air_test"), s!("cs_5_1")).expect("compiled");
+        // SAFETY: the root signature is ours and inside the shader as well.
+        let pso: ID3D12PipelineState = unsafe {
+            host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&pass.root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                ..Default::default()
+            })
+        }
+        .expect("a pipeline");
+        let inf = f32::INFINITY;
+        let inputs: [[f32; 4]; 6] = [
+            [inf, inf, inf, 2.0],
+            [inf, 1.0, 1.0, 2.0],
+            [f32::NAN, 1.0, 1.0, 2.0],
+            [1e30, 1e30, 1e30, 2.0],
+            [0.5, 0.5, 0.5, 2.0],
+            [1.0, 0.1, 1.0, 100.0],
+        ];
+        let run = |finite: bool| {
+            let mut cells = vec![[0.0f32; 4]; (3 * CELLS + 1) as usize];
+            cells[(2 * CELLS + 1) as usize..][..inputs.len()].copy_from_slice(&inputs);
+            let mut words = [0u32; 17];
+            words[16] = flags(finite, false);
+            run_on_cells(host, &pass, &pso, &cells, &words, inputs.len() as u32)[..inputs.len()].to_vec()
+        };
+        let finite = run(true);
+        for (got, put) in finite.iter().zip(&inputs) {
+            assert!(got[..3].iter().all(|v| v.is_finite() && *v >= 0.0), "{put:?} -> {got:?}");
+            let has = 0.2126 * got[0] + 0.7152 * got[1] + 0.0722 * got[2];
+            assert!(has <= put[3] * 1.0001, "bounded by the cap: {put:?} -> {got:?}");
+        }
+        assert_eq!(finite[4][..3], [0.5, 0.5, 0.5], "a value under the cap stays");
+        let before = run(false);
+        assert!(before[0][..3].iter().any(|v| v.is_nan()), "infinity times 0 was NaN: {:?}", before[0]);
+        assert_eq!(finite.iter().map(|c| c[3]).collect::<Vec<_>>(), [0.0, 0.0, 0.0, 0.0, 0.0, 1.0], "only the last is magenta");
+        assert_eq!(flags(true, true), 3);
+    }
+
     /// One dispatch of `mean` over `cells` with `skip_dark`, read back.
     fn run_mean(host: &crate::host::Host, cells: &[[f32; 4]], skip_dark: f32) -> Vec<[f32; 4]> {
         let pass = make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
-        let bytes = std::mem::size_of_val(cells) as u64;
-        assert_eq!(bytes, CELL_BYTES);
-        let mut words = [0u32; 16];
+        let mut words = [0u32; 17];
         words[8] = 0.04f32.to_bits();
         words[12] = 3.0f32.to_bits();
         words[14] = 0.033f32.to_bits();
         words[15] = skip_dark.to_bits();
+        run_on_cells(host, &pass, &pass.mean, cells, &words, 1)
+    }
+
+    /// One dispatch of `pso` (`groups` wide) over `cells` with `words`, read back.
+    fn run_on_cells(
+        host: &crate::host::Host,
+        pass: &Pass,
+        pso: &ID3D12PipelineState,
+        cells: &[[f32; 4]],
+        words: &[u32; 17],
+        groups: u32,
+    ) -> Vec<[f32; 4]> {
+        let bytes = std::mem::size_of_val(cells) as u64;
+        assert_eq!(bytes, CELL_BYTES);
         let (upload, at) = host.upload_buffer(bytes).expect("an upload buffer");
         let back = host.read_back_buffer(bytes).expect("a read-back buffer");
         let data: Vec<u8> = cells.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
@@ -853,11 +995,11 @@ mod tests {
             l.CopyBufferRegion(&pass.cells, 0, &upload, 0, bytes);
             l.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
             l.SetComputeRootSignature(&pass.root);
-            l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
             l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
-            l.SetPipelineState(&pass.mean);
-            l.Dispatch(1, 1, 1);
+            l.SetPipelineState(pso);
+            l.Dispatch(groups, 1, 1);
             l.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             l.CopyBufferRegion(&back, 0, &pass.cells, 0, bytes);
         }
