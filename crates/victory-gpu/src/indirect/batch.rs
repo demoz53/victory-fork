@@ -32,6 +32,11 @@ pub(crate) const JOBS: u32 = 256;
 pub(crate) const TABLE: u64 = 16 + 16 * JOBS as u64;
 /// The bytes of a clamped record's place in the scratch buffer.
 pub(crate) const SLOT: u32 = 32;
+/// The longest stride of an execution that reads a clamped record from its
+/// place: an execution of one record reads only the record's own words, but
+/// is entitled to a stride of bytes from where it starts, so the scratch
+/// buffer has this much room past its last place.
+pub(crate) const STRIDE: u32 = 4096;
 /// The source buffers a pass can read.
 pub(crate) const SOURCES: usize = 4;
 /// The most executions charged by one job: the most a record costs (2^26)

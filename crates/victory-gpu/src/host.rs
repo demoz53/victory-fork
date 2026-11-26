@@ -7306,7 +7306,7 @@ impl HostList {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
+            let size = u64::from(BATCHES * JOBS * SLOT + crate::indirect::batch::STRIDE);
             let made = host()?.uav_buffer(size)?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);

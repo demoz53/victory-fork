@@ -3914,7 +3914,7 @@ impl State {
         list: &HostList,
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
-        kind: u32,
+        (kind, stride): (u32, u32),
     ) -> Option<(ID3D12Resource, u64)> {
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
@@ -3928,9 +3928,10 @@ impl State {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
-        // A record no job can name (past 32 bits of its copy, off 4 bytes):
-        // clamped on its own, and the batch stays for the others.
-        if !crate::indirect::batch::fits(offset, kind) {
+        // A record no job can name (past 32 bits of its copy, off 4 bytes),
+        // or records further apart than a place has room for: clamped on
+        // its own, and the batch stays for the others.
+        if !crate::indirect::batch::fits(offset, kind) || stride > crate::indirect::batch::STRIDE {
             return None;
         }
         // A dispatch's record is noted with its execution, as its own clamp
@@ -4078,7 +4079,7 @@ impl State {
             None
         } else {
             args.refresh(list, arguments, len);
-            let batch = self.batched(list, &args, arguments, kind);
+            let batch = self.batched(list, &args, arguments, (kind, stride));
             if batch.is_none() {
                 batch_count(B_REFUSED);
             } else if kind == DISPATCH {
