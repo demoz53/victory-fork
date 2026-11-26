@@ -471,7 +471,7 @@ pub struct Options<'a> {
     /// Whether the CPU runs a kind itself ([`native`]).
     pub native: &'a dyn Fn(Kind) -> bool,
     /// Whether the stubs are made known to crash reports and stack walks
-    /// ([`stub_at`]): once a process, for the title's image.
+    /// (`stub_at`): once a process, for the title's image.
     pub register: bool,
 }
 
