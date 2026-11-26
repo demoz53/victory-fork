@@ -148,8 +148,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg_attr(feature = "diagnostics", track_caller)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    // With `VICTORY_TIMING_LEAN=1` one call in 16 is timed
+    // (`crate::copystat::record_timer`).
     #[cfg(feature = "diagnostics")]
-    let (started, place) = (std::time::Instant::now(), std::panic::Location::caller().line());
+    let (started, place) = (crate::copystat::record_timer(), std::panic::Location::caller().line());
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
@@ -296,11 +298,22 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         return;
     }
     let (max_lists, max_bytes) = idle_limits();
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    let later = crate::host::drop_later();
+    for (i, Detached { host, _uploads, mut _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
-        drop(_state);
-        drop(_uploads);
+        // With `VICTORY_DROP_LATER=1` the slots go back here and the rest
+        // goes to the reaper's thread, with a list not kept for reuse.
+        if later {
+            _state.give_back_slots();
+            crate::host::reap_later(Leftovers(Some(_state), _uploads, None));
+        } else {
+            drop(_state);
+            drop(_uploads);
+        }
         if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_lists {
+            if later {
+                crate::host::reap_later(Leftovers(None, Vec::new(), Some(host)));
+            }
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -311,9 +324,28 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         if idle.0.len() < max_lists && idle.1 + bytes <= max_bytes {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+        } else if later {
+            drop(idle);
+            crate::host::reap_later(Leftovers(None, Vec::new(), Some(host)));
         }
     }
 }
+
+/// What [`recycle`] hands the reaper's thread with `VICTORY_DROP_LATER=1`:
+/// a landed list's draw state (its descriptor slots given back already),
+/// its uploads, and the host list itself when it is not kept.
+#[cfg(windows)]
+struct Leftovers(
+    #[allow(dead_code)] Option<crate::draw::State>,
+    #[allow(dead_code)] Vec<Vec<u8>>,
+    #[allow(dead_code)] Option<crate::host::HostList>,
+);
+
+// SAFETY: the card has run the list (it landed) and nothing else names
+// these any more; the reaper only drops them. D3D12 objects are
+// free-threaded, and the state's dynamic slots were given back here.
+#[cfg(windows)]
+unsafe impl Send for Leftovers {}
 
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
@@ -2073,14 +2105,15 @@ impl ValueWait {
     /// that thread in run 49 found it in this question).
     /// `VICTORY_WAIT_ASK=1` asks first, as before.
     pub(crate) fn met(&self) -> bool {
+        // (Not timed with `VICTORY_TIMING_LEAN=1`.)
         #[cfg(all(windows, feature = "diagnostics"))]
-        let started = std::time::Instant::now();
+        let started = crate::timing::Timer::stats();
         let met = self.holds();
         #[cfg(all(windows, feature = "diagnostics"))]
         {
             use crate::copystat::{C, add};
             add(C::WaitChecks, 1);
-            add(C::WaitCheckNs, started.elapsed().as_nanos() as u64);
+            add(C::WaitCheckNs, started.ns());
         }
         met
     }

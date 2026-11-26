@@ -15,7 +15,6 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -136,7 +135,7 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+static STAGING: Mutex<Option<crate::fasthash::Map<usize, Arc<Staging>>>> = Mutex::new(None);
 
 /// Every staging state, grouped by the address where its texture's title
 /// memory starts. [`STAGING`] is keyed by resource, which cannot answer
@@ -232,7 +231,7 @@ unsafe impl Send for Through {}
 unsafe impl Sync for Through {}
 
 /// The copy buffers of [`alias`], by the placed view's texture.
-static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+static THROUGH: Mutex<Option<crate::fasthash::Map<usize, Arc<Through>>>> = Mutex::new(None);
 
 /// `VICTORY_ALIAS_ALWAYS` (on by default; `0`: off): [`alias`] owes its
 /// copy until the list has copied that source into the view, not until the
@@ -279,7 +278,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     let Some(host) = host() else { return false };
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-        let map = map.get_or_insert_with(HashMap::new);
+        let map = map.get_or_insert_with(Default::default);
         match map.get(&(placed as usize)) {
             Some(through) => through.clone(),
             None => {
@@ -636,7 +635,7 @@ pub(crate) fn let_go_idle() {
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: Mutex<Option<crate::fasthash::Set<usize>>> = Mutex::new(None);
 
 /// A host copy or resolve writes `resource`. True if it is the first.
 pub(crate) fn host_written(resource: This) -> bool {
@@ -1804,7 +1803,7 @@ impl Ahead {
 }
 
 /// [`Ahead`] stagings by texture, and their bytes.
-static AHEAD: Mutex<Option<HashMap<usize, Ahead>>> = Mutex::new(None);
+static AHEAD: Mutex<Option<crate::fasthash::Map<usize, Ahead>>> = Mutex::new(None);
 static AHEAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Since the start: stagings made ahead, and taken by their texture's
@@ -1848,7 +1847,7 @@ pub(crate) fn stage_ahead(resource: This, texture: &ID3D12Resource) {
     }
     {
         let mut ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-        let ahead = ahead.get_or_insert_with(HashMap::new);
+        let ahead = ahead.get_or_insert_with(Default::default);
         if ahead.contains_key(&(resource as usize)) {
             return;
         }
@@ -1884,7 +1883,7 @@ pub(crate) fn stage_ahead(resource: This, texture: &ID3D12Resource) {
     unsafe { std::ptr::write_bytes(data, 0, total as usize) };
     let made = Ahead { buffer, data: data as usize, bytes, footprints, rows, total, at: crate::host::now_ms() };
     let mut ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-    match ahead.get_or_insert_with(HashMap::new).entry(resource as usize) {
+    match ahead.get_or_insert_with(Default::default).entry(resource as usize) {
         std::collections::hash_map::Entry::Occupied(_) => made.give_back(),
         std::collections::hash_map::Entry::Vacant(slot) => {
             AHEAD_BYTES.fetch_add(bytes, Relaxed);
@@ -1916,7 +1915,7 @@ pub(crate) fn staging_now(resource: This, texture: &ID3D12Resource) -> bool {
 
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
+    let map = map.get_or_insert_with(Default::default);
     if let Some(s) = map.get(&(resource as usize)) {
         return Some(s.clone());
     }

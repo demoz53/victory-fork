@@ -104,8 +104,13 @@ pub(crate) fn now_ms() -> u64 {
 /// frames begun so far (high half, `crate::frame::current`) and tenths of a
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
+///
+/// With `VICTORY_TIMING_LEAN=1` the tenths come from the system's tick
+/// count (`crate::timing::tick_ms`, steps of 10-16 ms), not a clock read:
+/// it is asked for every host copy and texture looked up.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    let ms = if crate::timing::lean() { crate::timing::tick_ms() } else { now_ms() };
+    (crate::frame::current() << 32) | ((ms / 100) & 0xffff_ffff)
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -334,7 +339,68 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
+    // With `VICTORY_DROP_LATER=1` on the reaper's thread: every submission
+    // that could use them has finished, so the last releases (some a kernel
+    // call that frees the card's memory) can be anyone's.
+    if drop_later() {
+        reap_later(done);
+        return;
+    }
     drop(done);
+}
+
+/// Whether what the submitting thread lets go of after its submissions ran
+/// goes to the reaper's thread ([`reap_later`]) instead of being dropped
+/// there (`VICTORY_DROP_LATER=1`; off by default): the objects retired
+/// until a submission finished ([`bury`]), and the landed lists' draw
+/// state, uploads and the lists not kept for reuse
+/// (`crate::list::recycle`). The profiler found 8.2% of that thread's
+/// running time in `Arc::drop_slow`, 96% of it in system code (the last
+/// releases of host objects). Nothing is dropped earlier than before, only
+/// later and elsewhere; descriptor slots are given back where they were
+/// (`crate::draw::State::tables_done`), not by the reaper.
+pub(crate) fn drop_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DROP_LATER").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_DROP_LATER=1: retired objects and landed lists' leftovers are let go on the reaper's thread");
+        }
+        on
+    })
+}
+
+/// Objects handed to the reaper's thread by [`reap_later`] since the start,
+/// and of them dropped there.
+pub(crate) static REAPED_LATER: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Drops `object` on the reaper's thread ([`reap`]), or here if there is
+/// no such thread. Only for what nothing will use any more: the card has
+/// run every submission that names it.
+pub(crate) fn reap_later<T: Send + 'static>(object: T) {
+    REAPED_LATER[0].fetch_add(1, Ordering::Relaxed);
+    send_to_reaper(Reaping::Any(Box::new(object)));
+}
+
+#[cfg(test)]
+mod reap_later_tests {
+    /// What [`super::reap_later`] is given is dropped on the reaper's
+    /// thread, not the caller's, and counted there.
+    #[test]
+    fn handed_objects_drop_on_the_reaper() {
+        struct Noted(std::sync::mpsc::Sender<Option<String>>);
+        impl Drop for Noted {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().name().map(str::to_owned));
+            }
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let before = super::REAPED_LATER[0].load(std::sync::atomic::Ordering::Relaxed);
+        super::reap_later(Noted(send));
+        let name = receive.recv_timeout(std::time::Duration::from_secs(10)).expect("dropped");
+        assert_eq!(name.as_deref(), Some("victory-reaper"));
+        assert!(super::REAPED_LATER[0].load(std::sync::atomic::Ordering::Relaxed) > before);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -2366,18 +2432,18 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fasthash::Set<(usize, usize, usize)>,
     /// Recorded GPU write declarations per host copy and range. A new
     /// refresh of that copy must still be flushed by its next declaration.
-    gpu_written: std::collections::HashMap<usize, std::collections::HashSet<(usize, usize)>>,
+    gpu_written: crate::fasthash::Map<usize, crate::fasthash::Set<(usize, usize)>>,
     /// What each fill of upload memory (by its destination) is for
     /// ([`fill_kind`]), for the settle line.
-    fill_kinds: std::collections::HashMap<usize, u8>,
+    fill_kinds: crate::fasthash::Map<usize, u8>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fasthash::Set<usize>,
     /// The source last copied into each view's host texture by
     /// `crate::texture::alias` in this list (both by address).
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: crate::fasthash::Map<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2406,7 +2472,7 @@ struct Deferred {
     /// for reads, since the last step that wrote title memory).
     memory_read_seen: usize,
     memory_write_seen: usize,
-    named_writes: std::collections::HashSet<usize>,
+    named_writes: crate::fasthash::Set<usize>,
 }
 
 impl Deferred {
@@ -2495,6 +2561,13 @@ struct Reaped {
 // dropped there.
 unsafe impl Send for Reaped {}
 
+/// What the reaper's thread drops: a list's leftovers at its reset, or
+/// anything else [`reap_later`] hands it.
+enum Reaping {
+    List(#[allow(dead_code)] Reaped),
+    Any(#[allow(dead_code)] Box<dyn Send>),
+}
+
 /// Whether what host lists held is let go on a thread of its own, not where
 /// the title resets them (`VICTORY_RESET_REAPER=0`: where they are reset,
 /// as before).
@@ -2515,14 +2588,22 @@ fn reaper() -> bool {
 /// Hands `reaped` to the thread that lets go of it ([`reaper`]); drops it
 /// here if there is no such thread.
 fn reap(reaped: Reaped) {
-    static LINE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Reaped>>>> = OnceLock::new();
+    send_to_reaper(Reaping::List(reaped));
+}
+
+fn send_to_reaper(reaped: Reaping) {
+    static LINE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Reaping>>>> = OnceLock::new();
     let line = LINE.get_or_init(|| {
-        let (send, receive) = std::sync::mpsc::channel::<Reaped>();
+        let (send, receive) = std::sync::mpsc::channel::<Reaping>();
         std::thread::Builder::new()
             .name("victory-reaper".into())
             .spawn(move || {
                 for reaped in receive {
+                    let any = matches!(reaped, Reaping::Any(_));
                     drop(reaped);
+                    if any {
+                        REAPED_LATER[1].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             })
             .ok()
@@ -9127,7 +9208,14 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            // With `VICTORY_TIMING_LEAN=1` one copy in 16 is timed (the
+            // "copies" time of the frame line is then an estimate), and
+            // the steps whose time nothing reads are not.
+            let started = match step {
+                Step::Copy(..) | Step::Fill(..) => crate::timing::Timer::sampled(),
+                Step::Run(_) | Step::Host(_) | Step::HostRead(..) => crate::timing::Timer::always(),
+                _ => crate::timing::Timer::stats(),
+            };
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -9160,6 +9248,8 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) | Step::HostRead(_, _, work) => {
+                    #[cfg(feature = "diagnostics")]
+                    let ran = started.began().unwrap_or_else(std::time::Instant::now);
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
@@ -9172,7 +9262,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, ran.elapsed().as_micros() as u64);
                     }
                     continue;
                 }
@@ -9213,7 +9303,7 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[0].fetch_add(started.us(), Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
@@ -9509,9 +9599,10 @@ impl Batch {
             if from >= to {
                 continue;
             }
-            let started = std::time::Instant::now();
+            // One range in 16 timed with `VICTORY_TIMING_LEAN=1`.
+            let started = crate::timing::Timer::sampled();
             let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+            let us = started.us();
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -9719,8 +9810,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // The kernel writes the destination: it must not be guarded until the
     // copy is done (the end of this function).
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
+    // (Sampled with `VICTORY_TIMING_LEAN=1`.)
     #[cfg(feature = "diagnostics")]
-    let moved = std::time::Instant::now();
+    let moved = crate::timing::Timer::sampled();
     // Into title memory: through the kernel, which reports a destination
     // page that is not there (the guarded copy only survives the source's).
     let whole = if title_dst {
@@ -9729,7 +9821,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         read(src, dst, len)
     };
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    crate::copystat::add(crate::copystat::C::MoveUs, moved.us());
     if whole {
         return;
     }
@@ -9769,12 +9861,12 @@ pub(crate) fn copy_streamed(dst: *mut u8, src: *const u8, len: usize) {
 fn copy_streamed_one(dst: *mut u8, src: *const u8, len: usize) {
     if len >= crate::guarded::STREAM_FEW && crate::guarded::stream() && !crate::guarded::kernel_first(src, len) {
         #[cfg(feature = "diagnostics")]
-        let moved = std::time::Instant::now();
+        let moved = crate::timing::Timer::sampled();
         // SAFETY: the destination is a host copy's mapped CPU side of `len`
         // bytes; a source page that is not there fails the copy.
         let whole = unsafe { crate::guarded::copy_streaming(src, dst, len) };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.us());
         if whole {
             return;
         }

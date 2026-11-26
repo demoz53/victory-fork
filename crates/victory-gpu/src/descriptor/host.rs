@@ -121,7 +121,7 @@ pub(crate) struct HostHeap {
     buffers: Mutex<std::collections::BTreeSet<u32>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
-    changed: Mutex<std::collections::HashSet<u32>>,
+    changed: Mutex<crate::fasthash::Set<u32>>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -404,11 +404,11 @@ pub(crate) struct Spans {
     /// smaller ([`stale_head_size`]).
     head_size: bool,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: crate::fasthash::Map<u32, u64>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: crate::fasthash::Map<[u32; 14], Option<u64>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -1621,8 +1621,9 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
+        // (The search is not timed with `VICTORY_TIMING_LEAN=1`.)
         #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
+        let started = crate::timing::Timer::stats();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = crate::lockstat::lock(&self.next, crate::lockstat::Lock::Ring);
@@ -1662,13 +1663,13 @@ impl HostHeap {
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+                add(C::DynamicNs, started.ns());
             }
             return None;
         };
         #[cfg(feature = "diagnostics")]
         {
-            crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+            crate::copystat::add(crate::copystat::C::DynamicNs, started.ns());
             crate::copystat::add(crate::copystat::C::DynamicTaken, n as u64);
         }
         taken[first..first + n].fill(true);
@@ -3128,8 +3129,7 @@ fn buffer_srv(
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -3168,8 +3168,7 @@ fn buffer_uav(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    let flags = shadow.flags();
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
@@ -3209,8 +3208,7 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(

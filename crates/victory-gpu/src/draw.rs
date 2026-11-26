@@ -750,7 +750,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: crate::fasthash::Map<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -758,9 +758,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: crate::fasthash::Map<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: crate::fasthash::Map<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// Raw thread counts `[x, y, z]` for a partial `DispatchX` call with
@@ -781,6 +781,15 @@ impl Drop for State {
 }
 
 impl State {
+    /// Gives back the dynamic slots the list holds now, as its drop would
+    /// (`VICTORY_DROP_LATER=1`: the rest of it is dropped on the reaper's
+    /// thread, the slots here).
+    pub(crate) fn give_back_slots(&mut self) {
+        for (heap, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -2036,8 +2045,7 @@ impl State {
         });
         let find = |a: u64| {
             let s = crate::shadow::find(a, 1)?;
-            // SAFETY: a live buffer.
-            let flags = unsafe { s.buffer.GetDesc() }.Flags;
+            let flags = s.flags();
             if flags.0 & UNORDERED == 0 {
                 once!("a root UAV of a buffer whose host copy shaders cannot write");
                 return None;
@@ -3206,7 +3214,8 @@ impl State {
             if let Some(View::Placed(false, resource, desc)) = current() {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                let asking = std::time::Instant::now();
+                // (Per-slot parts not timed with `VICTORY_TIMING_LEAN=1`.)
+                let asking = crate::timing::Timer::stats();
                 // Neither its first nor its last page there: the memory
                 // between them is looked at in the slot's turn
                 // (`VICTORY_MAPPED_EXACT`; DexNom/VIctory 921d8d3b4).
@@ -3217,7 +3226,7 @@ impl State {
                 if between {
                     host.texture_slot_looked_between(index, write, mapped != 0);
                 }
-                HEAP_PASS_PARTS[2].fetch_add(asking.elapsed().as_micros() as u64, Ordering::Relaxed);
+                HEAP_PASS_PARTS[2].fetch_add(asking.us(), Ordering::Relaxed);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -3298,7 +3307,7 @@ impl State {
                 host.texture_slot_later(index, write, frame, 1);
                 continue;
             }
-            let making = std::time::Instant::now();
+            let making = crate::timing::Timer::stats();
             let view = match &mut into {
                 PassInto::List(_) => heap.handle(index).and_then(|handle| host.mirror(index, handle, true)),
                 // On the worker the slot is made when this pass's list is
@@ -3378,7 +3387,7 @@ impl State {
                     // The card holds these bytes already: there, for the
                     // age histogram.
                     host.texture_slot_uploaded(index, write, frame);
-                    HEAP_PASS_PARTS[6].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    HEAP_PASS_PARTS[6].fetch_add(making.us(), Ordering::Relaxed);
                     if heap_recheck() {
                         let print = crate::texture::fingerprint(address, len);
                         host.texture_slot_recheck(index, write, frame + recheck_frames()[0], (address, len), print, 0, frame);
@@ -3388,8 +3397,10 @@ impl State {
                     continue;
                 }
             }
-            let uploading = std::time::Instant::now();
-            HEAP_PASS_PARTS[6].fetch_add((uploading - making).as_micros() as u64, Ordering::Relaxed);
+            let uploading = crate::timing::Timer::stats();
+            if let (Some(made), Some(upload)) = (making.began(), uploading.began()) {
+                HEAP_PASS_PARTS[6].fetch_add((upload - made).as_micros() as u64, Ordering::Relaxed);
+            }
             if let Some(view) = &view {
                 match &mut into {
                     PassInto::List(list) => readable(list, sampled.kind, view),
@@ -3405,8 +3416,8 @@ impl State {
                     }
                 }
             }
-            HEAP_PASS_PARTS[7].fetch_add(uploading.elapsed().as_micros() as u64, Ordering::Relaxed);
-            HEAP_PASS_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+            HEAP_PASS_PARTS[7].fetch_add(uploading.us(), Ordering::Relaxed);
+            HEAP_PASS_PARTS[3].fetch_add(making.us(), Ordering::Relaxed);
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
@@ -5409,6 +5420,20 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+/// Whether a bound texture view skips the diagnostics' look-up of its host
+/// texture and description when debug lines are off (`VICTORY_BIND_LEAN=1`;
+/// off by default). Every shader view of a texture a draw bound looked the
+/// host texture up again (its table lock, a reference counted and let go,
+/// a clock read) and asked for its description, only for a debug line
+/// about textures the title fills: one look-up and one `GetDesc` per view
+/// bound, in diagnostics builds. The line is written as before when debug
+/// lines are on.
+#[cfg(feature = "diagnostics")]
+fn bind_lean() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_LEAN").is_some_and(|v| v == "1"))
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -5437,10 +5462,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliasing = std::time::Instant::now();
+            // (Not timed with `VICTORY_TIMING_LEAN=1`: two clock reads a
+            // texture view bound.)
+            let aliasing = crate::timing::Timer::stats();
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
-            crate::texture::UPLOAD_PARTS[4].fetch_add(aliasing.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::texture::UPLOAD_PARTS[4].fetch_add(aliasing.us(), Ordering::Relaxed);
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
@@ -5459,8 +5486,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // With `VICTORY_BIND_LEAN=1` the host texture and its description
+            // are only looked up when the debug line below can be written.
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if (!bind_lean() || tracing::enabled!(tracing::Level::DEBUG))
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {

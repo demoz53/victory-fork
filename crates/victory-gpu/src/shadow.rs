@@ -90,6 +90,26 @@ pub(crate) struct Shadow {
     /// Whether shaders were ever given a range of the copy to write
     /// ([`Shadow::gpu_writes`]).
     shaders_wrote: AtomicBool,
+    /// `buffer`'s width and flags, read once when the copy is made (a
+    /// resource's description never changes): [`Shadow::width`] and
+    /// [`Shadow::flags`] answer from them with `VICTORY_DESC_CACHE=1`.
+    desc: (u64, windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS),
+}
+
+/// Whether a host copy's buffer width and flags come from the copy's own
+/// record instead of a `GetDesc` call on its buffer (`VICTORY_DESC_CACHE=1`;
+/// off by default). Every buffer view made for a bind asked once or twice
+/// (2.4-3.0% of each recording thread's running time in
+/// `ID3D12Resource::GetDesc`, open world, with the texture views' asks).
+pub(crate) fn desc_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DESC_CACHE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_DESC_CACHE=1: host copies' buffer width and flags from their records, not GetDesc");
+        }
+        on
+    })
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2821,6 +2841,8 @@ impl Shadow {
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        // SAFETY: a live buffer.
+        let described = unsafe { buffer.GetDesc() };
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
@@ -2849,7 +2871,26 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             declared: Mutex::default(),
             shaders_wrote: AtomicBool::new(false),
+            desc: (described.Width, described.Flags),
         }
+    }
+
+    /// The width of `buffer` in bytes ([`desc_cache`]).
+    pub(crate) fn width(&self) -> u64 {
+        if desc_cache() {
+            return self.desc.0;
+        }
+        // SAFETY: a live buffer.
+        unsafe { self.buffer.GetDesc() }.Width
+    }
+
+    /// The flags of `buffer` ([`desc_cache`]).
+    pub(crate) fn flags(&self) -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS {
+        if desc_cache() {
+            return self.desc.1;
+        }
+        // SAFETY: a live buffer.
+        unsafe { self.buffer.GetDesc() }.Flags
     }
 
     /// Whether shaders were ever given a range of the copy to write: a
@@ -4609,6 +4650,49 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+mod desc_tests {
+    /// A host copy's recorded width and flags are its buffer's
+    /// (`VICTORY_DESC_CACHE=1` answers from them).
+    #[test]
+    fn a_copy_records_its_buffers_description() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (buffer, data) = host.shared_buffer(1 << 16).unwrap();
+        // SAFETY: a live buffer.
+        let (gpu, desc) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc()) };
+        let copy = super::Shadow::new(buffer, data, gpu, 0x1_0000_0000, 1 << 16);
+        assert_eq!(copy.desc, (desc.Width, desc.Flags));
+        assert_eq!(copy.width(), desc.Width);
+        assert_eq!(copy.flags(), desc.Flags);
+    }
+
+    /// The micro-measurement behind the switch (printed; `--nocapture`).
+    #[test]
+    #[ignore = "a measurement: cargo test -p victory-gpu --profile diag --lib desc_tests -- --ignored --nocapture"]
+    fn get_desc_costs() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
+        const N: u32 = 1_000_000;
+        let t = std::time::Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..N {
+            // SAFETY: a live buffer.
+            sum = sum.wrapping_add(unsafe { buffer.GetDesc() }.Width);
+        }
+        let ns = t.elapsed().as_nanos() as f64 / f64::from(N);
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            sum = sum.wrapping_add(windows::core::Interface::as_raw(&buffer.clone()) as u64 & 1);
+        }
+        let clone = t.elapsed().as_nanos() as f64 / f64::from(N);
+        println!("ID3D12Resource::GetDesc {ns:.1} ns, a COM clone and release {clone:.1} ns ({sum})");
+    }
 }
 
 #[cfg(test)]

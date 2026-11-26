@@ -325,27 +325,81 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// 60-75% of their time on these additions while a cutscene's shaders were
 /// translated (VICTORY_PROFILE, play-5, 2026-11-25): every allocation and
 /// release of every thread went through the same cache line.
+///
+/// The first [`ALONE`] threads each have a stripe of their own, which only
+/// that thread writes: a plain load and store per counter, no locked
+/// addition (the game runs some 130 threads; 32 shared stripes had four
+/// threads to a stripe). Later threads share the last [`SHARED`] stripes
+/// with atomic additions, as all did before.
 static OWN: [Stripe; STRIPES] = [const { Stripe([const { AtomicU64::new(0) }; 8]) }; STRIPES];
 
-/// One thread group's copy of the counters, alone on its cache lines.
+/// One thread's (or thread group's) copy of the counters, alone on its
+/// cache lines.
 #[repr(align(128))]
 struct Stripe([AtomicU64; 8]);
-const STRIPES: usize = 32;
+const ALONE: usize = 256;
+const SHARED: usize = 16;
+const STRIPES: usize = ALONE + SHARED;
 
-/// This thread's stripe: handed out in turn on a thread's first count. The
-/// thread-local has a constant initialiser and no destructor, so reading it
-/// inside the allocator neither allocates nor runs after the thread's end.
-fn stripe() -> &'static [AtomicU64; 8] {
+/// This thread's stripe, and whether it is the thread's alone: handed out
+/// in turn on a thread's first count. The thread-local has a constant
+/// initialiser and no destructor, so reading it inside the allocator
+/// neither allocates nor runs after the thread's end.
+fn stripe() -> (&'static [AtomicU64; 8], bool) {
     use std::cell::Cell;
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     thread_local! { static MINE: Cell<usize> = const { Cell::new(usize::MAX) }; }
     let i = MINE.with(|m| {
         if m.get() == usize::MAX {
-            m.set(NEXT.fetch_add(1, Relaxed) % STRIPES);
+            let n = NEXT.fetch_add(1, Relaxed);
+            m.set(if n < ALONE { n } else { ALONE + n % SHARED });
         }
         m.get()
     });
-    &OWN[i].0
+    (&OWN[i].0, i < ALONE)
+}
+
+/// Whether allocations are counted (`VICTORY_ALLOC_COUNT=0`: not; counted
+/// by default, as before): 0 not known yet, 1 counted, 2 not. Read from the
+/// environment on the first allocation with `GetEnvironmentVariableW` into
+/// a buffer on the stack (that allocates nothing on our heap, so it can be
+/// asked from inside the allocator), so that it holds from the process's
+/// first block on: a block counted when made is counted when released.
+///
+/// Without the counts the memory line's "our own allocations" reads 0 and
+/// "our own blocks of 32 MB and more" none; every allocation and release
+/// then costs one load of this flag beside the system's heap.
+static COUNTING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline]
+fn counting() -> bool {
+    match COUNTING.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = !alloc_count_off();
+            COUNTING.store(if on { 1 } else { 2 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// `VICTORY_ALLOC_COUNT` is `0`, asked without our heap.
+fn alloc_count_off() -> bool {
+    let mut name = [0u16; 20];
+    for (wide, &byte) in name.iter_mut().zip(b"VICTORY_ALLOC_COUNT") {
+        *wide = u16::from(byte);
+    }
+    let mut value = [0u16; 4];
+    // SAFETY: a terminated name and a buffer of the length given.
+    let n = unsafe {
+        windows_sys::Win32::System::Environment::GetEnvironmentVariableW(
+            name.as_ptr(),
+            value.as_mut_ptr(),
+            value.len() as u32,
+        )
+    };
+    n == 1 && value[0] == u16::from(b'0')
 }
 
 /// The counter `i` of [`OWN`] over all stripes.
@@ -365,13 +419,16 @@ fn block_class(size: usize) -> usize {
 
 fn own(size: usize, made: bool) {
     let class = block_class(size);
-    let own = stripe();
-    if made {
-        own[class].fetch_add(size as u64, Relaxed);
-        own[4 + class].fetch_add(1, Relaxed);
+    let (own, alone) = stripe();
+    let (bytes, blocks) = if made { (size as u64, 1) } else { ((size as u64).wrapping_neg(), u64::MAX) };
+    if alone {
+        // Only this thread writes its stripe; a reader meanwhile reads a
+        // whole word either way.
+        own[class].store(own[class].load(Relaxed).wrapping_add(bytes), Relaxed);
+        own[4 + class].store(own[4 + class].load(Relaxed).wrapping_add(blocks), Relaxed);
     } else {
-        own[class].fetch_sub(size as u64, Relaxed);
-        own[4 + class].fetch_sub(1, Relaxed);
+        own[class].fetch_add(bytes, Relaxed);
+        own[4 + class].fetch_add(blocks, Relaxed);
     }
 }
 
@@ -411,8 +468,9 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
-/// The system's allocator with every block counted in [`OWN`] (two atomic
-/// additions per allocation and per release: diagnostics builds only).
+/// The system's allocator with every block counted in [`OWN`] (two
+/// additions per allocation and per release: diagnostics builds only;
+/// `VICTORY_ALLOC_COUNT=0` counts nothing, [`COUNTING`]).
 struct Counting;
 
 // SAFETY: every call goes to the system's allocator unchanged; only
@@ -421,7 +479,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
         let at = unsafe { std::alloc::System.alloc(layout) };
-        if !at.is_null() {
+        if !at.is_null() && counting() {
             own(layout.size(), true);
             big(at, layout.size(), true);
         }
@@ -431,7 +489,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
         let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
-        if !at.is_null() {
+        if !at.is_null() && counting() {
             own(layout.size(), true);
             big(at, layout.size(), true);
         }
@@ -439,8 +497,10 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
-        own(layout.size(), false);
-        big(at, layout.size(), false);
+        if counting() {
+            own(layout.size(), false);
+            big(at, layout.size(), false);
+        }
         // SAFETY: the caller's contract, passed on.
         unsafe { std::alloc::System.dealloc(at, layout) };
     }
@@ -448,7 +508,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn realloc(&self, at: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // SAFETY: the caller's contract, passed on.
         let moved = unsafe { std::alloc::System.realloc(at, layout, size) };
-        if !moved.is_null() {
+        if !moved.is_null() && counting() {
             own(layout.size(), false);
             own(size, true);
             big(at, layout.size(), false);
@@ -552,6 +612,38 @@ mod own_tests {
         assert!(super::big_blocks().contains("48.00"));
         drop(block);
         assert!(!listed(at));
+    }
+
+    /// The micro-measurement behind the lone stripes: the two additions of
+    /// a count on a stripe of the thread's own against the locked additions
+    /// of a shared one, and a small block made and released (printed;
+    /// `--nocapture`).
+    #[test]
+    #[ignore = "a measurement: cargo test -p victory-gpu --profile diag --features diagnostics --lib own_tests -- --ignored --nocapture"]
+    fn counting_costs() {
+        const N: u32 = 4_000_000;
+        let (own, _) = super::stripe();
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let add = u64::from(i & 1);
+            own[0].store(own[0].load(Relaxed).wrapping_add(add), Relaxed);
+            own[4].store(own[4].load(Relaxed).wrapping_add(add), Relaxed);
+        }
+        let alone = t.elapsed().as_nanos() as f64 / f64::from(N);
+        let shared = &super::OWN[super::ALONE].0;
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let add = u64::from(i & 1);
+            shared[0].fetch_add(add, Relaxed);
+            shared[4].fetch_add(add, Relaxed);
+        }
+        let locked = t.elapsed().as_nanos() as f64 / f64::from(N);
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            std::hint::black_box(Box::new(i));
+        }
+        let block = t.elapsed().as_nanos() as f64 / f64::from(N);
+        println!("a count: lone stripe {alone:.2} ns, shared stripe {locked:.2} ns; a 4-byte block made and released {block:.1} ns");
     }
 
     /// A big block shows in the counters while it lives (other tests
@@ -1201,10 +1293,23 @@ fn places_text(mut places: Vec<(u32, u64, u64)>, frames: f64, most: usize) -> (f
     (total, text)
 }
 
-/// A list call on this thread, made at line `place` of `list.rs`, that began
-/// at `started` has returned.
-pub(crate) fn recorded(started: std::time::Instant, place: u32) {
-    let ns = started.elapsed().as_nanos() as u64;
+/// The timing of a list call about to be made: every call's, or with
+/// `VICTORY_TIMING_LEAN=1` one call's in 16 on each thread (counted 16
+/// times: the list-call times on the frame line, by thread and between a
+/// thread's submissions are then estimates; their call counts stay exact).
+/// Every call's with `VICTORY_FRAME_PARTS=1`, and the first after a present
+/// (for "until the first list call").
+pub(crate) fn record_timer() -> crate::timing::Timer {
+    if !crate::timing::lean() || frame_parts() || !RECORDED_SINCE.load(Relaxed) {
+        return crate::timing::Timer::always();
+    }
+    crate::timing::Timer::sampled()
+}
+
+/// A list call on this thread, made at line `place` of `list.rs`, timed by
+/// `started` ([`record_timer`]), has returned.
+pub(crate) fn recorded(started: crate::timing::Timer, place: u32) {
+    let ns = started.ns();
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
     if frame_parts() {
