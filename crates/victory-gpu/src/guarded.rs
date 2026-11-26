@@ -64,6 +64,65 @@ core::arch::global_asm!(
     "ret",
 );
 
+// `VICTORY_STREAM_COPY=1`: as `victory_guarded_copy`, the destination
+// written with AVX2 streaming stores: the bytes up to its next 32-byte
+// boundary with `rep movsb`, then 32-byte blocks (an unaligned load, a
+// non-temporal store), then the rest with `rep movsb`; fenced. A read fault
+// anywhere from `victory_guarded_stream_at` up to
+// `victory_guarded_stream_after` is moved to `victory_guarded_stream_fail`
+// (fenced too). After Joly0's `victory_safe_stream` (avatarmanz/VIctory-7900XTX
+// pull request #98, 9a3006bb5, GPL-3.0-or-later).
+core::arch::global_asm!(
+    ".globl victory_guarded_stream",
+    ".globl victory_guarded_stream_at",
+    ".globl victory_guarded_stream_after",
+    ".globl victory_guarded_stream_fail",
+    "victory_guarded_stream:",
+    "push rdi",
+    "push rsi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, rdi",
+    "neg rcx",
+    "and rcx, 31",
+    "cmp rcx, r8",
+    "jbe 2f",
+    "mov rcx, r8",
+    "2:",
+    "sub r8, rcx",
+    "victory_guarded_stream_at:",
+    "rep movsb",
+    "mov r9, r8",
+    "shr r9, 5",
+    "and r8, 31",
+    "test r9, r9",
+    "jz 4f",
+    "3:",
+    "vmovdqu ymm0, ymmword ptr [rsi]",
+    "vmovntdq ymmword ptr [rdi], ymm0",
+    "add rsi, 32",
+    "add rdi, 32",
+    "dec r9",
+    "jnz 3b",
+    "4:",
+    "mov rcx, r8",
+    "rep movsb",
+    "victory_guarded_stream_after:",
+    "sfence",
+    "vzeroupper",
+    "mov eax, 1",
+    "pop rsi",
+    "pop rdi",
+    "ret",
+    "victory_guarded_stream_fail:",
+    "sfence",
+    "vzeroupper",
+    "xor eax, eax",
+    "pop rsi",
+    "pop rdi",
+    "ret",
+);
+
 unsafe extern "C" {
     fn victory_guarded_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
     static victory_guarded_copy_at: u8;
@@ -71,6 +130,10 @@ unsafe extern "C" {
     fn victory_guarded_write(dst: *mut u8, src: *const u8, len: usize) -> u32;
     static victory_guarded_write_at: u8;
     static victory_guarded_write_fail: u8;
+    fn victory_guarded_stream(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    static victory_guarded_stream_at: u8;
+    static victory_guarded_stream_after: u8;
+    static victory_guarded_stream_fail: u8;
 }
 
 /// Whether reads go through the guarded copy (`VICTORY_GUARDED_READS`).
@@ -105,6 +168,19 @@ fn install() {
             c.Rip = fail;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // The streaming copy: a read fault anywhere in its copying part.
+        let (from, to) = (
+            std::ptr::addr_of!(victory_guarded_stream_at) as u64,
+            std::ptr::addr_of!(victory_guarded_stream_after) as u64,
+        );
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && (from..to).contains(&c.Rip)
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] == READ
+        {
+            c.Rip = std::ptr::addr_of!(victory_guarded_stream_fail) as u64;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // The guarded write: a destination page that is not there, not
         // writable, or a guard page (the system has taken its guard off).
         const WRITE: usize = 1;
@@ -135,6 +211,55 @@ fn install() {
 pub(crate) unsafe fn copy(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // SAFETY: as the caller vouches; the source is checked by the fault.
     unsafe { victory_guarded_copy(dst, src, len) != 0 }
+}
+
+/// Whether copies into host memory that the CPU does not read again soon
+/// (host copies' CPU sides, which the card reads; snapshots, compared only
+/// after the card ran) write with AVX2 streaming stores
+/// (`VICTORY_STREAM_COPY=1`; off by default; needs AVX2 and the guarded
+/// reads). Ported from avatarmanz/VIctory-7900XTX pull request #98 (Joly0,
+/// 4688ba056 and 9a3006bb5, GPL-3.0-or-later): a plain copy (`rep movsb`,
+/// as `memcpy`) reads each destination line into the cache before it
+/// writes it; streaming stores do not.
+pub(crate) fn stream() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() && stream_enabled(std::env::var("VICTORY_STREAM_COPY").ok().as_deref()))
+}
+
+fn stream_enabled(setting: Option<&str>) -> bool {
+    setting.is_some_and(|v| v.trim() == "1") && std::is_x86_feature_detected!("avx2")
+}
+
+/// Below this a streaming copy is a plain one: the head and tail are most
+/// of it, and a small destination may well be in the cache already.
+pub(crate) const STREAM_FEW: usize = 4096;
+
+/// [`copy`], the destination written with streaming stores (fenced before
+/// it returns); false if a page of the source is not readable (the bytes
+/// before it are copied then).
+///
+/// # Safety
+///
+/// As [`copy`]; the processor has AVX2.
+pub(crate) unsafe fn copy_streaming(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    // SAFETY: as the caller vouches; the source is checked by the fault.
+    unsafe { victory_guarded_stream(dst, src, len) != 0 }
+}
+
+/// Copies `len` bytes of host memory: with streaming stores if [`stream`]
+/// is on and they are [`STREAM_FEW`] or more, else plainly.
+///
+/// # Safety
+///
+/// Both ranges are valid for `len` bytes and do not overlap.
+pub(crate) unsafe fn copy_host(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: the caller's; host memory does not fault, and if it did the
+    // bytes would be copied again plainly below.
+    if len >= STREAM_FEW && stream() && unsafe { copy_streaming(src, dst, len) } {
+        return;
+    }
+    // SAFETY: the caller's.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
 }
 
 /// `VICTORY_COPY_PLAIN=1` (off by default; needs the guarded reads on):
@@ -260,6 +385,92 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stream_switch_is_opt_in() {
+        assert!(!stream_enabled(None));
+        assert!(!stream_enabled(Some("0")));
+        assert!(!stream_enabled(Some("2")));
+        assert_eq!(stream_enabled(Some("1")), std::is_x86_feature_detected!("avx2"));
+    }
+
+    /// The streaming copy puts every byte of the range and none beside it,
+    /// for many alignments of either side and lengths around the block and
+    /// the threshold (after #98's test).
+    #[test]
+    fn a_streaming_copy_copies_the_range_and_nothing_beside() {
+        if !on() || !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let src: Vec<u8> = (0..300_000usize).map(|i| (i * 131 + i / 251) as u8).collect();
+        for len in [0usize, 1, 3, 31, 32, 33, 64, 95, 4095, 4096, 4097, 4096 + 127, 70_001, 200_000] {
+            for src_at in [0usize, 1, 7, 32, 45] {
+                for dst_at in [0usize, 1, 13, 31, 32, 64 + 5] {
+                    let mut dst = vec![0xA5u8; len + dst_at + 100];
+                    // SAFETY: both inside their vectors, apart.
+                    assert!(unsafe { copy_streaming(src.as_ptr().add(src_at), dst.as_mut_ptr().add(dst_at), len) });
+                    let at = (len, src_at, dst_at);
+                    assert!(dst[..dst_at].iter().all(|&b| b == 0xA5), "before {at:?}");
+                    assert!(dst[dst_at..dst_at + len] == src[src_at..src_at + len], "inside {at:?}");
+                    assert!(dst[dst_at + len..].iter().all(|&b| b == 0xA5), "after {at:?}");
+                    let mut plain = vec![0xA5u8; len + dst_at + 100];
+                    // SAFETY: as above.
+                    unsafe { copy_host(src.as_ptr().add(src_at), plain.as_mut_ptr().add(dst_at), len) };
+                    assert!(plain == dst, "copy_host {at:?}");
+                }
+            }
+        }
+    }
+
+    /// A source page that is not there, or not readable, fails the
+    /// streaming copy wherever it falls (head, blocks or tail), and the same
+    /// copy works once the page is back.
+    #[test]
+    fn a_stream_from_missing_memory_fails() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        if !on() || !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        const P: usize = 4096;
+        // SAFETY: our own fresh pages, the second one of `a` taken away and
+        // given back around each copy.
+        unsafe {
+            let a = VirtualAlloc(std::ptr::null(), 4 * P, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            let b = VirtualAlloc(std::ptr::null(), 4 * P, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!a.is_null() && !b.is_null());
+            let fill = || {
+                for i in 0..4 * P {
+                    a.add(i).write((i * 7 + 3) as u8);
+                }
+            };
+            fill();
+            let mut old = 0;
+            // The missing page met in the blocks, in the tail, in the head.
+            for (from, len) in [(0usize, 3 * P), (P - 100, 120), (P - 5, 10), (P - 6, 40)] {
+                for missing in [true, false] {
+                    b.write_bytes(0xEE, 4 * P);
+                    if missing {
+                        VirtualFree(a.add(P).cast(), P, MEM_DECOMMIT);
+                    } else {
+                        VirtualProtect(a.add(P).cast(), P, PAGE_NOACCESS, &mut old);
+                    }
+                    let done = copy_streaming(a.add(from), b.add(from), len);
+                    VirtualAlloc(a.add(P).cast(), P, MEM_COMMIT, PAGE_READWRITE);
+                    VirtualProtect(a.add(P).cast(), P, PAGE_READWRITE, &mut old);
+                    assert!(!done, "from {from} len {len} missing {missing}");
+                    fill();
+                    assert!(copy_streaming(a.add(from), b.add(from), len));
+                    let (to, src) = (std::slice::from_raw_parts(b, 4 * P), std::slice::from_raw_parts(a, 4 * P));
+                    assert!(to[from..from + len] == src[from..from + len]);
+                }
+            }
+            VirtualFree(a.cast(), 0, MEM_RELEASE);
+            VirtualFree(b.cast(), 0, MEM_RELEASE);
+        }
+    }
 
     /// A write in place stops at a page that is not writable, having
     /// written the pages before it, and says so; with the switch off

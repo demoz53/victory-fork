@@ -8282,6 +8282,150 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
 }
 
+/// [`copy_mapped`] of title memory into a host copy's CPU side, which the
+/// CPU does not read again soon (the card reads it): with
+/// `VICTORY_STREAM_COPY=1` and [`crate::guarded::STREAM_FEW`] bytes or more
+/// the guarded copy with streaming stores ([`crate::guarded::copy_streaming`];
+/// after avatarmanz/VIctory-7900XTX #98, Joly0, 9a3006bb5); with
+/// `VICTORY_COPY_THREADS` and a long range, in pieces on its threads
+/// ([`copy_threads`]). What fails is copied again as [`copy_mapped`] does.
+pub(crate) fn copy_streamed(dst: *mut u8, src: *const u8, len: usize) {
+    if len >= COPY_THREADS_LEAST && copy_threads() > 1 {
+        return copy_in_pieces(dst, src, len, copy_threads());
+    }
+    copy_streamed_one(dst, src, len);
+}
+
+fn copy_streamed_one(dst: *mut u8, src: *const u8, len: usize) {
+    if len >= crate::guarded::STREAM_FEW && crate::guarded::stream() && !crate::guarded::kernel_first(src, len) {
+        #[cfg(feature = "diagnostics")]
+        let moved = std::time::Instant::now();
+        // SAFETY: the destination is a host copy's mapped CPU side of `len`
+        // bytes; a source page that is not there fails the copy.
+        let whole = unsafe { crate::guarded::copy_streaming(src, dst, len) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        if whole {
+            return;
+        }
+        crate::guarded::note_fault(src, len);
+    }
+    copy_mapped(dst, src, len, false);
+}
+
+/// The fewest bytes [`copy_streamed`] cuts into pieces for [`copy_threads`].
+const COPY_THREADS_LEAST: usize = 2 << 20;
+
+/// `VICTORY_COPY_THREADS=<n>` (2 to 8; off by default): a refresh's copy of
+/// [`COPY_THREADS_LEAST`] bytes or more of title memory into a host copy is
+/// cut into `n` pieces, `n - 1` of them done by threads kept for it (on the
+/// fast cores with `VICTORY_FAST_CORES=2` or more) and one by the caller,
+/// which returns only when all are in: the copy is complete before
+/// anything that uses it, as before. Pieces are pure byte moves (each its
+/// own [`copy_streamed_one`]), so nothing is locked in them.
+fn copy_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| copy_threads_of(std::env::var("VICTORY_COPY_THREADS").ok().as_deref()))
+}
+
+fn copy_threads_of(value: Option<&str>) -> usize {
+    value.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n >= 2).map_or(0, |n| n.min(8))
+}
+
+/// The pieces of [`copy_in_pieces`] waiting for a thread, and its threads.
+struct CopyPool {
+    jobs: Mutex<std::collections::VecDeque<Box<dyn FnOnce() + Send>>>,
+    more: std::sync::Condvar,
+}
+
+fn copy_pool() -> &'static CopyPool {
+    static POOL: OnceLock<CopyPool> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let pool = POOL.get_or_init(|| CopyPool { jobs: Mutex::new(std::collections::VecDeque::new()), more: std::sync::Condvar::new() });
+    STARTED.call_once(|| {
+        for i in 0..copy_threads().saturating_sub(1) {
+            let _ = std::thread::Builder::new().name(format!("victory-copy-{i}")).spawn(|| {
+                crate::cores::keep_helper_on_fast_cores("victory-copy");
+                let pool = POOL.get().expect("made above");
+                loop {
+                    let job = {
+                        let mut jobs = pool.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(job) = jobs.pop_front() {
+                                break job;
+                            }
+                            jobs = pool.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    job();
+                }
+            });
+        }
+    });
+    pool
+}
+
+/// [`copy_streamed`] in `n` pieces of whole 64 KiB blocks; the caller takes
+/// the first and then any piece still waiting (its own or another caller's:
+/// pieces only move bytes), and waits for the rest.
+fn copy_in_pieces(dst: *mut u8, src: *const u8, len: usize, n: usize) {
+    let n = n.max(1);
+    let each = len.div_ceil(n).next_multiple_of(64 << 10);
+    let (dst, src) = (dst as usize, src as usize);
+    let pieces: Vec<(usize, usize)> = (0..n).map(|i| (i * each).min(len)).map(|at| (at, each.min(len - at))).filter(|p| p.1 > 0).collect();
+    let left = std::sync::Arc::new((Mutex::new(pieces.len() - 1), std::sync::Condvar::new()));
+    let pool = copy_pool();
+    {
+        let mut jobs = pool.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for &(at, n) in &pieces[1..] {
+            let left = left.clone();
+            jobs.push_back(Box::new(move || {
+                copy_streamed_one((dst + at) as *mut u8, (src + at) as *const u8, n);
+                let mut k = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                *k -= 1;
+                if *k == 0 {
+                    left.1.notify_all();
+                }
+            }));
+        }
+    }
+    pool.more.notify_all();
+    copy_streamed_one(dst as *mut u8, src as *const u8, pieces[0].1);
+    loop {
+        let job = pool.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        match job {
+            Some(job) => job(),
+            None => break,
+        }
+    }
+    let mut k = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *k > 0 {
+        k = left.1.wait(k).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+#[cfg(test)]
+mod copy_thread_tests {
+    #[test]
+    fn the_switch_reads_a_count_of_two_to_eight() {
+        use super::copy_threads_of as of;
+        assert_eq!((of(None), of(Some("0")), of(Some("1")), of(Some("x"))), (0, 0, 0, 0));
+        assert_eq!((of(Some("2")), of(Some(" 4 ")), of(Some("64"))), (2, 4, 8));
+    }
+
+    /// Pieces cover the range once, in order, whatever the length.
+    #[test]
+    fn pieces_copy_every_byte_once() {
+        let src: Vec<u8> = (0..(5 << 20) + 12_345usize).map(|i| (i * 31 + i / 4099) as u8).collect();
+        for n in [1, 2, 3, 8] {
+            let mut dst = vec![0u8; src.len() + 64];
+            super::copy_in_pieces(dst.as_mut_ptr(), src.as_ptr(), src.len(), n);
+            assert!(dst[..src.len()] == src[..], "{n} pieces");
+            assert!(dst[src.len()..].iter().all(|&b| b == 0), "{n} pieces");
+        }
+    }
+}
+
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
@@ -10446,6 +10590,196 @@ mod fill_on_card_tests {
                 super::parse_env_flag(Some(OsStr::new(on))),
                 "{on:?} must enable flag"
             );
+        }
+    }
+}
+
+/// Micro-benchmarks of the copy routines (`cargo test -p victory-gpu --lib
+/// copy_bench -- --ignored --nocapture`): MB/s for blocks of 4 KiB, 64 KiB
+/// and 4 MiB, walked through 256 MiB so the source is not in the cache, into
+/// ordinary memory and into a mapped upload buffer of the card; and the
+/// write watch's cost per asking, in write-watched memory and in a view
+/// (where it fails, as it does for the title's physical-page views).
+#[cfg(test)]
+mod copy_bench {
+    use super::*;
+
+    const TOTAL: usize = 256 << 20;
+
+    fn upload(size: usize) -> Option<(ID3D12Resource, *mut u8)> {
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: device creation on the default adapter, an upload buffer
+        // made and mapped.
+        unsafe {
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            let device = device?;
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer)
+                .ok()?;
+            let buffer = buffer?;
+            let mut data = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut data)).ok()?;
+            Some((buffer, data.cast()))
+        }
+    }
+
+    type Copy = Box<dyn Fn(*const u8, *mut u8, usize)>;
+
+    /// MB/s of `copy` over `TOTAL` bytes in blocks of `block`, best of three.
+    fn rate(src: *const u8, dst: *mut u8, block: usize, copy: &dyn Fn(*const u8, *mut u8, usize)) -> f64 {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let mut at = 0;
+            while at + block <= TOTAL {
+                copy(src.wrapping_add(at), dst.wrapping_add(at), block);
+                at += block;
+            }
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        TOTAL as f64 / 1e6 / best
+    }
+
+    #[test]
+    #[ignore = "a benchmark: run alone, with --nocapture"]
+    fn copy_bench() {
+        assert!(crate::guarded::on());
+        let src: Vec<u8> = (0..TOTAL).map(|i| (i * 13 + i / 4093) as u8).collect();
+        let mut ordinary = vec![1u8; TOTAL];
+        let card = upload(TOTAL);
+        let avx2 = std::is_x86_feature_detected!("avx2");
+        // SAFETY (each routine): both ranges inside their allocations, apart.
+        let routines: Vec<(&str, Copy)> = vec![
+            ("memcpy", Box::new(|s, d, n| unsafe { std::ptr::copy_nonoverlapping(s, d, n) })),
+            ("guarded rep movsb (refreshes today)", Box::new(|s, d, n| assert!(unsafe { crate::guarded::copy(s, d, n) }))),
+            ("ReadProcessMemory (title copies today)", Box::new(|s, d, n| assert!(read_kernel(s, d, n)))),
+            (
+                "guarded streaming (STREAM_COPY=1)",
+                Box::new(move |s, d, n| assert!(avx2 && unsafe { crate::guarded::copy_streaming(s, d, n) })),
+            ),
+            (
+                "4 pieces of rep movsb (COPY_THREADS=4; 2 MiB and more)",
+                Box::new(|s, d, n| if n >= COPY_THREADS_LEAST { copy_in_pieces(d, s, n, 4) } else { copy_streamed_one(d, s, n) }),
+            ),
+        ];
+        // The pool's threads are started by `copy_threads`, off here: three
+        // helpers take the pieces instead.
+        let _helpers = PieceHelpers::start(3);
+        println!("| routine | into | 4 KiB | 64 KiB | 4 MiB |");
+        println!("|---|---|---|---|---|");
+        for (name, copy) in &routines {
+            for (into, dst) in [("ordinary", Some(ordinary.as_mut_ptr())), ("upload buffer", card.as_ref().map(|c| c.1))] {
+                let Some(dst) = dst else { continue };
+                let r: Vec<String> =
+                    [4 << 10, 64 << 10, 4 << 20].iter().map(|&b| format!("{:.0}", rate(src.as_ptr(), dst, b, copy.as_ref()))).collect();
+                println!("| {name} | {into} | {} | {} | {} |", r[0], r[1], r[2]);
+            }
+        }
+        // Reading back out of the upload buffer (write-combined, uncached).
+        if let Some((_, data)) = card.as_ref() {
+            let r = rate(*data, ordinary.as_mut_ptr(), 64 << 10, &|s, d, n| unsafe { std::ptr::copy_nonoverlapping(s, d, n) });
+            println!("| memcpy out of the upload buffer | ordinary | | {r:.0} | |");
+        }
+        watch_bench();
+    }
+
+    /// Helpers that take pieces from the pool's queue while the benchmark runs.
+    struct PieceHelpers(std::sync::Arc<std::sync::atomic::AtomicBool>, Vec<std::thread::JoinHandle<()>>);
+
+    impl PieceHelpers {
+        fn start(n: usize) -> Self {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let threads = (0..n)
+                .map(|_| {
+                    let stop = stop.clone();
+                    std::thread::spawn(move || {
+                        let pool = copy_pool();
+                        while !stop.load(Ordering::Relaxed) {
+                            let job = pool.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                            match job {
+                                Some(job) => job(),
+                                None => std::thread::yield_now(),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            Self(stop, threads)
+        }
+    }
+
+    impl Drop for PieceHelpers {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+            for t in self.1.drain(..) {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Microseconds per write-watch asking of 2 MiB: in write-watched
+    /// memory (answered) and in a mapped view (failed).
+    fn watch_bench() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, GetWriteWatch, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+            MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualAlloc, VirtualFree,
+        };
+        const SIZE: usize = 64 << 20;
+        const ASK: usize = 2 << 20;
+        let mut found = vec![0usize; ASK / 4096];
+        let mut per_call = |base: *mut u8| {
+            let started = std::time::Instant::now();
+            let (mut failed, mut n) = (0u32, 0u32);
+            for round in 0..20 {
+                let mut at = 0;
+                while at + ASK <= SIZE {
+                    // SAFETY: inside our allocation; a page written every
+                    // other round so the answer is not empty.
+                    unsafe {
+                        if round % 2 == 0 {
+                            base.add(at).write(1);
+                        }
+                        let mut count = found.len();
+                        let mut granularity = 0;
+                        let answer =
+                            GetWriteWatch(1, base.add(at).cast(), ASK, found.as_mut_ptr().cast(), &mut count, &mut granularity);
+                        failed += u32::from(answer != 0);
+                    }
+                    n += 1;
+                    at += ASK;
+                }
+            }
+            (started.elapsed().as_secs_f64() * 1e6 / f64::from(n), failed, n)
+        };
+        // SAFETY: our own allocation and mapping, let go at the end.
+        unsafe {
+            let watched =
+                VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | 0x20_0000, PAGE_READWRITE).cast::<u8>();
+            assert!(!watched.is_null());
+            let (us, failed, n) = per_call(watched);
+            println!("write watch, 2 MiB asked in write-watched memory: {us:.2} us a call ({failed} of {n} failed)");
+            VirtualFree(watched.cast(), 0, MEM_RELEASE);
+            let section =
+                CreateFileMappingW(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            assert!(!view.Value.is_null());
+            let (us, failed, n) = per_call(view.Value.cast());
+            println!("write watch, 2 MiB asked in a mapped view: {us:.2} us a call ({failed} of {n} failed)");
+            UnmapViewOfFile(view);
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 }
