@@ -2,8 +2,8 @@
 
 `test/all17` = `test/all16` (fb98a3eda) + merges of test/avfix, test/slots, test/stream2 (to 5fe884eb9), test/res1,
 test/split, test/loops2 (its first commit 9e9272327 only), five commits of test/testkit (0600708fa, 5867481c7,
-d59bd65f6, c3ec9f984, 2bf01ab20), the two new commits of test/speed1 (to 4e2e1f6e1), test/clamps (d4b2d6324) and
-one commit of test/all13y (95d04e060). `test/all16` = `test/all15b` (3b9488230) +
+d59bd65f6, c3ec9f984, 2bf01ab20), the two new commits of test/speed1 (to 4e2e1f6e1), test/clamps (d4b2d6324), one
+commit of test/all13y (95d04e060) and test/pairs (97ac88160). `test/all16` = `test/all15b` (3b9488230) +
 test/lx, test/cxall, test/stream1 (holds test/fairq), test/shirt1, test/speed1 (to 625bc32b6), test/compose.
 One build, every feature behind its switch: set several in one run line.
 
@@ -56,6 +56,8 @@ workers" line's two extra fields; a trace string built at each composed present.
 | `VICTORY_TEXTURE_DROP_MIPS` | `1`-`4` | 0 | the host copy of a title-filled 2D texture (512 texels and up, 5 levels and up) leaves out its N largest levels; for 8 GB cards; the picture gets softer | test/res1 (soldsawn) | no |
 | `VICTORY_COPY_PLAIN` | `1` | off | shader output goes back into title memory with a plain copy (the kernel's write behind it); small reads and reads from blocks that faulted go straight to the kernel; needs the guarded reads (on unless `VICTORY_GUARDED_READS=0`) | test/res1 (soldsawn) | no |
 | `VICTORY_GROUP_SPLIT` | `1` | off | a wave64 compute program whose thread groups hold several console waves that share nothing runs each console wave as a host thread group of its own (else it does not translate: the water tile-mask writer f133e35efed2a48a is one) | test/split (Corgansm/victory-corgi) | YES |
+| `VICTORY_WAVE_PAIRS` | `1` the paired form after the exact forms and before the wave-wide one; `first` before every other retry form (for comparing pictures) | off | a console wave64 compute program on 32-lane host waves runs each console wave as ONE host wave, each thread two lanes (no barrier added inside a branch); f133e35efed2a48a takes it | test/pairs (fxceless PR #854) | YES (by program: only the programs whose answer changes translate again) |
+| `VICTORY_WAVE_PAIRS_ONLY`, `VICTORY_WAVE_PAIRS_NOT` | `<hash>,...` | unset | the paired form for the listed programs alone, or not for the listed ones | test/pairs | YES (by program) |
 | `VICTORY_AFTER_LOOP` | `1` | off | the loops a per-lane branch leaves count as that branch's region | test/loops2 9e9272327 (fxceless PR #1249) | YES |
 | `VICTORY_REMAP_SAME` | `0`, `1`, `2` | 0 | a mapping of pages that are shown there already: 0 views taken away and made again (as before); 1 no view touched, the GPU side told of the bytes; 2 nor is the GPU side told | test/speed1 ec85139be (Neptune) | no |
 | `VICTORY_ALIAS_RUNS` | `1` | off | a copy of page mappings makes one view for a run of pages that follow one another, not one a page | test/speed1 ec85139be (Neptune) | no |
@@ -149,7 +151,11 @@ switch.
   told as written at every asking. Run `cargo test` with no `VICTORY_*` switch exported.
 
 ## Combining them in all17
-- No pair has to stay apart, and nothing refuses at startup. Three pairs needed care in the merge:
+- No pair has to stay apart, and nothing refuses at startup. Four pairs needed care in the merge:
+  - `VICTORY_WAVE_PAIRS=1` with `VICTORY_GROUP_SPLIT=1`: THE PAIRED FORM WINS for a program both could take (it is
+    tried before the wave-wide form, where the split is; f133e35efed2a48a takes the paired form and is not
+    split). A program the paired form refuses still gets the split. A paired program keeps the console's thread
+    group count, so its dispatches need no change.
   - `VICTORY_GROUP_SPLIT=1` with `VICTORY_INDIRECT_BATCH`: a split program's indirect dispatches keep their own clamp
     (it multiplies z by the split; the batched clamp does not) and are counted as refused in the batch line.
   - `VICTORY_TEXTURE_DROP_MIPS` with `VICTORY_COPY_KEEP=1`: a whole-texture copy made level by level (host copies
@@ -166,7 +172,7 @@ switch.
   PARTIAL_PROMPT (cs-all1's culprit is among them), VRAM_IDLE_MS (ignored beside TEXTURE_KEEP), DROP_MIPS (softer
   picture; for 8 GB cards), REMAP_SAME and ALIAS_RUNS (runtime mapping: a line of their own).
 - Shader-changing switches now: LOOP_EXITS, NORM_EXACT, HEAP_BELOW_ZERO, LOCAL_LDS_SYNC, NAN_GUARD, GROUP_SPLIT,
-  AFTER_LOOP. `tools/shader-sweep.sh` says offline which programs one of them changes.
+  AFTER_LOOP, WAVE_PAIRS (and its two lists). `tools/shader-sweep.sh` says offline which programs one of them changes.
 - Swept offline (tools/shader-sweep.sh, the 3,605 programs of shaders-save-boat, VICTORY_HOST_MAX_WAVE=32):
   `VICTORY_GROUP_SPLIT=1 VICTORY_AFTER_LOOP=1` together change 3 compute programs (20b78ee12ecdb57d,
   ce79e9eba7ae0348, fa0bd10a35bfef3c) and let one more translate (f133e35efed2a48a, refused without them); all 4
