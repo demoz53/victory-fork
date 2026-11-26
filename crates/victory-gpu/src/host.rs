@@ -2131,6 +2131,7 @@ struct Deferred {
     /// for reads, since the last step that wrote title memory).
     memory_read_seen: usize,
     memory_write_seen: usize,
+    named_writes: std::collections::HashSet<usize>,
 }
 
 impl Deferred {
@@ -2184,6 +2185,7 @@ impl Deferred {
         // every reset).
         self.memory_read_seen = 0;
         self.memory_write_seen = 0;
+        self.named_writes.clear();
     }
 
     /// Advances the list's title-memory copy watermarks to `total` (`writes`:
@@ -7355,6 +7357,11 @@ impl HostList {
     /// declaration.
     pub(crate) fn memory_sync_range(&self, total: usize, writes: bool) -> (usize, usize) {
         self.deferred().memory_sync_range(total, writes)
+    }
+
+    /// First raw-address write declaration for this copy in this recording.
+    pub(crate) fn first_named_write(&self, index: usize) -> bool {
+        self.deferred().named_writes.insert(index)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
