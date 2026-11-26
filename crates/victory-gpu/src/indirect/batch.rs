@@ -331,6 +331,7 @@ pub(super) fn record(
             uav_barrier(),
             transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
+        crate::waitstat::global(crate::waitstat::Cause::Batch, 1);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {

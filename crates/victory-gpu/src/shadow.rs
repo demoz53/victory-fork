@@ -1303,6 +1303,8 @@ fn remember_read(at: usize, bytes: Option<&[u8]>) {
 /// the whole span, or with [`back_blocks`] only the 1 KiB blocks that
 /// differ from what was read, joined into runs. Returns the bytes written.
 fn put_back(at: usize, merged: &[u8]) -> usize {
+    // VICTORY_FILL_TITLE=1: where and when shader writes landed.
+    crate::watch::landing(at, merged.len());
     put_back_by(at, merged, back_blocks(), |at, bytes| {
         let _writing = crate::watch::writing(at, bytes.len());
         crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());

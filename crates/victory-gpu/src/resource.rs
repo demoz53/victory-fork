@@ -396,6 +396,25 @@ pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
     hosted(this, true).and_then(|made| made.1)
 }
 
+/// The host textures unordered access to title texture `this` goes to, if
+/// its host copy is made (none is made here): the colour twin and the depth
+/// plane's twin of a depth texture, else the host copy itself (as the
+/// title's own unordered access barriers are given them, `list.rs`
+/// `host_barrier`).
+#[cfg(windows)]
+pub(crate) fn uav_targets(this: This) -> Option<Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, twin) = hosted(this, false)?;
+    Some(match twin {
+        Some(twin) => std::iter::once(twin.colour.texture.clone())
+            .chain(twin.plane.as_ref().map(|p| p.texture.clone()))
+            .collect(),
+        None => vec![host.texture.clone()],
+    })
+}
+
 /// The twin's texture, for the unordered access views of `this`.
 #[cfg(windows)]
 pub(crate) fn twin_resource<'a>(

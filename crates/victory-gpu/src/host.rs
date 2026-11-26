@@ -3659,6 +3659,38 @@ fn refresh_blocked(
     touches(immed, from, to).then_some(21)
 }
 
+/// Whether a small fill of upload memory, or copy from a title buffer, of
+/// `len` bytes at `src` goes on without waiting for the flights whose
+/// shaders may write there (`VICTORY_FILL_TITLE=1`; off by default): when
+/// the title itself wrote the memory since a copy took it (the block's
+/// guard is off: [`crate::watch::written_since_taken`]), or no shader's
+/// write landed in its pages in the last 600 frames
+/// ([`crate::watch::landed_lately`]). Bottom-of-pipe writes and read-backs
+/// over it are still waited for ([`blocked_by_steps`]).
+///
+/// The title's 174 MB heap is declared written as a whole (a root view has
+/// no size), and the title keeps a ring of constants in it: one small fill
+/// a frame at a new place each time waited for every flight's copy-back
+/// (the "fill of upload memory" settles: 3.0 of 5.7 a frame at the house).
+///
+/// What can go wrong: a constant a flight's shader really writes, in a
+/// block the title (or an earlier flight's landing) also wrote, or for the
+/// first time, is read as it was before that flight.
+///
+/// Ported from avatarmanz/VIctory-7900XTX 9fea7434c (avatarmanz, GPL-3.0;
+/// measured by Op-lite/victory-scarlett on an RTX 4060 Laptop at 15-24 ms
+/// a frame less waiting to read title memory behind flights). Adapted: the
+/// guards' answer is asked only of view memory (ours never guards other
+/// memory), and the landed pages are noted where our relay and copy-back
+/// put shader writes in (`crate::shadow`'s `put_back`), with the whole 64
+/// KiB pages of the memory's other views.
+fn fill_is_titles(src: usize, len: usize) -> bool {
+    const SMALL: usize = 64 << 10;
+    crate::watch::fill_title()
+        && len <= SMALL
+        && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
+}
+
 /// [`blocked_by`] over one slice of steps, returning `(reason, read_stat)`
 /// (`read_stat`: the place in `LATE_STATS` of the first read found) with
 /// `WHY_RUN` taking precedence over an earlier `WHY_READ` (fxceless #207).
@@ -3672,11 +3704,17 @@ fn blocked_by_steps<'a>(
         return None;
     }
     let any_written = |from: usize, to: usize| touches(written, from, to) || touches(immed, from, to);
+    // VICTORY_FILL_TITLE=1: a small read the title's own bytes answer
+    // waits only for bottom-of-pipe writes and read-backs there.
+    let read_written = |from: usize, to: usize| {
+        let read_back = by_copy.iter().any(|&(owner, a, b)| owner == 0 && a < to && b > from);
+        touches(immed, from, to) || (touches(written, from, to) && (read_back || !fill_is_titles(from, to - from)))
+    };
     let mut read_stat: Option<Option<usize>> = None;
     for step in steps {
         let stat = match step {
-            &Step::Copy(dst, src, len) => (any_written(src, src + len) || any_written(dst, dst + len)).then_some(15),
-            &Step::Fill(_, src, len) => any_written(src, src + len).then_some(16),
+            &Step::Copy(dst, src, len) => (read_written(src, src + len) || any_written(dst, dst + len)).then_some(15),
+            &Step::Fill(_, src, len) => read_written(src, src + len).then_some(16),
             Step::Texture { staging, .. } => {
                 let (at, len) = staging.memory();
                 any_written(at, at + len).then_some(17)
@@ -3728,6 +3766,7 @@ fn blocked_by(
             && let Some(slot) = stat
         {
             LATE_STATS[slot].fetch_add(1, Ordering::Relaxed);
+            crate::waitstat::read_by(slot.min(18));
             if slot >= 19 {
                 LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
@@ -4096,6 +4135,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[waited_at(why)].fetch_add(us, Ordering::Relaxed);
+    crate::waitstat::settled(waited_at(why), us);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
@@ -5371,6 +5411,7 @@ impl Host {
                             }),
                         },
                     }]);
+                    crate::waitstat::global(crate::waitstat::Cause::Ours, 1);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -5404,6 +5445,7 @@ impl Host {
                                 }),
                             },
                         }]);
+                        crate::waitstat::global(crate::waitstat::Cause::Ours, 1);
                         list.SetComputeRootSignature(&inflight.root);
                         list.SetPipelineState(&inflight.pso);
                         list.SetComputeRootUnorderedAccessView(2, work.differs.0.GetGPUVirtualAddress());
@@ -6314,6 +6356,7 @@ impl Host {
                 counted = true;
                 LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
                 LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+                crate::waitstat::settled(waited_at(why), 0);
             }
             LATE_STATS[11].fetch_add(flights as u64, Ordering::Relaxed);
             if flights > 0 {
@@ -6335,6 +6378,7 @@ impl Host {
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[waited_at(why)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                crate::waitstat::settle_stood(waited_at(why), gpu.as_micros() as u64);
                 SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
@@ -6517,6 +6561,7 @@ impl Host {
             let us = started.elapsed().as_micros() as u64;
             STAGING_WAIT_US.fetch_add(us, Ordering::Relaxed);
             STAGING_WAITED_US.fetch_add(us, Ordering::Relaxed);
+            crate::waitstat::stood(crate::waitstat::Stood::Staging, us);
             SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
         }
     }
@@ -6888,6 +6933,7 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        crate::waitstat::stood(crate::waitstat::Stood::Synchronous, gpu.as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -7834,6 +7880,7 @@ impl HostList {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                 ..Default::default()
             }]);
+            crate::waitstat::global(crate::waitstat::Cause::Ours, 1);
             self.list.CopyBufferRegion(buffer, at, &shadow.buffer, offset, len);
             self.list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COPY_DEST, constants)]);
             *readable = true;
@@ -8026,6 +8073,13 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+    }
+
+    /// The buffer [`HostList::budget`] gave the address of (the card's copy
+    /// when there is one), once it has been asked for.
+    pub(crate) fn budget_resource(&self) -> Option<&ID3D12Resource> {
+        let card = self.card_budget.get().and_then(Option::as_ref);
+        card.or_else(|| self.budget.get()?.as_ref().map(|(buffer, _)| buffer))
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -9907,6 +9961,11 @@ impl Meter {
                 // VICTORY_LOCK_STATS=1: waits on the recording path's shared
                 // locks since the last line.
                 if let Some(line) = crate::lockstat::line((self.presented - presented_then).max(1) as f64) {
+                    tracing::info!("{line}");
+                }
+                // VICTORY_WAIT_STATS=1: the card's and the submitting
+                // thread's waits since the last line.
+                if let Some(line) = crate::waitstat::line((self.presented - presented_then).max(1) as f64) {
                     tracing::info!("{line}");
                 }
             }
