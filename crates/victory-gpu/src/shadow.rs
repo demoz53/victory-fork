@@ -2892,6 +2892,50 @@ impl Shadow {
     pub(crate) fn span(&self) -> (u64, u64) {
         (self.start, self.len)
     }
+}
+
+/// Diagnostics, since the last line: bytes sent up to copies in the card's
+/// memory before submissions, by copy (start, length): the per-buffer
+/// traffic report kitty-core/Kitty6 60532f0c1 found its 21 MB ping-pong
+/// buffer with (GPL-3.0; the idea, not its code).
+#[cfg(feature = "diagnostics")]
+static SENT_UP: Mutex<Option<std::collections::HashMap<(u64, u64), (u64, u64)>>> = Mutex::new(None);
+
+/// `bytes` of the copy at `span` went up to the card (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sent_up(span: (u64, u64), bytes: u64) {
+    let mut map = SENT_UP.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(std::collections::HashMap::new).entry(span).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += bytes;
+}
+
+/// The `most` copies that took the most bytes up since the last call, a line
+/// each, per frame over `frames` (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sent_up_lines(frames: f64, most: usize) -> Vec<String> {
+    let taken = SENT_UP.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut all: Vec<_> = taken.into_iter().flatten().collect();
+    let total: u64 = all.iter().map(|(_, (_, b))| b).sum();
+    all.sort_by_key(|&(_, (_, bytes))| std::cmp::Reverse(bytes));
+    let frames = frames.max(1.0);
+    let mut lines = vec![format!(
+        "  sent up to copies in the card's memory: {} copies, {:.1} MB/frame; the largest follow",
+        all.len(),
+        total as f64 / 1e6 / frames
+    )];
+    lines.extend(all.into_iter().take(most).map(|((start, len), (ranges, bytes))| {
+        format!(
+            "  sent up to {start:#x}+{len:#x}: {:.2} MB/frame in {:.1} ranges/frame ({:.0}% of the copy a frame)",
+            bytes as f64 / 1e6 / frames,
+            ranges as f64 / frames,
+            bytes as f64 * 100.0 / frames / (len.max(1) as f64)
+        )
+    }));
+    lines
+}
+
+impl Shadow {
 
     /// Whether the copy is title memory in place (nothing is copied).
     pub(crate) fn in_place(&self) -> bool {

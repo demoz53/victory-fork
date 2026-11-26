@@ -7105,6 +7105,8 @@ impl Host {
                                     crate::meters::ours_mark(&mut stamps.borrow_mut(), list, crate::meters::Kind::BufferCopies);
                                     list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                                     crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
+                                    #[cfg(feature = "diagnostics")]
+                                    crate::shadow::sent_up(shadow.span(), (b - a) as u64);
                                 }
                                 if let (Some((split, section)), Some(((buffer, _, _), _)), Some(mask)) = (split, &masks, &work.mask) {
                                     // The masked pages: the buffer goes from
@@ -7153,6 +7155,8 @@ impl Host {
                                         list.CopyBufferRegion(&shadow.buffer, at as u64, &ring.buffer, into, n);
                                         crate::shadow::CARD_STATS[0].fetch_add(n, Ordering::Relaxed);
                                         crate::shadow::lean_sent(n);
+                                        #[cfg(feature = "diagnostics")]
+                                        crate::shadow::sent_up(shadow.span(), n);
                                         match wrote.last_mut() {
                                             Some(last) if last.1 == into => last.1 = into + n,
                                             _ => wrote.push((into, into + n)),
@@ -12333,6 +12337,11 @@ impl Meter {
                     per_frame(5),
                     per_frame(6) / 1e3
                 );
+                // Which copies those bytes went up for (diagnostics).
+                #[cfg(feature = "diagnostics")]
+                for line in crate::shadow::sent_up_lines(frames, 8) {
+                    tracing::info!("{line}");
+                }
             }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
