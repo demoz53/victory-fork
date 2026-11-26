@@ -73,6 +73,12 @@ the bound render targets kept at each set of targets (for TARGET_VARIANTS), and 
 per pipeline at its creation (a bool per pipeline, now also in release builds; `VICTORY_SKIP_PIPELINES` is still a
 diagnostics-build switch).
 
+## New in test/async1 (on top of all21; not merged yet)
+| Switch | Values | Default | What it does | From | Shader |
+|---|---|---|---|---|---|
+| `VICTORY_ASYNC_SUBMIT` | `1` | off (needs `VICTORY_RELAY` or `VICTORY_LATE_WAIT`, and lists cut at their waits, the default; refused with a warning otherwise) | the title's submit call only puts its lists behind the queue's line; a thread of ours (`victory-submit`) prepares, settles and sends the lines in order while the title goes on. A part being sent keeps a marker at its line's head, so later submissions and signals stay behind it. The lines are run first, on the caller's thread, before: a present (so a present returns, as before, only once the frame is sent), a fence the title blocks on without an event, a synchronous submission of ours, and the title's page-mapping changes (`CopyPageMappingsBatchX`, done at once). Frame line: "submissions prepared off the title's submit calls per frame" (parts sent, their ms, and how long title threads stood at each of those four places) | our 99250881f (port of fxceless f85101b60) rebased onto all21 | no |
+| `VICTORY_FLIP_LANDED` | `1` on, `0` off | unset: on with `VICTORY_ASYNC_SUBMIT=1`, off without it (needs `VICTORY_RELAY`/`VICTORY_LATE_WAIT`) | the title's blocking flip wait first waits (at most its own time-out, never past 1.5 s) until what it submitted before the present of the frame before the one it records has landed: shader writes copied back, read-backs, bottom-of-pipe values, fences. Frame line: "the title's flip waits per frame" (waits, those that found the frame before not landed, ms waited, time-outs) | fx PR #995 (tunczzz, 72dbd10) | no |
+
 ## New in all21 (merged on top of all20)
 | Switch | Values | Default | What it does | From | Shader |
 |---|---|---|---|---|---|
