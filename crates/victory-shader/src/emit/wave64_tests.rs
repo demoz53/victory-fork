@@ -2083,6 +2083,7 @@ fn without_cascades_exact_a_pair_in_shared_lanes_stays_two_scalars() {
         readlane(31, 10, 4),
     ]);
     assert!(instructions(&p, "s_mov_b64").is_empty());
+}
 
 /// The wave size `lower` declares for `native` on a host of 32-lane waves.
 fn flag_wave(native: &NativeProgram) -> Option<u32> {
