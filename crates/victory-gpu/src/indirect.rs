@@ -1340,10 +1340,15 @@ void main() {
             // SAFETY: as above.
             (0..=pieces as usize).map(|i| unsafe { table_ptr.cast::<u32>().add(i).read_volatile() }).collect()
         };
-        // SAFETY (each): inside the mapping of the copy.
-        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
-        // SAFETY (each): the slot's mapping holds `INFLIGHT_SLOT` bytes.
-        let slot = |len: usize| unsafe { std::slice::from_raw_parts(fetched_ptr, len).to_vec() };
+        let set = |at: usize, value: u8| {
+            // SAFETY: every `at` below is inside the mapping of the copy.
+            unsafe { now_ptr.add(at).write_volatile(value) }
+        };
+        let slot = |len: usize| {
+            // SAFETY: the slot's mapping holds `INFLIGHT_SLOT` bytes, and
+            // no `len` below is more.
+            unsafe { std::slice::from_raw_parts(fetched_ptr, len).to_vec() }
+        };
         run(&mut warp, 0, 0);
         // Piece 2 of the copy (title piece 2: bytes 2 * 64 KiB - 40 on), its
         // slot from the multiple of 16 below to the one above its end.
