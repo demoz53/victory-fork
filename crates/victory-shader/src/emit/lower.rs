@@ -415,7 +415,7 @@ pub(super) const LANE_ELSEWHERE: Why = "a lane written or read where not every l
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
+/// Per IR block: every lane of the wave that started the program runs it â€“ no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
@@ -1117,7 +1117,7 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
-/// The widest wave the host GPU runs (0: not known – no host-specific forms); see
+/// The widest wave the host GPU runs (0: not known â€“ no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1416,7 +1416,7 @@ pub fn lds_fit() -> bool {
 }
 
 /// Whether a descriptor read from below the start of a heap is taken as heap slot 0
-/// (`VICTORY_HEAP_BELOW_ZERO=0`: its byte offset shifted unsigned, a slot near 0x7ffffff,
+/// (`VICTORY_HEAP_BELOW_ZERO` unset or 0: its byte offset shifted unsigned, a slot near 0x7ffffff,
 /// as before). From JordanFromIT/CGBJ-VIctory fa3aee394 ("Shader: take a descriptor below the
 /// heap as slot 0"): the slot read the host's stride table about 512 MiB past its start, a
 /// GPU page fault and then a ring timeout. Part of the translation: the shader cache keys on
@@ -1426,7 +1426,7 @@ pub fn heap_below_zero() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BELOW_ZERO").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BELOW_ZERO").is_some_and(|v| v != "0"))
 }
 
 thread_local! {
@@ -1561,14 +1561,14 @@ pub fn swizzle_modes() -> bool {
 /// lowered through the format) of UNORM and SNORM fields up to 16 bits
 /// convert a code to the float nearest its exact quotient, worked out in
 /// integers, and give exactly 1.0 and -1.0 at the ends, as the console's
-/// buffer unit does (`VICTORY_NORM_EXACT=0`: the host's division, which is
+/// buffer unit does (`VICTORY_NORM_EXACT` unset or 0: the host's division, which is
 /// one ulp off for some codes on some cards; a title that truncates `x *
 /// 255` back to a material index then picks another material). Ported from
 /// upstream Marvisak/VIctory da82e444e (Marvis) and 645391bcc (Duff). Part
 /// of the translation: the shader cache keys on it.
 pub fn norm_exact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_NORM_EXACT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NORM_EXACT").is_some_and(|v| v != "0"))
 }
 
 /// Whether [`early_depth`] is declared (`VICTORY_EARLY_DEPTH=0`: never, the
@@ -1740,8 +1740,8 @@ impl<'a> Lower<'a> {
             // does not need a fixed WaveSize (which 64-only GCN GPUs and WARP refuse).
             let one_wave = group > 1 && group <= wave;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
-            // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
-            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
+            // wave64 program whose cross-lane code stays inside 32-lane halves â€“ DPP rows,
+            // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there â€“ runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
@@ -1764,7 +1764,7 @@ impl<'a> Lower<'a> {
                     // waves, which exchange through their own pair of dwords.)
                     // LDS the console shares within its one wave without barriers: split into
                     // two waves of 32, a group barrier before every LDS access keeps their order
-                    // – where every thread of the group gets there (no lane branch around it,
+                    // â€“ where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
                     let lds = |i: &Inst| {
                         matches!(i.fields, Fields::Ds { .. })
@@ -3920,7 +3920,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2Ï€ (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -3938,7 +3938,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 Ã— 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -3954,7 +3954,7 @@ impl<'a> Lower<'a> {
 
     /// [`nan_guard_mode`]: a float a pixel program exports to a colour target (`strict`) and,
     /// with `stores`, a value a typed store writes (not `strict`), with NaN made 0 and an
-    /// infinity ±65504, so one bad pixel does not stay in a history the title blends into each
+    /// infinity Â±65504, so one bad pixel does not stay in a history the title blends into each
     /// frame. Not `strict`: only the NaN the GPU makes (0x7FC00000, either sign) and
     /// infinities, since typed stores go out as `.f32` whatever the view's format (integer
     /// words 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000 change too). From
@@ -3987,7 +3987,7 @@ impl<'a> Lower<'a> {
         self.as_float(r)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 Ã— anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -5214,7 +5214,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (Ã—64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -5413,7 +5413,7 @@ impl<'a> Lower<'a> {
     /// otherwise a NaN loses to a number (two quiet NaNs give the data);
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
-    // flushing them they would order as ±0 first (MODE is not modelled).
+    // flushing them they would order as Â±0 first (MODE is not modelled).
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
@@ -8227,7 +8227,7 @@ impl<'a> Lower<'a> {
                 // Follows the default f32 flush-to-zero (FTZ) denormal mode
                 // used by the console and D3D12/DXIL: subnormal inputs
                 // (`exp == 0`) and underflowing results (`exp + delta <= 0`)
-                // flush to signed zero, while `±inf` and NaNs pass through
+                // flush to signed zero, while `Â±inf` and NaNs pass through
                 // (with sNaNs quieted).
                 let (x_f, delta) = (f(self, 0)?, s(self, 1)?);
                 let x = self.as_int(x_f);
@@ -9255,7 +9255,7 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, at, odd);
         let up = self.s.m.bin(c, Bin::Or, above, tie);
         let up = self.s.m.select(c, up, one, zero);
-        // Rebias the exponent (1023 → 127); a carry out of the mantissa
+        // Rebias the exponent (1023 â†’ 127); a carry out of the mantissa
         // steps the exponent, up to infinity.
         let bias = k(self, 1023 - 127);
         let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
@@ -10887,7 +10887,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 Ã— the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
