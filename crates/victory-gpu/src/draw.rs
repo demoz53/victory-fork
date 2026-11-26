@@ -1756,6 +1756,12 @@ impl State {
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
+            // Its plane's pass was recorded just now (`VICTORY_PLANE_NOW`):
+            // the title's state, and this draw's preparation, again.
+            if list.take_plane_reset() {
+                self.replay(list);
+                return self.prepare_for(list, indexed, mesh);
+            }
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1784,6 +1790,11 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // A depth plane's pass recorded since (a copy, `VICTORY_PLANE_NOW`):
+        // the title's state first.
+        if list.take_plane_reset() {
+            self.replay(list);
+        }
         let l = &list.list;
         // The textures this draw's material record names are wanted
         // (`VICTORY_MATERIAL_TEXTURE_DEMAND=1`): before the pass below.
@@ -2000,6 +2011,13 @@ impl State {
                     return false;
                 }
             }
+        }
+        // A depth plane's pass recorded while this draw's views were
+        // prepared (`VICTORY_PLANE_NOW`): the title's state again, and the
+        // binding again on top of it (the plane is up to date now).
+        if list.take_plane_reset() {
+            self.replay(list);
+            return self.bind(list, p, compute);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.

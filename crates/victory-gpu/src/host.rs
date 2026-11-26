@@ -942,6 +942,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// A depth plane's pass was recorded among the title's commands
+    /// (`VICTORY_PLANE_NOW`): the list's pipeline, root signature, heaps and
+    /// targets are ours until the title's are set again ([`Self::take_plane_reset`]).
+    plane_reset: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1246,6 +1250,36 @@ impl PlanePass {
 /// heap, graphics root signature, pipeline, depth target, viewport,
 /// scissor and topology and puts none of them back: it is for a list that
 /// records nothing of the title's after it.
+/// `VICTORY_PLANE_NOW=1` (off by default): a depth plane whose twin a list
+/// wrote and that the same list then uses (tests, reads, copies) gets its
+/// pass ([`record_plane_pass`]) right there, before the use, instead of when
+/// the list closes; the title's pipeline, root signatures, heaps, targets,
+/// viewports, scissors and topology are set again before its next draw or
+/// dispatch. Without it such a use sees the plane as it was before the list's
+/// shader writes ("times used before the pass" in the memory line, about one
+/// a frame): per-pixel classes one list late, the suspect for a face black
+/// on the first shot after a cut and stippled cloth (Op-lite/victory-scarlett
+/// silent-defects audit C4, GPL-3.0-or-later; ideas). With it that count
+/// stays 0 and "drawn at once" counts these passes.
+pub(crate) fn plane_now() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PLANE_NOW.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| plane_now_from(std::env::var_os("VICTORY_PLANE_NOW").as_deref()))
+}
+
+fn plane_now_from(set: Option<&std::ffi::OsStr>) -> bool {
+    set.is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_PLANE_NOW`, for its thread only.
+    pub(crate) static TEST_PLANE_NOW: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 fn record_plane_pass(
     list: &ID3D12GraphicsCommandList,
     depth: &ID3D12Resource,
@@ -4857,6 +4891,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                plane_reset: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -7255,6 +7290,7 @@ impl HostList {
         self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plane_reset.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // (A recording that was closed left none: one that was not never ran,
         // and its batches' buffers are as they were.)
@@ -7404,13 +7440,22 @@ impl HostList {
         // still recording the title's commands cannot take. This use sees
         // the plane as it was; the pass runs when the list closes
         // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
+        // `VICTORY_PLANE_NOW=1`: the pass is recorded here, before this use,
+        // and the title's state is set again before its next draw or
+        // dispatch ([`Self::take_plane_reset`]).
+        let now = copy && !colour && twin.plane.is_some() && plane_now();
+        if copy && !colour && twin.plane.is_some() && !now {
             u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
         drop(twins);
         if copy {
             self.twin_copy(&depth, &twin, colour);
+            if now {
+                self.pass_plane(&depth, &twin);
+                self.plane_reset.store(true, Ordering::Relaxed);
+                crate::resource::PLANES[3].fetch_add(1, Ordering::Relaxed);
+            }
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
@@ -7580,6 +7625,13 @@ impl HostList {
 
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
+    /// Whether a depth plane's pass was recorded among the title's commands
+    /// since the last asking (`VICTORY_PLANE_NOW`): the caller sets the
+    /// title's state again (`crate::draw::State::replay`).
+    pub(crate) fn take_plane_reset(&self) -> bool {
+        self.plane_reset.swap(false, Ordering::Relaxed)
+    }
+
     pub(crate) fn twins_written(&self) {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
@@ -9729,12 +9781,13 @@ impl Meter {
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
-                    "{}; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                    "{}; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass, {} drawn at once (VICTORY_PLANE_NOW)",
                     crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
                     crate::resource::TWINS[0].load(Ordering::Relaxed),
                     crate::resource::TWINS[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[1].load(Ordering::Relaxed),
-                    crate::resource::PLANES[2].load(Ordering::Relaxed)
+                    crate::resource::PLANES[2].load(Ordering::Relaxed),
+                    crate::resource::PLANES[3].load(Ordering::Relaxed)
                 ),
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
