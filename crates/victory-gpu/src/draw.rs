@@ -4405,6 +4405,13 @@ impl State {
         {
             batch_count(B_PARTS);
             None
+        } else if kind == DISPATCH && p.group_split() > 1 {
+            // A program split into one host group per console wave
+            // (`VICTORY_GROUP_SPLIT=1`): the clamp of its own multiplies
+            // each record's z (`crate::indirect::with_split`), which the
+            // batched clamp does not do. Clamped on its own, below.
+            batch_count(B_REFUSED);
+            None
         } else {
             args.refresh(list, arguments, len);
             let batch = self.batched(list, &args, arguments, (kind, stride), stores);
