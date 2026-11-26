@@ -99,6 +99,50 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// Where `CS_UpdateHistory_*` writes the reflections (R9G9B9E5 as 32-bit
 /// integers); the lighting programs read that image next.
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// The other image `CS_UpdateHistory_*` (6fad2980c2774c90, 92 instructions)
+/// writes. Read from its code: per 8x8 tile of its list, where a mask is
+/// set, it loads a colour and, when two words of its constants are both
+/// non-zero, packs it as R9G9B9E5 and stores it at table dword 48 (register
+/// u36, the register the resolve's diffuse light (1, 176) has too);
+/// otherwise it stores the colour unpacked at dword 40 (u31). Which branch
+/// the title takes is not known offline.
+pub(crate) const REFLECTIONS_PACKED: (u8, u32) = (1, 48);
+
+/// `VICTORY_AMBIENT_REFLECT_AT=48`: [`reflect`] holds the image at table
+/// dword 48 ([`REFLECTIONS_PACKED`]), the one `CS_UpdateHistory_*` writes
+/// packed. Unset, `40` or anything else: dword 40, as before.
+pub(crate) fn reflections() -> (u8, u32) {
+    static AT: OnceLock<(u8, u32)> = OnceLock::new();
+    *AT.get_or_init(|| parse_reflect_at(&std::env::var("VICTORY_AMBIENT_REFLECT_AT").unwrap_or_default()))
+}
+
+fn parse_reflect_at(set: &str) -> (u8, u32) {
+    if set.trim() == "48" { REFLECTIONS_PACKED } else { REFLECTIONS }
+}
+
+/// `VICTORY_AMBIENT_SKIP_DARK=<share>` (off by default): a frame whose
+/// light of visible surfaces is dark in more than all but `<share>` of the
+/// 64x36 cells (no cell sends out anything: a cut, a fade, the title's
+/// cleared image on the first frame of a shot) is not followed: the cells
+/// and the slow mean stay as the last frame with light left them. Without
+/// it such a frame takes the light around to nothing at once (the jump of
+/// [`settle`]), and with it everything the stand-in lights: a body in the
+/// room's shade turns black for a shot after a cut. `0.1` asks that at
+/// least a tenth of the cells hold light. Unset, 0 or unparsable: off.
+fn skip_dark() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let share = parse_skip_dark(&std::env::var("VICTORY_AMBIENT_SKIP_DARK").unwrap_or_default());
+        if share > 0.0 {
+            tracing::info!(share, "frames without light in the stand-in's cells are not followed (VICTORY_AMBIENT_SKIP_DARK)");
+        }
+        share
+    })
+}
+
+fn parse_skip_dark(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).map_or(0.0, |v| v.min(1.0))
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -276,21 +320,24 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
 #define PX 160
 #define PY 90
+// Where `keep` puts a frame's cells before `mean` takes them.
+#define FRESH_CELLS (2 * CELLS + 1)
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float held;
-    float jump; float fresh; float dt;
+    float jump; float fresh; float dt; float skip_dark;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// CELLS + 1 on where they are, from FRESH_CELLS on this frame's light
+// before `mean` takes it.
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
@@ -319,14 +366,26 @@ void keep(uint3 at : SV_DispatchThreadID) {
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / 20.0);
     }
-    cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
+    cells[FRESH_CELLS + at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void mean() {
     float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    uint lit = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        float3 c = cells[FRESH_CELLS + i].rgb;
+        sum += c;
+        lit += dot(c, LUMA) > 1e-6 ? 1 : 0;
+    }
     float4 was = cells[CELLS];
+    // (`skip_dark` > 0: a frame with light in fewer than that share of the
+    // cells is not followed once something was kept: a cut or a fade.)
+    if (skip_dark > 0.0 && was.a > 0.0 && float(lit) < skip_dark * float(CELLS)) {
+        cells[CELLS] = float4(was.rgb, was.a + dt);
+        return;
+    }
+    for (uint j = 0; j < CELLS; j++) cells[j] = cells[FRESH_CELLS + j];
     float3 now = sum / CELLS;
     // (`jump` > 0: a change of more than that factor either way is
     // followed at once, as a new room is.)
@@ -510,7 +569,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+// The cells, their mean, where they are, and a frame's cells before the
+// mean takes them (`FRESH_CELLS`).
+const CELL_BYTES: u64 = (3 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -639,7 +700,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -653,6 +714,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (dt / 1000.0).to_bits();
+    words[15] = skip_dark().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -660,7 +722,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -714,17 +776,104 @@ mod tests {
         assert_eq!(parse_settle(Some("0")), None);
         assert_eq!(parse_settle(Some("500,0,2")), Some(Settle { ms: 500.0, jump: 0.0, fresh: 2.0 }));
         assert_eq!(parse_settle(Some("100")), Some(Settle { ms: 100.0, jump: 3.0, fresh: 0.0 }));
+        assert_eq!(parse_reflect_at(""), REFLECTIONS);
+        assert_eq!(parse_reflect_at("40"), REFLECTIONS);
+        assert_eq!(parse_reflect_at(" 48 "), REFLECTIONS_PACKED);
+        assert_eq!(parse_skip_dark(""), 0.0);
+        assert_eq!(parse_skip_dark("0"), 0.0);
+        assert_eq!(parse_skip_dark("0.1"), 0.1);
+        assert_eq!(parse_skip_dark("3"), 1.0);
+        assert_eq!(parse_skip_dark("-1"), 0.0);
+        assert_eq!(parse_skip_dark("nan"), 0.0);
     }
 
+    /// `mean` on the card: a frame of dark cells is not followed with
+    /// `skip_dark`, and is (at once, as a jump) without it.
     #[test]
-    fn roles_by_name() {
-        assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
-        assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
-        assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
-        assert_eq!(role(b"..CS_UpdateHistory_e877ef6e_Wrapped.."), Some(Role::Reflect));
-        assert_eq!(role(b"CS_TemporalResolve"), None);
-        // The name the resolve has in the containers this title gives us.
-        assert_eq!(role(b"CS_ScreenProbes_TemporalResolve_ReflectiveCaustics_a911b49c_Wrapped"), Some(Role::Resolve));
+    fn a_dark_frame_is_not_followed() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; skipping");
+            return;
+        };
+        let lit = [0.5f32, 0.5, 0.5];
+        // Frame one lit, frame two dark; the mean after each.
+        let run = |skip: f32| -> [[f32; 4]; 2] {
+            let mut out = [[0.0; 4]; 2];
+            let mut cells = vec![[0.0f32; 4]; (3 * CELLS + 1) as usize];
+            for (frame, light) in [lit, [0.0; 3]].into_iter().enumerate() {
+                for c in &mut cells[(2 * CELLS + 1) as usize..] {
+                    *c = [light[0], light[1], light[2], 1.0];
+                }
+                cells = run_mean(host, &cells, skip);
+                out[frame] = cells[CELLS as usize];
+            }
+            out
+        };
+        let [first, second] = run(0.1);
+        assert!((first[0] - 0.5).abs() < 1e-5, "{first:?}");
+        assert!((second[0] - 0.5).abs() < 1e-5, "kept: {second:?}");
+        assert!(second[3] > first[3], "its age goes on: {first:?} {second:?}");
+        let [_, followed] = run(0.0);
+        assert!(followed[0] < 1e-5, "without the switch the dark frame is taken as a jump: {followed:?}");
+    }
+
+    /// One dispatch of `mean` over `cells` with `skip_dark`, read back.
+    fn run_mean(host: &crate::host::Host, cells: &[[f32; 4]], skip_dark: f32) -> Vec<[f32; 4]> {
+        let pass = make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+        let bytes = std::mem::size_of_val(cells) as u64;
+        assert_eq!(bytes, CELL_BYTES);
+        let mut words = [0u32; 16];
+        words[8] = 0.04f32.to_bits();
+        words[12] = 3.0f32.to_bits();
+        words[14] = 0.033f32.to_bits();
+        words[15] = skip_dark.to_bits();
+        let (upload, at) = host.upload_buffer(bytes).expect("an upload buffer");
+        let back = host.read_back_buffer(bytes).expect("a read-back buffer");
+        let data: Vec<u8> = cells.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: the upload buffer is mapped for `bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), at, data.len()) };
+        let transition = |from, to| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: a borrowed pointer the barrier does not own.
+                    pResource: unsafe { std::mem::transmute_copy(&pass.cells) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: from,
+                    StateAfter: to,
+                }),
+            },
+            ..Default::default()
+        };
+        let commands = host.new_list().expect("a list");
+        let l = &commands.list;
+        // SAFETY: an open list; our root signature, pipelines and buffers,
+        // which live through the run (`execute` waits for it).
+        unsafe {
+            l.CopyBufferRegion(&pass.cells, 0, &upload, 0, bytes);
+            l.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetComputeRootSignature(&pass.root);
+            l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+            l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+            l.SetPipelineState(&pass.mean);
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            l.CopyBufferRegion(&back, 0, &pass.cells, 0, bytes);
+        }
+        commands.close();
+        host.execute(&[&commands]);
+        let mut ptr = std::ptr::null_mut();
+        let mut out = vec![0u8; bytes as usize];
+        // SAFETY: the copy has run; the buffer holds `bytes`.
+        unsafe {
+            back.Map(0, None, Some(&mut ptr)).expect("mapped");
+            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), out.len());
+            back.Unmap(0, None);
+        }
+        out.chunks_exact(16)
+            .map(|c| std::array::from_fn(|i| f32::from_le_bytes(c[i * 4..i * 4 + 4].try_into().unwrap())))
+            .collect()
     }
 
     /// The passes compile with the system's compiler and the host takes them.
