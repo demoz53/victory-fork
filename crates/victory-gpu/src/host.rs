@@ -8037,6 +8037,13 @@ impl HostList {
         Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
     }
 
+    /// The buffer [`HostList::budget`] gave the address of (the card's copy
+    /// when there is one), once it has been asked for.
+    pub(crate) fn budget_resource(&self) -> Option<&ID3D12Resource> {
+        let card = self.card_budget.get().and_then(Option::as_ref);
+        card.or_else(|| self.budget.get()?.as_ref().map(|(buffer, _)| buffer))
+    }
+
     /// The budget's words in the card's own memory ([`card_budget`]), if
     /// the list can zero them itself (`WriteBufferImmediate`).
     fn make_card_budget(&self) -> Option<ID3D12Resource> {

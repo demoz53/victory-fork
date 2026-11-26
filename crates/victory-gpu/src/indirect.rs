@@ -714,7 +714,8 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_at(c, &list.list, (dst, before, at), budget, src, count, spec, ahead);
+    let budget = (budget, list.budget_resource());
+    let recorded = record_clamp_scoped(c, &list.list, (dst, before, at), budget, src, count, spec, ahead);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -747,8 +748,54 @@ fn record_clamp_as(
 fn record_clamp_at(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    (dst, before, at): (&ID3D12Resource, D3D12_RESOURCE_STATES, u64),
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES, u64),
     budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_scoped(c, l, dst, (budget, None), src, count, spec, ahead)
+}
+
+/// Whether the wait after each clamp is one for every earlier shader
+/// write (the default), or with `VICTORY_CLAMP_WAITS=0` one on the list's
+/// budget buffer alone.
+///
+/// The wait before the clamp stays as it is: the title's passes that
+/// write the argument and count buffers the clamp reads are ordered by it.
+/// After the clamp, what it wrote is the scratch buffer (its move to
+/// `INDIRECT_ARGUMENT` orders that before the executions that read it)
+/// and the budget's words (the next clamp, launch or batched pass reads
+/// and charges them: the barrier on the budget orders that; the copy of
+/// the card's budget at the list's end moves it out of unordered access
+/// first). Nothing else the clamp wrote is read; and the title's own work
+/// after the clamp is ordered after the title's earlier writes by the wait
+/// before the clamp, whatever comes after it. So the second full wait,
+/// which made the card drain between each clamp and its draw, orders
+/// nothing that needs it. The same holds for windows clamped ahead
+/// (`VICTORY_INDIRECT_WINDOW`) and beside the batched clamps
+/// (`VICTORY_INDIRECT_BATCH=3`): those passes keep their own full wait
+/// before them, and the records left to this clamp are its own.
+///
+/// Ported from lordon1a/victory-laptop-8gb 32b5e420b (lordon1a), a port of
+/// Op-lite/victory-scarlett f748fb557a after Trexies' 6b358fe83 (GPL-3.0):
+/// on an RTX 3070 Ti Laptop, Series S, 149.3 -> 143.0 ms median, p90 250 ->
+/// 146 ms, picture the same.
+fn clamp_waits_global() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAITS").is_none_or(|v| v != "0"))
+}
+
+/// [`record_clamp_at`] with the budget's buffer, if the caller has it: then
+/// with `VICTORY_CLAMP_WAITS=0` the wait after the clamp is on it alone
+/// ([`clamp_waits_global`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_scoped(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before, at): (&ID3D12Resource, D3D12_RESOURCE_STATES, u64),
+    (budget, budget_buffer): (u64, Option<&ID3D12Resource>),
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -822,8 +869,14 @@ fn record_clamp_at(
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
+    // VICTORY_CLAMP_WAITS=0: the wait after it on the budget alone, and
+    // none when no record ran.
+    let scoped = budget_buffer.filter(|_| !clamp_waits_global());
     let second = [
-        uav_barrier(),
+        match scoped {
+            Some(budget) => resource_uav_barrier(budget),
+            None => uav_barrier(),
+        },
         transition(
             dst,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -831,6 +884,7 @@ fn record_clamp_at(
         ),
     ];
     let skip = usize::from(!waits);
+    let skip_after = usize::from(!waits || (scoped.is_some() && records == 0));
     // SAFETY: l is an open command list, dst is a live scratch buffer,
     // barriers transition dst correctly, and constants and root arguments
     // match c's compute pipeline layout.
@@ -848,8 +902,12 @@ fn record_clamp_at(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
-        crate::waitstat::global(crate::waitstat::Cause::ClampAfter, u64::from(waits));
+        l.ResourceBarrier(&second[skip_after..]);
+        if scoped.is_some() {
+            crate::waitstat::scoped(crate::waitstat::Cause::ClampAfter, u64::from(skip_after == 0));
+        } else {
+            crate::waitstat::global(crate::waitstat::Cause::ClampAfter, u64::from(waits));
+        }
     }
     true
 }
@@ -924,6 +982,22 @@ pub(crate) fn open_batch(
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
+}
+
+/// An unordered access barrier on `resource` alone: its earlier shader
+/// writes finish before later work on it.
+pub(crate) fn resource_uav_barrier(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: borrowed for the recording, as a transition's
+                // resource is: never released through the barrier.
+                pResource: std::mem::ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(resource) })),
+            }),
+        },
+    }
 }
 
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
