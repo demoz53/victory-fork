@@ -5,6 +5,9 @@
 
 #[cfg(windows)]
 pub mod hooks;
+pub mod modcmd;
+#[cfg(windows)]
+pub mod modgame;
 pub mod sgd5;
 
 pub mod cpu_sites;

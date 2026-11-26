@@ -371,6 +371,38 @@ pub fn take_teleport() -> Option<Teleport> {
     TELEPORTS.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
 }
 
+/// The words that begin a mod command line (`victory_game::modcmd::WORDS`,
+/// which parses them: the keys file only routes them by their first word).
+pub const MOD_WORDS: &[&str] =
+    &["teleport", "tp", "time", "weather", "heal", "invincible", "wanted", "spawn", "vehicle", "native", "status"];
+
+/// Mod command lines reached in the keys file, for the title's frame hook.
+static MOD_LINES: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+/// The oldest mod command line the keys file has reached and nothing has taken.
+pub fn take_mod_line() -> Option<String> {
+    MOD_LINES.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
+}
+
+/// Whether the keys file hands mod command lines on: `VICTORY_MOD=1` and
+/// `VICTORY_TITLE_COMMANDS=1` (and title patches not off). Then every
+/// `teleport` line goes to the mod as well (any distance; `teleport x y`
+/// finds the ground).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+static MOD_LINES_ON: LazyLock<bool> = LazyLock::new(|| {
+    let is = |n: &str, v: &str| std::env::var(n).is_ok_and(|x| x.trim() == v);
+    is("VICTORY_MOD", "1") && is("VICTORY_TITLE_COMMANDS", "1") && !is("VICTORY_TITLE_PATCHES", "0")
+});
+
+/// A mod command line (first word one of [`MOD_WORDS`], at most 400
+/// characters), as the keys file hands it on.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub fn mod_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let first = line.split_whitespace().next()?.to_ascii_lowercase();
+    (MOD_WORDS.contains(&first.as_str()) && line.len() <= 400).then(|| line.to_owned())
+}
+
 /// `teleport <x> <y> <z> [<heading>]`, every number finite, coordinates
 /// within 100 km; `None` for anything else.
 pub fn parse_teleport(line: &str) -> Option<Teleport> {
@@ -1308,22 +1340,39 @@ mod script {
     }
 
     /// One line of the keys file: the keys held together (none for `wait`);
-    /// a `teleport` line holds nothing for one frame and hands its command
-    /// to the title's frame hook when it is reached.
+    /// a `teleport` line (or, with `VICTORY_MOD=1`, any mod command line)
+    /// holds nothing for one frame and hands its command to the title's
+    /// frame hook when it is reached.
     #[derive(Clone, Debug, PartialEq)]
     pub(super) struct Line {
         pub(super) keys: Vec<u8>,
         pub(super) hold: Hold,
-        pub(super) command: Option<super::Teleport>,
+        pub(super) command: Option<Command>,
+    }
+
+    /// What a command line hands to the title's frame hook.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) enum Command {
+        Teleport(super::Teleport),
+        /// A mod command line, parsed by the mod (`victory_game::modcmd`).
+        Mod(String),
     }
 
     /// `<key>`, `<key>+<key>... <ms>`, `wait <ms>`, `<key>+... <n>f` or
     /// `wait <n>f` (ms at most 60000, n from 1 to 6000); `None` for anything
     /// else.
     pub(super) fn parse(line: &str) -> Option<Line> {
+        parse_with(line, *super::MOD_LINES_ON)
+    }
+
+    /// [`parse`], with mod command lines taken (`mods`) or not.
+    pub(super) fn parse_with(line: &str, mods: bool) -> Option<Line> {
+        if mods && let Some(m) = super::mod_line(line) {
+            return Some(Line { keys: Vec::new(), hold: Hold::Frames(1), command: Some(Command::Mod(m)) });
+        }
         if line.split_whitespace().next() == Some("teleport") {
             let t = super::parse_teleport(line)?;
-            return Some(Line { keys: Vec::new(), hold: Hold::Frames(1), command: Some(t) });
+            return Some(Line { keys: Vec::new(), hold: Hold::Frames(1), command: Some(Command::Teleport(t)) });
         }
         let mut words = line.split_whitespace();
         let key = words.next()?;
@@ -1478,7 +1527,11 @@ mod script {
                     && let Some(line) = self.queue.pop_front()
                 {
                     self.played.lines += 1;
-                    if let Some(t) = line.command {
+                    if let Some(Command::Mod(m)) = &line.command {
+                        tracing::info!(frame, line = %m, "VICTORY_KEYS_FILE: mod command handed to the title's frame hook");
+                        super::MOD_LINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(m.clone());
+                    }
+                    if let Some(Command::Teleport(t)) = line.command {
                         tracing::info!(
                             x = t.x,
                             y = t.y,
@@ -1598,6 +1651,31 @@ mod script {
             assert_eq!(take_teleport(), Some(Teleport { x: 1.0, y: 2.0, z: 3.0, heading: Some(0.5) }));
             assert_eq!(take_teleport(), None);
             assert_eq!(p.tick(t0, 3), vec![b'J']);
+        }
+
+        #[test]
+        fn mod_lines_are_handed_on_only_with_the_mod() {
+            use super::super::take_mod_line;
+            // Without the mod: as before (a teleport needs x y z; other mod words are bad lines).
+            assert_eq!(parse_with("tp 1 2", false), None);
+            assert_eq!(parse_with("teleport 1 2", false), None);
+            assert!(matches!(parse_with("teleport 1 2 3", false).unwrap().command, Some(Command::Teleport(_))));
+            // With it: every mod word, the teleport too (the mod parses them).
+            for (text, want) in [("teleport 1 2 3", "teleport 1 2 3"), ("  tp rel 5 0 ", "tp rel 5 0"), ("Time 6 30", "Time 6 30"), ("heal", "heal")] {
+                let l = parse_with(text, true).unwrap();
+                assert_eq!((l.keys.len(), l.hold, l.command), (0, Hold::Frames(1), Some(Command::Mod(want.to_owned()))), "{text:?}");
+            }
+            assert!(parse_with("W 2f", true).unwrap().command.is_none(), "keys stay keys");
+            assert_eq!(parse_with("fly 1 2", true), None);
+            while take_mod_line().is_some() {}
+            let t0 = Instant::now();
+            let mut p = Player::new(t0);
+            p.push(line("W 1f"));
+            p.push(parse_with("weather rain", true).unwrap());
+            assert_eq!(p.tick(t0, 0), vec![b'W']);
+            assert_eq!(take_mod_line(), None, "not reached yet");
+            assert_eq!(p.tick(t0, 1), Vec::<u8>::new());
+            assert_eq!(take_mod_line().as_deref(), Some("weather rain"));
         }
 
         #[test]

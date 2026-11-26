@@ -43,7 +43,7 @@ pub fn set_logger(log: fn(bool, &str)) {
     LOGGER.store(log as usize, Ordering::Relaxed);
 }
 
-fn say(warning: bool, text: &str) {
+pub(crate) fn say(warning: bool, text: &str) {
     let log = LOGGER.load(Ordering::Relaxed);
     if log != 0 {
         // SAFETY: set by `set_logger` from a `fn(bool, &str)`.
@@ -456,6 +456,16 @@ fn frame_work(base: usize) {
         (source != 0).then(|| unsafe { std::mem::transmute::<usize, fn() -> Option<Teleport>>(source) }()).flatten()
     };
     let st = &mut *st;
+    // VICTORY_MOD: the keys file's teleports are the mod's (any distance), and
+    // its commands run here, on this thread.
+    let modding = crate::modgame::enabled();
+    if modding {
+        while let Some(t) = take() {
+            crate::modgame::push("keys", teleport_line(&t));
+        }
+        crate::modgame::frame(base, ped, frame());
+    }
+    let take = || if modding { None } else { take() };
     let t = match decide(&mut st.once, &mut st.still, from, take) {
         None => return,
         Some(Err((t, why))) => {
@@ -481,6 +491,15 @@ fn frame_work(base: usize) {
             ));
         }
         Err(why) => say(true, &format!("teleport refused: {why} (frame {}, from {from:?}, to {:?})", frame(), t.to)),
+    }
+}
+
+/// A keys-file teleport as a mod command line.
+pub fn teleport_line(t: &Teleport) -> String {
+    let [x, y, z] = t.to;
+    match t.heading {
+        Some(h) => format!("teleport {x} {y} {z} {h}"),
+        None => format!("teleport {x} {y} {z}"),
     }
 }
 
@@ -529,7 +548,8 @@ pub fn wanted(var: &dyn Fn(&str) -> Option<String>) -> Vec<Hook> {
         }
         t
     });
-    if pos_log || commands || once.is_some() {
+    let modding = crate::modgame::configure(var);
+    if pos_log || commands || once.is_some() || modding {
         POS_LOG.store(u8::from(pos_log), Ordering::Relaxed);
         STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).once = once;
         hooks.push(Hook {

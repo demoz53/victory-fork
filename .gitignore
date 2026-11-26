@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# The mod panel's saved places (made on its first start)
+tools/modpanel/places.json

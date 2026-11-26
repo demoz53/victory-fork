@@ -1,0 +1,17 @@
+# mod1-tp: the mod's teleports from the keys file (VICTORY_MOD=1 VICTORY_TITLE_COMMANDS=1), about 12 s after control.
+# 1 near with z (done in its first frame), 2 a 5 m step forward and a 5 m hop up (nudges), 3 FAR without z: 283 m
+# north-east of the house (inland: the water lies south-west, the way the water's-edge spot faces at heading 2.17),
+# held over the height map until the game has loaded the ground there, then set on it; 4 FAR back with z (the deck).
+teleport -2357.4 -5525.4 3.0
+wait 10f
+tp rel 5 0
+wait 8f
+tp rel 0 5
+wait 12f
+teleport -2155 -5330
+wait 50f
+J 10f
+teleport -2355.6 -5526.3 7.2 2.17
+wait 30f
+J 12f
+wait 4f

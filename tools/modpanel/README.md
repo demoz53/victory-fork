@@ -1,0 +1,74 @@
+# The mod panel and the mod commands (`VICTORY_MOD=1`)
+
+Single player only. The game side runs inside VIctory's frame hook (a detour of the game timer update) and calls the
+game's own functions; no game file is changed. Everything is off unless `VICTORY_MOD=1`, and off with
+`VICTORY_TITLE_PATCHES=0`.
+
+## Starting it
+
+1. Start the game with these switches set (beside your usual ones):
+
+   ```
+   VICTORY_MOD=1
+   VICTORY_MOD_FILE=C:\Users\<you>\Documents\victory-data\mod\commands.txt
+   VICTORY_MOD_STATUS=C:\Users\<you>\Documents\victory-data\mod\status.txt
+   ```
+
+   The folder must exist (the panel makes it when it first sends). For the keys-file route (tests) add
+   `VICTORY_TITLE_COMMANDS=1` (a diagnostics build).
+
+2. Start the panel (Python 3 with tkinter; nothing to install):
+
+   ```
+   python tools\modpanel\modpanel.py --mod-file <the same commands.txt> --status-file <the same status.txt> --top
+   ```
+
+   Without `--mod-file` / `--status-file` it uses `VICTORY_MOD_FILE` / `VICTORY_MOD_STATUS` from its environment, else
+   `Documents\victory-data\mod\commands.txt` and `status.txt`. `--top` keeps it above the game's window. `--places
+   <file>` picks another places file (default `places.json` beside the panel, made on its first start).
+
+The panel only appends lines to the mod file and reads the status file. It says "The game is not running" when the
+status file is missing or older than 3 s, and then sends nothing (the game only runs lines added while it runs).
+
+## Commands
+
+One per line, in the mod file or (with `VICTORY_TITLE_COMMANDS=1`) as lines of a keys-file route. Numbers are metres
+and radians; x east, y north, z up; heading 0 = north, counter-clockwise (pi/2 faces west). `#` starts a comment.
+Every command answers in the status file (`last_command`, `last_result`) and in the log
+(`VICTORY_MOD: <modfile|keys> "<line>" (frame N): ok: ...` or `refused: <why>`).
+
+| Command | Example | What |
+|---|---|---|
+| `teleport x y [z [heading]]` (or `tp`) | `teleport -2355.6 -5526.3 7.2 2.17` | Any distance. The player (or its vehicle, with whoever is in it) moves at once; if the ground there is not loaded yet it is held at the target (at z, or 10 m over the game's height map without z) until the game has loaded it, then set down: at z, or 1 m over the ground found. After 12 s without ground: at z, or 1 m over the height map, with a warning. |
+| `teleport x y` | `teleport -2155 -5330` | As above; the ground is found. |
+| `tp rel <forward> <up>` | `tp rel 5 0`, `tp rel 0 5` | Along the way the player faces, and up (z = now + up). |
+| `tp waypoint` | `tp waypoint` | To the map waypoint, on the ground (refused without one). |
+| `status` | `status` | Rewrite the status file now. |
+
+Coming in the next pieces: `time`, `weather`, `heal`, `invincible`, `wanted`, `spawn vehicle`, `vehicle repair`,
+`native`. They are already parsed and answer "not in this build yet".
+
+## The status file
+
+`key=value` lines, rewritten twice a second (through a temporary file and a rename, so it is never half written):
+`game updated_unix_ms frame player x y z heading heading_deg in_vehicle health max_health wanted clock clock_frozen
+weather teleport last_command last_source last_frame last_result commands_ok commands_refused`.
+
+## Safety
+
+- Every game address is used only after the bytes there are the ones recorded for this executable (1.0.2.1, PE stamp
+  0x6af783d4), and every data word only through a checked instruction that reads it; otherwise the command is
+  refused with the reason.
+- Calls happen only on the frame hook's own thread, once a frame; nothing blocks a frame.
+- Nothing but `status` runs while there is no player.
+- A command runs once. A teleport still waiting for its ground is replaced by the next teleport, and dropped if the
+  player or its vehicle changes.
+
+## What is proven
+
+| Piece | Offline (tests) | In the game |
+|---|---|---|
+| Mod file, status file, parser, teleports | parser, tail (partial lines, new file), atomic status write, the far teleport's steps with a fake world | not yet |
+
+Sources: viper-community/viper e44573c6e (LGPL-2.1-or-later): addresses, signatures and recipes, all checked again
+against the executable's bytes.

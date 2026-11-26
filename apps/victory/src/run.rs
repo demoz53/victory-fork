@@ -446,6 +446,7 @@ fn apply_title_patches(
     victory_game::hooks::set_logger(victory_loader::patch::log_line);
     victory_game::hooks::configure(image.base(), victory_gpu::frame::current);
     victory_game::hooks::set_teleport_source(keys_file_teleport);
+    victory_game::modgame::set_line_source(victory_hle::modules::gameinput::take_mod_line);
     // SAFETY: the title's image, mapped and not yet run.
     unsafe { install_hooks(image.base(), size, &hooks) };
 }
