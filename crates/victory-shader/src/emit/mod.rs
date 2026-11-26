@@ -125,7 +125,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{heap_half_bits, host_uses_wave32, lane_loop_fix, set_host_max_wave, with_group_base};
-pub use pairs::{Mode as WavePairs, mode as wave_pairs};
+pub use pairs::{Mode as WavePairs, mode_for as wave_pairs_for};
 pub use per_program::{deep_skips_allowed, for_program, wave64_retried, wave_wide_first};
 pub use rect::rect_list_gs;
 pub use shader::{
@@ -512,7 +512,7 @@ fn emit_once(
         // (why the program as it is did not do: the first line of each program's retries)
         report("as it is", &original);
         // `VICTORY_WAVE_PAIRS=first`: the paired form ([`pairs::paired`]) before every other.
-        if pairs::mode() == pairs::Mode::First {
+        if pairs::mode_for(program.as_deref()) == pairs::Mode::First {
             let again = pairs::paired(c, native, p, io, res);
             report("paired lanes (VICTORY_WAVE_PAIRS=first)", &again);
             if done(&again) {
@@ -608,7 +608,7 @@ fn emit_once(
                 // the forms above refuse, before the wave-wide form and before every
                 // approximate one: each console wave as one host wave of 32 lanes, each thread
                 // two of its lanes, with no barrier added inside a branch.
-                if pairs::mode() == pairs::Mode::BeforeWide {
+                if pairs::mode_for(program.as_deref()) == pairs::Mode::BeforeWide {
                     let again = pairs::paired(c, native, p, io, res);
                     report("paired lanes (VICTORY_WAVE_PAIRS)", &again);
                     if done(&again) {

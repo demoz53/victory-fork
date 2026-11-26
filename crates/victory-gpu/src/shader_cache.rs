@@ -95,7 +95,6 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_SKIP_DESCRIPTORS",
                     "VICTORY_DIV_FIXUP",
                     "VICTORY_WAVE_EXACT",
-                    "VICTORY_WAVE_PAIRS",
                     "VICTORY_WAVE_WIDE_LANE_RESOURCES",
                     "VICTORY_EARLY_DEPTH",
                     "VICTORY_PIXEL_HELPERS",
@@ -180,11 +179,33 @@ pub(crate) fn host_shader_from_group(container: &[u8], base: u32) -> Result<Host
             // any, gets there)
             let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
             let wide_first = emit::wave_wide_first(Some(&hash)) && emit::wave64_retried(container);
-            let key = group_key(&wide_first_key(&program_key(build(), off), wide_first), base);
+            // (`VICTORY_WAVE_PAIRS` and its lists: the answer for this program, when it is
+            // one the paired form can matter for)
+            let pairs = match emit::wave_pairs_for(Some(&hash)) {
+                emit::WavePairs::Off => emit::WavePairs::Off,
+                mode if emit::wave64_retried(container) => mode,
+                _ => emit::WavePairs::Off,
+            };
+            let key = pairs_key(&group_key(&wide_first_key(&program_key(build(), off), wide_first), base), pairs);
             cached(cache, &key, emit::host_uses_wave32(), container, translate)
         }
         None => translate(container),
     }
+}
+
+/// `key` mixed with the program's answer to `VICTORY_WAVE_PAIRS`
+/// (`victory_shader::emit::wave_pairs_for`) when the paired form is tried for
+/// it; as it is otherwise, so the switch and its lists are in no key.
+fn pairs_key(key: &[u8; 32], pairs: victory_shader::emit::WavePairs) -> [u8; 32] {
+    let how: &[u8] = match pairs {
+        victory_shader::emit::WavePairs::Off => return *key,
+        victory_shader::emit::WavePairs::BeforeWide => b"VICTORY_WAVE_PAIRS=1 for this program",
+        victory_shader::emit::WavePairs::First => b"VICTORY_WAVE_PAIRS=first for this program",
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(key);
+    h.update(how);
+    *h.finalize().as_bytes()
 }
 
 /// `key` mixed with the per-program decision of `VICTORY_WAVE_WIDE_FIRST`
