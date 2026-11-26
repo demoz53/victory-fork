@@ -535,6 +535,12 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Slots the title wrote with a texture view that is due at once, since a
+/// pass over textures picked by index last took the due ones (`draw.rs`
+/// `heap_textures`): what a pass within the frame catches up with
+/// (`VICTORY_TEXTURE_CATCH_UP_MS`). (zm0kiemedia/Neptune_VI b900c6467.)
+pub(crate) static FRESH_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Since the last line in the log: first uploads of textures picked by
 /// index, by the frames between the slot's write and the upload
 /// ([`age_bucket`]: 0, 1, 2, 3-5, 6-15, 16-63, more). Until the upload a
@@ -1714,6 +1720,9 @@ impl HostHeap {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
             } else {
+                if !seen {
+                    FRESH_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 0
             };
             textures.written(index, frame, due, seen);

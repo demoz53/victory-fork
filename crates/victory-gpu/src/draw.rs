@@ -70,7 +70,73 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// While `State::early_textures` runs a pass that catches up within a
+    /// frame ([`catch_up`]): the pass does the uploads that are due and
+    /// none of the frame's own pass's bookkeeping.
+    static PASS_LIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Passes over textures picked by index within a frame, when the title has
+/// written slots since the last pass
+/// (`VICTORY_TEXTURE_CATCH_UP_MS=<least>[,<most>]`): the least milliseconds
+/// between two passes, and the most milliseconds such passes may take in
+/// one frame (20 unless said). Unset or 0: one pass a frame and the bakes',
+/// as before.
+///
+/// The frame's pass runs at the frame's first draw; a slot the title writes
+/// after it waited for the next frame's, and the draws of its own frame
+/// read nothing there (zm0kiemedia/Neptune_VI b900c6467, where the value is
+/// 2: "47 % of the textures picked by index were there one frame after
+/// their slot was written, and 37 % in the same frame, because the frame's
+/// pass had run before the title wrote them"). The cap a frame is ours:
+/// theirs has none, and a title that writes slots all through a frame with
+/// a backlog due could spend the frame in such passes.
+fn catch_up() -> (u64, u64) {
+    static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let limits = catch_up_from(std::env::var("VICTORY_TEXTURE_CATCH_UP_MS").ok().as_deref());
+        if limits.0 != 0 {
+            tracing::info!(
+                least_ms_between = limits.0,
+                most_ms_a_frame = limits.1,
+                "textures picked by index: passes within a frame catch up with the slots the title writes (VICTORY_TEXTURE_CATCH_UP_MS)"
+            );
+        }
+        limits
+    })
+}
+
+/// [`catch_up`] from the variable's value.
+fn catch_up_from(value: Option<&str>) -> (u64, u64) {
+    let mut parts = value.unwrap_or("").split(',').map(|p| p.trim().parse::<u64>().ok());
+    let least = parts.next().flatten().unwrap_or(0);
+    let most = parts.next().flatten().unwrap_or(20);
+    if least == 0 || most == 0 { (0, 0) } else { (least, most) }
+}
+
+/// The milliseconds and bytes of one pass that catches up (Neptune's).
+const CATCH_UP_PASS: (u64, u64) = (6, 48 << 20);
+
+/// Whether a pass that catches up is due: `fresh` slots written since the
+/// last pass took the due ones, which began `since_ms` ago, with such
+/// passes having taken `spent_micros` of this frame. Then the milliseconds
+/// it may take.
+fn catch_up_due((least, most): (u64, u64), fresh: u64, since_ms: u64, spent_micros: u64) -> Option<u64> {
+    let left = (most * 1000).saturating_sub(spent_micros) / 1000;
+    (least != 0 && fresh > 0 && since_ms >= least && left > 0).then(|| CATCH_UP_PASS.0.min(left))
+}
+
+/// When a pass over textures picked by index last began (`host::now_ms`).
+static PASS_BEGAN_MS: AtomicU64 = AtomicU64::new(0);
+/// The frame [`CATCH_UP_SPENT`] is of.
+static CATCH_UP_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The microseconds the passes that catch up have taken in that frame.
+static CATCH_UP_SPENT: AtomicU64 = AtomicU64::new(0);
+/// A pass that catches up is under way (one at a time).
+static CATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Since the last line in the log: passes made to catch up, and the
+/// microseconds they took.
+pub(crate) static CATCH_UPS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
@@ -2058,9 +2124,29 @@ impl State {
         }
     }
 
+    /// Takes the turn for a pass that catches up within `frame`
+    /// ([`catch_up`], [`catch_up_due`]); then the milliseconds it may take.
+    /// The caller gives the turn back (`CATCHING`).
+    fn claim_catch_up(frame: u64) -> Option<u64> {
+        let limits = catch_up();
+        if limits.0 == 0 {
+            return None;
+        }
+        if CATCH_UP_FRAME.swap(frame, Ordering::Relaxed) != frame {
+            CATCH_UP_SPENT.store(0, Ordering::Relaxed);
+        }
+        let ms = catch_up_due(
+            limits,
+            crate::descriptor::host::FRESH_WRITES.load(Ordering::Relaxed),
+            crate::host::now_ms().saturating_sub(PASS_BEGAN_MS.load(Ordering::Relaxed)),
+            CATCH_UP_SPENT.load(Ordering::Relaxed),
+        )?;
+        CATCHING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).ok().map(|_| ms)
+    }
+
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
-        if compute || (early_ms == 0 && bake_ms == 0) {
+        if compute || (early_ms == 0 && bake_ms == 0 && catch_up().0 == 0) {
             return;
         }
         let bake = bake_ms > 0
@@ -2157,7 +2243,10 @@ impl State {
                 continue;
             }
             demand::SEEN[1].fetch_add(1, Ordering::Relaxed);
-            demand::mailbox().note(key, frame, &due);
+            let new = demand::mailbox().note(key, frame, &due);
+            // With passes within the frame ([`catch_up`]): one is due
+            // before this draw, for what it names.
+            crate::descriptor::host::FRESH_WRITES.fetch_add(new as u64, Ordering::Relaxed);
         }
     }
 
@@ -2269,11 +2358,37 @@ impl State {
         let Some(host) = heap.host() else {
             return false;
         };
-        let Some((budget, bake)) =
-            Self::claim_early_budget(frame, bake, early_ms, bake_ms, last_frame, baked_ms)
-        else {
-            return false;
-        };
+        let (budget, bake, catching) =
+            match Self::claim_early_budget(frame, bake, early_ms, bake_ms, last_frame, baked_ms) {
+                Some((budget, bake)) => (budget, bake, false),
+                // Neither the frame's first nor a bake's: one that catches
+                // up with what the title wrote since the last pass, if due.
+                None => match Self::claim_catch_up(frame) {
+                    Some(ms) => ((ms, CATCH_UP_PASS.1), false, true),
+                    None => return false,
+                },
+            };
+        if catching {
+            // The turn is given back on every way out of here.
+            struct Turn;
+            impl Drop for Turn {
+                fn drop(&mut self) {
+                    PASS_LIGHT.set(false);
+                    PASS_BUDGET.set(None);
+                    CATCHING.store(false, Ordering::Release);
+                }
+            }
+            let _turn = Turn;
+            let began = std::time::Instant::now();
+            PASS_BUDGET.set(Some(budget));
+            PASS_LIGHT.set(true);
+            self.heap_textures(list, heap, host);
+            let took = began.elapsed().as_micros() as u64;
+            CATCH_UP_SPENT.fetch_add(took, Ordering::Relaxed);
+            CATCH_UPS[0].fetch_add(1, Ordering::Relaxed);
+            CATCH_UPS[1].fetch_add(took, Ordering::Relaxed);
+            return true;
+        }
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
             let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
@@ -2428,16 +2543,33 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
-        if !room {
+        // A pass that catches up within a frame ([`catch_up`]) leaves the
+        // frame's own pass its bookkeeping: it asks the card nothing (what
+        // the last pass was told holds), takes no remapped ranges, counts
+        // nothing for the frame line, and looks at 512 slots at most.
+        let light = PASS_LIGHT.get();
+        static ROOM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let room = if light {
+            ROOM.load(Ordering::Relaxed)
+        } else {
+            let room = crate::resource::room();
+            ROOM.store(room, Ordering::Relaxed);
+            room
+        };
+        if !room && !light {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
-        host.texture_slots_remapped(frame);
-        let (mut due, census) = host.texture_slots_due(frame, 4096);
+        if !light {
+            host.texture_slots_remapped(frame);
+        }
+        // What the title writes from here on is the next pass's.
+        crate::descriptor::host::FRESH_WRITES.store(0, Ordering::Relaxed);
+        PASS_BEGAN_MS.store(crate::host::now_ms(), Ordering::Relaxed);
+        let (mut due, census) = host.texture_slots_due(frame, if light { 512 } else { 4096 });
         // What the material records of the last frames' draws name goes
         // ahead (`VICTORY_MATERIAL_TEXTURE_DEMAND=1`), three other slots
         // between each two of them.
@@ -2462,23 +2594,28 @@ impl State {
             due.retain(|d| !first.iter().any(|f| f.0 == d.0));
             due.splice(0..0, first);
         }
-        HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
-        for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
-            count.store(now, Ordering::Relaxed);
+        if !light {
+            HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
+            for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
+                count.store(now, Ordering::Relaxed);
+            }
+            // Where the card's memory is, and what the due slots would need
+            // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
+            // room, and every five seconds after it).
+            Self::card_accounting(heap, host, frame, room);
         }
-        // Where the card's memory is, and what the due slots would need
-        // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
-        // room, and every five seconds after it).
-        Self::card_accounting(heap, host, frame, room);
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
         // half a frame per second, while the title streams by the clock.
         // (About a second before the runtime told of the memory it maps:
         // the looks are now only for what that does not tell.)
+        // (A pass that catches up is no measure of a frame's time: it
+        // takes the wait the last other pass worked out.)
         static PASSED: AtomicU64 = AtomicU64::new(0);
+        static MOST: AtomicU64 = AtomicU64::new(16);
         let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+        let took = if light { 1 } else { now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1) };
         // `VICTORY_RELOOK_MS` (20,000 unless said; 4,000 before), the
         // longest wait in ms, clamped to 16-1,024 frames. Ported from
         // fxceless/victory-fork PR #1246 (Exopus-0x65f7ad0).
@@ -2486,7 +2623,13 @@ impl State {
         let relook = *RELOOK_MS.get_or_init(|| {
             std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20_000)
         });
-        let most = (relook / took).clamp(16, if relook == 4000 { 256 } else { 1024 });
+        let most = if light {
+            MOST.load(Ordering::Relaxed)
+        } else {
+            let most = (relook / took).clamp(16, if relook == 4000 { 256 } else { 1024 });
+            MOST.store(most, Ordering::Relaxed);
+            most
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -4733,6 +4876,28 @@ mod rect_bounds_tests {
 #[cfg(test)]
 mod early_textures_tests {
     use super::*;
+
+    /// `VICTORY_TEXTURE_CATCH_UP_MS`: off unless said; the least time
+    /// between two passes, and the most they take in a frame (20).
+    #[test]
+    fn catch_up_is_opt_in_and_capped_a_frame() {
+        assert_eq!(catch_up_from(None), (0, 0));
+        assert_eq!(catch_up_from(Some("0")), (0, 0));
+        assert_eq!(catch_up_from(Some("nonsense")), (0, 0));
+        assert_eq!(catch_up_from(Some("2")), (2, 20));
+        assert_eq!(catch_up_from(Some(" 3 , 40 ")), (3, 40));
+        assert_eq!(catch_up_from(Some("2,0")), (0, 0));
+        // Off: never.
+        assert_eq!(catch_up_due((0, 0), 100, 1000, 0), None);
+        // Nothing written since the last pass, or one began too lately.
+        assert_eq!(catch_up_due((2, 20), 0, 1000, 0), None);
+        assert_eq!(catch_up_due((2, 20), 5, 1, 0), None);
+        // Due: a pass of 6 ms, less when the frame's 20 are nearly used.
+        assert_eq!(catch_up_due((2, 20), 1, 2, 0), Some(6));
+        assert_eq!(catch_up_due((2, 20), 1, 2, 16_000), Some(4));
+        assert_eq!(catch_up_due((2, 20), 1, 2, 19_500), None);
+        assert_eq!(catch_up_due((2, 20), 1, 2, 25_000), None);
+    }
 
     #[test]
     fn early_budget_runs_once_per_frame_and_resets_bake_budget() {

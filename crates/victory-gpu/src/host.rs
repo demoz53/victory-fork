@@ -8592,6 +8592,16 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                let [catch_ups, catch_up_micros] =
+                    crate::draw::CATCH_UPS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if catch_ups != 0 {
+                    tracing::info!(
+                        "textures picked by index: {:.1} passes a frame caught up with slots written since the last pass, \
+                         {:.2} ms a frame (VICTORY_TEXTURE_CATCH_UP_MS)",
+                        catch_ups as f64 / frames,
+                        catch_up_micros as f64 / 1e3 / frames
+                    );
+                }
                 // How long after its slot was written a texture was there
                 // (zm0kiemedia/Neptune_VI b900c6467's QUEUE_AGE line).
                 let ages = crate::descriptor::host::QUEUE_AGE
