@@ -399,7 +399,7 @@ pub(crate) fn release_held(all: bool) {
 #[cfg(windows)]
 pub(crate) fn behind() -> bool {
     #[cfg(test)]
-    if BEHIND_HERE.get() {
+    if BEHIND_HERE.get() || BEHIND_ALL.load(Ordering::Relaxed) {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -429,6 +429,69 @@ pub(crate) fn behind() -> bool {
 thread_local! {
     /// Tests: [`behind`] is on for this thread (no worker runs the lines).
     static BEHIND_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: [`group`] on this thread, whatever the switch says.
+    static GROUP_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests that send for real (they run alone): [`behind`] is on for every
+/// thread, so that the host's helper thread leaves the lines to the test.
+#[cfg(all(windows, test))]
+static BEHIND_ALL: AtomicBool = AtomicBool::new(false);
+
+/// Whether the thread that runs the lines takes everything that is free to
+/// run from them and prepares it as ONE host submission
+/// (`VICTORY_GROUP_COMMIT=1`; off by default; needs [`behind`],
+/// `VICTORY_ASYNC_SUBMIT=1`).
+///
+/// Why (the open world, Series S profile, 100-130 ms a frame): the title
+/// sends 43-52 submissions a frame, and each is prepared, sent and partly
+/// waited for on its own: 20,900 refreshes of host copies a frame for 4,100
+/// distinct copies, a landing per submission, and the card with nothing
+/// queued for half the frame. With [`behind`] alone our thread still takes
+/// one part at a time. While it prepares one, the title queues more: with
+/// the switch it takes all of them at once ([`release_grouped`]) and hands
+/// the host one submission of all their lists, in the order it would have
+/// sent them: each host copy is refreshed once for the batch, it is one
+/// `ExecuteCommandLists` and one flight, and its copy-backs land once.
+///
+/// What stays as it is, and what cuts a batch:
+/// - each queue's parts in the order they were given, behind their waits:
+///   a queue's wait for a fence not reached, or for a memory value not met,
+///   stops that queue's line (a value an earlier part of the batch writes at
+///   the bottom of the pipe meets it, as one of a flight in the air does);
+/// - a fence signal of a queue is posted when the batch that holds the
+///   parts before it has been sent, behind that flight: set when it has
+///   landed, never earlier;
+/// - bottom-of-pipe writes and read-backs are done when the batch has
+///   landed, in the lists' order;
+/// - a part whose preparing reads title memory that an earlier part of the
+///   batch writes when it has run does not join it
+///   (`crate::host::group::Gathered::blocks`): it starts the next batch,
+///   which waits for that flight's landing as a single submission does;
+/// - a present, a fence the title blocks on, a synchronous submission of
+///   ours and a page-mapping change run the lines first on their own thread
+///   ([`before_sync`]): whatever was queued before them is sent before they
+///   go on, and nothing queued after them can be in the same batch.
+#[cfg(windows)]
+pub(crate) fn group() -> bool {
+    #[cfg(test)]
+    if let Some(on) = GROUP_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_GROUP_COMMIT").is_some_and(|v| v == "1");
+        let on = asked && behind();
+        if on {
+            tracing::info!(
+                most = crate::host::group::most(),
+                "the parts waiting in the queues' lines are prepared and sent as one host submission (VICTORY_GROUP_COMMIT=1)"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_GROUP_COMMIT=1 needs VICTORY_ASYNC_SUBMIT=1 (and what that needs): off");
+        }
+        on
+    })
 }
 
 /// Whether there is something for [`worker`] to look at.
@@ -473,9 +536,19 @@ thread_local! {
 pub(crate) fn before_sync(why: usize) {
     if behind() && !RELEASING_HERE.get() {
         let stood = std::time::Instant::now();
+        // (What ends the batches sent from here: [`release_grouped`].)
+        let before = SYNC_WHY.replace(why);
         release_held_now(false);
+        SYNC_WHY.set(before);
         BEHIND_STATS[why].fetch_add(stood.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread runs the lines for one of [`before_sync`]'s callers
+    /// (its place in [`BEHIND_STATS`]); `usize::MAX`: it does not.
+    static SYNC_WHY: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 /// [`before_sync`]'s callers, the places of [`BEHIND_STATS`] their time is
@@ -521,6 +594,35 @@ pub(crate) fn behind_line(frames: f64) {
         s[BEFORE_FENCE] / 1000.0,
         s[BEFORE_OURS] / 1000.0,
         s[BEFORE_MAPPING] / 1000.0,
+    );
+    if !group() {
+        return;
+    }
+    let largest = GROUP_STATS[GROUP_LARGEST].swap(0, Ordering::Relaxed);
+    let g: Vec<f64> = GROUP_STATS.iter().map(|g| g.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let batches = g[GROUP_BATCHES].max(f64::MIN_POSITIVE);
+    tracing::info!(
+        "group commit per frame (VICTORY_GROUP_COMMIT=1): {:.1} batches of {:.1} parts and {:.1} lists each on average (the \
+         most parts in one since the last line: {largest}), each one host submission; {:.0} refreshes of host copies saved (a \
+         copy refreshed by a part of a batch after the first that refreshes it); batches sent per frame by the title's \
+         thread at a present {:.1}, at a blocking fence wait {:.1}, at a synchronous submission of ours {:.1}, at a \
+         page-mapping change {:.1} (each with whatever was queued before it), by our own thread {:.1}; lines that gave a \
+         batch no more, per frame: the next part reads what a part of the batch writes when it has run {:.1}, a wait for \
+         a memory value {:.1}, the queue's wait for a fence {:.1}, {} lists in the batch {:.1}",
+        g[GROUP_BATCHES],
+        g[GROUP_PARTS] / batches,
+        g[GROUP_LISTS] / batches,
+        g[GROUP_SAVED],
+        g[BEFORE_PRESENT],
+        g[BEFORE_FENCE],
+        g[BEFORE_OURS],
+        g[BEFORE_MAPPING],
+        g[CUT_DRY],
+        g[CUT_READ],
+        g[CUT_VALUE],
+        g[CUT_FENCE],
+        crate::host::group::most(),
+        g[CUT_MOST],
     );
 }
 
@@ -570,6 +672,16 @@ fn release_held_now(all: bool) {
         }
     }
     let _leave = Leave(was_here);
+    // Group commit: everything that is free to run, as one submission.
+    if !all
+        && behind()
+        && group()
+        && crate::host::late()
+        && let Some(host) = crate::host::host()
+    {
+        release_grouped(&mut || lock(&WAITING).clone(), &mut |lists, order| host.execute_late(lists, order));
+        return;
+    }
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
@@ -697,6 +809,259 @@ fn release_held_now(all: bool) {
         }
         if !moved {
             break;
+        }
+    }
+}
+
+/// What [`release_grouped`] has gathered for one host submission.
+#[cfg(windows)]
+#[derive(Default)]
+struct Group {
+    /// The parts' host lists and the order they run in.
+    lists: Vec<crate::list::Detached>,
+    order: Vec<usize>,
+    /// The fence signals behind them, in the order they were taken.
+    after: Vec<(crate::fence::FenceRef, u64)>,
+    /// What the parts write once they have run.
+    gathered: crate::host::group::Gathered,
+    /// Why each line that still holds something gave no more (queue, one of
+    /// the `CUT_` places).
+    stops: Vec<(usize, usize)>,
+}
+
+#[cfg(windows)]
+impl Group {
+    fn add(&mut self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        {
+            let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            self.gathered.add(&runs);
+        }
+        let first = self.lists.len();
+        self.order.extend(order.iter().map(|&i| first + i));
+        self.lists.extend(lists);
+    }
+
+    /// Whether a line may pass `wait` with these parts gathered: with none,
+    /// as always ([`value_met`], which may settle the flights to know).
+    /// Else: memory holds the value; or a bottom-of-pipe write of a part
+    /// gathered, or of a flight in the air, stores one that meets it. Where
+    /// neither says, the line stands until the parts have been sent and is
+    /// then asked the usual way.
+    fn passes(&self, wait: &crate::list::ValueWait) -> bool {
+        if self.gathered.is_empty() {
+            return value_met(wait);
+        }
+        wait.met()
+            || match self.gathered.meets(wait) {
+                Some(met) => met,
+                None => crate::host::group::late_met_peek(wait),
+            }
+    }
+}
+
+/// The queues whose lines have a [`Held::Running`] marker at their head
+/// for the batch being gathered and sent ([`release_grouped`], which holds
+/// `RELEASING` for as long as this lives): dropped, the markers come off,
+/// as [`Marked`]'s does, and for the same reason the process ends if a
+/// panic drops it.
+#[cfg(windows)]
+struct MarkedLines(Vec<usize>);
+
+#[cfg(windows)]
+impl Drop for MarkedLines {
+    fn drop(&mut self) {
+        for &q in &self.0 {
+            // SAFETY: a live queue: one released waits for `RELEASING`.
+            let line = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(line);
+            if matches!(held.first(), Some(Held::Running)) {
+                held.remove(0);
+            }
+        }
+        if std::thread::panicking() {
+            tracing::error!(
+                "preparing a batch from the queues' lines panicked (VICTORY_GROUP_COMMIT; the panic's message is above): \
+                 the process ends rather than stand still"
+            );
+            #[cfg(not(test))]
+            std::process::abort();
+        }
+    }
+}
+
+/// [`GROUP_STATS`]: what ended a batch. The first four are
+/// [`before_sync`]'s places: the batch was sent by a title thread at a
+/// present, a blocking fence wait, a submission of ours, a page-mapping
+/// change, which sends whatever is queued before it and lets nothing queued
+/// after it join. Then, per line that still held something when the batch
+/// went: its next part reads what a part of the batch writes when it has
+/// run, it stands at a wait for a memory value, it stands at its queue's
+/// wait for a fence, the batch was full. And last: the batch was sent by
+/// our own thread (it took what was queued when it looked).
+#[cfg(windows)]
+const CUT_READ: usize = 4;
+#[cfg(windows)]
+const CUT_VALUE: usize = 5;
+#[cfg(windows)]
+const CUT_FENCE: usize = 6;
+#[cfg(windows)]
+const CUT_MOST: usize = 7;
+#[cfg(windows)]
+const CUT_DRY: usize = 8;
+/// [`GROUP_STATS`] after the cuts: batches sent, the parts and the host
+/// lists in them, refreshes saved (a host copy refreshed by a part of a
+/// batch after the first part that refreshes it: sent one by one, each
+/// part's own refresh), and the most parts in one batch.
+#[cfg(windows)]
+const GROUP_BATCHES: usize = 9;
+#[cfg(windows)]
+const GROUP_PARTS: usize = 10;
+#[cfg(windows)]
+const GROUP_LISTS: usize = 11;
+#[cfg(windows)]
+const GROUP_SAVED: usize = 12;
+#[cfg(windows)]
+const GROUP_LARGEST: usize = 13;
+
+/// Since the last frame line, with [`group`]: the cuts by cause (the `CUT_`
+/// places), then the `GROUP_` places.
+#[cfg(windows)]
+static GROUP_STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+
+/// [`release_held_now`] with [`group`]: the lines of `waiting()`'s queues
+/// are run as far as they are free to run, and the parts met on the way
+/// are not sent one by one: they are gathered, each queue's in its order
+/// and the queues in the order they would have been run, and given to
+/// `send` as one submission (their host lists and the order those run in).
+/// Then the fence signals met behind them are posted, behind that flight,
+/// and the lines are looked at again, until nothing moves.
+///
+/// While a batch is gathered and sent, every line something was taken from
+/// has the [`Held::Running`] marker at its head, as the line of a part
+/// being sent has without the switch: what the title adds stays behind it.
+/// The caller holds `RELEASING`.
+#[cfg(windows)]
+fn release_grouped(
+    waiting: &mut dyn FnMut() -> Vec<usize>,
+    send: &mut dyn FnMut(Vec<crate::list::Detached>, Vec<usize>),
+) {
+    let most = crate::host::group::most();
+    loop {
+        let queues = waiting();
+        let mut group = Group::default();
+        let mut marked = MarkedLines(Vec::new());
+        // Pass after pass over the lines, until one adds nothing: what a
+        // part taken from one queue writes at the bottom of the pipe may be
+        // what another queue's wait stands at, and a signal posted at once
+        // (nothing gathered before it) may be what another queue waits for.
+        loop {
+            let mut added = false;
+            for &q in &queues {
+                // SAFETY: a live queue: one released is taken off the list,
+                // and waits for `RELEASING` first.
+                let line = unsafe { &(*(q as *const Queue)).held };
+                let mut held = lock(line);
+                // Our own marker, from an earlier pass: put back below.
+                let was_marked = marked.0.contains(&q);
+                if was_marked && matches!(held.first(), Some(Held::Running)) {
+                    held.remove(0);
+                }
+                let mut mark = was_marked;
+                group.stops.retain(|s| s.0 != q);
+                loop {
+                    let stop = match held.first() {
+                        None | Some(Held::Running) => break,
+                        Some(Held::Wait(fence, value)) => {
+                            (crate::fence::completed(fence.as_this()) < *value).then_some(CUT_FENCE)
+                        }
+                        Some(Held::Value(wait)) => (!group.passes(wait)).then_some(CUT_VALUE),
+                        Some(Held::Run(lists, order)) if !group.gathered.is_empty() => {
+                            let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+                            if group.gathered.blocks(&runs) {
+                                Some(CUT_READ)
+                            } else if group.gathered.lists + runs.len() > most {
+                                Some(CUT_MOST)
+                            } else {
+                                None
+                            }
+                        }
+                        Some(Held::Run(..) | Held::Signal(..)) => None,
+                    };
+                    if let Some(cause) = stop {
+                        group.stops.push((q, cause));
+                        break;
+                    }
+                    match held.remove(0) {
+                        Held::Wait(..) | Held::Value(_) | Held::Running => {}
+                        Held::Run(lists, order) => {
+                            #[cfg(feature = "diagnostics")]
+                            crate::capture::op(q, || format!("RUN held submission of {} lists (in a batch)", order.len()));
+                            group.add(lists, order);
+                            mark = true;
+                        }
+                        // Behind the parts gathered so far, whichever
+                        // queue's: sent one by one they would be in the air
+                        // by now, and the signal behind them. With nothing
+                        // gathered: now, as without batches.
+                        Held::Signal(fence, value) if group.gathered.is_empty() => {
+                            if let Err(fence) = crate::host::late_signal(fence, value) {
+                                crate::fence::set(fence.as_this(), value);
+                            }
+                        }
+                        Held::Signal(fence, value) => {
+                            group.after.push((fence, value));
+                            mark = true;
+                        }
+                    }
+                    added = true;
+                }
+                if mark {
+                    held.insert(0, Held::Running);
+                    if !was_marked {
+                        marked.0.push(q);
+                    }
+                } else if held.is_empty() {
+                    lock(&WAITING).retain(|&w| w != q);
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        let Group { lists, order, after, mut gathered, stops } = group;
+        if lists.is_empty() {
+            // Nothing to send (and so no signal kept, no line marked):
+            // the passes above ran the lines as far as they go.
+            break;
+        }
+        let sending = std::time::Instant::now();
+        // (VICTORY_FILL_AHEAD: the batch's fills ahead of its own parts,
+        // for the host to note under the batch's number.)
+        gathered.hand_ahead();
+        send(lists, order);
+        drop(crate::host::group::take_ahead());
+        // The signals behind the parts: posted with the markers still on,
+        // so that a signal the title gives one of those queues now stays
+        // behind them.
+        for (fence, value) in after {
+            if let Err(fence) = crate::host::late_signal(fence, value) {
+                crate::fence::set(fence.as_this(), value);
+            }
+        }
+        drop(marked);
+        BEHIND_STATS[SENT_PARTS].fetch_add(gathered.parts as u64, Ordering::Relaxed);
+        BEHIND_STATS[SENT_US].fetch_add(sending.elapsed().as_micros() as u64, Ordering::Relaxed);
+        GROUP_STATS[GROUP_BATCHES].fetch_add(1, Ordering::Relaxed);
+        GROUP_STATS[GROUP_PARTS].fetch_add(gathered.parts as u64, Ordering::Relaxed);
+        GROUP_STATS[GROUP_LISTS].fetch_add(gathered.lists as u64, Ordering::Relaxed);
+        GROUP_STATS[GROUP_SAVED].fetch_add(gathered.saved, Ordering::Relaxed);
+        GROUP_STATS[GROUP_LARGEST].fetch_max(gathered.parts as u64, Ordering::Relaxed);
+        // Who sent it: a title thread at one of `before_sync`'s places,
+        // or our own.
+        let why = SYNC_WHY.get();
+        GROUP_STATS[if why <= BEFORE_MAPPING { why } else { CUT_DRY }].fetch_add(1, Ordering::Relaxed);
+        for (_, cause) in stops {
+            GROUP_STATS[cause].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1888,5 +2253,444 @@ mod tests {
         unsafe { CloseHandle(ev) };
         assert_eq!(rel1(f1), 0, "f1 internal ref must drop after release_held");
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// The group-commit tests read [`GROUP_STATS`]: one at a time.
+    #[cfg(windows)]
+    static GROUP_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A new host list recorded by `record` and closed, as a part in a
+    /// queue's line; and its name in these tests (its list's interface
+    /// pointer, which stays when the host list moves).
+    #[cfg(windows)]
+    fn part(host: &crate::host::Host, record: impl FnOnce(&crate::host::HostList)) -> (Held, usize) {
+        use windows::core::Interface;
+        let list = host.new_list().unwrap();
+        record(&list);
+        list.close();
+        let name = list.list.as_raw() as usize;
+        (Held::Run(vec![crate::list::Detached::ours(list)], vec![0]), name)
+    }
+
+    /// Runs the lines of `queues` with group commit, each batch given to
+    /// these tests instead of the host: the names of its lists, in order.
+    /// `sent` is told when a batch is "sent" (which one, counted from 1),
+    /// before the signals behind it are posted. The queues are not in
+    /// `WAITING`: other tests' threads do not run their lines.
+    #[cfg(windows)]
+    fn run_grouped(queues: &[This], mut sent: impl FnMut(usize)) -> Vec<Vec<usize>> {
+        use windows::core::Interface;
+        let waiting: Vec<usize> = queues.iter().map(|&q| q as usize).collect();
+        let mut batches: Vec<Vec<usize>> = Vec::new();
+        release_grouped(&mut || waiting.clone(), &mut |lists, order| {
+            batches.push(order.iter().map(|&i| lists[i].host().list.as_raw() as usize).collect());
+            sent(batches.len());
+        });
+        batches
+    }
+
+    /// 64 KiB of "title memory" holding a title buffer, and its host copy.
+    #[cfg(windows)]
+    fn title_buffer(resource: usize) -> (usize, std::sync::Arc<crate::shadow::Shadow>) {
+        let memory: &'static mut [u8] = Box::leak(vec![0x11u8; 1 << 16].into_boxed_slice());
+        let start = memory.as_ptr() as u64;
+        crate::shadow::register(resource, start, 1 << 16);
+        (start as usize, crate::shadow::find(start, 1 << 16).expect("a host copy"))
+    }
+
+    #[cfg(windows)]
+    fn group_stat(place: usize) -> u64 {
+        GROUP_STATS[place].load(Ordering::Relaxed)
+    }
+
+    /// `VICTORY_GROUP_COMMIT`: the parts waiting in a line go out as one
+    /// submission, in order; a part whose preparing reads title memory that
+    /// a part of the batch writes when it has run (here: a fill of bytes an
+    /// earlier part's shaders write) does not join it and starts the next
+    /// batch, with what follows it. A copy two parts of a batch refresh is
+    /// counted as a refresh saved.
+    #[cfg(windows)]
+    #[test]
+    fn a_part_reading_what_the_batch_writes_starts_the_next_batch() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _alone = lock(&GROUP_TESTS);
+        let (base, copy) = title_buffer(0x6c00_0001);
+        let (q, f1, f2) = queue_and_fences();
+        // (The fills' destination: these lists are never run.)
+        let to = Box::leak(vec![0u8; 4096].into_boxed_slice()).as_mut_ptr();
+        let other = crate::host::fill_kind::OTHER;
+        // A: its shaders write [64, 128) of the buffer. B: a fill from
+        // elsewhere in it, and a refresh of the copy A refreshed. C: a fill
+        // of bytes A's shaders write. D: nothing of the title's.
+        let (a, a_name) = part(host, |l| {
+            copy.refresh(l, base as u64, 256);
+            copy.gpu_writes(l, base as u64 + 64, 64);
+        });
+        let (b, b_name) = part(host, |l| {
+            l.defer_fill_as(to, (base + 1024) as *const u8, 64, other);
+            copy.refresh(l, base as u64 + 4096, 256);
+        });
+        let (c, c_name) = part(host, |l| l.defer_fill_as(to, (base + 96) as *const u8, 16, other));
+        let (d, d_name) = part(host, |_| {});
+        lock(&queue(q).held).extend([a, b, c, d]);
+        let before = [CUT_READ, GROUP_BATCHES, GROUP_PARTS, GROUP_LISTS, GROUP_SAVED].map(group_stat);
+        let batches = run_grouped(&[q], |_| {});
+        assert_eq!(batches, [vec![a_name, b_name], vec![c_name, d_name]]);
+        let after = [CUT_READ, GROUP_BATCHES, GROUP_PARTS, GROUP_LISTS, GROUP_SAVED].map(group_stat);
+        assert_eq!([0, 1, 2, 3, 4].map(|i| after[i] - before[i]), [1, 2, 4, 4, 1], "cuts for a read, batches, parts, lists, refreshes saved");
+        assert!(lock(&queue(q).held).is_empty());
+        crate::shadow::unregister(0x6c00_0001, base as u64);
+        release_all(&[q, f1, f2]);
+    }
+
+    /// `VICTORY_GROUP_COMMIT`: a queue that waits for a fence is not in the
+    /// batch whose signal it waits for: the signal is posted only when the
+    /// parts before it have been sent, and the waiting queue's part goes in
+    /// the next batch. While a batch is being sent its queue's line has the
+    /// marker at its head: a signal the title gives that queue meanwhile
+    /// stays behind the batch.
+    #[cfg(windows)]
+    #[test]
+    fn a_queue_waiting_for_a_fence_is_not_in_the_batch_that_signals_it() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _alone = lock(&GROUP_TESTS);
+        let (q1, f1, f2) = queue_and_fences();
+        let (q2, f3, f4) = queue_and_fences();
+        let (a, a_name) = part(host, |_| {});
+        let (b, b_name) = part(host, |_| {});
+        let (c, c_name) = part(host, |_| {});
+        // Queue 1: A, signal f1 = 1, B. Queue 2: wait for f1 = 1, then C.
+        lock(&queue(q1).held).extend([a, Held::Signal(crate::fence::FenceRef::new(f1), 1), b]);
+        lock(&queue(q2).held).extend([Held::Wait(crate::fence::FenceRef::new(f1), 1), c]);
+        let cuts = group_stat(CUT_FENCE);
+        let mut seen = Vec::new();
+        let batches = run_grouped(&[q1, q2], |n| {
+            // The fence when the batch goes out: not set before the lists
+            // before its signal were sent.
+            seen.push(crate::fence::completed(f1));
+            if n == 1 {
+                assert!(matches!(lock(&queue(q1).held).first(), Some(Held::Running)), "no marker on the line being sent");
+                assert_eq!(signal(q1, f2, 5), S_OK);
+                assert_eq!(crate::fence::completed(f2), 0, "a signal passed the batch being sent");
+            }
+        });
+        assert_eq!(batches, [vec![a_name, b_name], vec![c_name]]);
+        assert_eq!(seen, [0, 1]);
+        assert_eq!(crate::fence::completed(f1), 1);
+        assert_eq!(crate::fence::completed(f2), 5, "the title's signal ran behind the batch");
+        assert_eq!(group_stat(CUT_FENCE) - cuts, 1);
+        assert!(lock(&queue(q1).held).is_empty() && lock(&queue(q2).held).is_empty());
+        release_all(&[q1, q2, f1, f2, f3, f4]);
+    }
+
+    /// `VICTORY_GROUP_COMMIT`: a wait for a memory value that a part of the
+    /// batch writes at the bottom of the pipe is met (the waiting part goes
+    /// to the card behind it, in the same submission); one nothing meets
+    /// stops its line, which runs when the value is there.
+    #[cfg(windows)]
+    #[test]
+    fn a_wait_for_a_value_is_met_by_a_part_of_the_batch_or_stops_its_line() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _alone = lock(&GROUP_TESTS);
+        let token: &'static mut [u32; 2] = Box::leak(Box::new([0, 0]));
+        let at = token.as_mut_ptr() as usize;
+        let (q1, f1, f2) = queue_and_fences();
+        let (q2, f3, f4) = queue_and_fences();
+        let (q3, f5, f6) = queue_and_fences();
+        const EQUAL: u32 = 3;
+        // Queue 1: A, which writes 7 to the first word when it has run.
+        // Queue 2: waits for that 7, then B. Queue 3: waits for a 9 in the
+        // second word, which nothing queued writes, then C.
+        let (a, a_name) = part(host, |l| l.defer_write(at as *mut u8, Written::Value(7), 4));
+        let (b, b_name) = part(host, |_| {});
+        let (c, c_name) = part(host, |_| {});
+        lock(&queue(q1).held).push(a);
+        lock(&queue(q2).held).extend([Held::Value(crate::list::ValueWait::of(at as u64, EQUAL, 7)), b]);
+        lock(&queue(q3).held).extend([Held::Value(crate::list::ValueWait::of(at as u64 + 4, EQUAL, 9)), c]);
+        let cuts = group_stat(CUT_VALUE);
+        assert_eq!(run_grouped(&[q1, q2, q3], |_| {}), [vec![a_name, b_name]]);
+        assert_eq!(group_stat(CUT_VALUE) - cuts, 1);
+        assert_eq!(lock(&queue(q3).held).len(), 2, "the queue passed a wait nothing met");
+        // SAFETY: the leaked words.
+        unsafe { (at as *mut u32).add(1).write_volatile(9) };
+        assert_eq!(run_grouped(&[q1, q2, q3], |_| {}), [vec![c_name]]);
+        release_all(&[q1, q2, q3, f1, f2, f3, f4, f5, f6]);
+    }
+
+    /// `VICTORY_GROUP_COMMIT`: a batch holds at most
+    /// `crate::host::group::most` host lists; the part that would pass it
+    /// starts the next batch.
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_is_cut_at_its_most_lists() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _alone = lock(&GROUP_TESTS);
+        let most = crate::host::group::most();
+        let (q, f1, f2) = queue_and_fences();
+        // Three parts of two fifths of the most each.
+        let lists = (most * 2 / 5).max(1);
+        let big = || {
+            let taken: Vec<crate::list::Detached> = (0..lists)
+                .map(|_| {
+                    let list = host.new_list().unwrap();
+                    list.close();
+                    crate::list::Detached::ours(list)
+                })
+                .collect();
+            Held::Run(taken, (0..lists).collect())
+        };
+        lock(&queue(q).held).extend([big(), big(), big()]);
+        let cuts = group_stat(CUT_MOST);
+        let batches = run_grouped(&[q], |_| {});
+        if 3 * lists > most {
+            assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2 * lists, lists]);
+            assert_eq!(group_stat(CUT_MOST) - cuts, 1);
+        } else {
+            assert_eq!(batches.len(), 1);
+        }
+        release_all(&[q, f1, f2]);
+    }
+
+    /// What a scripted run of fake lists leaves behind: the two title
+    /// buffers' bytes, what the lists copied to a read-back buffer on the
+    /// card (what their fills and host copies held when they ran), the
+    /// bottom-of-pipe word, the fence, and how many host submissions it
+    /// took.
+    #[cfg(windows)]
+    #[derive(Debug)]
+    struct Left {
+        title: Vec<u8>,
+        card: Vec<u8>,
+        token: u32,
+        fence: u64,
+        sent: u64,
+    }
+
+    /// Queues the script's six parts on two queues and runs the lines until
+    /// they are empty, one part a submission or with group commit:
+    ///
+    /// graphics queue: G1 writes 64 bytes of buffer A on the card and
+    /// declares them (they land in title memory); G2 fills from buffer B;
+    /// G3 fills from the bytes G1 writes; G4 reads buffer B's host copy and
+    /// writes 7 to a word at the bottom of the pipe; then a signal;
+    /// compute queue: a wait for that 7, C1 fills from buffer B; a wait for
+    /// the signal's fence, C2 reads buffer A's host copy.
+    #[cfg(windows)]
+    fn script(grouped: bool) -> Left {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const LEN: usize = 1 << 16;
+        let host = crate::host::host().expect("a D3D12 device");
+        assert!(crate::host::relay(), "run with VICTORY_RELAY=2");
+        // SAFETY: a private allocation, kept until the process ends.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let (a, b, token) = (base, base + LEN, base + 2 * LEN);
+        // SAFETY: the allocation: two buffers of LEN bytes and a word.
+        unsafe {
+            for i in 0..LEN {
+                (a as *mut u8).add(i).write((i * 3 + 1) as u8);
+                (b as *mut u8).add(i).write((i * 5 + 2) as u8);
+            }
+        }
+        crate::shadow::register(a, a as u64, LEN as u64);
+        crate::shadow::register(b, b as u64, LEN as u64);
+        let copy_a = crate::shadow::find(a as u64, LEN as u64).expect("buffer A's copy");
+        let copy_b = crate::shadow::find(b as u64, LEN as u64).expect("buffer B's copy");
+        let back = host.read_back_buffer(512).expect("a read-back buffer");
+        let (upload, data) = host.upload_buffer(256).expect("an upload buffer");
+        let pattern: Vec<u8> = (0..64u32).map(|i| (i * 7 + 3) as u8).collect();
+        // SAFETY: the upload buffer holds 256 mapped bytes.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 64) };
+        let other = crate::host::fill_kind::OTHER;
+        // A fill of 64 bytes of title memory at `src`, copied to the
+        // read-back buffer at `at` when the list runs.
+        let fill = |l: &crate::host::HostList, src: usize, at: u64| {
+            let (buffer, offset, to) = l.scratch_view(64).expect("scratch memory");
+            l.defer_fill_as(to, src as *const u8, 64, other);
+            // SAFETY: an open list; live buffers, ranges inside them.
+            unsafe { l.list.CopyBufferRegion(&back, at, &buffer, offset, 64) };
+        };
+        let (g, f1, f2) = queue_and_fences();
+        let (c, f3, f4) = queue_and_fences();
+        let (g1, _) = part(host, |l| {
+            copy_a.refresh(l, a as u64, 256);
+            // SAFETY: as above. (The card writes the copy, as a shader would.)
+            unsafe { l.list.CopyBufferRegion(&copy_a.buffer, copy_a.offset(a as u64 + 64), &upload, 0, 64) };
+            copy_a.gpu_writes(l, a as u64 + 64, 64);
+        });
+        let (g2, _) = part(host, |l| fill(l, b, 0));
+        let (g3, _) = part(host, |l| fill(l, a + 64, 64));
+        let (g4, _) = part(host, |l| {
+            copy_b.refresh(l, b as u64, 256);
+            // SAFETY: as above.
+            unsafe { l.list.CopyBufferRegion(&back, 128, &copy_b.buffer, copy_b.offset(b as u64 + 16), 64) };
+            l.defer_write(token as *mut u8, Written::Value(7), 4);
+        });
+        let (c1, _) = part(host, |l| fill(l, b + 256, 192));
+        let (c2, _) = part(host, |l| {
+            copy_a.refresh(l, a as u64, 256);
+            // SAFETY: as above.
+            unsafe { l.list.CopyBufferRegion(&back, 256, &copy_a.buffer, copy_a.offset(a as u64 + 64), 64) };
+        });
+        const EQUAL: u32 = 3;
+        lock(&queue(g).held).extend([g1, g2, g3, g4, Held::Signal(crate::fence::FenceRef::new(f1), 1)]);
+        lock(&queue(c).held).extend([
+            Held::Value(crate::list::ValueWait::of(token as u64, EQUAL, 7)),
+            c1,
+            Held::Wait(crate::fence::FenceRef::new(f1), 1),
+            c2,
+        ]);
+        let sent_before = crate::host::submissions().0;
+        BEHIND_ALL.store(true, Ordering::Relaxed);
+        GROUP_HERE.set(Some(grouped));
+        lock(&WAITING).extend([g as usize, c as usize]);
+        for _ in 0..16 {
+            release_held_now(false);
+            // Everything in the air lands (title memory, the word, the fence).
+            crate::host::settle_for_present();
+            if lock(&queue(g).held).is_empty() && lock(&queue(c).held).is_empty() {
+                break;
+            }
+        }
+        assert!(lock(&queue(g).held).is_empty() && lock(&queue(c).held).is_empty(), "the lines did not run dry");
+        crate::host::settle_for_present();
+        GROUP_HERE.set(None);
+        BEHIND_ALL.store(false, Ordering::Relaxed);
+        let sent = crate::host::submissions().0 - sent_before;
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: every list ran (the settles waited for them); 320 bytes
+        // of the read-back buffer; the allocation above.
+        let left = unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            let card = std::slice::from_raw_parts(mapped.cast::<u8>(), 320).to_vec();
+            back.Unmap(0, None);
+            Left {
+                title: std::slice::from_raw_parts(base as *const u8, 2 * LEN).to_vec(),
+                card,
+                token: (token as *const u32).read_volatile(),
+                fence: crate::fence::completed(f1),
+                sent,
+            }
+        };
+        // What the script must leave, however it was sent.
+        assert_eq!(left.title[64..128], pattern[..], "what the card wrote to buffer A is in title memory");
+        assert_eq!(left.card[64..128], pattern[..], "G3's fill read what G1's lists wrote (it waited for their landing)");
+        assert_eq!(left.card[256..320], pattern[..], "C2 read buffer A's copy after G1");
+        assert_eq!(left.card[..64], left.title[LEN..LEN + 64], "G2's fill");
+        assert_eq!(left.card[128..192], left.title[LEN + 16..LEN + 80], "G4's read of buffer B's copy");
+        assert_eq!(left.card[192..256], left.title[LEN + 256..LEN + 320], "C1's fill");
+        assert_eq!((left.token, left.fence), (7, 1));
+        crate::shadow::unregister(a, a as u64);
+        crate::shadow::unregister(b, b as u64);
+        release_all(&[g, c, f1, f2, f3, f4]);
+        left
+    }
+
+    /// `VICTORY_GROUP_COMMIT`: a script of fake lists on two queues (shader
+    /// writes that land in title memory, fills that read them, host copies,
+    /// a bottom-of-pipe write another queue waits for, a fence another
+    /// queue waits for) leaves the same bytes in title memory and gives the
+    /// card the same bytes sent in batches as sent one part a submission;
+    /// in batches it takes three host submissions for the six parts (cut
+    /// where a fill reads what an earlier part writes when it has run, and
+    /// where a queue waits for the fence signalled behind the batch).
+    /// (`VICTORY_RELAY=2 cargo test -p victory-gpu --lib group_commit --
+    /// --ignored --test-threads=1`)
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a D3D12 adapter and VICTORY_RELAY=2; run alone"]
+    fn group_commit_leaves_the_bytes_of_parts_sent_singly() {
+        let _alone = lock(&GROUP_TESTS);
+        let before = [GROUP_BATCHES, GROUP_PARTS, CUT_READ, CUT_FENCE].map(group_stat);
+        let singly = script(false);
+        assert_eq!([GROUP_BATCHES, GROUP_PARTS, CUT_READ, CUT_FENCE].map(group_stat), before, "group commit ran without its switch");
+        let batched = script(true);
+        let after = [GROUP_BATCHES, GROUP_PARTS, CUT_READ, CUT_FENCE].map(group_stat);
+        assert_eq!(singly.title, batched.title, "title memory");
+        assert_eq!(singly.card, batched.card, "what the card was given");
+        assert_eq!((singly.token, singly.fence), (batched.token, batched.fence));
+        assert_eq!([after[0] - before[0], after[1] - before[1]], [3, 6], "batches and parts");
+        assert_eq!([after[2] - before[2], after[3] - before[3]], [1, 1], "cuts for an in-batch read and for a queue's fence wait");
+        assert_eq!((singly.sent, batched.sent), (6, 3), "host submissions");
+    }
+
+    /// `VICTORY_GROUP_COMMIT`: what cuts a batch from the title's side. A
+    /// present, a fence the title blocks on and a synchronous submission of
+    /// ours each send everything queued before them first, on their own
+    /// thread, and what is queued after them is another batch.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a D3D12 adapter and VICTORY_RELAY=2; run alone"]
+    fn group_commit_is_cut_at_a_present_a_blocking_fence_wait_and_a_synchronous_submission() {
+        use std::ffi::c_void;
+        let _alone = lock(&GROUP_TESTS);
+        let host = crate::host::host().expect("a D3D12 device");
+        assert!(crate::host::relay(), "run with VICTORY_RELAY=2");
+        BEHIND_ALL.store(true, Ordering::Relaxed);
+        GROUP_HERE.set(Some(true));
+        let (q, f1, f2) = queue_and_fences();
+        let queued = |parts: usize, signal: Option<(This, u64)>| {
+            let mut held = lock(&queue(q).held);
+            for _ in 0..parts {
+                held.push(part(host, |_| {}).0);
+            }
+            if let Some((fence, value)) = signal {
+                held.push(Held::Signal(crate::fence::FenceRef::new(fence), value));
+            }
+            drop(held);
+            let mut waiting = lock(&WAITING);
+            if !waiting.contains(&(q as usize)) {
+                waiting.push(q as usize);
+            }
+        };
+        let stats = || [GROUP_BATCHES, GROUP_PARTS, BEFORE_PRESENT, BEFORE_FENCE, BEFORE_OURS, CUT_DRY].map(group_stat);
+        let since = |before: [u64; 6]| {
+            let now = stats();
+            [0, 1, 2, 3, 4, 5].map(|i| now[i] - before[i])
+        };
+
+        // A present: the two parts queued before it are one batch, sent
+        // before it returns; the part queued after it is the next.
+        let before = stats();
+        queued(2, None);
+        assert_eq!(present(std::ptr::null(), 0, std::ptr::null(), std::ptr::null()), S_OK);
+        assert!(lock(&queue(q).held).is_empty(), "the present returned with parts still queued");
+        assert_eq!(since(before), [1, 2, 1, 0, 0, 0], "one batch of two parts, cut by the present");
+        queued(1, None);
+        release_held_now(false);
+        assert_eq!(since(before), [2, 3, 1, 0, 0, 1], "the part after the present is a batch of its own");
+
+        // A fence the title blocks on (no event): the parts and the signal
+        // queued before the wait go out first, and the wait returns once
+        // they have landed and the fence is set.
+        let before = stats();
+        queued(2, Some((f1, 3)));
+        let set_event = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f1, 0x48);
+        assert_eq!(set_event(f1, 3, std::ptr::null_mut()), S_OK);
+        assert_eq!(crate::fence::completed(f1), 3);
+        assert_eq!(since(before), [1, 2, 0, 1, 0, 0], "one batch of two parts, cut by the blocking wait");
+
+        // A submission of ours that is waited for: behind what was queued.
+        let before = stats();
+        queued(2, None);
+        let ours = host.new_list().unwrap();
+        ours.close();
+        host.execute(&[&ours]);
+        assert!(lock(&queue(q).held).is_empty(), "our submission passed parts still queued");
+        assert_eq!(since(before), [1, 2, 0, 0, 1, 0], "one batch of two parts, cut by our submission");
+
+        crate::host::settle_for_present();
+        GROUP_HERE.set(None);
+        BEHIND_ALL.store(false, Ordering::Relaxed);
+        release_all(&[q, f1, f2]);
     }
 }

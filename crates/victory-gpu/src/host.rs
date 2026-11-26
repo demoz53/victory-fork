@@ -29,6 +29,10 @@ mod awake;
 /// was at the title's submit call.
 pub(crate) mod audit;
 
+/// `VICTORY_GROUP_COMMIT`: what the queues ask while they gather queued
+/// parts into one host submission.
+pub(crate) mod group;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -4274,6 +4278,35 @@ fn blocked_by_steps_noting<'a>(
     read_stat.map(|stat| (WHY_READ, stat))
 }
 
+/// The fills of `runs` that [`blocked_by_steps_noting`] lets read ahead of
+/// the shader writes in `written` (`VICTORY_FILL_AHEAD`): source and bytes.
+/// For the parts of a batch ([`group`]), whose fills ahead of an earlier
+/// part of the same batch are noted when the batch gets its number.
+fn fills_ahead(
+    written: &[(usize, usize)],
+    by_copy: &[(usize, usize, usize)],
+    immed: &[(usize, usize)],
+    runs: &[&HostList],
+) -> Vec<(usize, usize)> {
+    let mut ahead = Vec::new();
+    if written.is_empty() {
+        return ahead;
+    }
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let &Step::Fill(_, src, len) = step
+                && fill_ahead::on(src, len)
+                && touches(written, src, src + len)
+                && !touches(immed, src, src + len)
+                && !by_copy.iter().any(|&(owner, a, b)| owner == 0 && a < src + len && b > src)
+            {
+                ahead.push((src, len));
+            }
+        }
+    }
+    ahead
+}
+
 /// What a fill of upload memory is for ([`HostList::defer_fill_as`]), and
 /// the settles for "a fill of upload memory" told apart by it: which kind
 /// of read still meets flights at its submission although
@@ -4588,6 +4621,13 @@ mod fill_ahead {
     /// A fill reads `len` bytes at `src` ahead of flights that may write
     /// them.
     pub(super) fn read(src: usize, len: usize) {
+        read_before(src, len, super::STARTED.load(Relaxed));
+    }
+
+    /// [`read`], ahead of submission `number` and those before it (group
+    /// commit: a fill of a batch ahead of an earlier part of the same batch
+    /// reads ahead of its own submission).
+    pub(super) fn read_before(src: usize, len: usize, number: u64) {
         if len == 0 {
             return;
         }
@@ -4602,7 +4642,7 @@ mod fill_ahead {
                 p.pruned = frame;
                 p.fills.retain(|f| f.2 + KEEP >= frame);
             }
-            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed), print));
+            p.fills.push((src, src + len, frame, number, print));
         }
     }
 
@@ -4795,6 +4835,42 @@ mod fill_ahead {
                 "a read-only title copy went ahead of shader writes"
             );
             TEST_MODE.set(None);
+        }
+
+        /// Group commit: a fill over what an earlier part of its own batch
+        /// writes joins the batch only with the switch, and is then kept for
+        /// the check at the batch's landing; without the switch it starts
+        /// the next batch, and so waits for the landing.
+        #[cfg(windows)]
+        #[test]
+        fn a_fill_ahead_of_its_own_batch_is_kept_for_the_landing() {
+            let Some(host) = super::super::host() else {
+                return; // no host GPU here
+            };
+            let memory: &'static mut [u8] = Box::leak(vec![0x22u8; 1 << 16].into_boxed_slice());
+            let base = memory.as_ptr() as usize;
+            let resource = 0x6c00_0002usize;
+            crate::shadow::register(resource, base as u64, 1 << 16);
+            let copy = crate::shadow::find(base as u64, 1 << 16).expect("a host copy");
+            let to = Box::leak(vec![0u8; 256].into_boxed_slice()).as_mut_ptr();
+            let writer = host.new_list().unwrap();
+            copy.refresh(&writer, base as u64, 256);
+            copy.gpu_writes(&writer, base as u64 + 64, 64);
+            writer.close();
+            let reader = host.new_list().unwrap();
+            reader.defer_fill_as(to, (base + 80) as *const u8, 16, super::super::fill_kind::OTHER);
+            reader.defer_fill_as(to, (base + 4096) as *const u8, 16, super::super::fill_kind::OTHER);
+            reader.close();
+            let mut gathered = super::super::group::Gathered::default();
+            gathered.add(&[&writer]);
+            TEST_MODE.set(Some(0));
+            assert!(gathered.blocks(&[&reader]), "a fill of what the batch writes joined it");
+            TEST_MODE.set(Some(1));
+            assert!(!gathered.blocks(&[&reader]));
+            gathered.add(&[&reader]);
+            assert_eq!(gathered.ahead(), [(base + 80, 16)], "the fill ahead of the batch's own part, and only it");
+            TEST_MODE.set(None);
+            crate::shadow::unregister(resource, base as u64);
         }
     }
 }
@@ -8473,6 +8549,12 @@ impl Host {
         // lists that may read them run.
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        // Group commit with VICTORY_FILL_AHEAD: the fills of this batch
+        // that read ahead of an earlier part of it are checked when it
+        // lands, as those ahead of flights are.
+        for (src, len) in group::take_ahead() {
+            fill_ahead::read_before(src, len, this_submission);
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
