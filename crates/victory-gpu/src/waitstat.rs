@@ -45,8 +45,9 @@ static SCOPED: [AtomicU64; CAUSES] = [const { AtomicU64::new(0) }; CAUSES];
 
 /// The title's barrier groups: calls, groups of each kind (global,
 /// texture, buffer, other), barriers in them, barriers whose accesses ask
-/// for an order of shader writes, calls that asked none.
-static GROUPS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// for an order of shader writes, calls that asked none, calls that fell
+/// back to the full wait under `VICTORY_BARRIER_GROUPS`.
+static GROUPS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// Settles by why (the host's `WHY_` places as `waited_at` gives them,
 /// 2..=11), their count and microseconds; and the settles for title
@@ -106,6 +107,14 @@ pub(crate) fn groups(kinds: [u64; 4], barriers: u64, ordering: u64) {
     GROUPS[6].fetch_add(ordering, Relaxed);
     if ordering == 0 {
         GROUPS[7].fetch_add(1, Relaxed);
+    }
+}
+
+/// A call of the title's barrier groups that `VICTORY_BARRIER_GROUPS`
+/// could not give barriers on its textures: it got the full wait.
+pub(crate) fn group_fell_back() {
+    if on() {
+        GROUPS[8].fetch_add(1, Relaxed);
     }
 }
 
@@ -184,7 +193,8 @@ pub(crate) fn line(frames: f64) -> Option<String> {
     Some(format!(
         "waits per frame (VICTORY_WAIT_STATS=1): barriers on every shader write {:.0} ({}); on one resource instead {:.0} ({}); \
          the title's barrier groups: {:.0} calls, {:.0} global / {:.0} texture / {:.0} buffer / {:.0} other groups, {:.0} barriers, \
-         {:.0} asking an order of shader writes, {:.0} calls asking none; settles {:.1}, {:.1} ms standing (by why: {}; title memory \
+         {:.0} asking an order of shader writes, {:.0} calls asking none, {:.0} calls that fell back to the full wait under VICTORY_BARRIER_GROUPS (a global or buffer barrier, or a texture with no \
+         host copy made for unordered access);settles {:.1}, {:.1} ms standing (by why: {}; title memory \
          read by a buffer copy {:.1}, a fill of upload memory {:.1}, a texture {:.1}, another copy {:.1}); the submitting thread also \
          stood: texture staging {:.1} ({:.1} ms), synchronous submissions {:.1} ({:.1} ms); waits for the submission lock (any thread) {:.1} ({:.1} ms)",
         global.iter().sum::<f64>(),
@@ -199,6 +209,7 @@ pub(crate) fn line(frames: f64) -> Option<String> {
         g[5],
         g[6],
         g[7],
+        g[8],
         settles.iter().sum::<f64>(),
         settle_ms.iter().sum::<f64>(),
         if by_why.is_empty() { "none".to_owned() } else { by_why.join(", ") },
