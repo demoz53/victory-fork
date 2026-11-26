@@ -1217,9 +1217,20 @@ mod tests {
         );
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        let placed = h;
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        // Released before `memory` goes: a shader-visible heap is found by
+        // the addresses of its descriptors for as long as it lives
+        // (`SHADER_HEAPS`), and left alive this one answered for whatever
+        // the next test was given at these addresses: another test's heap
+        // was not found at its own slots (`shader_slot` gave this heap and
+        // slot 48 or 54 for the other's slot 1).
+        let release = slot::<extern "system" fn(This) -> u32>(h, 0x10);
+        assert_eq!(release(placed), 0);
+        assert_eq!(release(h), 0);
+        drop(memory);
     }
 
     #[cfg(windows)]
