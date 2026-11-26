@@ -204,11 +204,55 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// Whether `VICTORY_PROCESS_PRIORITY` asks for the process to run above
+/// normal priority (`above` or `1`; anything else, or unset: as started).
+#[cfg(any(windows, test))]
+fn above_normal_asked(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("above" | "1"))
+}
+
+/// Runs the process above normal priority, as long as it runs
+/// (`VICTORY_PROCESS_PRIORITY=above`; off by default).
+///
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading, and our
+/// own threads run at normal: a program that keeps the processors busy at
+/// normal priority (a virus scan, a browser, a build not started at low
+/// priority) takes turns with them. In the other fork's runs cpu-1 and
+/// play-1125-0203 loading took 40 to 60 s instead of 28 to 33 and the
+/// opening ran without the models that were to be there. With the switch a
+/// thread the title set below normal still runs ahead of other programs'
+/// normal ones. Nothing in the title or in what is drawn changes.
+///
+/// Ported from avatarmanz/VIctory-7900XTX (commit c278c6779,
+/// GPL-3.0-or-later, as this), where it is on unless
+/// `VICTORY_PROCESS_PRIORITY=normal`.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if !above_normal_asked(std::env::var("VICTORY_PROCESS_PRIORITY").ok().as_deref()) {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=above)");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_process_priority_is_raised_only_when_asked() {
+        assert!(!above_normal_asked(None));
+        assert!(!above_normal_asked(Some("normal")));
+        assert!(!above_normal_asked(Some("0")));
+        assert!(above_normal_asked(Some("above")));
+        assert!(above_normal_asked(Some(" 1 ")));
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {

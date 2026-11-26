@@ -1905,6 +1905,7 @@ fn workers() -> &'static Workers {
         let n = wide_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {

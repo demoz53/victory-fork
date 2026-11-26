@@ -1144,11 +1144,60 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
-/// A list call on this thread that began at `started` has returned.
-pub(crate) fn recorded(started: std::time::Instant) {
+/// Whether list-call time is also counted by the method that was called
+/// (`VICTORY_FRAME_PARTS=1`; off by default): a line beside "list calls by
+/// thread" names the places in `list.rs` whose calls took longest.
+///
+/// The recording line says how long all list calls took together (run
+/// all15b-on1, the boat scene: 190-360 ms a frame on five threads, 7-9
+/// microseconds a call; the avatarmanz build in its own log 100-160 ms,
+/// 3.4 a call) and by thread, but not which methods the time is in: the
+/// draws, the indirect executions with their clamps, the tables with their
+/// constant fills, the copies. Counting costs a look in a short list a call.
+fn frame_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAME_PARTS").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`frame_parts`]: list-call time by
+/// the line of `list.rs` the call was made at (line, nanoseconds, calls).
+static PLACES: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// This thread's part of [`PLACES`] not yet added to it.
+    static PLACES_UNSENT: std::cell::RefCell<Vec<(u32, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Adds `ns` in `calls` calls made at `line` to `places`.
+fn place_add(places: &mut Vec<(u32, u64, u64)>, line: u32, ns: u64, calls: u64) {
+    match places.iter_mut().find(|p| p.0 == line) {
+        Some(p) => (p.1, p.2) = (p.1 + ns, p.2 + calls),
+        None => places.push((line, ns, calls)),
+    }
+}
+
+/// The `most` places of `places` whose calls took longest, longest first,
+/// as text per frame, and the milliseconds per frame of all of them.
+fn places_text(mut places: Vec<(u32, u64, u64)>, frames: f64, most: usize) -> (f64, Vec<String>) {
+    places.sort_by_key(|p| std::cmp::Reverse(p.1));
+    let total = places.iter().map(|p| p.1).sum::<u64>() as f64 / 1e6 / frames;
+    let text = places
+        .iter()
+        .take(most)
+        .map(|p| format!("list.rs:{} {:.1} ms in {:.0} calls", p.0, p.1 as f64 / 1e6 / frames, p.2 as f64 / frames))
+        .collect();
+    (total, text)
+}
+
+/// A list call on this thread, made at line `place` of `list.rs`, that began
+/// at `started` has returned.
+pub(crate) fn recorded(started: std::time::Instant, place: u32) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    if frame_parts() {
+        PLACES_UNSENT.with(|p| place_add(&mut p.borrow_mut(), place, ns, 1));
+    }
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1162,6 +1211,13 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if frame_parts() {
+        let mine = PLACES_UNSENT.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let mut all = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+        for (line, ns, calls) in mine {
+            place_add(&mut all, line, ns, calls);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1498,6 +1554,15 @@ pub(crate) fn log(frames: f64) {
         .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    if frame_parts() {
+        let places = std::mem::take(&mut *PLACES.lock().unwrap_or_else(|e| e.into_inner()));
+        let n = places.len();
+        let (total, most) = places_text(places, frames, 12);
+        tracing::info!(
+            "  list calls by the place in list.rs that makes them, per frame, all threads (VICTORY_FRAME_PARTS=1):              {n} places, {total:.1} ms; {}",
+            most.join(", ")
+        );
+    }
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
@@ -1515,5 +1580,24 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+#[cfg(test)]
+mod frame_parts_tests {
+    use super::{place_add, places_text};
+
+    /// Calls made at one line are counted together, and the places that
+    /// took longest are named first, per frame.
+    #[test]
+    fn list_call_time_is_counted_by_place_and_the_longest_named_first() {
+        let mut places = Vec::new();
+        place_add(&mut places, 300, 2_000_000, 2);
+        place_add(&mut places, 120, 9_000_000, 3);
+        place_add(&mut places, 300, 4_000_000, 4);
+        assert_eq!(places, [(300, 6_000_000, 6), (120, 9_000_000, 3)]);
+        let (total, text) = places_text(places, 3.0, 1);
+        assert!((total - 5.0).abs() < 1e-9);
+        assert_eq!(text, ["list.rs:120 3.0 ms in 1 calls"]);
     }
 }

@@ -1421,6 +1421,7 @@ pub(crate) fn make_host_copy_soon(this: This) -> bool {
     STARTED.call_once(|| {
         for n in 0..makers {
             let _ = std::thread::Builder::new().name(format!("victory-texture-maker-{n}")).spawn(|| {
+                crate::cores::keep_many_on_fast_cores("victory-texture-maker");
                 loop {
                     let next = {
                         let mut m = MAKERS.lock().unwrap_or_else(|e| e.into_inner());

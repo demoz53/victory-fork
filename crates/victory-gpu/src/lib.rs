@@ -20,6 +20,8 @@ mod capture;
 #[cfg(windows)]
 mod compose;
 pub mod console;
+#[cfg(windows)]
+mod cores;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
