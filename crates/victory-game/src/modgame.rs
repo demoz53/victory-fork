@@ -126,6 +126,65 @@ pub mod sites {
     /// `Wanted_IgnoresCrimes`: pins [`WANTED_FLAGS`] bit [`WANTED_IGNORE_CRIMES`] (`mov eax, [rcx+0x14]; and eax, 0x20`).
     pub const WANTED_IGNORE_READ: Site = Site { name: "WANTED_IGNORE_READ", rva: 0x00ea540, bytes: &[0x85, 0xd2, 0x75, 0x19, 0x8b, 0x41, 0x14, 0x83, 0xe0, 0x20, 0x0b, 0x81, 0x38, 0x5f, 0x00, 0x00, 0x75, 0x0f, 0x83, 0xb9, 0x40, 0x5f, 0x00, 0x00] };
     pub const WANTED_MAX_LEVEL_GLOBAL: Pin = Pin { site: WANTED_SET_MAX_LEVEL, disp: 8, end: 12, target: 0x0a02_06cc };
+    /// `void Vehicle_RequestFix(CVehicle*)`: the game's own full repair (what its heal cheat uses). The repair systems apply it on the next frame.
+    pub const VEHICLE_REQUEST_FIX: Site = Site { name: "VEHICLE_REQUEST_FIX", rva: 0x1d1b1c0, bytes: &[0x56, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0xce, 0x8b, 0x89, 0x9c, 0x00, 0x00, 0x00, 0xe8, 0x6d, 0xe4, 0x32, 0x03, 0x48, 0x85, 0xc0, 0x74, 0x08] };
+    /// `PartHealthComp* (u32 entityId)`: `u32` count at [`VEH_PARTS_COUNT`], 20-byte entries at `*(+VEH_PARTS)`.
+    pub const VEHICLE_PART_HEALTH: Site = Site { name: "VEHICLE_PART_HEALTH", rva: 0x50572a0, bytes: &[0x89, 0xc8, 0x25, 0x00, 0x00, 0x3e, 0x00, 0x3d, 0x00, 0x00, 0x04, 0x00, 0x75, 0x3a, 0x81, 0xe1, 0xff, 0xff, 0x01, 0x00, 0x0f, 0xaf, 0x0d, 0x29] };
+    /// `void PartHealth_RestoreToMax(entry)`.
+    pub const VEHICLE_PART_RESTORE: Site = Site { name: "VEHICLE_PART_RESTORE", rva: 0x3d2e580, bytes: &[0xc5, 0xfa, 0x10, 0x09, 0xe9, 0xf7, 0xc3, 0x31, 0xfc] };
+    /// `ShaderParams* Entity_GetShaderParams(drawable)`; the drawable is `*(entity + ENTITY_DRAWABLE)`.
+    pub const ENTITY_SHADER_PARAMS: Site = Site { name: "ENTITY_SHADER_PARAMS", rva: 0x4f56f90, bytes: &[0x48, 0x83, 0xc1, 0x18, 0xba, 0x15, 0x00, 0x00, 0x00, 0xe9, 0x32, 0x96, 0x11, 0x00] };
+    /// `void ShaderParams_SetDirt(params, float dirt (xmm1, 0..1), u8 0)`.
+    pub const SHADER_SET_DIRT: Site = Site { name: "SHADER_SET_DIRT", rva: 0x1208100, bytes: &[0x45, 0x84, 0xc0, 0x74, 0x26, 0xc5, 0xfa, 0x11, 0x89, 0x7c, 0x06, 0x00, 0x00, 0xc5, 0xf8, 0x28, 0xc1, 0xc5, 0xfa, 0x10, 0x89, 0x78, 0x06, 0x00] };
+    /// `u64 VehicleModels_HashAt(u32 n)`, the model hash of the n-th vehicle model: `mov rdx, [rip+X]` where X ([`VEHICLE_MODEL_POOL`]) holds the vehicle model pool.
+    pub const VEHICLE_MODEL_HASH_AT: Site = Site { name: "VEHICLE_MODEL_HASH_AT", rva: 0x4aac670, bytes: &[0x56, 0x57, 0x48, 0x8b, 0x15, 0xc7, 0xd5, 0xa0, 0x05, 0x31, 0xc0, 0x39, 0x4a, 0x10, 0x76, 0x7a, 0x44, 0x8b, 0x42, 0x0c, 0x45, 0x85, 0xc0, 0x74] };
+    /// `const char* Text_GetString(u32 label, bool emptyIfMissing)`: the UTF-8 text for a label in the player's language, from the loaded text blocks.
+    pub const TEXT_GET_STRING: Site = Site { name: "TEXT_GET_STRING", rva: 0x10fbf80, bytes: &[0x48, 0x83, 0xec, 0x28, 0x41, 0x89, 0xd0, 0x89, 0xca, 0x48, 0x8d, 0x4c, 0x24, 0x20, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff] };
+    /// `CBaseModelInfo* GetArchetypeFromHashKey(u64 hash, u32* outModelId, bool)`.
+    pub const GET_ARCHETYPE_FROM_HASH: Site = Site { name: "GET_ARCHETYPE_FROM_HASH", rva: 0x00bf810, bytes: &[0x56, 0x57, 0x55, 0x53, 0x48, 0x85, 0xc9, 0x74, 0x4b, 0x44, 0x8b, 0x15, 0xb4, 0x64, 0x61, 0x07] };
+    /// `bool HasModelLoaded(u32 modelId)`.
+    pub const HAS_MODEL_LOADED: Site = Site { name: "HAS_MODEL_LOADED", rva: 0x4f16110, bytes: &[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xec, 0x28, 0x89, 0xcd, 0x81, 0xe5, 0xff, 0xff, 0x3f, 0x00] };
+    /// `void ModelRequest_Request(u16* request, const u32* modelId, const Defaults*, const u32* zero, u8 flags, u8 1, u8 0, const u8 zero16[16])`: asks the streaming system for a
+    pub const MODEL_REQUEST: Site = Site { name: "MODEL_REQUEST", rva: 0x07a0f90, bytes: &[0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xec, 0x38, 0x40, 0x8a, 0xac, 0x24, 0xb0, 0x00, 0x00, 0x00] };
+    /// In the vehicle cheat's blocking request: `lea r8, [rip+X]`, X = [`MODEL_REQUEST_DEFAULTS`].
+    pub const MODEL_REQUEST_DEFAULTS_READ: Site = Site { name: "MODEL_REQUEST_DEFAULTS_READ", rva: 0x3b25469, bytes: &[0x4c, 0x8d, 0x05, 0x7c, 0x62, 0xfc, 0x06] };
+    /// `bool ModelRequest_IsLoaded(const u16* request)`: the requested model is in memory.
+    pub const MODEL_REQUEST_LOADED: Site = Site { name: "MODEL_REQUEST_LOADED", rva: 0x51e7ff0, bytes: &[0x56, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0xce, 0xe8, 0xe3, 0x00, 0x12, 0x00, 0x84, 0xc0, 0x74, 0x0d, 0x48, 0x89, 0xf1, 0x48, 0x83, 0xc4, 0x20] };
+    /// `void ModelRequest_Release(u16* request)`: drops the request (null-safe on an empty word, which it leaves 0). The model may then be streamed out once nothing else uses it.
+    pub const MODEL_REQUEST_RELEASE: Site = Site { name: "MODEL_REQUEST_RELEASE", rva: 0x52d56f0, bytes: &[0x56, 0x48, 0x83, 0xec, 0x20, 0x0f, 0xb7, 0x01, 0xa9, 0xff, 0x3f, 0x00, 0x00, 0x75, 0x06, 0x48, 0x83, 0xc4, 0x20, 0x5e, 0xc3] };
+    /// `VehicleCreateParams::VehicleCreateParams(params*)`.
+    pub const VEH_PARAMS_CTOR: Site = Site { name: "VEH_PARAMS_CTOR", rva: 0x5285ab0, bytes: &[0x56, 0x57, 0x53, 0x48, 0x83, 0xec, 0x30, 0xc5, 0xf8, 0x29, 0x74, 0x24, 0x20, 0x31, 0xc0] };
+    /// `CVehicle* CreateVehicleFromParams(params*)`: the synchronous creation vehicle population uses.
+    pub const CREATE_VEHICLE_FROM_PARAMS: Site = Site { name: "CREATE_VEHICLE_FROM_PARAMS", rva: 0x2363cb0, bytes: &[0x56, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0xce, 0xe8, 0xd3, 0xff, 0xff, 0xff, 0x84, 0xc0, 0x74, 0x4c] };
+    /// `bool World_RegisterNewEntity(manager, entity, params*, int slot /* -1 = allocate */)`: what vehicle population calls right after creation.
+    pub const WORLD_REGISTER_NEW_ENTITY: Site = Site { name: "WORLD_REGISTER_NEW_ENTITY", rva: 0x0a7e7e0, bytes: &[0x56, 0x57, 0x53, 0x48, 0x83, 0xec, 0x20, 0x4c, 0x89, 0xc3, 0x48, 0x89, 0xd7, 0x48, 0x89, 0xce] };
+    /// `mov rcx, [rip+X]`: X ([`WORLD_ENTITY_MANAGER`]) is the world entity manager.
+    pub const WORLD_MANAGER_READ: Site = Site { name: "WORLD_MANAGER_READ", rva: 0x0c2fa70, bytes: &[0x48, 0x8b, 0x0d, 0xb9, 0xb2, 0xd7, 0x08] };
+    /// `u64 World_Add(CEntity*, u32 location, u8 a3, u8 skip_notify)`: inserts an entity into the world scene and (when `skip_notify == 0`) notifies components, including adding
+    pub const WORLD_ADD: Site = Site { name: "WORLD_ADD", rva: 0x509c0b0, bytes: &[0x48, 0x83, 0xec, 0x58, 0x31, 0xc0, 0x44, 0x88, 0x4c, 0x24, 0x28, 0x45, 0x31, 0xc9, 0x66, 0xc7, 0x44, 0x24, 0x30, 0xff, 0xff, 0xc7, 0x44, 0x24] };
+    /// `mov edx, [rip+X]`: X ([`WORLD_DEFAULT_LOCATION`]) is the default world location passed to [`WORLD_ADD`].
+    pub const WORLD_DEFAULT_LOCATION_READ: Site = Site { name: "WORLD_DEFAULT_LOCATION_READ", rva: 0x066e152, bytes: &[0x8b, 0x15, 0x98, 0x7c, 0x4d, 0x0a] };
+    /// `void Phys_Wake(CEntity*, void* physics_world)`: wakes a sleeping physics instance (state 2 -> 1 active collider) so gravity, collisions and velocity take effect.
+    pub const PHYS_WAKE: Site = Site { name: "PHYS_WAKE", rva: 0x15a7a10, bytes: &[0x48, 0x83, 0xe1, 0xf0, 0x48, 0x8b, 0x49, 0x38, 0x48, 0x85, 0xc9, 0x74, 0x16, 0x80, 0xb9, 0x56, 0x01, 0x00, 0x00, 0x02, 0x0f, 0x84, 0x46, 0x0d] };
+    /// `lea rdx, [rip+X]` in `VehicleComp_OnAddedToWorld`: X ([`PHYSICS_WORLD`]) is the physics world passed to [`PHYS_WAKE`].
+    pub const PHYSICS_WORLD_READ: Site = Site { name: "PHYSICS_WORLD_READ", rva: 0x080a8eb, bytes: &[0x48, 0x8d, 0x15, 0xd6, 0x97, 0x33, 0x0a] };
+    /// `mov eax, [rip+X]` in the script vehicle creator: X ([`VEHICLE_COUNTER`]) is the creation counter stored into each params block.
+    pub const VEHICLE_COUNTER_READ: Site = Site { name: "VEHICLE_COUNTER_READ", rva: 0x4ab8bed, bytes: &[0x8b, 0x05, 0x5d, 0x2b, 0x76, 0x05] };
+    /// Destructor of the params sub-object at [`vehicle_params::SUB_OBJECT`] (a `jmp` thunk).
+    pub const VEH_PARAMS_SUB_DTOR: Site = Site { name: "VEH_PARAMS_SUB_DTOR", rva: 0x52858a0, bytes: &[0xe9, 0x2b, 0x00, 0x00, 0x00, 0xcc] };
+    /// Releases the object pointer at [`vehicle_params::RESOURCE`] (null-safe).
+    pub const VEH_PARAMS_RELEASE: Site = Site { name: "VEH_PARAMS_RELEASE", rva: 0x5224170, bytes: &[0x48, 0x85, 0xc9, 0x0f, 0x85, 0x07, 0x00, 0x00, 0x00, 0xc3] };
+    /// The game heap's free (a `jmp` thunk).
+    pub const GAME_FREE: Site = Site { name: "GAME_FREE", rva: 0x4d9c130, bytes: &[0xe9, 0x1b, 0x00, 0x00, 0x00, 0xcc] };
+    /// `void SetPedIntoVehicle_Impl(CPed*, CVehicle*, bool anySeat, u32 seat)`: what the put-ped-in-vehicle
+    /// script command runs (it clears the ped's tasks first).
+    pub const PED_INTO_VEHICLE: Site = Site { name: "PED_INTO_VEHICLE", rva: 0x4c03280, bytes: &[0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xec, 0x38, 0x44, 0x89, 0xcd, 0x45, 0x89, 0xc6, 0x48, 0x89, 0xd6, 0x49, 0x89, 0xcf] };
+    pub const VEHICLE_MODEL_POOL: Pin = Pin { site: VEHICLE_MODEL_HASH_AT, disp: 5, end: 9, target: 0x0a4b_9c40 };
+    pub const MODEL_REQUEST_DEFAULTS: Pin = Pin { site: MODEL_REQUEST_DEFAULTS_READ, disp: 3, end: 7, target: 0x0aae_b6ec };
+    pub const WORLD_ENTITY_MANAGER: Pin = Pin { site: WORLD_MANAGER_READ, disp: 3, end: 7, target: 0x099a_ad30 };
+    pub const WORLD_DEFAULT_LOCATION: Pin = Pin { site: WORLD_DEFAULT_LOCATION_READ, disp: 2, end: 6, target: 0x0ab4_5df0 };
+    pub const PHYSICS_WORLD: Pin = Pin { site: PHYSICS_WORLD_READ, disp: 3, end: 7, target: 0x0ab4_40c8 };
+    pub const VEHICLE_COUNTER: Pin = Pin { site: VEHICLE_COUNTER_READ, disp: 2, end: 6, target: 0x0a21_b750 };
 }
 
 /// The CPed vtable and the two slots called through an entity's vtable.
@@ -208,6 +267,15 @@ struct State {
     /// Held states, re-applied about once a second ([`keep`]).
     held: Held,
     kept_at: Option<Instant>,
+    spawn: Option<SpawnJob>,
+    /// The game's vehicle models, read once.
+    models: Option<Vec<VehicleModel>>,
+    /// The vehicle last spawned (checked alive before use), or 0.
+    spawned: usize,
+    /// `wanted n` waiting for the game to show the level: (n, since, line).
+    wanted_check: Option<(u32, Instant, String)>,
+    /// Times never wanted was put back since it was set (said once, then counted).
+    never_again: u32,
 }
 
 #[derive(Default)]
@@ -268,6 +336,11 @@ pub fn configure(var: &dyn Fn(&str) -> Option<String>) -> bool {
         started: Instant::now(),
         held: Held::default(),
         kept_at: None,
+        spawn: None,
+        models: None,
+        spawned: 0,
+        wanted_check: None,
+        never_again: 0,
     });
     true
 }
@@ -454,6 +527,487 @@ impl modcmd::World for TitleWorld {
     }
 }
 
+// ---- vehicles -------------------------------------------------------------------------
+
+/// The script vehicle creator's params block (VIper `vehicle_params`); the
+/// world entity manager keeps a pointer to it for a while after creation.
+#[repr(C, align(32))]
+struct VehicleParams([u8; VP_SIZE]);
+
+const VP_SIZE: usize = 0x800;
+/// How long a registered params block is kept before it is cleaned up.
+const VP_KEEP: Duration = Duration::from_secs(3);
+const VP_MODEL_ID: usize = 0x630;
+const VP_KIND: usize = 0x634;
+const VP_KIND_VALUE: u64 = 0x0000_0007_0000_0005;
+const VP_ENTITY_TYPE: usize = 0x644;
+const VP_ENTITY_TYPE_VALUE: u16 = 6;
+const VP_MATRIX: usize = 0x650;
+const VP_COUNTER: usize = 0x2d0;
+const VP_HAS_VARIATION: usize = 0x129;
+/// The script creator's other defaults, after the constructor: (offset, bytes, value).
+const VP_DEFAULTS: &[(usize, u8, u32)] = &[
+    (0x730, 2, 0x10),
+    (0x691, 1, 1),
+    (0x693, 1, 0),
+    (0x694, 1, 0),
+    (0x696, 1, 1),
+    (0x6e0, 1, 6),
+    (0x2d8, 4, u32::MAX),
+    (0x2dc, 4, 0),
+    (0x098, 4, 0),
+    (0x09d, 1, 0),
+    (0x6c4, 1, 0),
+    (0x6c6, 1, 1),
+    (0x120, 4, 0),
+    (0x0d8, 4, 0),
+    (0x0dc, 4, 0),
+    (0x6d6, 1, 0),
+    (0x6d8, 4, 0), // f32 0.0
+    (0x6d7, 1, 0),
+    (0x695, 1, 1),
+    (0x277, 1, 1),
+];
+/// Cleanup offsets, in the script creator's order.
+const VP_SUB_OBJECT: usize = 0x280;
+const VP_SUB_OBJECT_TAG: usize = 0xd0;
+const VP_SUB_OBJECT_TAG_VALUE: u64 = 0x16;
+const VP_BUFFER_A_TAG: usize = 0x158;
+const VP_BUFFER_A_TAG_VALUE: u64 = 0x10;
+const VP_BUFFER_A_LEN: usize = 0x144;
+const VP_BUFFER_A_CAP: usize = 0x140;
+const VP_BUFFER_A: usize = 0x148;
+const VP_RESOURCE: usize = 0x130;
+const VP_BUFFER_B_LEN: usize = 0xcc;
+const VP_BUFFER_B: usize = 0xd0;
+/// Archetype fields (VIper `archetype`, `vehicle_model`).
+const ARCH_HASH: usize = 0x60;
+const ARCH_TYPE: usize = 153;
+const ARCH_TYPE_VEHICLE: u8 = 5;
+const INVALID_MODEL_ID: u32 = 0x3f_ffff;
+const NAME_LABEL: usize = 0x118;
+const MAKE_LABEL: usize = 0x11c;
+/// Pool layout (VIper `pool`).
+const POOL_STORAGE: usize = 0x00;
+const POOL_STRIDE: usize = 0x08;
+const POOL_CAPACITY: usize = 0x0c;
+const POOL_FLAGS: usize = 0x28;
+const POOL_LIVE_MASK: usize = 0x30;
+/// The entity's physics instance, set by the world entity manager.
+const PHYSICS_INST: usize = 0x38;
+/// Model request flags of the script request-model command; the request index bits.
+const REQUEST_FLAGS_SCRIPT: u8 = 6;
+const REQUEST_INDEX_MASK: u16 = 0x3fff;
+/// Waits: for the model to stream in, for the physics instance.
+const MODEL_WAIT: Duration = Duration::from_secs(10);
+const PHYSICS_WAIT: Duration = Duration::from_secs(5);
+/// Vehicle parts and the drawable (VIper VEH_PARTS_COUNT, VEH_PARTS, VEH_PART_SIZE, ENTITY_DRAWABLE).
+const VEH_PARTS_COUNT: usize = 196;
+const VEH_PARTS: usize = 200;
+const VEH_PART_SIZE: usize = 20;
+const ENTITY_DRAWABLE: usize = 0x28;
+
+const SPAWN_SITES: [Site; 18] = [
+    sites::GET_ARCHETYPE_FROM_HASH,
+    sites::HAS_MODEL_LOADED,
+    sites::MODEL_REQUEST,
+    sites::MODEL_REQUEST_LOADED,
+    sites::MODEL_REQUEST_RELEASE,
+    sites::VEH_PARAMS_CTOR,
+    sites::CREATE_VEHICLE_FROM_PARAMS,
+    sites::WORLD_REGISTER_NEW_ENTITY,
+    sites::WORLD_ADD,
+    sites::PHYS_WAKE,
+    sites::VEH_PARAMS_SUB_DTOR,
+    sites::VEH_PARAMS_RELEASE,
+    sites::GAME_FREE,
+    sites::VEHICLE_FROM_ID,
+    sites::GROUND_Z,
+    sites::MODEL_REQUEST_DEFAULTS_READ,
+    sites::VEHICLE_COUNTER_READ,
+    sites::WORLD_MANAGER_READ,
+];
+
+/// A vehicle model the game defines.
+#[derive(Clone)]
+struct VehicleModel {
+    hash: u64,
+    name: String,
+    make: String,
+}
+
+/// A spawn under way, over several frames.
+struct SpawnJob {
+    line: String,
+    model: VehicleModel,
+    id: u32,
+    word: u16,
+    since: Instant,
+    /// Once made: the vehicle, its params (until [`VP_KEEP`]), whether it is in the world.
+    made: Option<(usize, Option<Box<VehicleParams>>, Instant, bool)>,
+}
+
+/// Reads a NUL-terminated text of at most 256 bytes.
+///
+/// # Safety
+/// `p` null or a readable NUL-terminated text.
+unsafe fn c_text(p: *const u8) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut n = 0;
+    // SAFETY: bounded walk of the text up to its NUL.
+    unsafe {
+        while n < 256 && *p.add(n) != 0 {
+            n += 1;
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(p, n)).into_owned()
+    }
+}
+
+/// Every vehicle model the game defines (the vehicle model pool, as VIper
+/// walks it) with its display name and make in the player's language.
+fn vehicle_models(st: &mut State, base: usize) -> Result<Vec<VehicleModel>, String> {
+    st.need(base, &[sites::TEXT_GET_STRING])?;
+    let pool = st.pin(base, sites::VEHICLE_MODEL_POOL)?;
+    let plausible = |p: usize| (0x1_0000..0x7fff_ffff_0000).contains(&p) && p & 7 == 0;
+    let mut out = Vec::new();
+    // SAFETY: the pool word (pinned) and the pool it points at, every pointer checked for plausibility, every slot
+    // index below its capacity; Text_GetString (checked) copied at once.
+    unsafe {
+        let p = (pool as *const usize).read_volatile();
+        if !plausible(p) {
+            return Err("the vehicle model pool is not there yet".into());
+        }
+        let storage = ((p + POOL_STORAGE) as *const usize).read_unaligned();
+        let stride = ((p + POOL_STRIDE) as *const u32).read_unaligned() as usize;
+        let cap = (((p + POOL_CAPACITY) as *const u32).read_unaligned() as usize).min(1 << 17);
+        let flags = ((p + POOL_FLAGS) as *const usize).read_unaligned();
+        let mask = ((p + POOL_LIVE_MASK) as *const u32).read_unaligned();
+        if !plausible(storage) || stride == 0 || !plausible(flags) {
+            return Err("the vehicle model pool reads wrong".into());
+        }
+        let text: extern "C" fn(u32, u8) -> *const u8 = std::mem::transmute(base + sites::TEXT_GET_STRING.rva as usize);
+        for i in 0..cap {
+            if mask & !((flags + 4 * i) as *const u32).read_unaligned() != 0 {
+                continue;
+            }
+            let mi = storage + stride * i;
+            if ((mi + ARCH_TYPE) as *const u8).read() & 7 != ARCH_TYPE_VEHICLE {
+                continue;
+            }
+            let hash = ((mi + ARCH_HASH) as *const u64).read_unaligned();
+            let name = c_text(text(((mi + NAME_LABEL) as *const u32).read_unaligned(), 1));
+            let make = c_text(text(((mi + MAKE_LABEL) as *const u32).read_unaligned(), 1));
+            out.push(VehicleModel { hash, name, make });
+        }
+    }
+    Ok(out)
+}
+
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+}
+
+/// The model a `spawn vehicle` names: its hash; or a display name (spaces and case
+/// ignored, with or without the make), or a name whose joaat is the hash's low half.
+fn find_model(models: &[VehicleModel], m: &modcmd::Model) -> Result<VehicleModel, String> {
+    match m {
+        modcmd::Model::Hash(h) => Ok(models.iter().find(|v| v.hash == *h).cloned().unwrap_or(VehicleModel { hash: *h, name: format!("{h:#018x}"), make: String::new() })),
+        modcmd::Model::Index(i) => models.get(*i).cloned().ok_or_else(|| format!("vehicle list has {} lines, not #{i}", models.len())),
+        modcmd::Model::Name(n) => {
+            let key = squash(n);
+            let j = modcmd::joaat(n);
+            let hit = models
+                .iter()
+                .find(|v| squash(&v.name) == key)
+                .or_else(|| models.iter().find(|v| squash(&format!("{}{}", v.make, v.name)) == key))
+                .or_else(|| models.iter().find(|v| v.hash as u32 == j));
+            hit.cloned().ok_or_else(|| format!("no vehicle model named {n:?} (vehicle list writes the game's names to a file)"))
+        }
+    }
+}
+
+/// The archetype of a model hash: (model id, is a vehicle).
+fn lookup_model(base: usize, hash: u64) -> Option<(u32, bool)> {
+    let mut id = INVALID_MODEL_ID;
+    // SAFETY: GetArchetypeFromHashKey (checked by the caller); the archetype's type byte.
+    unsafe {
+        let f: extern "C" fn(u64, *mut u32, u8) -> usize = std::mem::transmute(base + sites::GET_ARCHETYPE_FROM_HASH.rva as usize);
+        let arch = f(hash, &mut id, 0);
+        if arch == 0 || id & INVALID_MODEL_ID == INVALID_MODEL_ID {
+            return None;
+        }
+        Some((id, ((arch + ARCH_TYPE) as *const u8).read() & 7 == ARCH_TYPE_VEHICLE))
+    }
+}
+
+fn start_spawn(st: &mut State, base: usize, line: &str, m: &modcmd::Model) -> Result<String, String> {
+    if st.spawn.is_some() {
+        return Err("a vehicle spawn is still under way".into());
+    }
+    st.need(base, &SPAWN_SITES)?;
+    for p in [sites::MODEL_REQUEST_DEFAULTS, sites::VEHICLE_COUNTER, sites::WORLD_ENTITY_MANAGER, sites::WORLD_DEFAULT_LOCATION, sites::PHYSICS_WORLD] {
+        st.pin(base, p)?;
+    }
+    let models = match st.models.clone() {
+        Some(m) => m,
+        None => {
+            let m = vehicle_models(st, base)?;
+            st.models = Some(m.clone());
+            m
+        }
+    };
+    let model = find_model(&models, m)?;
+    let (id, vehicle) = lookup_model(base, model.hash).ok_or_else(|| format!("the game has no model {:#018x}", model.hash))?;
+    if !vehicle {
+        return Err(format!("{:#018x} is not a vehicle model", model.hash));
+    }
+    let defaults = base + sites::MODEL_REQUEST_DEFAULTS.target as usize;
+    #[repr(C, align(16))]
+    struct Zero16([u8; 16]);
+    let (mut word, zero, extra) = (0u16, 0u32, Zero16([0; 16]));
+    // SAFETY: ModelRequest_Request (checked) with VIper's arguments: (&word, &id, defaults (pinned), &0, 6, 1, 0, &zero16).
+    unsafe {
+        let f: extern "C" fn(*mut u16, *const u32, usize, *const u32, u8, u8, u8, *const Zero16) = std::mem::transmute(base + sites::MODEL_REQUEST.rva as usize);
+        f(&mut word, &id, defaults, &zero, REQUEST_FLAGS_SCRIPT, 1, 0, &extra);
+    }
+    let what = format!("{} {} ({:#018x})", model.make, model.name, model.hash).trim().to_owned();
+    st.spawn = Some(SpawnJob { line: line.to_owned(), model, id, word, since: Instant::now(), made: None });
+    Ok(format!("{what}: model asked for; made in front of the player once it is loaded"))
+}
+
+/// Gives back a model request.
+fn release_request(base: usize, word: &mut u16) {
+    // SAFETY: ModelRequest_Release (checked at the spawn's start), null-safe on an empty word.
+    unsafe {
+        let f: extern "C" fn(*mut u16) = std::mem::transmute(base + sites::MODEL_REQUEST_RELEASE.rva as usize);
+        f(word);
+    }
+}
+
+/// Releases what the game put in a params block, in the script creator's order (VIper `VehicleParams::cleanup`).
+fn cleanup_params(base: usize, mut params: Box<VehicleParams>) {
+    let p = params.0.as_mut_ptr() as usize;
+    // SAFETY: the three checked functions on our own block, as the game's creator cleans its own.
+    unsafe {
+        let sub_dtor: extern "C" fn(usize) = std::mem::transmute(base + sites::VEH_PARAMS_SUB_DTOR.rva as usize);
+        let release: extern "C" fn(usize) = std::mem::transmute(base + sites::VEH_PARAMS_RELEASE.rva as usize);
+        let free: extern "C" fn(usize) = std::mem::transmute(base + sites::GAME_FREE.rva as usize);
+        let q = p + VP_SUB_OBJECT;
+        ((q + VP_SUB_OBJECT_TAG) as *mut u64).write_unaligned(VP_SUB_OBJECT_TAG_VALUE);
+        sub_dtor(q);
+        ((p + VP_BUFFER_A_TAG) as *mut u64).write_unaligned(VP_BUFFER_A_TAG_VALUE);
+        ((p + VP_BUFFER_A_LEN) as *mut u32).write_unaligned(0);
+        let a = ((p + VP_BUFFER_A) as *const usize).read_unaligned();
+        if a != 0 {
+            free(a);
+        }
+        ((p + VP_BUFFER_A_CAP) as *mut u32).write_unaligned(0);
+        ((p + VP_BUFFER_A) as *mut u64).write_unaligned(0);
+        release(((p + VP_RESOURCE) as *const usize).read_unaligned());
+        ((p + VP_BUFFER_B_LEN) as *mut u32).write_unaligned(0);
+        let b = ((p + VP_BUFFER_B) as *const usize).read_unaligned();
+        if b != 0 {
+            free(b);
+        }
+    }
+}
+
+/// Creates the vehicle as the game's script creator fills its params (VIper `create_vehicle`).
+fn create_vehicle(base: usize, id: u32, at: [f32; 3], heading: f32) -> Option<(usize, Option<Box<VehicleParams>>)> {
+    let mut params = Box::new(VehicleParams([0; VP_SIZE]));
+    let p = params.0.as_mut_ptr() as usize;
+    let (s, c) = heading.sin_cos();
+    let rows = [[c, s, 0.0, 0.0], [-s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [at[0], at[1], at[2], 0.0]];
+    // SAFETY: our own 0x800-byte block (32-aligned) filled at VIper's offsets; the checked constructor, creator and
+    // register calls; the counter and manager words pinned at the spawn's start.
+    unsafe {
+        let ctor: extern "C" fn(usize) = std::mem::transmute(base + sites::VEH_PARAMS_CTOR.rva as usize);
+        let create: extern "C" fn(usize) -> usize = std::mem::transmute(base + sites::CREATE_VEHICLE_FROM_PARAMS.rva as usize);
+        let register: extern "C" fn(usize, usize, usize, i32) -> u8 = std::mem::transmute(base + sites::WORLD_REGISTER_NEW_ENTITY.rva as usize);
+        ctor(p);
+        for &(off, n, v) in VP_DEFAULTS {
+            match n {
+                1 => ((p + off) as *mut u8).write(v as u8),
+                2 => ((p + off) as *mut u16).write_unaligned(v as u16),
+                _ => ((p + off) as *mut u32).write_unaligned(v),
+            }
+        }
+        ((p + VP_MODEL_ID) as *mut u32).write_unaligned(id);
+        ((p + VP_KIND) as *mut u64).write_unaligned(VP_KIND_VALUE);
+        ((p + VP_ENTITY_TYPE) as *mut u16).write_unaligned(VP_ENTITY_TYPE_VALUE);
+        for (i, row) in rows.iter().enumerate() {
+            ((p + VP_MATRIX + 16 * i) as *mut [f32; 4]).write_unaligned(*row);
+        }
+        let counter = (base + sites::VEHICLE_COUNTER.target as usize) as *mut u32;
+        let n = counter.read_volatile().wrapping_add(1);
+        counter.write_volatile(n);
+        ((p + VP_COUNTER) as *mut u32).write_unaligned(n);
+        ((p + VP_HAS_VARIATION) as *mut u8).write(0);
+        let veh = create(p);
+        if veh == 0 {
+            cleanup_params(base, params);
+            return None;
+        }
+        let world = ((base + sites::WORLD_ENTITY_MANAGER.target as usize) as *const usize).read_volatile();
+        if world != 0 && register(world, veh, p, -1) != 0 {
+            Some((veh, Some(params)))
+        } else {
+            cleanup_params(base, params);
+            Some((veh, None))
+        }
+    }
+}
+
+/// Whether `veh` is still the live vehicle of its id (the generation-checked lookup).
+fn vehicle_alive(base: usize, veh: usize) -> bool {
+    // SAFETY: VehicleFromEntityId (checked) with the id read from a vehicle we made (its storage stays in the pool).
+    unsafe {
+        let f: extern "C" fn(u32) -> usize = std::mem::transmute(base + sites::VEHICLE_FROM_ID.rva as usize);
+        f(entity_id(veh)) == veh
+    }
+}
+
+/// One frame of a spawn under way.
+fn step_spawn(st: &mut State, base: usize, ped: usize, frame_no: u64) {
+    let Some(job) = st.spawn.as_mut() else { return };
+    let name = format!("{} {}", job.model.make, job.model.name).trim().to_owned();
+    let mut finish: Option<(bool, String)> = None;
+    let mut spawned_now = 0;
+    match job.made.as_mut() {
+        None => {
+            let w = job.word;
+            // SAFETY: ModelRequest_IsLoaded / HasModelLoaded (checked) on our request word and model id.
+            let loaded = unsafe {
+                let req: extern "C" fn(*const u16) -> u8 = std::mem::transmute(base + sites::MODEL_REQUEST_LOADED.rva as usize);
+                let has: extern "C" fn(u32) -> u8 = std::mem::transmute(base + sites::HAS_MODEL_LOADED.rva as usize);
+                (w & REQUEST_INDEX_MASK != 0 && req(&w) != 0) || has(job.id) != 0
+            };
+            if loaded && ped != 0 {
+                // SAFETY: the live player, on its thread.
+                let (here, h) = unsafe { entity_place(ped) };
+                let mut at = modcmd::relative(here, h, 5.0, 0.0);
+                let mut world = TitleWorld { base, ent: ped };
+                at[2] = modcmd::World::ground(&mut world, at[0], at[1], here[2] + 5.0).map_or(here[2] + 0.5, |g| g + 0.5);
+                let made = create_vehicle(base, job.id, at, h);
+                release_request(base, &mut job.word);
+                match made {
+                    Some((veh, params)) => {
+                        say(false, &format!("VICTORY_MOD: {name} made at x={:.2} y={:.2} z={:.2} (frame {frame_no}, {} ms after asking)", at[0], at[1], at[2], job.since.elapsed().as_millis()));
+                        job.made = Some((veh, params, Instant::now(), false));
+                    }
+                    None => finish = Some((false, format!("refused: the game did not make {name} (vehicle budget or pool full?)"))),
+                }
+            } else if job.since.elapsed() >= MODEL_WAIT {
+                release_request(base, &mut job.word);
+                finish = Some((false, format!("refused: {name}'s model did not load in {} s", MODEL_WAIT.as_secs())));
+            }
+        }
+        Some((veh, params, at, in_world)) => {
+            let veh = *veh;
+            if !vehicle_alive(base, veh) {
+                if let Some(p) = params.take() {
+                    cleanup_params(base, p);
+                }
+                finish = Some((false, format!("{name} was made but is gone again")));
+            } else {
+                // SAFETY: the live vehicle we made (checked above).
+                let phys = unsafe { ((veh + PHYSICS_INST) as *const usize).read_unaligned() };
+                if !*in_world && phys != 0 {
+                    // SAFETY: World_Add and Phys_Wake (checked) on the live vehicle, with the pinned location and world.
+                    unsafe {
+                        let loc = ((base + sites::WORLD_DEFAULT_LOCATION.target as usize) as *const u32).read_volatile();
+                        let add: extern "C" fn(usize, u32, u8, u8) -> u64 = std::mem::transmute(base + sites::WORLD_ADD.rva as usize);
+                        let wake: extern "C" fn(usize, usize) = std::mem::transmute(base + sites::PHYS_WAKE.rva as usize);
+                        add(veh, loc, 0, 0);
+                        wake(veh, base + sites::PHYSICS_WORLD.target as usize);
+                    }
+                    *in_world = true;
+                } else if !*in_world && at.elapsed() >= PHYSICS_WAIT {
+                    *in_world = true;
+                    say(true, &format!("VICTORY_MOD: {name} has no physics after {} s: not woken", PHYSICS_WAIT.as_secs()));
+                }
+                if at.elapsed() >= VP_KEEP
+                    && let Some(p) = params.take()
+                {
+                    cleanup_params(base, p);
+                }
+                if *in_world && params.is_none() {
+                    finish = Some((true, format!("ok: {name} is in front of the player")));
+                    spawned_now = veh;
+                }
+            }
+        }
+    }
+    if spawned_now != 0 {
+        st.spawned = spawned_now;
+    }
+    if let Some((good, text)) = finish {
+        let line = job.line.clone();
+        st.spawn = None;
+        say(!good, &format!("VICTORY_MOD: spawn {line:?} (frame {frame_no}): {text}"));
+        set_last_result(st, text);
+    }
+}
+
+/// Repairs the player's vehicle (VIper `repair_vehicle`): the game's own fix, every part to full, clean.
+fn repair(st: &mut State, base: usize, ped: usize) -> Result<String, String> {
+    st.need(base, &[sites::PED_COMPONENT_51, sites::VEHICLE_FROM_ID, sites::VEHICLE_REQUEST_FIX, sites::VEHICLE_PART_HEALTH, sites::VEHICLE_PART_RESTORE, sites::ENTITY_SHADER_PARAMS, sites::SHADER_SET_DIRT])?;
+    // SAFETY: the live player, on its thread; the sites checked above.
+    let veh = unsafe { ped_vehicle(base, ped) };
+    if veh == 0 {
+        return Err("the player is not in a vehicle".into());
+    }
+    // SAFETY: the player's live vehicle; the checked functions with VIper's arguments; part entries below their count.
+    unsafe {
+        let fix: extern "C" fn(usize) = std::mem::transmute(base + sites::VEHICLE_REQUEST_FIX.rva as usize);
+        let parts_of: extern "C" fn(u32) -> usize = std::mem::transmute(base + sites::VEHICLE_PART_HEALTH.rva as usize);
+        let restore: extern "C" fn(usize) = std::mem::transmute(base + sites::VEHICLE_PART_RESTORE.rva as usize);
+        let shader: extern "C" fn(usize) -> usize = std::mem::transmute(base + sites::ENTITY_SHADER_PARAMS.rva as usize);
+        let dirt: extern "C" fn(usize, f32, u8) = std::mem::transmute(base + sites::SHADER_SET_DIRT.rva as usize);
+        fix(veh);
+        let mut n = 0;
+        let parts = parts_of(entity_id(veh));
+        if parts != 0 {
+            let count = ((parts + VEH_PARTS_COUNT) as *const u32).read_unaligned() as usize;
+            let list = ((parts + VEH_PARTS) as *const usize).read_unaligned();
+            if list != 0 {
+                for i in 0..count.min(256) {
+                    restore(list + VEH_PART_SIZE * i);
+                    n += 1;
+                }
+            }
+        }
+        let drawable = ((veh + ENTITY_DRAWABLE) as *const usize).read_unaligned();
+        if drawable != 0 {
+            let p = shader(drawable);
+            if p != 0 {
+                dirt(p, 0.0, 0);
+            }
+        }
+        Ok(format!("the game's repair asked for (applied next frame), {n} parts restored, cleaned"))
+    }
+}
+
+/// Writes the game's vehicle models (hash, make, name) beside the status file.
+fn vehicle_list(st: &mut State, base: usize) -> Result<String, String> {
+    let models = vehicle_models(st, base)?;
+    st.models = Some(models.clone());
+    let path = st.status.as_ref().map(|p| {
+        let mut s = p.as_os_str().to_owned();
+        s.push(".vehicles.txt");
+        PathBuf::from(s)
+    });
+    let Some(path) = path else { return Err("no VICTORY_MOD_STATUS: nowhere to write the list".into()) };
+    let mut text = String::from("# index hash name make (spawn vehicle <name without spaces>, <hash> or #<index>)\n");
+    for (i, m) in models.iter().enumerate() {
+        text.push_str(&format!("#{i}\t{:#018x}\t{}\t{}\n", m.hash, m.name, m.make));
+    }
+    modcmd::write_atomic(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(format!("{} vehicle models written to {}", models.len(), path.display()))
+}
+
 // ---- the frame's work ---------------------------------------------------------------
 
 fn now_ms(st: &State) -> u64 {
@@ -486,6 +1040,8 @@ pub fn frame(base: usize, ped: usize, frame_no: u64) {
         }
     }
     step_warp(st, base, ped, frame_no);
+    step_spawn(st, base, ped, frame_no);
+    step_wanted(st, base, ped, frame_no);
     if ped != 0 && st.kept_at.is_none_or(|t| t.elapsed() >= KEEP_EVERY) {
         st.kept_at = Some(Instant::now());
         keep(st, base, ped, frame_no);
@@ -629,7 +1185,10 @@ fn run(st: &mut State, base: usize, ped: usize, frame_no: u64, line: &str, cmd: 
             };
             match now {
                 Some(l) if l == n as i32 => Ok(format!("wanted level {l}")),
-                Some(l) => Ok(format!("asked for {n}; the game holds it at {l} (its highest allowed now may be lower)")),
+                Some(_) => {
+                    st.wanted_check = Some((n, Instant::now(), line.to_owned()));
+                    Ok(format!("wanted level {n} asked; the game shows it a moment later (watch wanted)"))
+                }
                 None => Err("the player has no wanted state".into()),
             }
         }
@@ -637,7 +1196,32 @@ fn run(st: &mut State, base: usize, ped: usize, frame_no: u64, line: &str, cmd: 
             // SAFETY: the live player, on its thread (sites checked inside).
             unsafe { set_never_wanted(st, base, ped, on) }?;
             st.held.never_wanted = on;
+            st.never_again = 0;
             Ok(if on { "never wanted: cleared, highest level 0, crimes ignored (kept so once a second)" } else { "wanted again possible: highest level 6, crimes count" }.into())
+        }
+        Command::SpawnVehicle(m) => start_spawn(st, base, line, &m),
+        Command::Repair => repair(st, base, ped),
+        Command::VehicleList => vehicle_list(st, base),
+        Command::Enter => {
+            st.need(base, &[sites::PED_INTO_VEHICLE, sites::VEHICLE_FROM_ID, sites::PED_COMPONENT_51])?;
+            let veh = st.spawned;
+            if veh == 0 || !vehicle_alive(base, veh) {
+                return Err("no vehicle spawned by the mod is there (spawn vehicle first)".into());
+            }
+            // SAFETY: the live player and the live vehicle we made (checked above).
+            let (me, car) = unsafe { (entity_place(ped).0, entity_place(veh).0) };
+            let d = ((me[0] - car[0]).powi(2) + (me[1] - car[1]).powi(2) + (me[2] - car[2]).powi(2)).sqrt();
+            if d > 50.0 {
+                return Err(format!("the vehicle spawned is {d:.0} m away (at most 50 m)"));
+            }
+            // SAFETY: SetPedIntoVehicle_Impl (checked) as the put-ped-in-vehicle command calls it: driver's seat 0.
+            unsafe {
+                let f: extern "C" fn(usize, usize, u8, u32) = std::mem::transmute(base + sites::PED_INTO_VEHICLE.rva as usize);
+                f(ped, veh, 0, 0);
+            }
+            // SAFETY: as above.
+            let now = unsafe { ped_vehicle(base, ped) };
+            Ok(if now == veh { "the player is in the driver's seat".into() } else { "asked; the in-vehicle state shows it a frame or two later (see in_vehicle)".into() })
         }
         Command::Status => unreachable!(),
         _ => Err("not in this build yet".into()),
@@ -768,17 +1352,51 @@ unsafe fn keep_never_wanted(st: &mut State, base: usize, ped: usize, frame_no: u
     let g = st.pin(base, sites::WANTED_MAX_LEVEL_GLOBAL)?;
     st.need(base, &[sites::WANTED_COMPONENT, sites::WANTED_IGNORE_READ])?;
     // SAFETY: the highest-level word (pinned) and the wanted flags (pinned by WANTED_IGNORE_READ).
-    let fine = unsafe {
+    let (max, flags, level) = unsafe {
         let comp: extern "C" fn(u32) -> usize = std::mem::transmute(base + sites::WANTED_COMPONENT.rva as usize);
         let w = comp(entity_id(ped));
-        (g as *const i32).read_volatile() == 0 && w != 0 && ((w + WANTED_FLAGS) as *const u32).read_unaligned() & WANTED_IGNORE_CRIMES != 0
+        if w == 0 {
+            return Err("the player has no wanted state".into());
+        }
+        ((g as *const i32).read_volatile(), ((w + WANTED_FLAGS) as *const u32).read_unaligned(), ((w + WANTED_CURRENT_LEVEL) as *const i32).read_unaligned())
     };
-    if !fine {
+    if max != 0 || flags & WANTED_IGNORE_CRIMES == 0 || level > 0 {
         // SAFETY: the caller's.
         unsafe { set_never_wanted(st, base, ped, true) }?;
-        say(false, &format!("VICTORY_MOD: never wanted applied again (the game had changed it; frame {frame_no})"));
+        st.never_again += 1;
+        if st.never_again == 1 || st.never_again.is_power_of_two() {
+            say(false, &format!(
+                "VICTORY_MOD: never wanted put back ({} times; the game had: highest level {max}, crimes-ignored flag {}, level {level}; frame {frame_no})",
+                st.never_again,
+                u8::from(flags & WANTED_IGNORE_CRIMES != 0)
+            ));
+        }
     }
     Ok(())
+}
+
+/// After `wanted n`: the level the game shows over the next 3 s (it applies a set level a moment later).
+fn step_wanted(st: &mut State, base: usize, ped: usize, frame_no: u64) {
+    let Some((n, since, line)) = st.wanted_check.clone() else { return };
+    if ped == 0 || st.need(base, &[sites::WANTED_COMPONENT, sites::WANTED_LEVEL_READ]).is_err() {
+        st.wanted_check = None;
+        return;
+    }
+    // SAFETY: the live player; both sites checked.
+    let l = unsafe { wanted_level(base, ped) }.unwrap_or(-1);
+    let ms = since.elapsed().as_millis();
+    let text = if l == n as i32 {
+        format!("ok: wanted level {l} (shown {ms} ms after asking)")
+    } else if since.elapsed() >= Duration::from_secs(3) {
+        format!("ok, but the game holds the wanted level at {l} 3 s after {n} was asked (a mission or its highest allowed level may hold it)")
+    } else {
+        return;
+    };
+    st.wanted_check = None;
+    say(false, &format!("VICTORY_MOD: {line:?} (frame {frame_no}): {text}"));
+    if st.last.as_ref().is_some_and(|x| x.line == line) {
+        set_last_result(st, text);
+    }
 }
 
 /// The game clock (hour, minute), when its struct is where recorded.
@@ -1031,6 +1649,11 @@ fn write_status(st: &mut State, base: usize, ped: usize, frame_no: u64) {
         Some(j) => s.put("teleport", format!("holding {} ms for the ground at x={:.1} y={:.1}", now_ms(st).saturating_sub(j.warp.since_ms), j.warp.x, j.warp.y)),
         None => s.put("teleport", "idle"),
     };
+    match &st.spawn {
+        Some(j) if j.made.is_none() => s.put("spawn", format!("loading {} {} for {} ms", j.model.make, j.model.name, j.since.elapsed().as_millis())),
+        Some(j) => s.put("spawn", format!("made {} {}, settling", j.model.make, j.model.name)),
+        None => s.put("spawn", "idle"),
+    };
     if let Some(l) = &st.last {
         s.put("last_command", &l.line).put("last_source", l.source).put("last_frame", l.frame).put("last_result", &l.result);
     }
@@ -1039,5 +1662,87 @@ fn write_status(st: &mut State, base: usize, ped: usize, frame_no: u64) {
         && !std::mem::replace(&mut st.status_said, true)
     {
         say(true, &format!("VICTORY_MOD: the status file {} could not be written ({e}); tried again twice a second", path.display()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_pin_lands_on_its_target_in_the_recorded_bytes() {
+        let pins = [
+            sites::LOCAL_PLAYER_PED,
+            sites::WAYPOINT_MGR,
+            sites::GAME_CLOCK,
+            sites::CLOCK_PAUSED_BY_SCRIPT,
+            sites::WEATHER_COUNT,
+            sites::WEATHER_TYPES,
+            sites::WEATHER_PERSIST,
+            sites::WANTED_MAX_LEVEL_GLOBAL,
+            sites::VEHICLE_MODEL_POOL,
+            sites::MODEL_REQUEST_DEFAULTS,
+            sites::WORLD_ENTITY_MANAGER,
+            sites::WORLD_DEFAULT_LOCATION,
+            sites::PHYSICS_WORLD,
+            sites::VEHICLE_COUNTER,
+        ];
+        for p in pins {
+            let d = p.disp as usize;
+            let b: [u8; 4] = p.site.bytes[d..d + 4].try_into().unwrap();
+            let target = i64::from(p.site.rva + p.end) + i64::from(i32::from_le_bytes(b));
+            assert_eq!(target, i64::from(p.target), "{}", p.site.name);
+            assert!(p.end as usize >= d + 4);
+        }
+    }
+
+    #[test]
+    fn checks_refuse_other_code() {
+        // A fake image: one site's bytes at its RVA, the rest zero.
+        let s = sites::CLOCK_IS_PAUSED;
+        let mut image = vec![0u8; s.rva as usize + 64];
+        image[s.rva as usize..s.rva as usize + s.bytes.len()].copy_from_slice(s.bytes);
+        let base = image.as_ptr() as usize;
+        let mut st = State {
+            tail: None,
+            status: None,
+            status_at: None,
+            status_said: false,
+            queue: VecDeque::new(),
+            checked: HashMap::new(),
+            warp: None,
+            last: None,
+            ok: 0,
+            refused: 0,
+            started: Instant::now(),
+            held: Held::default(),
+            kept_at: None,
+            spawn: None,
+            models: None,
+            spawned: 0,
+            wanted_check: None,
+            never_again: 0,
+        };
+        assert!(st.need(base, &[s]).is_ok());
+        assert!(st.pin(base, sites::CLOCK_PAUSED_BY_SCRIPT).is_ok_and(|a| a == base + 0x092e_0031));
+        image[s.rva as usize + 3] ^= 1;
+        let mut fresh = HashMap::new();
+        std::mem::swap(&mut st.checked, &mut fresh);
+        let e = st.need(base, &[s]).unwrap_err();
+        assert!(e.contains("CLOCK_IS_PAUSED") && e.contains("refused"), "{e}");
+    }
+
+    #[test]
+    fn vehicle_names_are_found_loosely() {
+        let m = |h: u64, n: &str, k: &str| VehicleModel { hash: h, name: n.into(), make: k.into() };
+        let models = [m(1, "Infernus", "Pegassi"), m(2, "Banshee 900R", "Bravado"), m(0xdead_0000_0000 | u64::from(modcmd::joaat("adder")), "Adder", "Truffade")];
+        let find = |n: &str| find_model(&models, &modcmd::Model::Name(n.into())).map(|v| v.hash);
+        assert_eq!(find("infernus"), Ok(1));
+        assert_eq!(find("banshee900r"), Ok(2));
+        assert_eq!(find("bravadobanshee900r"), Ok(2));
+        assert_eq!(find("adder"), Ok(models[2].hash));
+        assert!(find("unicorn").is_err());
+        assert_eq!(find_model(&models, &modcmd::Model::Hash(2)).map(|v| v.name), Ok("Banshee 900R".into()));
+        assert_eq!(find_model(&models, &modcmd::Model::Hash(9)).map(|v| v.hash), Ok(9), "an unlisted hash is tried as is");
     }
 }

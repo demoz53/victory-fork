@@ -1,0 +1,15 @@
+# mod1-car: vehicle spawn from the keys file (VICTORY_MOD=1 VICTORY_TITLE_COMMANDS=1), about 11 s after control.
+# To the yard 280 m north-east (seen in mod1-tp), write the game's vehicle list beside the status file, spawn the
+# first model of that list 5 m ahead, get in, repair, and teleport home WITH the vehicle (it moves with the player).
+teleport -2155 -5330
+wait 20f
+vehicle list
+spawn vehicle #0
+wait 50f
+J 8f
+vehicle enter
+wait 10f
+vehicle repair
+wait 6f
+teleport -2357.4 -5525.4 3.0 2.17
+wait 30f

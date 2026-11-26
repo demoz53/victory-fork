@@ -185,7 +185,12 @@ class Panel:
         self.vehicle = tk.StringVar(value=self.vehicles[0] if self.vehicles else "")
         ttk.Combobox(wp, textvariable=self.vehicle, values=self.vehicles, width=14).grid(row=8, column=1, sticky="w")
         ttk.Button(wp, text="Spawn", command=self.spawn).grid(row=8, column=2, sticky="w")
-        ttk.Button(wp, text="Repair my vehicle", command=lambda: self.send("vehicle repair")).grid(row=9, column=1, sticky="w")
+        vb = ttk.Frame(wp)
+        vb.grid(row=9, column=0, columnspan=3, sticky="w")
+        ttk.Button(vb, text="Get in", command=lambda: self.send("vehicle enter")).pack(side="left")
+        ttk.Button(vb, text="Repair", command=lambda: self.send("vehicle repair")).pack(side="left")
+        ttk.Button(vb, text="List the game's vehicles", command=self.list_vehicles).pack(side="left")
+        self.vehicle_box = wp.grid_slaves(row=8, column=1)[0]
 
         # Raw line and log.
         raw = ttk.Frame(outer)
@@ -245,6 +250,28 @@ class Panel:
     def set_time(self):
         hh, mm = self.show_hour()
         self.send(f"time {hh} {mm}")
+
+    def list_vehicles(self):
+        """Asks the game for its vehicle list; it lands beside the status file and fills the list."""
+        self.send("vehicle list")
+        self.root.after(1500, self.load_vehicle_list)
+
+    def load_vehicle_list(self):
+        path = self.status_file + ".vehicles.txt"
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                rows = [l.rstrip("\n").split("\t") for l in f if l.startswith("#") and "\t" in l]
+        except OSError:
+            self.log(f"no vehicle list yet ({path})")
+            return
+        names = []
+        for r in rows:
+            if len(r) >= 3 and r[2].strip():
+                names.append(r[2].strip())
+            elif len(r) >= 2:
+                names.append(r[1])
+        self.vehicle_box.configure(values=sorted(set(names), key=str.lower))
+        self.log(f"{len(rows)} vehicle models listed (the list holds their display names)")
 
     def spawn(self):
         name = self.vehicle.get().strip()

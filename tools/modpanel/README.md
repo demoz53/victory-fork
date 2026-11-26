@@ -51,16 +51,20 @@ Every command answers in the status file (`last_command`, `last_result`) and in 
 | `invincible on\|off` | `invincible on` | All 19 damage multipliers 0 (the game's damage-proofs setter); off puts back what the player had. Re-applied once a second and on a new player ped. |
 | `wanted <0-6>` | `wanted 2` | Sets the wanted level (the game's maximum is 6); says if the game holds it lower. |
 | `wanted never on\|off` | `wanted never on` | Clears the level, sets the highest level to 0 and makes crimes ignored; off: 6 and crimes count. Re-applied once a second (missions set their own). |
+| `vehicle list` | `vehicle list` | Writes every vehicle model the game defines to `<status file>.vehicles.txt`: `#index hash name make` (names in the game's language). The panel's "List the game's vehicles" button fills its vehicle box from it. |
+| `spawn vehicle <name>` | `spawn vehicle infernus` | A vehicle 5 m in front of the player, facing the same way, on the ground there. The name is the game's display name (case and spaces ignored, with or without the make), else a name whose one-at-a-time hash is the model hash's low half. The model is asked for and the vehicle made when it has loaded (over several frames, never blocking; 10 s at most), then put in the world and its physics woken. One spawn at a time. |
+| `spawn vehicle 0x<hash>` / `#<n>` | `spawn vehicle #0` | By 64-bit model hash, or by line number of `vehicle list`. |
+| `vehicle enter` | `vehicle enter` | The player into the driver's seat of the vehicle the mod spawned last (at most 50 m away). |
+| `vehicle repair` | `vehicle repair` | The player's vehicle: the game's own full repair (applied the next frame), every part to full health, cleaned. |
 | `status` | `status` | Rewrite the status file now. |
 
-Coming in the next pieces: `spawn vehicle`, `vehicle repair`, `native`. They are already parsed and answer "not in
-this build yet".
+Coming in the next piece: `native`. It is already parsed and answers "not in this build yet".
 
 ## The status file
 
 `key=value` lines, rewritten twice a second (through a temporary file and a rename, so it is never half written):
 `game updated_unix_ms frame player x y z heading heading_deg in_vehicle health max_health wanted clock clock_frozen
-weather freeze_held weather_held invincible never_wanted teleport last_command last_source last_frame last_result commands_ok commands_refused`.
+weather freeze_held weather_held invincible never_wanted teleport spawn last_command last_source last_frame last_result commands_ok commands_refused`.
 
 ## Safety
 
@@ -78,6 +82,7 @@ weather freeze_held weather_held invincible never_wanted teleport last_command l
 |---|---|---|
 | Mod file, status file, parser, teleports | parser, tail (partial lines, new file), atomic status write, the far teleport's steps with a fake world | not yet |
 | Time, weather, heal, invincible, wanted | parser; every address's bytes and every data word's pin checked against the executable | not yet |
+| Vehicles | parser, name matching, pins | not yet |
 
 Sources: viper-community/viper e44573c6e (LGPL-2.1-or-later): addresses, signatures and recipes, all checked again
 against the executable's bytes.

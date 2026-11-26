@@ -61,17 +61,23 @@ pub enum Command {
     SpawnVehicle(Model),
     /// `vehicle repair`.
     Repair,
+    /// `vehicle list`: the game's vehicle models, to a file beside the status file.
+    VehicleList,
+    /// `vehicle enter`: the player into the driver's seat of the vehicle last spawned.
+    Enter,
     /// `native <target> [args...]`.
     Native { target: Target, args: Vec<Arg> },
     /// `status`: write the status file now.
     Status,
 }
 
-/// A model: a name (searched among the game's vehicle models) or its 64-bit hash.
+/// A model: a name (searched among the game's vehicle models), its 64-bit
+/// hash, or `#n`, the n-th line of `vehicle list`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Model {
     Name(String),
     Hash(u64),
+    Index(usize),
 }
 
 /// Which script-command handler `native` calls.
@@ -303,13 +309,16 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
             n.parse::<u32>().ok().filter(|&n| n <= WANTED_MAX).ok_or_else(|| format!("wanted wants 0 to {WANTED_MAX} or never on|off"))?,
         ),
         ("wanted", _) => return Err(format!("wanted wants 0 to {WANTED_MAX} or never on|off")),
-        ("spawn", ["vehicle", m]) => Command::SpawnVehicle(match hex_u64(m).filter(|_| m.starts_with("0x")) {
-            Some(h) => Model::Hash(h),
-            None => Model::Name(m.to_ascii_lowercase()),
+        ("spawn", ["vehicle", m]) => Command::SpawnVehicle(match (hex_u64(m).filter(|_| m.starts_with("0x")), m.strip_prefix('#')) {
+            (Some(h), _) => Model::Hash(h),
+            (None, Some(n)) => Model::Index(n.parse::<usize>().map_err(|_| format!("{m:?}: # wants a line number of vehicle list"))?),
+            (None, None) => Model::Name(m.to_ascii_lowercase()),
         }),
         ("spawn", _) => return Err("spawn wants vehicle <name|0xhash>".into()),
         ("vehicle", ["repair"]) => Command::Repair,
-        ("vehicle", _) => return Err("vehicle wants repair".into()),
+        ("vehicle", ["list"]) => Command::VehicleList,
+        ("vehicle", ["enter"]) => Command::Enter,
+        ("vehicle", _) => return Err("vehicle wants repair, list or enter".into()),
         ("native", [t, args @ ..]) => {
             if args.len() > MOST_ARGS {
                 return Err(format!("native takes at most {MOST_ARGS} arguments"));
@@ -590,6 +599,11 @@ mod tests {
         assert_eq!(p("spawn vehicle Infernus"), Command::SpawnVehicle(Model::Name("infernus".into())));
         assert_eq!(p("spawn vehicle 0x1234abcd00000001"), Command::SpawnVehicle(Model::Hash(0x1234_abcd_0000_0001)));
         assert_eq!(p("vehicle repair"), Command::Repair);
+        assert_eq!(p("vehicle list"), Command::VehicleList);
+        assert_eq!(p("vehicle enter"), Command::Enter);
+        assert_eq!(p("spawn vehicle #12"), Command::SpawnVehicle(Model::Index(12)));
+        assert!(parse("spawn vehicle #x").is_err());
+        assert!(parse("vehicle fly").is_err());
         assert_eq!(p("status"), Command::Status);
         assert!(parse("fly 1").unwrap_err().contains("unknown"));
         assert!(parse("heal now").unwrap_err().contains("wrong arguments"));
