@@ -1638,6 +1638,9 @@ mod tests {
         // together, and an Intel CPU (this PC's) has neither SSE4a nor
         // clzero nor the pair.
         assert_eq!(native(Kind::Monitorx), native(Kind::Mwaitx));
+        // With `--nocapture`: what a rewrite on this machine would leave alone.
+        let has: Vec<String> = Kind::ALL.iter().map(|&k| format!("{} {}", k.name(), native(k))).collect();
+        println!("this CPU has: {}", has.join(", "));
         let vendor = std::arch::x86_64::__cpuid(0);
         let name: Vec<u8> = [vendor.ebx, vendor.edx, vendor.ecx].iter().flat_map(|r| r.to_le_bytes()).collect();
         if name == b"GenuineIntel" {
