@@ -1154,6 +1154,107 @@ fn recheck_frames() -> &'static [u64] {
     if crate::texture::dense_recheck() { &RECHECK_FRAMES_DENSE } else { &RECHECK_FRAMES }
 }
 
+/// Looks a frame at most that [`recheck_every`] makes when its setting
+/// names none: 128 looks of at most 48 KiB each (the plain fingerprint,
+/// `crate::texture::fingerprint`) read and hash 6 MiB a frame at most.
+const RECHECK_EVERY_LOOKS: u64 = 128;
+
+/// Once the look schedule ([`recheck_frames`]) is through, an uploaded
+/// texture picked by index is looked at again every `frames` frames for as
+/// long as its slot shows it, at most `looks` such looks a frame
+/// (`VICTORY_HEAP_RECHECK_EVERY=<frames>[,<looks>]`; unset or 0: never
+/// again, as before; looks [`RECHECK_EVERY_LOOKS`] unless said). Ported
+/// from ryancase94/victory-Rycas 920423a97 (Rycas, GPL-3.0), with the cap a
+/// frame added here: the title streams a texture's memory in and rewrites
+/// it long after its view was written (a play of the boat mission there
+/// found textures changed 4,700 and 7,600 frames after their upload, the
+/// schedule ending 576 frames after it), and what changed later stayed as
+/// it was on the card for the rest of the run: skin red or black, flashes
+/// at a change of view. Our own play (vf-play-6) still found changes at the
+/// schedule's last look. A look past the cap waits a few frames, unhashed.
+fn recheck_every() -> Option<(u64, u64)> {
+    static EVERY: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = recheck_every_of(std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().as_deref());
+        if let Some((frames, looks)) = every {
+            tracing::info!(
+                frames,
+                looks,
+                "uploaded textures picked by index are looked at again every so many frames after their look schedule, at most so many looks a frame (VICTORY_HEAP_RECHECK_EVERY)"
+            );
+        }
+        every
+    })
+}
+
+/// [`recheck_every`] for a value of the switch: `<frames>[,<looks>]`, frames
+/// at least 1 (0, nothing or not a number: off), looks at least 1.
+fn recheck_every_of(value: Option<&str>) -> Option<(u64, u64)> {
+    let mut parts = value?.split(',');
+    let frames = parts.next()?.trim().parse::<u64>().ok().filter(|&f| f > 0)?;
+    let looks = match parts.next() {
+        Some(looks) => looks.trim().parse::<u64>().ok()?.max(1),
+        None => RECHECK_EVERY_LOOKS,
+    };
+    Some((frames, looks))
+}
+
+/// What becomes of a slot whose look found its memory as uploaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterLook {
+    /// Looked at again after this many frames, as look number `looks`.
+    Again { wait: u64, looks: u8 },
+    /// Up to date: out of the queue until written again.
+    Done,
+}
+
+/// [`AfterLook`] for look number `looks` of `schedule`, with `every` the
+/// setting of [`recheck_every`]: the next look of the schedule, then
+/// (numbered `schedule.len()`, so the line of a change tells the looks
+/// past the schedule apart) every so many frames, or none.
+fn after_unchanged_look(schedule: &[u64], looks: u8, every: Option<(u64, u64)>) -> AfterLook {
+    match schedule.get(usize::from(looks) + 1) {
+        Some(&wait) => AfterLook::Again { wait, looks: looks + 1 },
+        None => match every {
+            Some((frames, _)) => AfterLook::Again {
+                wait: frames,
+                looks: schedule.len().min(usize::from(u8::MAX)) as u8,
+            },
+            None => AfterLook::Done,
+        },
+    }
+}
+
+/// Whether look number `looks` is one past the schedule ([`recheck_every`]).
+fn past_schedule(schedule: &[u64], looks: u8) -> bool {
+    usize::from(looks) >= schedule.len()
+}
+
+/// Takes one of this frame's looks past the schedule, `most` a frame:
+/// false when the frame has had them all. `state` holds the frame and the
+/// looks taken in it.
+fn take_periodic_look(state: &AtomicU64, frame: u64, most: u64) -> bool {
+    // The frame in the high 40 bits, the looks taken in the low 24.
+    const LOOKS: u64 = (1 << 24) - 1;
+    let frame = frame & (u64::MAX >> 24);
+    let mut seen = state.load(Ordering::Relaxed);
+    loop {
+        let taken = if seen >> 24 == frame { seen & LOOKS } else { 0 };
+        if taken >= most.min(LOOKS) {
+            return false;
+        }
+        let next = frame << 24 | (taken + 1);
+        match state.compare_exchange_weak(seen, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(now) => seen = now,
+        }
+    }
+}
+
+/// Since the start, looks past the schedule ([`recheck_every`]): made,
+/// that found the memory changed, and put off by the cap a frame.
+pub(crate) static HEAP_RECHECK_PERIODIC: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -3187,15 +3288,47 @@ impl State {
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+                // Past the schedule (`VICTORY_HEAP_RECHECK_EVERY`): within
+                // the looks a frame, else put off a few frames unhashed.
+                let periodic = past_schedule(recheck_frames(), looks);
+                if periodic {
+                    static PERIODIC_FRAME: AtomicU64 = AtomicU64::new(0);
+                    let (every, most) = recheck_every().unwrap_or((8, RECHECK_EVERY_LOOKS));
+                    if !take_periodic_look(&PERIODIC_FRAME, frame, most) {
+                        // Spread over a period, so that slots put off do
+                        // not crowd the next frames' due slots.
+                        HEAP_RECHECK_PERIODIC[2].fetch_add(1, Ordering::Relaxed);
+                        let later = frame + 1 + u64::from(index) % every.max(8);
+                        host.texture_slot_recheck(index, write, later, (at, len), print, looks, uploaded);
+                        continue;
+                    }
+                    HEAP_RECHECK_PERIODIC[0].fetch_add(1, Ordering::Relaxed);
+                }
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match recheck_frames().get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    // The schedule over: looked at again every so many
+                    // frames for as long as the slot shows it
+                    // (`recheck_every`), or never again.
+                    match after_unchanged_look(recheck_frames(), looks, recheck_every()) {
+                        AfterLook::Again { wait, looks } => {
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        AfterLook::Done => host.texture_slot_done(index, write, None),
                     }
                     continue;
+                }
+                if periodic {
+                    let found = HEAP_RECHECK_PERIODIC[1].fetch_add(1, Ordering::Relaxed) + 1;
+                    if found <= 50 || found.is_multiple_of(500) {
+                        tracing::info!(
+                            slot = index,
+                            frames_after_upload = frame.saturating_sub(uploaded),
+                            found,
+                            looks = HEAP_RECHECK_PERIODIC[0].load(Ordering::Relaxed),
+                            put_off = HEAP_RECHECK_PERIODIC[2].load(Ordering::Relaxed),
+                            "a texture picked by index changed after its look schedule ended, found by a look every so many frames (VICTORY_HEAP_RECHECK_EVERY)"
+                        );
+                    }
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
@@ -5800,6 +5933,78 @@ fn dispatch_dimensions(
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_HEAP_RECHECK_EVERY`: frames, then looks a frame; off for
+    /// nothing, 0 or what is not a number.
+    #[test]
+    fn heap_recheck_every_reads_frames_and_looks() {
+        use super::{RECHECK_EVERY_LOOKS, recheck_every_of};
+        assert_eq!(recheck_every_of(None), None);
+        for off in ["", "0", "x", "-5", "0,64"] {
+            assert_eq!(recheck_every_of(Some(off)), None, "{off:?}");
+        }
+        assert_eq!(recheck_every_of(Some("120")), Some((120, RECHECK_EVERY_LOOKS)));
+        assert_eq!(recheck_every_of(Some(" 120 , 64 ")), Some((120, 64)));
+        assert_eq!(recheck_every_of(Some("120,0")), Some((120, 1)));
+        assert_eq!(recheck_every_of(Some("120,x")), None);
+    }
+
+    /// The look schedule goes on as before, and past its end a slot is
+    /// looked at every so many frames (numbered past the schedule) instead
+    /// of leaving the queue; without the switch it leaves, as before.
+    #[test]
+    fn heap_recheck_every_goes_on_past_the_schedule() {
+        use super::{AfterLook, RECHECK_FRAMES, after_unchanged_look, past_schedule};
+        let s = &RECHECK_FRAMES[..];
+        for every in [None, Some((120, 128))] {
+            let mut looks = 0u8;
+            let mut waits = vec![s[0]];
+            while let AfterLook::Again { wait, looks: next } = after_unchanged_look(s, looks, every) {
+                if past_schedule(s, next) {
+                    break;
+                }
+                assert!(!past_schedule(s, looks));
+                waits.push(wait);
+                looks = next;
+            }
+            assert_eq!(waits, s, "the schedule is unchanged ({every:?})");
+            assert_eq!(waits.iter().sum::<u64>(), 576);
+        }
+        let last = (s.len() - 1) as u8;
+        assert_eq!(after_unchanged_look(s, last, None), AfterLook::Done);
+        let past = AfterLook::Again { wait: 120, looks: s.len() as u8 };
+        assert_eq!(after_unchanged_look(s, last, Some((120, 128))), past);
+        // And on and on, for as long as the slot shows the texture.
+        assert!(past_schedule(s, s.len() as u8));
+        assert_eq!(after_unchanged_look(s, s.len() as u8, Some((120, 128))), past);
+        assert_eq!(after_unchanged_look(s, s.len() as u8, None), AfterLook::Done);
+    }
+
+    /// At most so many looks past the schedule a frame, counted afresh in
+    /// each frame, from any number of threads.
+    #[test]
+    fn heap_recheck_every_caps_looks_a_frame() {
+        use super::take_periodic_look;
+        use std::sync::atomic::AtomicU64;
+        let state = AtomicU64::new(0);
+        assert_eq!((0..10).filter(|_| take_periodic_look(&state, 7, 4)).count(), 4);
+        assert_eq!((0..10).filter(|_| take_periodic_look(&state, 8, 4)).count(), 4);
+        // Another cap in the next frame.
+        assert_eq!((0..3).filter(|_| take_periodic_look(&state, 9, 2)).count(), 2);
+        // No looks at all with a cap of 0.
+        assert!(!take_periodic_look(&state, 10, 0));
+        let state = std::sync::Arc::new(AtomicU64::new(0));
+        let taken: usize = (0..4)
+            .map(|_| {
+                let state = state.clone();
+                std::thread::spawn(move || (0..1000).filter(|_| take_periodic_look(&state, 3, 128)).count())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .sum();
+        assert_eq!(taken, 128);
+    }
+
     /// A dropped host view heap leaves none of its entries in the heap
     /// passes' caches, and its host copy goes with it (`VICTORY_HEAP_FORGET`,
     /// after fxceless pull request #1276's test); another heap's stay.
