@@ -6,7 +6,9 @@
 //! of the title writes nothing.
 
 use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// One change: the name it is said by, where it goes (from the image's
@@ -71,6 +73,109 @@ pub unsafe fn patch_mapped(base: usize, size: usize, patches: &[MemoryPatch<'_>]
     Ok(())
 }
 
+/// `mov r64, gs:[0x58]` (the title's load of its thread's TLS array), 9
+/// bytes: the loader turns each into `call thunk; nop4` when the image got
+/// a TLS index other than 0 (`crate::tls`).
+const TLS_LOAD_LEN: usize = 9;
+
+fn is_tls_load(b: &[u8]) -> bool {
+    b.len() >= TLS_LOAD_LEN
+        && b[0] == 0x65
+        && (b[1] == 0x48 || b[1] == 0x4c)
+        && b[2] == 0x8b
+        && b[3] & 0xc7 == 0x04
+        && b[4..TLS_LOAD_LEN] == [0x25, 0x58, 0, 0, 0]
+}
+
+/// Whether mapped code `now` is the executable's `expect`, where each TLS
+/// load of `expect` may have become the loader's `call rel32; nop4`
+/// (SonicRaT/XNW 2fa40fef6 `levers.rs` `code_is`, GPL-3.0).
+pub fn code_matches(now: &[u8], expect: &[u8]) -> bool {
+    if now.len() != expect.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < expect.len() {
+        if is_tls_load(&expect[i..]) && now[i] == 0xe8 && now[i + 5..i + TLS_LOAD_LEN] == [0x0f, 0x1f, 0x40, 0x00] {
+            i += TLS_LOAD_LEN;
+        } else if now[i] == expect[i] {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether the code at `base + rva` (inside an image of `size` bytes) is
+/// `expect`, TLS loads as the loader left them ([`code_matches`]).
+///
+/// # Safety
+/// `base..base + size` is an image mapped in this process.
+pub unsafe fn code_at(base: usize, size: usize, rva: u32, expect: &[u8]) -> bool {
+    let at = rva as usize;
+    if at.checked_add(expect.len()).is_none_or(|end| end > size) {
+        return false;
+    }
+    // SAFETY: inside the mapped image (checked above), read only.
+    code_matches(unsafe { std::slice::from_raw_parts((base + at) as *const u8, expect.len()) }, expect)
+}
+
+/// `jmp qword [rip+0]` then the target: 14 bytes, reaches anywhere.
+fn far_jump(to: usize) -> [u8; 14] {
+    let mut j = [0xff, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    j[6..].copy_from_slice(&(to as u64).to_le_bytes());
+    j
+}
+
+/// Puts a far jump to `hook` at the function at `base + rva`, whose first
+/// bytes must be `entry` (whole instructions, at least 14 bytes, none of
+/// them position dependent: they run again elsewhere), and returns the
+/// trampoline that runs them and goes on after them: calling it is calling
+/// the original function. The entry's bytes past the jump become `int3`
+/// (never run). The trampoline is a block of ours anywhere in memory
+/// (absolute jumps both ways), made read-and-execute.
+///
+/// From SonicRaT/XNW 2fa40fef6 `apps/xnw/src/detours.rs` (GPL-3.0).
+///
+/// # Safety
+/// `base..base + size` is an image mapped in this process, no thread runs
+/// the code at the entry, and `hook` is a function of the original's type.
+pub unsafe fn detour(base: usize, size: usize, rva: u32, entry: &[u8], hook: usize, name: &str) -> Result<usize, PatchError> {
+    if entry.len() < 14 || entry.len() > 48 {
+        return Err(PatchError::Length(name.to_owned()));
+    }
+    let at = rva as usize;
+    if at.checked_add(entry.len()).is_none_or(|end| end > size) {
+        return Err(PatchError::Outside(name.to_owned()));
+    }
+    let code = (base + at) as *mut u8;
+    // SAFETY: inside the mapped image, read only.
+    if unsafe { std::slice::from_raw_parts(code, entry.len()) } != entry {
+        return Err(PatchError::Mismatch(name.to_owned()));
+    }
+    // SAFETY: a fresh block of our own.
+    let tramp = unsafe { VirtualAlloc(std::ptr::null(), 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) }.cast::<u8>();
+    if tramp.is_null() {
+        return Err(PatchError::Protect(name.to_owned()));
+    }
+    let back = far_jump(code as usize + entry.len());
+    let mut old = 0;
+    // SAFETY: 64 bytes of ours hold the moved bytes (at most 48) and a jump.
+    unsafe {
+        std::ptr::copy_nonoverlapping(entry.as_ptr(), tramp, entry.len());
+        std::ptr::copy_nonoverlapping(back.as_ptr(), tramp.add(entry.len()), back.len());
+        VirtualProtect(tramp.cast(), 64, PAGE_EXECUTE_READ, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), tramp.cast(), 64);
+    }
+    let mut new = vec![0xcc; entry.len()];
+    new[..14].copy_from_slice(&far_jump(hook));
+    let p = MemoryPatch { name, rva, expect: entry, write: &new };
+    // SAFETY: forwarded from this function's contract.
+    unsafe { patch_mapped(base, size, &[p]) }?;
+    Ok(tramp as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +224,69 @@ mod tests {
             // SAFETY: our allocation, no longer used.
             unsafe { VirtualFree(self.0 as _, 0, MEM_RELEASE) };
         }
+    }
+
+    static TRAMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "system" fn plus_one(a: usize, b: usize) -> usize {
+        // SAFETY: the trampoline of the test function, of this type.
+        let original: extern "system" fn(usize, usize) -> usize =
+            unsafe { std::mem::transmute(TRAMP.load(std::sync::atomic::Ordering::Relaxed)) };
+        original(a, b) + 1
+    }
+
+    /// A function made in memory with a 15-byte prologue (`push r15; push
+    /// r14; push rsi; push rdi; push rbp; push rbx; sub rsp, 28h; mov rsi,
+    /// rdx`) returning `a + b`: detoured, it runs the hook, which runs the
+    /// original through the trampoline.
+    #[test]
+    fn a_detour_runs_the_hook_then_the_original() {
+        let prologue = [0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0xd6];
+        let body = [
+            0x48, 0x89, 0xc8, // mov rax, rcx
+            0x48, 0x01, 0xf0, // add rax, rsi
+            0x48, 0x83, 0xc4, 0x28, // add rsp, 28h
+            0x5b, 0x5d, 0x5f, 0x5e, // pop rbx; pop rbp; pop rdi; pop rsi
+            0x41, 0x5e, 0x41, 0x5f, 0xc3, // pop r14; pop r15; ret
+        ];
+        // SAFETY: a fresh block of our own.
+        let code = unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) } as usize;
+        assert_ne!(code, 0);
+        // SAFETY: inside the block.
+        unsafe {
+            std::ptr::copy_nonoverlapping(prologue.as_ptr(), (code + 16) as *mut u8, prologue.len());
+            std::ptr::copy_nonoverlapping(body.as_ptr(), (code + 16 + prologue.len()) as *mut u8, body.len());
+        }
+        // SAFETY: the function just written, of this type.
+        let f: extern "system" fn(usize, usize) -> usize = unsafe { std::mem::transmute(code + 16) };
+        assert_eq!(f(2, 3), 5);
+        // Other bytes than expected: nothing changes.
+        let mut wrong = prologue;
+        wrong[3] ^= 1;
+        // SAFETY: our block, nothing runs it now.
+        assert!(matches!(unsafe { detour(code, 4096, 16, &wrong, plus_one as *const () as usize, "w") }, Err(PatchError::Mismatch(_))));
+        assert_eq!(f(2, 3), 5);
+        // SAFETY: as above.
+        let tramp = unsafe { detour(code, 4096, 16, &prologue, plus_one as *const () as usize, "f") }.unwrap();
+        TRAMP.store(tramp, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(f(2, 3), 6, "the hook ran and called the original");
+        // SAFETY: as above: the bytes are ours now, not the expected ones.
+        assert!(unsafe { detour(code, 4096, 16, &prologue, plus_one as *const () as usize, "f") }.is_err());
+        // SAFETY: our block.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(code as _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn code_matches_takes_the_loaders_tls_rewrite() {
+        // mov rax, gs:[0x58]; mov rax, [rax]
+        let exe = [0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0, 0, 0, 0x48, 0x8b, 0x00];
+        let rewritten = [0xe8, 1, 2, 3, 4, 0x0f, 0x1f, 0x40, 0x00, 0x48, 0x8b, 0x00];
+        assert!(code_matches(&exe, &exe));
+        assert!(code_matches(&rewritten, &exe));
+        let mut other = rewritten;
+        other[10] = 0x8a;
+        assert!(!code_matches(&other, &exe));
+        assert!(!code_matches(&rewritten[..11], &exe));
     }
 
     #[test]

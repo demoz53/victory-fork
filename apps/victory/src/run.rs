@@ -419,14 +419,63 @@ fn apply_title_patches(
         (start.checked_add(len).is_some_and(|end| end <= size))
             .then(|| unsafe { std::slice::from_raw_parts((image.base() + start) as *const u8, len) })
     });
-    let Some(groups) = title_patch_groups(build, console, var, constants) else {
-        return;
-    };
-    // SAFETY: the title's image, mapped and not yet run.
-    let made = unsafe { apply_patch_groups(image.base(), size, &groups) };
-    if made.contains(&RT_FALLBACK) {
-        victory_gpu::pipeline::set_title_fallbacks(true);
+    if let Some(groups) = title_patch_groups(build, console, var, constants) {
+        // SAFETY: the title's image, mapped and not yet run.
+        let made = unsafe { apply_patch_groups(image.base(), size, &groups) };
+        if made.contains(&RT_FALLBACK) {
+            victory_gpu::pipeline::set_title_fallbacks(true);
+        }
     }
+    // Detours that call the title's own functions: the same off switch,
+    // the known build only.
+    if var("VICTORY_TITLE_PATCHES").as_deref() == Some("0") {
+        return;
+    }
+    let hooks = victory_game::hooks::wanted(&var);
+    if hooks.is_empty() {
+        return;
+    }
+    if build.is_none() {
+        println!("title hook     none: not a known build (it runs without them)");
+        return;
+    }
+    victory_game::hooks::configure(image.base(), victory_gpu::frame::current);
+    // SAFETY: the title's image, mapped and not yet run.
+    unsafe { install_hooks(image.base(), size, &hooks) };
+}
+
+/// Installs each hook whose function's entry and whose called functions'
+/// code are the expected ones (else that hook is left out, said once), and
+/// returns the names installed.
+///
+/// # Safety
+/// As [`victory_loader::patch::detour`]: the mapped image, none of its code
+/// running.
+#[cfg(windows)]
+unsafe fn install_hooks(base: usize, size: usize, hooks: &[victory_game::hooks::Hook]) -> Vec<&'static str> {
+    let mut made = Vec::new();
+    for h in hooks {
+        // SAFETY: forwarded: reads of the mapped image.
+        if let Some(&(rva, _)) = h.calls.iter().find(|&&(rva, code)| !unsafe { victory_loader::patch::code_at(base, size, rva, code) }) {
+            println!("title hook     none for {}: the title's function at +{rva:#x} is not the expected code (another build?)", h.name);
+            continue;
+        }
+        // SAFETY: forwarded.
+        match unsafe { victory_loader::patch::detour(base, size, h.rva, h.entry, h.hook, h.name) } {
+            Ok(trampoline) => {
+                h.original.store(trampoline, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "title hook     +{:#x} {} (in memory): its entry {} jumps to ours; the original runs from {trampoline:#x}",
+                    h.rva,
+                    h.name,
+                    hex_str(h.entry)
+                );
+                made.push(h.name);
+            }
+            Err(e) => println!("title hook     none for {} ({e}): the title runs without it", h.name),
+        }
+    }
+    made
 }
 
 /// The group `VICTORY_RT_FALLBACK` makes.
@@ -659,6 +708,35 @@ mod patch_tests {
         // A number instead: the settings' load is the one place.
         let n = title_patch_groups(Some(build), Console::SeriesX, vars(&[("VICTORY_TEX_UPGRADES", "40")]), None).unwrap();
         assert_eq!(n[0].1.iter().map(|p| p.rva).collect::<Vec<_>>(), [0x224_3645]);
+    }
+
+    #[test]
+    fn hooks_are_installed_only_over_their_expected_code() {
+        let var = |n: &str| (n == "VICTORY_CINE").then(|| "skip".to_owned());
+        let hooks = victory_game::hooks::wanted(&var);
+        assert_eq!(hooks.len(), 1);
+        let h = &hooks[0];
+        let mut sites: Vec<(u32, &[u8])> = vec![(h.rva, h.entry)];
+        sites.extend(h.calls.iter().copied());
+        // One called function's code is not there: nothing is installed.
+        let mut image = image_with(&sites[..sites.len() - 1]);
+        // SAFETY: our own buffer, nothing runs it.
+        assert!(unsafe { install_hooks(image.as_mut_ptr() as usize, image.len(), &hooks) }.is_empty());
+        assert_eq!(&image[h.rva as usize..][..h.entry.len()], h.entry, "left as it was");
+        // All there: the entry jumps to the hook, the trampoline is set.
+        let mut image = image_with(&sites);
+        // SAFETY: as above.
+        assert_eq!(unsafe { install_hooks(image.as_mut_ptr() as usize, image.len(), &hooks) }, ["cine"]);
+        let at = &image[h.rva as usize..][..14];
+        assert_eq!(at[..6], [0xff, 0x25, 0, 0, 0, 0]);
+        assert_eq!(u64::from_le_bytes(at[6..14].try_into().unwrap()) as usize, h.hook);
+        let trampoline = h.original.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(trampoline, 0);
+        // SAFETY: the trampoline just made: the moved entry, then a jump back.
+        let moved = unsafe { std::slice::from_raw_parts(trampoline as *const u8, h.entry.len() + 14) };
+        assert_eq!(&moved[..h.entry.len()], h.entry);
+        let back = u64::from_le_bytes(moved[h.entry.len() + 6..].try_into().unwrap()) as usize;
+        assert_eq!(back, image.as_ptr() as usize + h.rva as usize + h.entry.len());
     }
 
     #[test]
