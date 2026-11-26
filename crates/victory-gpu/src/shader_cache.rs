@@ -105,6 +105,8 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_LOCAL_ANY_MASKS",
                     "VICTORY_HEAP_HANDLE_LOCAL",
                     "VICTORY_HEAP_BELOW_ZERO",
+                    // Mesh shaders declare a payload under it (`crate::launch`).
+                    "VICTORY_MESH_CLAMP_IN_DRAW",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

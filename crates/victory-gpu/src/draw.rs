@@ -537,6 +537,10 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// `VICTORY_MESH_CLAMP_IN_DRAW=2`: work that can store to buffers (a
+    /// dispatch, a draw whose shaders store) was recorded in the list since
+    /// the last wait of ours before a launched mesh record (`crate::launch`).
+    launch_wait: bool,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -3292,6 +3296,10 @@ impl State {
         self.drew();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        // A pipeline with the bounding stage (`crate::launch`,
+        // `VICTORY_MESH_CLAMP_IN_DRAW`): the count goes to it as a root
+        // constant, unbounded by the budget as before.
+        let launch = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.launch.as_ref());
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -3300,8 +3308,13 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    match launch {
+                        Some(launch) => {
+                            crate::launch::record(list, launch.roots, crate::launch::Launch::Direct(x));
+                        }
+                        // SAFETY: an open list with everything set.
+                        None => unsafe { l6.DispatchMesh(x, 1, 1) },
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -3886,6 +3899,9 @@ impl State {
     /// can write buffers, so arguments may be others from here on
     /// ([`batches`]; no host pipeline: nothing runs, nothing is stored).
     fn buffers_written(&mut self) {
+        // (`VICTORY_MESH_CLAMP_IN_DRAW=2`: any dispatch, as the clamp's
+        // first wait ordered every one.)
+        self.launch_wait = true;
         if self.batch.is_none() {
             return;
         }
@@ -3895,6 +3911,7 @@ impl State {
     /// [`State::buffers_written`] for a dispatch whose shaders are known to
     /// store to buffers or not.
     fn dispatched_as(&mut self, stores: bool) {
+        self.launch_wait = true;
         self.batch_meets(Met::Dispatch { stores });
     }
 
@@ -3902,7 +3919,7 @@ impl State {
     /// [`State::buffers_written`] if its shaders can store to buffers, or
     /// if it has no host pipeline to tell by.
     fn drew(&mut self) {
-        if self.batch.is_none() {
+        if self.batch.is_none() && !crate::launch::waits() {
             return;
         }
         let stores = crate::pipeline::host_pipeline(self.pipeline as This)
@@ -3913,6 +3930,7 @@ impl State {
     /// [`State::drew`] for a draw whose shaders are known to store to
     /// buffers or not.
     fn drew_as(&mut self, stores: bool) {
+        self.launch_wait |= stores;
         self.batch_meets(Met::Draw { stores });
     }
 
@@ -4098,6 +4116,51 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let stores = p.stages.iter().any(|stage| stage.translated().stores);
+        // One mesh record of a pipeline with the bounding stage
+        // (`crate::launch`, `VICTORY_MESH_CLAMP_IN_DRAW`): the draw reads and
+        // bounds it itself, with no pass of ours before it. As a direct mesh
+        // draw for windows and batches.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = &p.launch
+        {
+            if !offset.is_multiple_of(4) {
+                why("a mesh record not 4-byte aligned");
+                return false;
+            }
+            self.draw_ends_windows();
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x} bounded in the draw"), false));
+            // `=2`: what the clamp's first wait ordered (every earlier
+            // shader write), when work that can store ran since the last
+            // such wait in this list (or the list is new to it).
+            const LAUNCH_USE: usize = usize::MAX - 0x79;
+            if crate::launch::waits() && (list.first_use(LAUNCH_USE) || self.launch_wait) {
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+                self.launch_wait = false;
+                crate::launch::count(crate::launch::L_WAIT);
+            }
+            // SAFETY: a live buffer.
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+            list.keep(&args.buffer);
+            self.mesh_scissor(list, true);
+            let launched = crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record));
+            self.mesh_scissor(list, false);
+            if !launched {
+                why("no budget for the bounding stage");
+                return false;
+            }
+            self.drew_as(stores);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         // One record without a count buffer: clamped in a batch (`batches`),
         // unless it is a dispatch of a pipeline that runs in parts (each
         // part's records are clamped where the first part's were, below).
@@ -4331,6 +4394,23 @@ impl State {
             why("prepare failed");
             return false;
         }
+        // A mesh call the bounding stage does not take (a count buffer, more
+        // than one record): clamped as before, on the same pipeline made
+        // without the stage (`crate::launch`).
+        if kind == MESH
+            && let Some(launch) = &p.launch
+        {
+            let Some(plain) = launch.plain() else {
+                why("no host pipeline without the bounding stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline of the same root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = plain.as_raw() as usize;
+            list.keep(plain);
+            crate::launch::count(crate::launch::L_PLAIN);
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
@@ -4439,7 +4519,7 @@ fn rect_vertex_span(v: VertexView, first: u32, count: u32, rects: u64) -> Option
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+pub(crate) fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
