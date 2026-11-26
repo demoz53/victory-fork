@@ -93,6 +93,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_LOOP_EXITS",
                     "VICTORY_AFTER_LOOP",
                     "VICTORY_PERMUTE_HALVES",
+                    "VICTORY_SHORT_WAVE_LAST",
                     "VICTORY_VCC_LOOP_POLARITY",
                     "VICTORY_SKIP_DESCRIPTORS",
                     "VICTORY_DIV_FIXUP",

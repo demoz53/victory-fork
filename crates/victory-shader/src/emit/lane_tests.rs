@@ -465,6 +465,26 @@ fn a_lane_write_reaches_both_halves() {
     eprintln!("v_writelane: 40 cases as the model");
 }
 
+/// `VICTORY_SHORT_WAVE_LAST`: a group that is a multiple of 32 threads translates the same
+/// with and without the rule; one that is not (48 or 80 threads) only with it off as before.
+#[test]
+fn the_short_wave_rule_changes_only_groups_that_are_no_multiple_of_32() {
+    let dxil = |threads: u32, on: bool| {
+        let native = native_of(&shuffle_program(false), true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let was = lower::TEST_SHORT_WAVE_LAST.replace(Some(on));
+        let shader = lowered(&native, &p, &HashSet::new());
+        lower::TEST_SHORT_WAVE_LAST.set(was);
+        shader.expect("lowered").dxil
+    };
+    for threads in [64, 96, 128] {
+        assert_eq!(dxil(threads, true), dxil(threads, false), "{threads} threads");
+    }
+    for threads in [48, 80] {
+        assert_ne!(dxil(threads, true), dxil(threads, false), "{threads} threads");
+    }
+}
+
 /// `v_readlane_b32` and `v_writelane_b32` with a lane number past the wave: the ISA takes the
 /// low six bits of it (lane 64 is lane 0, lane 101 is lane 37, -1 is lane 63). The source's
 /// tests name lanes below 64 only on this path (its dual-bank form found the rule); these
@@ -634,7 +654,6 @@ fn lanes_left_out_by_exec_keep_their_values() {
 /// have is not compared (not there on the console: outside EXEC). The barriers must not
 /// hang with a host wave short.
 #[test]
-#[ignore = "fails here: in a group of 48 the short host wave can take console lanes 0..31, and lanes 16..31 have no thread"]
 fn a_shuffle_in_partial_groups_stays_in_its_console_wave() {
     let _one = one_at_a_time();
     for threads in [48u32, 96] {

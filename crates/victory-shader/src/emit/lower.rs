@@ -34,7 +34,7 @@ pub(super) use loop_regions::scope as after_loop_scope;
 /// Lane fixes of wave64 compute on 32-lane hosts that the lane tests found.
 mod lanes;
 #[cfg(test)]
-pub(super) use lanes::TEST_PERMUTE_HALVES;
+pub(super) use lanes::{TEST_PERMUTE_HALVES, TEST_SHORT_WAVE_LAST};
 
 type Why = &'static str;
 
@@ -4263,11 +4263,15 @@ impl<'a> Lower<'a> {
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
+        // (a group that is not a multiple of 32 threads: only its full host waves count off
+        // the counter and the short one takes the last run, [`lanes::short_wave_last`])
+        let (first, full) = self.full_waves_count(first);
         let k32 = self.s.m.i32(32);
         let add = self.s.m.select(e, first, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let base = self.short_wave_base(full, base);
         if self.halves_borrowed {
             // every wave has taken its base before the program's code writes the dword
             self.group_sync(e);
