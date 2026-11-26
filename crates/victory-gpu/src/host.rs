@@ -83,7 +83,13 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// In the order they were retired, which is (nearly) the order of the
+/// counts they wait for: [`bury`] takes from the front only what is due, so
+/// that its work is what it drops, not everything still waiting (with
+/// `VICTORY_RETIRE_AHEAD` the list holds about a frame and a half of
+/// retirements). One retired a moment after a later count waits behind it
+/// for a submission or two: later, never earlier.
+static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -325,12 +331,46 @@ fn retire_with<T: 'static>(object: T, ahead: u64) -> Option<u64> {
     let started = STARTED.load(Ordering::Acquire);
     let Some(at) = retire_at(started, FINISHED.load(Ordering::Acquire), ahead) else {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        if retire_reaper() {
+            reap_later(Retired(Box::new(object)));
+        } else {
+            drop(object);
+        }
         return None;
     };
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired).push((at, Retired(Box::new(object))));
+    crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired).push_back((at, Retired(Box::new(object))));
     Some(at)
+}
+
+/// Whether the last release of what [`retire`] is given (dropped at once,
+/// or by [`bury`] once its submissions are through) and of the texture
+/// staging the sweep lets go (`texture::let_go_idle`) happens on the
+/// reaper's thread (`VICTORY_REAPER=1`; off by default). After fxceless's
+/// VICTORY_REAPER: dropping a host texture or buffer is a call into Direct3D
+/// and the driver (the allocation destroyed, its card address freed); our
+/// profile has `host::retire` in `Arc::drop_slow` at 6.7 % of the
+/// submitting thread's running time, fxceless measured 7.8 ms a frame there
+/// with 46-ms spikes in one sweep. Nothing goes earlier than before: an
+/// object still waits its submissions (and `VICTORY_RETIRE_AHEAD` more);
+/// only who drops it changes. `VICTORY_DROP_LATER=1` sends [`bury`]'s to
+/// the reaper too (and more: landed lists' leftovers).
+pub(crate) fn retire_reaper() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REAPER").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_REAPER=1: retired objects and swept texture staging are released on the reaper's thread");
+        }
+        on
+    })
+}
+
+/// Hands `object` to the reaper's thread to be dropped there
+/// ([`retire_reaper`]): something the card no longer uses, whose type need
+/// not be `Send` (D3D12 objects are free-threaded; see [`Retired`]).
+pub(crate) fn reap_retired<T: 'static>(object: T) {
+    reap_later(Retired(Box::new(object)));
 }
 
 /// The submission count something retired with `started` and `finished`
@@ -372,19 +412,17 @@ pub(crate) fn submissions() -> (u64, u64) {
 fn bury(finished: u64) {
     let done: Vec<(u64, Retired)> = {
         let mut retired = crate::lockstat::lock(&RETIRED, crate::lockstat::Lock::Retired);
-        if retired.is_empty() {
+        let due = retired.iter().take_while(|(at, _)| *at <= finished).count();
+        if due == 0 {
             return;
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
+        retired.drain(..due).collect()
     };
-    // With `VICTORY_DROP_LATER=1` on the reaper's thread: every submission
-    // that could use them has finished, so the last releases (some a kernel
-    // call that frees the card's memory) can be anyone's.
-    if drop_later() {
+    // With `VICTORY_DROP_LATER=1` or `VICTORY_REAPER=1` on the reaper's
+    // thread: every submission that could use them has finished, so the
+    // last releases (some a kernel call that frees the card's memory) can
+    // be anyone's.
+    if drop_later() || retire_reaper() {
         reap_later(done);
         return;
     }
@@ -456,6 +494,15 @@ mod retire_tests {
         assert!(!gone.load(Ordering::SeqCst), "dropped before the submissions ahead finished");
         super::bury(at);
         assert!(gone.load(Ordering::SeqCst));
+        // One retired behind a later count waits for it, never less: buried
+        // only from the front, in order.
+        let (first, second) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let far = super::retire_with(Flag(first.clone()), 1 << 40).unwrap();
+        let near = super::retire_with(Flag(second.clone()), 16).unwrap();
+        super::bury(near);
+        assert!(!first.load(Ordering::SeqCst) && !second.load(Ordering::SeqCst));
+        super::bury(far);
+        assert!(first.load(Ordering::SeqCst) && second.load(Ordering::SeqCst));
         // As before: nothing running and nothing ahead is dropped at once.
         let now = Arc::new(AtomicBool::new(false));
         let (started, finished) = super::submissions();
