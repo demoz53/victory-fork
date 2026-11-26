@@ -969,9 +969,7 @@ fn float_compares_tell_nan_by_its_bits_with_nan_exact() {
         eprintln!("  {m}");
     }
     let exact = float_compare_mistakes(true);
-    assert!(exact.is_empty(), "VICTORY_NAN_EXACT=1: {} wrong:
-{}", exact.len(), exact.join("
-"));
+    assert!(exact.is_empty(), "VICTORY_NAN_EXACT=1: {} wrong:\n{}", exact.len(), exact.join("\n"));
 }
 
 /// `VICTORY_NAN_EXACT` changes the code of float compares alone: an integer compare and the
@@ -5203,4 +5201,156 @@ fn sdwa_16bit_dst_unused_sext_sign_extends_word0() {
             assert_eq!(got, want, "{backend}: v_cvt_i16_f16_sdwa(-1.0, dst_sel={dst_sel}, dst_unused={dst_unused}) = {got:#010x}, want {want:#010x}");
         });
     }
+}
+
+/// A typed buffer's 32-bit words keep their bits through a format load, an OR and a format
+/// store (`buffer_load_format_x`, `v_or_b32` of bit 14, `buffer_store_format_xyzw`), as the shadow
+/// tile program f133e35efed2a48a updates its per-tile flags (at 0x29558-0x2957c, with
+/// `s_bitset1_b32` and `buffer_store_format_xyzw` of four copies): words that are float denormals as bit
+/// patterns (0x00004000 and every flag word below bit 23), NaNs of every kind and the
+/// infinities among them. Run on the card and WARP through the R32_FLOAT view the layer makes
+/// of a title's R32_UINT buffer (`VICTORY_INT_VIEWS_AS_FLOAT`, on by default) and through an
+/// R32_UINT view (`VICTORY_INT_VIEWS_AS_FLOAT=0`). Gives the words that lost bits. (Scout
+/// lead: Xeltax/VIcky RT88a found such a read-modify-write wiping the flags through integer
+/// views on its tree; on this RTX 4060 Ti and WARP, with this translation, none does.)
+fn typed_flag_words() -> Vec<String> {
+    /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
+    const fn mubuf_idxen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const LOAD_FORMAT_X: u32 = 0x00;
+    const STORE_FORMAT_XYZW: u32 = 0x07;
+    let words_in: Vec<u32> = vec![
+        0x0000_0000, 0x0000_0001, 0x0000_4000, 0x0000_2001, 0x007F_FFFF, 0x0080_0000,
+        0x8000_0001, 0x8000_0000, 0x3F80_0000, 0x7F80_0000, 0xFF80_0000, 0x7F80_0001,
+        0x7FC0_0000, 0x7FC0_1234, 0x7FFF_FFFF, 0xFFFF_FFFF, 0xFFC0_0000, 0x0012_3456,
+        0x1234_5678, 0xDEAD_BEEF, 0x0000_FFFF, 0x7F7F_FFFF, 0x0040_0000, 0x0000_0100,
+        0x8000_4000, 0x0000_8000, 0x7F80_4000, 0x0000_0002, 0x0000_0003, 0x0001_0000,
+        0x0020_0000, 0x00FF_FFFF,
+    ];
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    // v1 = buffer[thread]; s20 = 0x4000; v1 |= s20; buffer[thread] = v1
+    words.extend_from_slice(&mubuf_idxen(LOAD_FORMAT_X, 1, 0, 8));
+    words.push(0xB014_4000); // s_movk_i32 s20, 0x4000
+    words.push(vop2(0x1c, 1, sgpr(20), 1)); // v_or_b32 v1, s20, v1
+    // v2..v4 = v1, stored as the title stores, all four channels to a one-channel view
+    for r in 2..5u8 {
+        words.push(vop1(0x001, r, vgpr(1))); // v_mov_b32
+    }
+    words.extend_from_slice(&mubuf_idxen(STORE_FORMAT_XYZW, 1, 0, 8));
+    words.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [words_in.len() as u32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
+        group_split: 1,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut dxil = shader.dxil.clone();
+        v.validate(&mut dxil).expect("DXIL validation failed");
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut wrong = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for float_view in [true, false] {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::R32Uav(float_view, &words_in)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let view = if float_view { "R32_FLOAT" } else { "R32_UINT" };
+            for (i, (&w, &got)) in words_in.iter().zip(&out[0]).enumerate() {
+                if got != w | 0x4000 {
+                    wrong.push(format!("{label}, {view} view: word {i} {w:#010x} | 0x4000 = {got:#010x}, want {:#010x}", w | 0x4000));
+                }
+            }
+        }
+    }
+    wrong
+}
+
+/// See [`typed_flag_words`]: every word keeps its bits through both views.
+#[test]
+fn typed_flag_words_keep_their_bits() {
+    let wrong = typed_flag_words();
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
 }

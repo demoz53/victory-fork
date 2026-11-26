@@ -1040,6 +1040,10 @@ pub enum View<'a> {
     RawUav(u32),
     /// A raw buffer UAV initialized from these dwords.
     RawUavData(&'a [u32]),
+    /// A typed buffer UAV of one-dword elements initialized from these dwords: R32_FLOAT when
+    /// the flag is set (as the layer views a title's R32_UINT buffer, `bit_exact_format`),
+    /// else R32_UINT.
+    R32Uav(bool, &'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1285,7 +1289,11 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
+                    View::RawUav(_)
+                    | View::RawUavData(_)
+                    | View::R32Uav(..)
+                    | View::HalfUav(_)
+                    | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1307,6 +1315,11 @@ impl Host {
                                 let n = data.len() as u32;
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
+                            View::R32Uav(float, data) => {
+                                let n = data.len() as u32;
+                                let f = if float { DXGI_FORMAT_R32_FLOAT } else { DXGI_FORMAT_R32_UINT };
+                                (n, f, n, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
@@ -1315,7 +1328,7 @@ impl Host {
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
                             D3D12_RESOURCE_STATE_COMMON,
                         )?;
-                        if let View::RawUavData(data) = v {
+                        if let View::RawUavData(data) | View::R32Uav(_, data) = v {
                             let initial = upload(data)?;
                             list.CopyBufferRegion(&b, 0, &initial, 0, bytes);
                             list.ResourceBarrier(&[transition(
