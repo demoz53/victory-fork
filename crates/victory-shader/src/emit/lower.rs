@@ -339,6 +339,9 @@ struct Lower<'a> {
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
+    /// With `VICTORY_SELECT_LANES=1`: the scalar dwords written as all lanes or none
+    /// ([`uniform_mask_values`]), which a `v_cndmask_b32` takes as one bit for every lane.
+    uniform_selects: HashSet<Value>,
     /// The console lane (0..63) of this thread, made in the entry block.
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
@@ -1237,9 +1240,26 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     let mut writes = vec![false; n];
     // per region: its order-free reductions (kind, address, byte offset, bytes), and whether
     // it has any other access
-    let mut reductions: Vec<Vec<(&str, Option<crate::ir::Value>, u32, u32)>> = vec![Vec::new(); n];
+    let mut reductions: Vec<Vec<(&str, Option<u32>, u32, u32)>> = vec![Vec::new(); n];
     let mut others = vec![false; n];
     let atomics_read = lds_atomics_read();
+    // The LDS addresses that are one number in every lane and every round: a `v_mov_b32` of a
+    // constant (`CS_MinMax_*`: `v_mov_b32 v3, 0` before its minimum and maximum).
+    let constant_at = |v: crate::ir::Value| -> Option<u32> {
+        let inst = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        match &inst.fields {
+            Fields::Valu(f)
+                if inst.name() == "v_mov_b32" && f.dpp.is_none() && f.sdwa.is_none() && f.src.len() == 1 =>
+            {
+                match f.src[0] {
+                    Operand::Const(c) => crate::resource::inline(c),
+                    Operand::Literal(x) => Some(x),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
@@ -1261,7 +1281,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             match &i.fields {
                 Fields::Ds { addr, offset0, offset1, .. } if LDS_REDUCTIONS.contains(&name) => {
                     let at = match addr {
-                        Some(crate::gfx10::Operand::Vector { reg, .. }) => i.read(Reg::V(*reg)),
+                        Some(crate::gfx10::Operand::Vector { reg, .. }) => i.read(Reg::V(*reg)).and_then(constant_at),
                         _ => None,
                     };
                     let bytes = if name.ends_with("64") { 8 } else { 4 };
@@ -1273,14 +1293,23 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     }
     // A region whose accesses are all integer reductions with no result for any lane leaves
     // each word the same whichever half of the console wave gets there first, as long as no
-    // word sees two kinds: two kinds go to one address register at offsets whose words differ
-    // (`CS_MinMax_*`: the minimum at +4, the maximum at +0).
+    // word sees two kinds: two kinds only at constant addresses (the same in every lane and
+    // every round of a loop) whose words differ (`CS_MinMax_*`: the minimum at 0 + 4, the
+    // maximum at 0 + 0). One address register is not enough: its lanes, or its rounds in a
+    // lane loop, may put a minimum and a maximum on one word.
+    let disjoint = |a: Option<u32>, oa: u32, ba: u32, b: Option<u32>, ob: u32, bb: u32| match (a, b) {
+        (Some(a), Some(b)) => {
+            let (x, y) = (u64::from(a) + u64::from(oa), u64::from(b) + u64::from(ob));
+            x + u64::from(ba) <= y || y + u64::from(bb) <= x
+        }
+        _ => false,
+    };
     let order_free = |r: usize| {
         !others[r]
             && reductions[r].iter().enumerate().all(|(k, &(na, aa, oa, ba))| {
-                reductions[r][..k].iter().all(|&(nb, ab, ob, bb)| {
-                    na == nb || aa.is_some() && aa == ab && (oa + ba <= ob || ob + bb <= oa)
-                })
+                reductions[r][..k]
+                    .iter()
+                    .all(|&(nb, ab, ob, bb)| na == nb || disjoint(aa, oa, ba, ab, ob, bb))
             })
     };
     let ordered = |r: usize| reads[r] && writes[r] && !order_free(r);
@@ -1335,15 +1364,16 @@ thread_local! {
 /// write: two kinds of atomics (a minimum then an add, an add returning the old value then a
 /// store) in one lane-branch region are then refused there, as a write and a read are, and the
 /// program takes a form in which they sit where every lane runs, each with its meeting. Ported
-/// from avatarmanz/VIctory-7900XTX PR #204 (feanorsun, 5e200817b). On; `VICTORY_LDS_ATOMICS_READ=0`
-/// as before (atomics taken as writes only: the two host waves of a console wave race there).
+/// from avatarmanz/VIctory-7900XTX PR #204 (feanorsun, 5e200817b). Opt-in until a game run
+/// proves it (`VICTORY_LDS_ATOMICS_READ=1`; unset: atomics taken as writes only, as before, and
+/// the two host waves of a console wave race there).
 fn lds_atomics_read() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_LDS_ATOMICS_READ.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_ATOMICS_READ").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_ATOMICS_READ").is_some_and(|v| v == "1"))
 }
 
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
@@ -1580,22 +1610,68 @@ pub(super) fn reads_mask_as_data(st: &Structured, masks: &HashSet<Value>, i: &In
 /// lowering takes this lane's bit of it, which is the console's bit only where
 /// host lanes are the console's. Ported from avatarmanz/VIctory-7900XTX PR #308
 /// (compaccount1-coder, 2031a0785).
-pub(super) fn selects_on_mask_data(st: &Structured, i: &Inst) -> bool {
+///
+/// A uniform selector (all lanes or none: an `s_cselect_b64` of 0 and -1 on SCC, an `s_mov_b64`
+/// of 0 or -1, which the structure pass keeps apart and does not export as a mask) is the same
+/// bit in every lane and needs no console lanes: `uniform` holds the dwords such instructions
+/// write ([`uniform_mask_values`]).
+pub(super) fn selects_on_mask_data(st: &Structured, uniform: &HashSet<Value>, i: &Inst) -> bool {
     let Fields::Valu(v) = &i.fields else {
         return false;
     };
-    i.name() == "v_cndmask_b32"
-        && matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
-            if i.read(Reg::S(code)).is_some_and(|m| !st.masks.contains_key(&m)))
+    let Some(&Operand::Scalar { code, .. }) = v.src.get(2) else {
+        return false;
+    };
+    let lo = i.read(Reg::S(code));
+    let hi = i.read(Reg::S(code + 1));
+    let all_or_none = lo.is_some_and(|l| uniform.contains(&l)) && hi.is_none_or(|h| uniform.contains(&h));
+    i.name() == "v_cndmask_b32" && lo.is_some_and(|m| !st.masks.contains_key(&m)) && !all_or_none
+}
+
+/// The scalar dwords of `p` written as all lanes or none: by an `s_cselect_b64` whose two
+/// sources are 0 and -1, or an `s_mov_b64` of 0 or -1 (in wave32 their 32-bit forms too)
+/// ([`selects_on_mask_data`]).
+pub(super) fn uniform_mask_values(p: &crate::ir::Program) -> HashSet<Value> {
+    let edge = |o: &Operand| match *o {
+        Operand::Const(c) => matches!(crate::resource::inline(c), Some(0 | 0xFFFF_FFFF)),
+        Operand::Literal(x) => matches!(x, 0 | 0xFFFF_FFFF),
+        _ => false,
+    };
+    let mut out = HashSet::new();
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        let Fields::Sop { src, .. } = &inst.fields else { continue };
+        // (in wave32 a mask is one dword: its 32-bit forms too)
+        let uniform = match inst.name() {
+            "s_cselect_b64" => src.len() == 2 && src.iter().all(edge),
+            "s_mov_b64" => src.len() == 1 && edge(&src[0]),
+            "s_cselect_b32" if !p.wave64 => src.len() == 2 && src.iter().all(edge),
+            "s_mov_b32" if !p.wave64 => src.len() == 1 && edge(&src[0]),
+            _ => false,
+        };
+        if uniform {
+            out.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::S(_))).map(|w| w.1));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`select_lanes`], for its thread only.
+    pub(super) static TEST_SELECT_LANES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether [`selects_on_mask_data`] asks for the console's lanes (wave size and lane order),
-/// as a mask read as data does. On; `VICTORY_SELECT_LANES=0` as before: such a program, with
-/// no other cross-lane code, ran with each lane taking the bit of whatever host lane it landed
-/// in.
+/// as a mask read as data does. Opt-in until a game run proves it (`VICTORY_SELECT_LANES=1`;
+/// unset: as before, such a program, with no other cross-lane code, ran with each lane taking
+/// the bit of whatever host lane it landed in).
 fn select_lanes() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SELECT_LANES.get() {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SELECT_LANES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SELECT_LANES").is_some_and(|v| v == "1"))
 }
 
 /// The parameters packing 16-bit rows two per dword and where each lays
@@ -2125,6 +2201,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            let uniform_selects = if select_lanes() { uniform_mask_values(p) } else { HashSet::new() };
             console_lanes = needs_wave32 || insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
@@ -2134,7 +2211,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, &masks, i)
-                    || select_lanes() && selects_on_mask_data(x.st, i)
+                    || select_lanes() && selects_on_mask_data(x.st, &uniform_selects, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -2160,7 +2237,7 @@ impl<'a> Lower<'a> {
                         || n.starts_with("ds_bpermute")
                         || reads_mask_as_data(x.st, &masks, i)
                         // (its lane's bit is the console lane's: lanes 32-63 the high dword's)
-                        || select_lanes() && selects_on_mask_data(x.st, i)
+                        || select_lanes() && selects_on_mask_data(x.st, &uniform_selects, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
@@ -2436,6 +2513,7 @@ impl<'a> Lower<'a> {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
                 _ => HashSet::new(),
             },
+            uniform_selects: if select_lanes() { uniform_mask_values(p) } else { HashSet::new() },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
@@ -9274,6 +9352,21 @@ impl<'a> Lower<'a> {
                     // pattern: every other lane, every other pair...):
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
+                    // All lanes or none (`s_cselect_b64 -1, 0`, `VICTORY_SELECT_LANES=1`): the
+                    // same bit in every lane, whichever lane it is.
+                    None if mask.is_some_and(|m| self.uniform_selects.contains(&m))
+                        && v.src.get(2).is_some_and(|o| match *o {
+                            Operand::Scalar { code, .. } => {
+                                !self.x.native.wave64
+                                    || inst.read(Reg::S(code + 1)).is_some_and(|h| self.uniform_selects.contains(&h))
+                            }
+                            _ => false,
+                        }) =>
+                    {
+                        let lo = self.i32_of(mask.ok_or(UNTRACKED)?).map_err(|_| UNTRACKED)?;
+                        let z = self.s.m.i32(0);
+                        self.s.m.cmp(c, pred::NE, lo, z)
+                    }
                     None if self.mask_data == MaskData::Console => {
                         let m = mask.ok_or(UNTRACKED)?;
                         let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;

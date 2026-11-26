@@ -1234,7 +1234,10 @@ fn lds_atomics_in_a_lane_branch_keep_the_consoles_order() {
             eprintln!("{what}: lanes below {s0}: the word is {} (the console: {s0})", got[0]);
         }
     }
-    let Some(card) = card_emitted("LDS atomics in a lane branch", &w, lds) else { return };
+    let was = lower::TEST_LDS_ATOMICS_READ.replace(Some(true));
+    let new = card_emitted("LDS atomics in a lane branch", &w, lds);
+    lower::TEST_LDS_ATOMICS_READ.set(was);
+    let Some(card) = new else { return };
     for s0 in [64, 33, 1, 0] {
         let got = card.run([s0, 0, COUNT, u32::MAX]);
         compare(&format!("LDS atomics in a lane branch, lanes below {s0}"), &got, &some([s0; 64]));
@@ -1316,7 +1319,35 @@ fn a_wave64_select_on_a_number_gives_each_lane_its_bit() {
     let bits = u64::from(HI) << 32 | u64::from(LO);
     let want: [u32; 64] = std::array::from_fn(|l| (bits >> l & 1) as u32);
     let _one = one_at_a_time();
-    let Some(card) = card_emitted("a select on a number", &w, |_| {}) else { return };
+    let was = lower::TEST_SELECT_LANES.replace(Some(true));
+    let new = card_emitted("a select on a number", &w, |_| {});
+    lower::TEST_SELECT_LANES.set(was);
+    let Some(card) = new else { return };
     compare("a wave64 select on a number", &card.run([0; 4]), &some(want));
     eprintln!("a wave64 select on a number: every lane its bit of the pair, as the model");
+}
+
+/// A select on an all-or-none selector (`s_cselect_b64 s[12:13], -1, 0` on `s0 == 0`): every
+/// lane takes the same side, so `VICTORY_SELECT_LANES` leaves the program in its plain form, and
+/// every lane stores 1 when s0 is 0, else 0.
+#[test]
+fn a_select_on_an_all_or_none_mask_is_every_lanes() {
+    let mut w = prologue();
+    w.extend([
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0x858C_80C1, // s_cselect_b64 s[12:13], -1, 0
+    ]);
+    // v_cndmask_b32 v12, 0, 1, s[12:13] (VOP3)
+    w.extend([0xD400_0000 | 0x101 << 16 | 12, 12 << 18 | int(1) << 9 | int(0)]);
+    epilogue(&mut w);
+    let _one = one_at_a_time();
+    let was = lower::TEST_SELECT_LANES.replace(Some(true));
+    let new = card_emitted("a select on all or none", &w, |_| {});
+    lower::TEST_SELECT_LANES.set(was);
+    let Some(card) = new else { return };
+    for s0 in [0, 1] {
+        let want = [u32::from(s0 == 0); 64];
+        compare(&format!("a select on all or none, s0 = {s0}"), &card.run([s0, 0, 0, 0]), &some(want));
+    }
+    eprintln!("a select on all or none: every lane the same side, as the model");
 }

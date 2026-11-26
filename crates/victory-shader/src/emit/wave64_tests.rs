@@ -1834,5 +1834,41 @@ fn a_select_on_a_mask_held_as_a_number_keeps_the_consoles_lanes() {
         0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
     ];
     // 64 threads in waves of 32: two console waves, and no LDS
-    assert_eq!(flag_wave(&native_of(&words, false, 64)), Some(32));
+    let was = lower::TEST_SELECT_LANES.replace(Some(true));
+    let on = flag_wave(&native_of(&words, false, 64));
+    lower::TEST_SELECT_LANES.set(was);
+    assert_eq!(on, Some(32));
+}
+
+/// A select on an all-or-none selector (`s_cselect_b64 -1, 0` on SCC, which the structure pass
+/// keeps apart and does not export as a mask) is every lane's: it does not ask for the console's
+/// lanes, so a wave64 program whose only "crossing" it is keeps its plain form; the same select
+/// on a number does ask.
+#[test]
+fn a_select_on_an_all_or_none_mask_keeps_the_plain_form() {
+    let program = |select: &[u32]| {
+        let mut words = select.to_vec();
+        words.extend([
+            0xD501_0000,
+            0x0031_0280, // v_cndmask_b32 v0, 0, 1, s[12:13]
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ]);
+        native_of(&words, true, 64)
+    };
+    let uniform = program(&[
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0x858C_80C1, // s_cselect_b64 s[12:13], -1, 0
+    ]);
+    let number = program(&[
+        0xBE8C_03FF, // s_mov_b32 s12, 0x55555555
+        0x5555_5555,
+        0xBE8D_03FF, // s_mov_b32 s13, 0x55555555
+        0x5555_5555,
+    ]);
+    let was = lower::TEST_SELECT_LANES.replace(Some(true));
+    let (u, n) = (flag_wave(&uniform), flag_wave(&number));
+    lower::TEST_SELECT_LANES.set(was);
+    assert_eq!(u, None, "all or none: the plain form");
+    assert_eq!(n, Some(32), "a number: the console's lanes");
 }

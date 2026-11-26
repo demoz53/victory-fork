@@ -890,6 +890,7 @@ fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
     // (the second at byte offset `at` from address register `addr`)
     let program_at = |first: u32, second: u32, at: u32, addr: u32| {
         let mut w = vec![
+            0x3414_0082, // v_lshlrev_b32 v10, 2, v0 (a lane's own address)
             0x7E12_0280, // v_mov_b32 v9, 0 (address and minimum)
             0x7E04_0281, // v_mov_b32 v2, 1 (increment)
             0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
@@ -911,6 +912,9 @@ fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
     };
     let program = |first: u32, second: u32| program_at(first, second, 0, 9);
     let meets = |p: &ir::Program| {
+        // (on unless the caller set it)
+        let was = super::TEST_LDS_ATOMICS_READ.get();
+        super::TEST_LDS_ATOMICS_READ.set(Some(was.unwrap_or(true)));
         let st = structure::structure(p).expect("structure");
         let all = super::all_lane_blocks(&st).expect("all-lane blocks");
         let names: Vec<&str> = p
@@ -922,7 +926,9 @@ fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
             .map(|i| i.name())
             .filter(|n| n.starts_with("ds_"))
             .collect();
-        (names.join(" "), super::lds_meetings(p, &st, &all).is_some())
+        let r = (names.join(" "), super::lds_meetings(p, &st, &all).is_some());
+        super::TEST_LDS_ATOMICS_READ.set(was);
+        r
     };
     let off = |p: &ir::Program| {
         let was = super::TEST_LDS_ATOMICS_READ.replace(Some(false));
@@ -951,9 +957,17 @@ fn lds_atomics_in_one_lane_branch_are_reads_and_writes() {
     // of one kind
     let p = program_at(0x07, 0x08, 4, 9);
     assert_eq!(meets(&p), ("ds_min_u32 ds_max_u32".into(), true));
-    // ... but from another address register, they may meet in one word: refused
+    // ... and from another register holding a constant (v2 = 1: bytes 5-8 against 0-3)
     let p = program_at(0x07, 0x08, 4, 2);
+    assert!(meets(&p).1);
+    // ... but at a lane's own address (v10 = lane * 4) the maximum at +4 of one lane is the
+    // minimum at +0 of the next lane's word: refused (also the first at v9 = 0 against it)
+    let p = program_at(0x07, 0x08, 4, 10);
     assert!(!meets(&p).1);
+    // (unset, the switch is off: the atomics as writes, the region taken as before)
+    let st = structure::structure(&program(0x07, 0x00)).expect("structure");
+    let all = super::all_lane_blocks(&st).expect("all-lane blocks");
+    assert!(super::lds_meetings(&program(0x07, 0x00), &st, &all).is_some());
     // two ds_write_b32: write-only as before
     let p = program(0x0D, 0x0D);
     assert_eq!(meets(&p), ("ds_write_b32 ds_write_b32".into(), true));
