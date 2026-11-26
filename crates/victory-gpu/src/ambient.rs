@@ -620,8 +620,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    if role == Role::Reflect && reflect() == 0.0 {
-        return false;
+    if role == Role::Reflect {
+        if reflect() == 0.0 {
+            return false;
+        }
+        static HELD: std::sync::Once = std::sync::Once::new();
+        HELD.call_once(|| tracing::info!(held = reflect(), size = ?views.size, "reflections held to the light around"));
     }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
