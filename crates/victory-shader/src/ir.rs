@@ -316,7 +316,9 @@ fn unspill(
     // per instruction the scalar codes it writes.
     let mut other = [false; 256];
     let mut relative_reads: [Vec<usize>; 256] = std::array::from_fn(|_| Vec::new());
-    let mut used = [false; 128];
+    // (every scalar code: an effect can name one past the registers, a VOP3 compare whose sdst
+    // holds a constant's code; avatarmanz PR #325, illuminatedfellow, f2cce2ea7)
+    let mut used = [false; 256];
     let mut parks = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
@@ -2593,4 +2595,23 @@ mod tests {
             "must not coalesce restore across read of first register: {names:?}"
         );
     }
+
+    /// A scalar destination field of 128 or more (a constant's code, not a register) is refused
+    /// or ignored, never an index past the scalar codes the parking search keeps. Ported from
+    /// avatarmanz/VIctory-7900XTX PR #325 (illuminatedfellow, f2cce2ea7; found by fuzzing).
+    #[test]
+    fn scalar_codes_past_the_registers_do_not_panic() {
+        // v_writelane_b32 v1, s0, 0: a program that parks a scalar, so the parking search runs.
+        const PARK: [u32; 2] = [0xD761_0001, 0x0001_0000];
+        for (words, wave64) in [
+            ([0xD4C5_A8D7, 0x9342_BFA0], true),
+            ([0xD401_53FF, 0x0509_8D04], false),
+            ([0xD4EC_FE8B, 0x1234_5678], false),
+        ] {
+            let words = [&PARK[..], &words[..], &[0xBF81_0000]].concat();
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = build(&code, wave64, 256);
+        }
+    }
 }
+

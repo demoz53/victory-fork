@@ -258,7 +258,14 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    // A panic in the translator is this shader's failure, not the thread's (fxceless PR #1353,
+    // Filip722; `VICTORY_PANIC_CATCH=0`: it unwinds as before).
+    let host = if crate::pipeline::make::panic_catch() {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::shader_cache::host_shader(container)))
+            .unwrap_or_else(|_| Err("the translator panicked".to_owned()))?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let is_main = |p: &victory_shader::NativeProgram| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs);
     // Which UAVs it stores to (`VICTORY_UAV_WRITTEN`): the main program's,
