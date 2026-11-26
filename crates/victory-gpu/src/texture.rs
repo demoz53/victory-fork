@@ -2109,10 +2109,8 @@ mod title_memory_tests {
             assert_eq!(unsafe { upload.data.add(offset).read() }, 0xab);
             // The same texel's other channels retain their original bytes.
             // SAFETY: the next three bytes are in the same RGBA8 texel.
-            assert_eq!(
-                unsafe { std::slice::from_raw_parts(upload.data.add(offset + 1), 3) },
-                &[1, 1, 1]
-            );
+            let rest = unsafe { std::slice::from_raw_parts(upload.data.add(offset + 1), 3) };
+            assert_eq!(rest, &[1, 1, 1]);
             std::mem::drop(upload);
             assert_eq!(
                 object::slot::<extern "system" fn(object::This) -> u32>(image, 0x10)(image),
