@@ -799,6 +799,11 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
     /// A look found none of its memory mapped ([`TextureQueue::away`]).
     away: bool,
+    /// Since the slot was written or its memory changed, for a texture
+    /// whose first and last page are both away
+    /// ([`TextureQueue::between`]): 0, the memory between them was not
+    /// looked at; 1, it was, and none was there; 2, some was there.
+    between: u8,
 }
 
 /// Whether due texture slots are served in turns, a slot looked at before
@@ -830,7 +835,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false, between: 0 });
     }
 
     fn remove(&mut self, index: u32) {
@@ -1003,13 +1008,38 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), away: false, between: 0 });
     }
 
     /// A look at slot `index` found none of its memory mapped.
     fn away(&mut self, index: u32, write: u64) {
         if let Some(w) = self.same(index, write) {
             w.away = true;
+        }
+    }
+
+    /// Whether the look at slot `index`, whose texture has neither its
+    /// first nor its last page there, goes on to the memory between them
+    /// (`crate::texture::mapped_bytes_in_turn`). That look asks about every
+    /// 64 KiB block of the texture, so a slot has it once after it was
+    /// written or the runtime told of its memory, in its turn; then again
+    /// at every eighth look in a row that found nothing (for what the
+    /// runtime does not tell of); and at every look while its texture is
+    /// one that has memory only between its ends.
+    fn between(&self, index: u32, write: u64) -> crate::texture::Between {
+        use crate::texture::Between;
+        match self.slots.get(&index).filter(|w| w.write == write) {
+            Some(w) if w.between == 2 => Between::Always,
+            Some(w) if w.between == 0 || (w.looks > 0 && w.looks.is_multiple_of(8)) => Between::InBudget,
+            _ => Between::Not,
+        }
+    }
+
+    /// The look between the ends of slot `index`'s texture was made, and
+    /// `found` some of its memory there or none.
+    fn looked_between(&mut self, index: u32, write: u64, found: bool) {
+        if let Some(w) = self.same(index, write) {
+            w.between = if found { 2 } else { 1 };
         }
     }
 
@@ -1814,6 +1844,16 @@ impl HostHeap {
         }
     }
 
+    /// See [`TextureQueue::between`].
+    pub(crate) fn texture_slot_between(&self, index: u32, write: u64) -> crate::texture::Between {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).between(index, write)
+    }
+
+    /// See [`TextureQueue::looked_between`].
+    pub(crate) fn texture_slot_looked_between(&self, index: u32, write: u64, found: bool) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).looked_between(index, write, found);
+    }
+
     /// A look at title slot `index` found none of its memory mapped: see
     /// [`TextureQueue::away`].
     pub(crate) fn texture_slot_away(&self, index: u32, write: u64) {
@@ -2000,7 +2040,7 @@ impl HostHeap {
                     Some(View::Placed(false, resource, desc)) if resource[0] != 1 && {
                         let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                         let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
-                        crate::texture::mapped_bytes(address as *const u8, len as usize) != 0
+                        crate::texture::any_mapped(address as usize, len as usize)
                     }
                 );
             if !back {
@@ -3741,6 +3781,43 @@ mod tests {
         assert_eq!(kept.expired(10_500, 5_000, false), [(6, 0x2_0001, true)]);
         assert_eq!(kept.expired(10_500, 5_000, true), [(7, 0x1_0002, false)]);
         assert!(kept.slots.is_empty());
+    }
+
+    /// A slot whose texture has both ends away is looked at between them
+    /// once after a write or a change of its memory, then at every eighth
+    /// look that found nothing, and always while memory is there only
+    /// between its ends.
+    #[test]
+    fn the_look_between_a_textures_ends_is_made_in_turns() {
+        use crate::texture::Between;
+        let mut q = TextureQueue::default();
+        q.written(3, 10, 0, false);
+        let w = q.slots[&3].write;
+        assert_eq!(q.between(3, w), Between::InBudget);
+        assert_eq!(q.between(3, w + 1), Between::Not, "another write's");
+        assert_eq!(q.between(4, 1), Between::Not, "not queued");
+        // Put off for the frame's share: still owed at the next look.
+        q.later(3, w, 10, 64);
+        assert_eq!(q.between(3, w), Between::InBudget);
+        // Made, and nothing there: not again until the eighth empty look.
+        q.looked_between(3, w, false);
+        for look in 2..=16u8 {
+            q.later(3, w, 10, 64);
+            assert_eq!(q.slots[&3].looks, look);
+            let turn = if look % 8 == 0 { Between::InBudget } else { Between::Not };
+            assert_eq!(q.between(3, w), turn, "look {look}");
+        }
+        // The runtime tells of memory mapped under it: owed again.
+        q.changed(3, 40, 41);
+        let w = q.slots[&3].write;
+        assert_eq!(q.between(3, w), Between::InBudget);
+        // Some is there between the ends: asked at every look from now on,
+        // until a look finds none (streamed out again).
+        q.looked_between(3, w, true);
+        q.partly(3, w, 42, 65536);
+        assert_eq!(q.between(3, w), Between::Always);
+        q.looked_between(3, w, false);
+        assert_eq!(q.between(3, w), Between::Not);
     }
 
     /// The age histogram's buckets: 0, 1, 2, 3-5, 6-15, 16-63, more.

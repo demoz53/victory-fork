@@ -1453,79 +1453,225 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Whether [`mapped_bytes`] looks at the memory between a texture's first and
+/// last page when neither of the two is there (on unless
+/// `VICTORY_MAPPED_EXACT=0`: then the answer is "none" at once, as before).
+fn mapped_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPED_EXACT").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line in the log: looks of [`mapped_bytes`] at the memory
+/// between two ends that were both away; those of them that found some of
+/// it there (textures the short cut called absent); and such looks put off
+/// because the frame had made its share ([`BETWEEN_BLOCKS`]).
+pub(crate) static MAPPED_BETWEEN: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether a look at a texture's memory may go on to the memory between its
+/// first and its last page when neither of the two is there
+/// ([`mapped_bytes_in_turn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Between {
+    /// No: none is there, as the short cut said.
+    Not,
+    /// Yes, if the frame has not made its share of such looks.
+    InBudget,
+    /// Yes.
+    Always,
+}
+
+/// The 64 KiB blocks the texture pass may ask about in one frame for looks
+/// between two ends that are away ([`Between::InBudget`]): about 2 ms. A
+/// block that is not there costs a question and a read that fails, 2.0 us
+/// on this project's PC (5 us for the two ends alone; 10, 35, 131 and 507
+/// us for an absent texture of 256 KiB, 1, 4 and 16 MiB), and the pass
+/// looks at 100 to 2,700 slots a frame, thousands of them away.
+const BETWEEN_BLOCKS: u64 = 1024;
+
+/// Whether a look between the ends of a texture of `blocks` blocks is
+/// within `frame`'s share; `spent` holds the frame and the blocks its looks
+/// took so far. The frame's first look is, whatever its size.
+fn between_in_budget(spent: &mut (u64, u64), frame: u64, blocks: u64) -> bool {
+    if spent.0 != frame {
+        *spent = (frame, 0);
+    }
+    if spent.1 != 0 && spent.1 + blocks > BETWEEN_BLOCKS {
+        return false;
+    }
+    spent.1 += blocks;
+    true
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// one not there.
+///
+/// With neither the first nor the last page committed the answer was none
+/// without a look at the pages between (two questions for the slots whose
+/// texture is away, which are asked again and again). That is wrong for a
+/// texture of which only pages in the middle have arrived: it counted as
+/// absent for as long as its ends stayed away, and was never staged (a
+/// material that never appears, with no error). The memory between is now
+/// looked at as well ([`mapped_exact`]), as the rest of this function looks
+/// at any texture: a block at a time, with no walk.
+///
+/// The fix is DexNom/VIctory 921d8d3b4's (GPL-3.0; the `texture.rs` part of
+/// "Repair pixel quad sampling, grow ray buffer views, and recover sparse
+/// textures"), with its test. Theirs sums the regions `VirtualQuery` tells
+/// of for such a texture; ours keeps to the questions by block, because one
+/// `VirtualQuery` in the title's big blocks walks to the end of the run of
+/// pages ([`by_query`]), and gives the texture pass its turns
+/// ([`mapped_bytes_in_turn`]), which theirs does not need.
+/// (The whole answer at once is asked by the frame listing and by tests.)
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    mapped_bytes_in_turn(at, len, || Between::Always).0
+}
+
+/// [`mapped_bytes`] for a caller that asks about many textures again and
+/// again (the texture pass): with neither the first nor the last page
+/// there, `between` says whether the memory between them is looked at now.
+/// Returns the bytes, and whether that look was made (then the bytes are
+/// what is there; else 0 means the two ends are away and no more).
+pub(crate) fn mapped_bytes_in_turn(at: *const u8, len: usize, between: impl FnOnce() -> Between) -> (u64, bool) {
+    use std::sync::atomic::Ordering::Relaxed;
     if len == 0 {
-        return 0;
+        return (0, false);
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
-    if !by_query() {
-        use windows_sys::Win32::System::ProcessStatus::{
-            K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
-        };
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
-            // By page, without the walk: whole pages, cut to the range.
-            let (there, _) = readable(start, len, false);
-            return (there as u64 * 4096).min(len as u64);
+    let ends_away = !committed(at, 1) && !committed((end - 1) as *const u8, 1);
+    if ends_away {
+        // Two pages at most: both were asked.
+        if !mapped_exact() || (end - 1) / 4096 - start / 4096 <= 1 {
+            return (0, false);
         }
-        // By 64 KiB block, one page asked of each: the title's memory is
-        // mapped in blocks of that size (the console's page), and the
-        // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
-        // textures "uploaded in part" kept the pass over the heap's views at
-        // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        const KERNEL_PAGE: usize = 4096;
-        let last_byte = start.saturating_add(len - 1);
-        let (first, last) = (start / BLOCK, last_byte / BLOCK);
-        // SAFETY: plain data.
-        let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
-        let mut there = 0u64;
-        let mut block = first;
-        while block <= last {
-            let n = (last - block + 1).min(info.len());
-            for (i, entry) in info[..n].iter_mut().enumerate() {
-                let lo = ((block + i) * BLOCK).max(start);
-                entry.VirtualAddress = (lo & !(KERNEL_PAGE - 1)) as *mut _;
-            }
-            // SAFETY: `n` entries of the size given; our own process.
-            let asked = unsafe {
-                K32QueryWorkingSetEx(
-                    GetCurrentProcess(),
-                    info.as_mut_ptr().cast(),
-                    (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-                )
-            } != 0;
-            for (i, entry) in info[..n].iter().enumerate() {
-                let base = (block + i) * BLOCK;
-                let lo = base.max(start);
-                let hi = base.saturating_add(BLOCK).min(end);
-                let probe = (lo & !(KERNEL_PAGE - 1)) as *const u8;
-                // SAFETY: plain data the query filled in.
-                let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-                let mut byte = [0u8];
-                if valid || crate::host::read_into(probe, &mut byte) {
-                    there += (hi - lo) as u64;
+        match between() {
+            Between::Not => return (0, false),
+            Between::InBudget => {
+                static SPENT: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((u64::MAX, 0));
+                let blocks = ((end - 1) / (64 << 10) - start / (64 << 10) + 1) as u64;
+                let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+                if !between_in_budget(&mut spent, crate::frame::current(), blocks) {
+                    MAPPED_BETWEEN[2].fetch_add(1, Relaxed);
+                    return (0, false);
                 }
             }
-            block += n;
+            Between::Always => {}
         }
-        return there;
+        MAPPED_BETWEEN[0].fetch_add(1, Relaxed);
     }
+    let there = mapped_sum(start, len);
+    if ends_away && there != 0 {
+        MAPPED_BETWEEN[1].fetch_add(1, Relaxed);
+    }
+    (there, ends_away)
+}
+
+/// Whether any of `[start, start + len)` is committed memory: for a caller
+/// that only asks whether a texture has anything to stage. It stops at the
+/// first part found there. (DexNom/VIctory 921d8d3b4 `any_mapped`.)
+pub(crate) fn any_mapped(start: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    if committed(start as *const u8, 1) {
+        return true;
+    }
+    let end = start.saturating_add(len);
+    if (end - 1) / 4096 == start / 4096 {
+        return false;
+    }
+    if !mapped_exact() {
+        return committed((end - 1) as *const u8, 1);
+    }
+    if by_query() { mapped_regions(start, end, true) > 0 } else { mapped_by_block(start, len, true) > 0 }
+}
+
+/// [`mapped_bytes`] of a range that is not empty, whatever its ends say.
+fn mapped_sum(start: usize, len: usize) -> u64 {
+    if by_query() {
+        return mapped_regions(start, start.saturating_add(len), false);
+    }
+    static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+        // By page, without the walk: whole pages, cut to the range.
+        let (there, _) = readable(start, len, false);
+        return (there as u64 * 4096).min(len as u64);
+    }
+    mapped_by_block(start, len, false)
+}
+
+/// The bytes of `[start, start + len)` (`len > 0`) that lie in 64 KiB
+/// blocks whose first page of the range is there; with `first_only`, those
+/// of the first such block alone.
+///
+/// By 64 KiB block, one page asked of each: the title's memory is
+/// mapped in blocks of that size (the console's page), and the
+/// answer is a measure of how much of a texture has arrived, not a
+/// promise that every byte can be read (the upload reads through the
+/// kernel). By page, a texture half there cost a failed kernel read
+/// for each of its missing pages, every frame it stayed due: 1,663
+/// textures "uploaded in part" kept the pass over the heap's views at
+/// 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
+fn mapped_by_block(start: usize, len: usize, first_only: bool) -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const BLOCK: usize = 64 << 10;
+    const KERNEL_PAGE: usize = 4096;
+    let end = start.saturating_add(len);
+    let last_byte = start.saturating_add(len - 1);
+    let (first, last) = (start / BLOCK, last_byte / BLOCK);
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut there = 0u64;
+    let mut block = first;
+    while block <= last {
+        let n = (last - block + 1).min(info.len());
+        for (i, entry) in info[..n].iter_mut().enumerate() {
+            let lo = ((block + i) * BLOCK).max(start);
+            entry.VirtualAddress = (lo & !(KERNEL_PAGE - 1)) as *mut _;
+        }
+        // SAFETY: `n` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (i, entry) in info[..n].iter().enumerate() {
+            let base = (block + i) * BLOCK;
+            let lo = base.max(start);
+            let hi = base.saturating_add(BLOCK).min(end);
+            let probe = (lo & !(KERNEL_PAGE - 1)) as *const u8;
+            // SAFETY: plain data the query filled in.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let mut byte = [0u8];
+            if valid || crate::host::read_into(probe, &mut byte) {
+                there += (hi - lo) as u64;
+                if first_only {
+                    return there;
+                }
+            }
+        }
+        block += n;
+    }
+    there
+}
+
+/// The bytes of `[start, end)` in committed regions, as `VirtualQuery` tells
+/// of them (`VICTORY_COMMITTED_QUERY=1`); with `first_only`, those of the
+/// first such region alone. With [`mapped_exact`], a region that may not be
+/// touched (no access, or a guard) counts as not there, as it does by block
+/// (DexNom/VIctory 921d8d3b4 `mapped_regions`).
+fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let refused = if mapped_exact() { PAGE_NOACCESS | PAGE_GUARD } else { 0 };
     let (mut p, mut there) = (start, 0u64);
     while p < end {
         // SAFETY: plain data filled in by the query.
@@ -1536,8 +1682,11 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & refused == 0 {
             there += (next - p) as u64;
+            if first_only {
+                break;
+            }
         }
         p = next;
     }
@@ -1953,6 +2102,77 @@ mod title_memory_tests {
             });
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// A texture of which only pages in the middle have arrived is there
+    /// with those pages' bytes, where the short cut by its two ends called
+    /// it absent. (DexNom/VIctory 921d8d3b4; the counts are ours.)
+    #[test]
+    fn a_texture_with_only_interior_pages_counts_its_resident_bytes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        let found = || super::MAPPED_BETWEEN[1].load(Relaxed);
+        // SAFETY: this private reservation is ours throughout the test.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 5 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(2 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            let before = found();
+            assert_eq!(super::mapped_bytes(base, 5 * BLOCK), BLOCK as u64);
+            assert!(found() > before, "counted as found between two ends that are away");
+            assert!(super::any_mapped(base as usize, 5 * BLOCK));
+            assert_eq!(super::mapped_bytes(base.add(BLOCK - 3), 2 * BLOCK + 9), BLOCK as u64);
+            assert_eq!(super::mapped_bytes(base, 2 * BLOCK), 0);
+            assert!(!super::any_mapped(base as usize, 2 * BLOCK));
+            // A texture whose start is there is found by its start, as before.
+            assert_eq!(super::mapped_bytes(middle, 3 * BLOCK), BLOCK as u64);
+            assert!(super::any_mapped(middle as usize, 3 * BLOCK));
+            // The same by the regions the system tells of.
+            assert_eq!(super::mapped_regions(base as usize, base as usize + 5 * BLOCK, false), BLOCK as u64);
+            assert_eq!(super::mapped_regions(base as usize, base as usize + 5 * BLOCK, true), BLOCK as u64);
+            // Committed and not to be touched: not there.
+            let mut old = 0;
+            assert_ne!(VirtualProtect(middle.cast(), BLOCK, PAGE_NOACCESS, &mut old), 0);
+            assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
+            assert_eq!(super::mapped_regions(base as usize, base as usize + 5 * BLOCK, false), 0);
+            assert_ne!(VirtualProtect(middle.cast(), BLOCK, PAGE_READWRITE, &mut old), 0);
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
+            assert!(!super::any_mapped(base as usize, 5 * BLOCK));
+            // A caller that takes turns: not now, or within the frame's share.
+            assert_ne!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), std::ptr::null_mut());
+            assert_eq!(super::mapped_bytes_in_turn(base, 5 * BLOCK, || super::Between::Not), (0, false));
+            assert_eq!(super::mapped_bytes_in_turn(base, 5 * BLOCK, || super::Between::Always), (BLOCK as u64, true));
+            // With its start there nobody is asked for a turn.
+            assert_eq!(
+                super::mapped_bytes_in_turn(middle, 3 * BLOCK, || unreachable!("its first page is there")),
+                (BLOCK as u64, false)
+            );
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_eq!(super::mapped_bytes_in_turn(base, 5 * BLOCK, || super::Between::Always), (0, true));
+            // Within two pages there is nothing between the ends to look at.
+            assert_eq!(super::mapped_bytes(base.add(100), 4096), 0);
+            assert!(!super::any_mapped(base as usize + 100, 4096));
+            assert!(!super::any_mapped(base as usize, 0));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// The looks between two ends that are away take a share of blocks a
+    /// frame; the frame's first is made whatever its size.
+    #[test]
+    fn looks_between_the_ends_take_a_share_of_blocks_a_frame() {
+        use super::{BETWEEN_BLOCKS, between_in_budget};
+        let mut spent = (u64::MAX, 0);
+        assert!(between_in_budget(&mut spent, 7, 4 * BETWEEN_BLOCKS), "the first of a frame");
+        assert!(!between_in_budget(&mut spent, 7, 1));
+        // The next frame begins anew.
+        assert!(between_in_budget(&mut spent, 8, BETWEEN_BLOCKS - 10));
+        assert!(between_in_budget(&mut spent, 8, 10));
+        assert!(!between_in_budget(&mut spent, 8, 1));
+        assert_eq!(spent, (8, BETWEEN_BLOCKS));
     }
 
     #[test]

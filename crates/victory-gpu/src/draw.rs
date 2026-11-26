@@ -2728,7 +2728,16 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
                 let asking = std::time::Instant::now();
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                // Neither its first nor its last page there: the memory
+                // between them is looked at in the slot's turn
+                // (`VICTORY_MAPPED_EXACT`; DexNom/VIctory 921d8d3b4).
+                let (mapped, between) =
+                    crate::texture::mapped_bytes_in_turn(address as *const u8, len as usize, || {
+                        host.texture_slot_between(index, write)
+                    });
+                if between {
+                    host.texture_slot_looked_between(index, write, mapped != 0);
+                }
                 HEAP_PASS_PARTS[2].fetch_add(asking.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);

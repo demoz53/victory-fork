@@ -1975,7 +1975,12 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             for &(at, len) in list {
                 n[0] += 1;
                 n[1] += len;
-                let there = crate::texture::mapped_bytes(at as *const u8, len as usize);
+                // (By its two ends alone where both are away: this asks
+                // about every due texture at once.)
+                let there = crate::texture::mapped_bytes_in_turn(at as *const u8, len as usize, || {
+                    crate::texture::Between::Not
+                })
+                .0;
                 if len > 0 && there >= len {
                     n[2] += 1;
                     n[3] += len;
