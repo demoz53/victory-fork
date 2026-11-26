@@ -43,16 +43,24 @@ Every command answers in the status file (`last_command`, `last_result`) and in 
 | `teleport x y` | `teleport -2155 -5330` | As above; the ground is found. |
 | `tp rel <forward> <up>` | `tp rel 5 0`, `tp rel 0 5` | Along the way the player faces, and up (z = now + up). |
 | `tp waypoint` | `tp waypoint` | To the map waypoint, on the ground (refused without one). |
+| `time <hh> <mm>` | `time 21 0` | Sets the game clock (the game's own clock setter). |
+| `time freeze on\|off` | `time freeze on` | Stops or starts the clock (the flag the game's pause-clock command sets); re-applied once a second while on, since missions may start it. |
+| `weather <name>` | `weather rain` | Sets the weather now and holds it (re-applied once a second if the game changes it). Names: sunny clear misty fog clouds overcast darkovercast drizzle shower rain thunder thunderstorm hurricane hail sandstorm, or any other name or `0x` hash the game knows (refused if it has none). |
+| `weather cycle` | `weather cycle` | Back to the game's own weather. |
+| `heal` | `heal` | Full health (gets the player up first if downed; refused if dying or dead). |
+| `invincible on\|off` | `invincible on` | All 19 damage multipliers 0 (the game's damage-proofs setter); off puts back what the player had. Re-applied once a second and on a new player ped. |
+| `wanted <0-6>` | `wanted 2` | Sets the wanted level (the game's maximum is 6); says if the game holds it lower. |
+| `wanted never on\|off` | `wanted never on` | Clears the level, sets the highest level to 0 and makes crimes ignored; off: 6 and crimes count. Re-applied once a second (missions set their own). |
 | `status` | `status` | Rewrite the status file now. |
 
-Coming in the next pieces: `time`, `weather`, `heal`, `invincible`, `wanted`, `spawn vehicle`, `vehicle repair`,
-`native`. They are already parsed and answer "not in this build yet".
+Coming in the next pieces: `spawn vehicle`, `vehicle repair`, `native`. They are already parsed and answer "not in
+this build yet".
 
 ## The status file
 
 `key=value` lines, rewritten twice a second (through a temporary file and a rename, so it is never half written):
 `game updated_unix_ms frame player x y z heading heading_deg in_vehicle health max_health wanted clock clock_frozen
-weather teleport last_command last_source last_frame last_result commands_ok commands_refused`.
+weather freeze_held weather_held invincible never_wanted teleport last_command last_source last_frame last_result commands_ok commands_refused`.
 
 ## Safety
 
@@ -69,6 +77,7 @@ weather teleport last_command last_source last_frame last_result commands_ok com
 | Piece | Offline (tests) | In the game |
 |---|---|---|
 | Mod file, status file, parser, teleports | parser, tail (partial lines, new file), atomic status write, the far teleport's steps with a fake world | not yet |
+| Time, weather, heal, invincible, wanted | parser; every address's bytes and every data word's pin checked against the executable | not yet |
 
 Sources: viper-community/viper e44573c6e (LGPL-2.1-or-later): addresses, signatures and recipes, all checked again
 against the executable's bytes.

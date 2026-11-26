@@ -1,0 +1,27 @@
+# mod1-world: clock, weather, heal, wanted, invincible from the keys file (VICTORY_MOD=1 VICTORY_TITLE_COMMANDS=1),
+# about 10 s after control, beside the house facing the water (sky and sea in view).
+teleport -2357.4 -5525.4 3.0 2.17
+wait 8f
+time 21 0
+wait 14f
+time 7 30
+wait 10f
+weather rain
+wait 18f
+J 8f
+weather clear
+time freeze on
+wait 8f
+heal
+wanted 2
+wait 20f
+wanted 0
+wanted never on
+invincible on
+wait 6f
+L 8f
+invincible off
+wanted never off
+time freeze off
+weather cycle
+wait 6f
